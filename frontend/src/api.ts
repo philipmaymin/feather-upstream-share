@@ -12,6 +12,7 @@ export interface SessionMeta {
 export interface Project {
   id: string
   label: string
+  cwd?: string | null
 }
 
 export interface ContentBlock {
@@ -30,10 +31,14 @@ export interface Message {
   timestamp: string
   content: ContentBlock[]
   delivery?: 'sent' | 'delivered'
+  stopReason?: string
 }
 
-export async function fetchSessions(): Promise<SessionMeta[]> {
-  const r = await fetch(`${BASE}/api/sessions`)
+export async function fetchSessions(project?: string | null): Promise<SessionMeta[]> {
+  const params = new URLSearchParams()
+  if (project) params.set('project', project)
+  const qs = params.toString()
+  const r = await fetch(`${BASE}/api/sessions${qs ? '?' + qs : ''}`)
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
   return (await r.json()).sessions
 }
@@ -137,7 +142,21 @@ export function subscribeMessages(
       : `${BASE}/api/sessions/${id}/stream`
     es = new EventSource(url)
 
-    es.addEventListener('connected', () => { retries = 0; onStatus?.('connected') })
+    es.addEventListener('connected', () => {
+      retries = 0
+      onStatus?.('connected')
+      // On reconnect, check if last message has stopReason (Claude finished while disconnected)
+      if (lastEventId) {
+        fetch(`${BASE}/api/sessions/${id}/messages`)
+          .then(r => r.ok ? r.json() : null)
+          .then(data => {
+            if (!data?.messages?.length) return
+            const last = data.messages[data.messages.length - 1]
+            if (last.stopReason) onMessage(last) // Re-emit so working state clears
+          })
+          .catch(() => {})
+      }
+    })
     es.addEventListener('message', (e) => {
       if (e.lastEventId) lastEventId = e.lastEventId
       try { onMessage(JSON.parse(e.data)) } catch {}

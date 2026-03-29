@@ -1,5 +1,5 @@
 declare const __BUILD_TIME__: string
-import { createSignal, createEffect, onMount, onCleanup, Show, For } from 'solid-js'
+import { createSignal, createEffect, createMemo, onMount, onCleanup, Show, For } from 'solid-js'
 import { MessageView } from './components/MessageView'
 import { Terminal } from './components/Terminal'
 import type { SessionMeta, Message, Project } from './api'
@@ -12,7 +12,9 @@ interface PendingFile { name: string; blob: Blob; dataUrl: string; isImage: bool
 function resizeImage(blob: Blob, maxDim = 1600): Promise<Blob> {
   return new Promise((resolve) => {
     const img = new Image()
+    const url = URL.createObjectURL(blob)
     img.onload = () => {
+      URL.revokeObjectURL(url)
       const { width: w, height: h } = img
       if (w <= maxDim && h <= maxDim) { resolve(blob); return }
       const scale = Math.min(maxDim / w, maxDim / h)
@@ -21,7 +23,7 @@ function resizeImage(blob: Blob, maxDim = 1600): Promise<Blob> {
       c.getContext('2d')!.drawImage(img, 0, 0, c.width, c.height)
       c.toBlob(b => resolve(b || blob), 'image/png')
     }
-    img.src = URL.createObjectURL(blob)
+    img.src = url
   })
 }
 
@@ -59,38 +61,36 @@ function pushHistory(text: string) {
   localStorage.setItem(HISTORY_KEY, JSON.stringify(h))
 }
 
-// ── Status phrases ──────────────────────────────────────────────────────
-const STATUS_PHRASES = [
-  'Ready, spaghetti', 'Scampering along', 'Razmatazzing', 'Beboppin', 'Vibing quietly',
-  'Percolating', 'Noodling around', 'Idle mischief', 'Simmering gently', 'On standby, chef',
-  'Loitering elegantly', 'Twiddling bits', 'Daydreaming in hex', 'Purring softly',
-  'Coasting nicely', 'Drifting downstream', 'Humming along', 'All systems nominal',
-  'Chillin like a villain', 'Idly spectacular', 'Zen mode activated', 'At your service',
-  'Awaiting brilliance', 'Smooth operator', 'Freshly caffeinated',
-]
-let lastPhraseIdx = -1
-function readyPhrase() {
-  let idx: number
-  do { idx = Math.floor(Math.random() * STATUS_PHRASES.length) } while (idx === lastPhraseIdx && STATUS_PHRASES.length > 1)
-  lastPhraseIdx = idx
-  return STATUS_PHRASES[idx]
-}
-
 // ── Dynamic favicon ──────────────────────────────────────────────────────
 function setFavicon(color: string) {
   const size = 32, c = document.createElement('canvas')
   c.width = c.height = size
   const ctx = c.getContext('2d')!
-  // Colored circle with F
+  // Draw feather shape
+  ctx.save()
+  ctx.translate(size * 0.15, size * 0.1)
+  ctx.scale(size / 64, size / 64)
   ctx.beginPath()
-  ctx.arc(size / 2, size / 2, size / 2 - 1, 0, Math.PI * 2)
+  // Feather body
+  ctx.moveTo(48, 4)
+  ctx.bezierCurveTo(36, 12, 28, 24, 20, 40)
+  ctx.quadraticCurveTo(18, 44, 16, 52)
+  ctx.lineTo(24, 46)
+  ctx.bezierCurveTo(28, 43, 32, 39, 35, 34)
+  ctx.bezierCurveTo(38, 30, 41, 25, 43, 20)
+  ctx.lineTo(45, 14)
+  ctx.quadraticCurveTo(46, 11, 48, 4)
+  ctx.closePath()
   ctx.fillStyle = color
   ctx.fill()
-  ctx.fillStyle = '#0a0e14'
-  ctx.font = 'bold 18px sans-serif'
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'middle'
-  ctx.fillText('F', size / 2, size / 2 + 1)
+  // Quill line
+  ctx.beginPath()
+  ctx.moveTo(20, 40)
+  ctx.bezierCurveTo(28, 24, 36, 12, 48, 4)
+  ctx.strokeStyle = '#0a0e14'
+  ctx.lineWidth = 1.5
+  ctx.stroke()
+  ctx.restore()
   let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]')
   if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link) }
   link.href = c.toDataURL()
@@ -126,7 +126,6 @@ export default function App() {
   const [sidebarRenaming, setSidebarRenaming] = createSignal<string | null>(null)
   const [sidebarRenameText, setSidebarRenameText] = createSignal('')
   const [sidebarTab, setSidebarTab] = createSignal<'sessions' | 'links'>('sessions')
-  const [showChangelog, setShowChangelog] = createSignal(false)
   const [projectsExpanded, setProjectsExpanded] = createSignal(false)
   const [links, setLinks] = createSignal<QuickLink[]>([])
   const [starred, setStarred] = createSignal<Record<string, string[]>>({})
@@ -198,6 +197,7 @@ export default function App() {
   // Scroll position memory (in-memory, per session)
   const scrollPositions = new Map<string, number>()
   let messageScrollRef: HTMLDivElement | undefined
+  let workingTimer: number | undefined
 
   function onGlobalKeyDown(e: KeyboardEvent) {
     // Ctrl+B / Cmd+B: toggle sidebar
@@ -216,7 +216,7 @@ export default function App() {
 
   async function initApp() {
     document.addEventListener('keydown', onGlobalKeyDown)
-    updateSessions(await fetchSessions())
+    updateSessions(await fetchSessions(currentProject()))
     fetchProjects().then(setProjects).catch(() => {})
     const base = location.pathname.replace(/\/+$/, '')
     fetch(`${base}/api/quick-links`).then(r => r.ok ? r.json() : []).then(setLinks).catch(() => {})
@@ -233,10 +233,17 @@ export default function App() {
       await initApp()
     }
   })
-  const pollTimer = setInterval(async () => {
-    try { updateSessions(await fetchSessions()) } catch {}
-  }, 10000)
-  onCleanup(() => { clearInterval(pollTimer); cleanupSSE?.(); document.removeEventListener('keydown', onGlobalKeyDown) })
+  onCleanup(() => { cleanupSSE?.(); document.removeEventListener('keydown', onGlobalKeyDown) })
+
+  // Re-fetch sessions when project filter changes
+  let prevProject = currentProject()
+  createEffect(() => {
+    const proj = currentProject()
+    if (proj !== prevProject) {
+      prevProject = proj
+      fetchSessions(proj).then(s => updateSessions(s)).catch(() => {})
+    }
+  })
 
   async function select(id: string) {
     const prev = currentId()
@@ -259,12 +266,24 @@ export default function App() {
     unread.delete(id)
     setUnreadSessions(unread)
     const s = sessions().find(s => s.id === id)
-    if (s) lastSeenUpdatedAt.set(id, s.updatedAt)
+    if (s) { lastSeenUpdatedAt.set(id, s.updatedAt); setLastSession(s) }
+    else setLastSession({ id, title: 'New session', updatedAt: new Date().toISOString(), isActive: true })
     cleanupSSE?.()
+    clearTimeout(workingTimer)
     try {
       const result = await fetchMessages(id)
       setMessages(result.messages)
       setHasMore(result.hasMore)
+      // Determine working state from loaded messages: if last message is
+      // from the assistant with a stopReason, Claude is done. If last message
+      // is from the user (or assistant without stopReason), Claude may still be working.
+      const msgs = result.messages
+      if (msgs.length > 0) {
+        const last = msgs[msgs.length - 1]
+        if (last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence') setWorking(false)
+        else if (last.role === 'user') setWorking(true)
+        else setWorking(false) // assistant mid-stream but no new SSE yet; let SSE update it
+      }
     } catch {}
     setLoading(false)
     // Restore scroll position if we have one saved
@@ -276,7 +295,18 @@ export default function App() {
     }
     setSSEStatus('connected')
     cleanupSSE = subscribeMessages(id, (msg) => {
-      if (msg.role === 'assistant') setWorking(false)
+      // Use stop_reason to accurately track working state
+      if (msg.stopReason === 'end_turn' || msg.stopReason === 'stop_sequence') {
+        setWorking(false)
+        clearTimeout(workingTimer)
+      } else if (msg.role === 'user') {
+        setWorking(true)
+        // Safety timeout: if no end_turn arrives within 5 minutes, clear working
+        clearTimeout(workingTimer)
+        workingTimer = window.setTimeout(() => {
+          if (working()) setWorking(false)
+        }, 5 * 60 * 1000)
+      }
       // Keep lastSeen fresh so the current session doesn't go unread on next poll
       lastSeenUpdatedAt.set(id, new Date().toISOString())
       setMessages(prev => {
@@ -299,20 +329,32 @@ export default function App() {
     }, setSSEStatus)
   }
 
-  async function handleNew() {
+  async function handleNew(newTab = false) {
     setCreating(true)
+    // Open the window synchronously to avoid popup blockers (iOS Safari
+    // blocks window.open after an await breaks the user-gesture chain)
+    const w = newTab ? window.open('', '_blank') : null
     try {
-      const id = await createSession()
-      select(id)
-      fetchSessions().then(s => updateSessions(s)).catch(() => {})
-    } catch (e) { console.error(e) }
+      const proj = currentProject() ? projects().find(p => p.id === currentProject()) : null
+      const id = await createSession(proj?.cwd ?? undefined)
+      // Fetch without project filter since the new session has no project yet
+      updateSessions(await fetchSessions())
+      if (w) {
+        w.location.href = `${location.origin}${location.pathname}#${id}`
+      } else {
+        await select(id)
+      }
+    } catch (e) {
+      console.error(e)
+      if (w) w.close()
+    }
     finally { setCreating(false) }
   }
 
   async function handleResume(id: string) {
     await resumeSession(id)
-    updateSessions(await fetchSessions())
-    select(id)
+    updateSessions(await fetchSessions(currentProject()))
+    await select(id)
   }
 
   async function handleInterrupt(id: string) {
@@ -330,21 +372,13 @@ export default function App() {
     updateSessions(await fetchSessions())
   }
 
-  async function handleRename(id: string) {
-    const title = renameText().trim()
-    if (!title) { setRenaming(false); return }
-    await renameSession(id, title)
+  async function doRename(id: string, title: string) {
+    if (!title.trim()) { setRenaming(false); setSidebarRenaming(null); return }
+    await renameSession(id, title.trim())
     setRenaming(false)
     setMenuOpen(false)
-    updateSessions(await fetchSessions())
-  }
-
-  async function handleSidebarRename(id: string) {
-    const title = sidebarRenameText().trim()
-    if (!title) { setSidebarRenaming(null); return }
-    await renameSession(id, title)
     setSidebarRenaming(null)
-    updateSessions(await fetchSessions())
+    updateSessions(await fetchSessions(currentProject()))
   }
 
   async function loadEarlier() {
@@ -374,7 +408,7 @@ export default function App() {
   async function handleFork(id: string) {
     setMenuOpen(false)
     await forkSession(id)
-    setTimeout(async () => { updateSessions(await fetchSessions()) }, 3000)
+    updateSessions(await fetchSessions(currentProject()))
   }
 
   function toggleVoice() {
@@ -406,13 +440,19 @@ export default function App() {
     if (!currentId()) {
       try {
         const id = await createSession()
-        updateSessions(await fetchSessions())
-        select(id)
-        // Wait a tick for the SSE to connect
-        await new Promise(r => setTimeout(r, 500))
+        updateSessions(await fetchSessions(currentProject()))
+        await select(id)
       } catch { return }
     }
     if (!currentId()) return
+    // Auto-resume if session is inactive
+    const s = cur()
+    if (s && !s.isActive) {
+      await resumeSession(s.id)
+      updateSessions(await fetchSessions(currentProject()))
+      // Wait for Claude to initialize before sending
+      await new Promise(r => setTimeout(r, 5000))
+    }
     setUploading(true)
     setText('')
     setFiles([])
@@ -437,26 +477,43 @@ export default function App() {
     sendInput(currentId()!, fullText)
     setUploading(false)
     setWorking(true)
+    // Safety timeout: clear working if no end_turn within 5 minutes
+    clearTimeout(workingTimer)
+    workingTimer = window.setTimeout(() => {
+      if (working()) setWorking(false)
+    }, 5 * 60 * 1000)
   }
 
   const cur = () => sessions().find(s => s.id === currentId())
+  const [lastSession, setLastSession] = createSignal<SessionMeta | null>(null)
 
+  // Keep lastSession in sync - persists even when sessions list doesn't contain the session
   createEffect(() => {
     const s = cur()
-    if (!s) setFavicon('#333')
-    else if (s.isActive) setFavicon('#4aba6a')
-    else setFavicon('#666')
+    if (s) setLastSession(s)
+    else if (!currentId()) setLastSession(null)
   })
 
-  // Page title: show working status, unread count, and session title
+  // Effective session for header display (cur() is live, lastSession is fallback)
+  const headerSession = () => cur() || lastSession()
+
   createEffect(() => {
-    const s = cur()
+    const s = headerSession()
+    const w = working()
+    if (!s) setFavicon('#333')
+    else if (w) setFavicon('#f5a742')        // Orange when working
+    else if (s.isActive) setFavicon('#4aba6a') // Green when ready
+    else setFavicon('#666')                    // Gray when inactive
+  })
+
+  // Page title: feather icon + status dot + project name
+  createEffect(() => {
+    const s = headerSession()
     const w = working()
     const unreadCount = unreadSessions().size
     const unreadPrefix = unreadCount > 0 ? `(${unreadCount}) ` : ''
     const dot = w ? '\u25CF' : '\u25CB'
     if (s) {
-      // Use project label for title (like old feather), fall back to short session title
       const proj = s.projectLabel || projects().find(p => p.id === s.projectId)?.label
       const label = proj || s.title.slice(0, 30)
       document.title = `${unreadPrefix}${dot} ${label}`
@@ -465,12 +522,11 @@ export default function App() {
     }
   })
 
-  const touchedFiles = () => {
+  const touchedFiles = createMemo(() => {
     const files = new Map<string, { actions: Set<string>, lastSeen: string }>()
     for (const msg of messages()) {
       for (const block of msg.content || []) {
         if (block.type !== 'tool_use') continue
-        // Only use file_path (Read/Write/Edit) — not path (Grep/Glob search dirs)
         const fp = block.input?.file_path
         if (typeof fp === 'string' && fp.startsWith('/')) {
           const existing = files.get(fp)
@@ -479,10 +535,14 @@ export default function App() {
         }
       }
     }
+    const actionOrder = ['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash']
     return [...files.entries()]
-      .map(([path, { actions, lastSeen }]) => ({ path, actions: [...actions], lastSeen }))
+      .map(([path, { actions, lastSeen }]) => ({
+        path, lastSeen,
+        actions: [...actions].sort((a, b) => (actionOrder.indexOf(a) === -1 ? 99 : actionOrder.indexOf(a)) - (actionOrder.indexOf(b) === -1 ? 99 : actionOrder.indexOf(b))),
+      }))
       .sort((a, b) => b.lastSeen.localeCompare(a.lastSeen))
-  }
+  })
 
   const tabStyle = (t: string) => ({
     padding: '6px 16px', border: 'none', 'border-bottom': tab() === t ? '2px solid #4aba6a' : '2px solid transparent',
@@ -663,10 +723,13 @@ export default function App() {
               </div>
               </Show>
             </div>
-            {/* New session button */}
-            <div style={{ padding: '8px 16px' }}>
-              <button onClick={handleNew} disabled={creating()} style={{ width: '100%', padding: '10px', background: creating() ? '#1a1a2e' : '#4aba6a', color: creating() ? '#666' : '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+            {/* New session buttons */}
+            <div style={{ padding: '8px 16px', display: 'flex', gap: '8px' }}>
+              <button onClick={() => handleNew()} disabled={creating()} style={{ flex: '1', padding: '10px', background: creating() ? '#1a1a2e' : '#4aba6a', color: creating() ? '#666' : '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                 {creating() ? 'Starting...' : '+ New Claude'}
+              </button>
+              <button onClick={() => handleNew(true)} disabled={creating()} title="Open in new tab" style={{ padding: '10px 12px', background: creating() ? '#1a1a2e' : '#3a9a5a', color: creating() ? '#666' : '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                &#8599;
               </button>
             </div>
             {/* Session list (filtered by project, grouped by time) */}
@@ -713,8 +776,8 @@ export default function App() {
                         <input
                           value={sidebarRenameText()}
                           onInput={(e) => setSidebarRenameText(e.target.value)}
-                          onKeyDown={(e) => { if (e.key === 'Enter') handleSidebarRename(s.id); if (e.key === 'Escape') setSidebarRenaming(null) }}
-                          onBlur={() => handleSidebarRename(s.id)}
+                          onKeyDown={(e) => { if (e.key === 'Enter') doRename(s.id, sidebarRenameText()); if (e.key === 'Escape') setSidebarRenaming(null) }}
+                          onBlur={() => doRename(s.id, sidebarRenameText())}
                           onClick={(e) => e.stopPropagation()}
                           ref={(el) => setTimeout(() => { el.focus(); el.select() }, 0)}
                           style={{ width: '100%', background: '#1a1a2e', border: '1px solid #4aba6a', 'border-radius': '4px', padding: '2px 6px', color: '#e5e5e5', 'font-size': '13px', outline: 'none' }}
@@ -749,7 +812,7 @@ export default function App() {
       <div style={{ flex: '1', display: 'flex', 'flex-direction': 'column', 'min-width': '0', height: '100%' }}>
         {/* Header */}
         <div style={{ padding: '8px 16px 0 56px', 'padding-top': 'max(8px, env(safe-area-inset-top))', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'align-items': 'center', gap: '8px', 'min-height': '48px', 'flex-shrink': '0' }}>
-          <Show when={cur()} fallback={<span style={{ color: '#666', 'font-size': '14px' }}>Select a session</span>}>
+          <Show when={headerSession()} fallback={<span style={{ color: '#666', 'font-size': '14px' }}>{currentId() ? 'Loading...' : 'Select a session'}</span>}>
             {(s) => <>
               <Show when={s().isActive}><span style={{ width: '8px', height: '8px', 'border-radius': '50%', background: '#4aba6a', 'flex-shrink': '0' }} /></Show>
               <Show when={renaming()} fallback={
@@ -763,21 +826,22 @@ export default function App() {
                 <input
                   value={renameText()}
                   onInput={(e) => setRenameText(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') handleRename(s().id); if (e.key === 'Escape') setRenaming(false) }}
-                  onBlur={() => handleRename(s().id)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') doRename(s().id, renameText()); if (e.key === 'Escape') setRenaming(false) }}
+                  onBlur={() => doRename(s().id, renameText())}
                   ref={(el) => setTimeout(() => el.focus(), 0)}
                   style={{ background: '#1a1a2e', border: '1px solid #4aba6a', 'border-radius': '6px', padding: '2px 8px', color: '#e5e5e5', 'font-size': '14px', 'font-weight': '600', outline: 'none', flex: '1', 'min-width': '0' }}
                 />
               </Show>
               <div style={{ flex: '1' }} />
-              <Show when={!s().isActive}>
-                <button onClick={() => handleResume(s().id)} style={{ background: '#4aba6a', color: '#000', border: 'none', 'border-radius': '6px', padding: '4px 12px', 'font-size': '12px', 'font-weight': '600', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Resume</button>
-              </Show>
               <div style={{ position: 'relative' }}>
                 <button onClick={() => setMenuOpen(!menuOpen())} style={{ background: 'none', border: 'none', color: '#888', 'font-size': '18px', cursor: 'pointer', padding: '4px 6px', '-webkit-tap-highlight-color': 'transparent' }}>{'\u22EE'}</button>
                 <Show when={menuOpen()}>
                   <div onClick={() => setMenuOpen(false)} style={{ position: 'fixed', inset: '0', 'z-index': '99' }} />
                   <div style={{ position: 'absolute', right: '0', top: '100%', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '8px', 'box-shadow': '0 4px 12px rgba(0,0,0,0.5)', 'z-index': '100', 'min-width': '140px', overflow: 'hidden' }}>
+                    <Show when={!s().isActive}>
+                      <button onClick={() => { handleResume(s().id); setMenuOpen(false) }}
+                        style={{ display: 'block', width: '100%', padding: '10px 16px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#4aba6a', 'font-size': '13px', 'text-align': 'left', cursor: 'pointer' }}>Resume</button>
+                    </Show>
                     <Show when={s().isActive}>
                       <button onClick={() => { handleInterrupt(s().id); setMenuOpen(false) }}
                         style={{ display: 'block', width: '100%', padding: '10px 16px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#d45555', 'font-size': '13px', 'text-align': 'left', cursor: 'pointer' }}>Stop</button>
@@ -802,44 +866,7 @@ export default function App() {
             <button onClick={() => setTab('chat')} style={tabStyle('chat')}>Chat</button>
             <button onClick={() => setTab('files')} style={tabStyle('files')}>Files{touchedFiles().length > 0 ? ` (${touchedFiles().length})` : ''}</button>
             <button onClick={() => setTab('terminal')} style={tabStyle('terminal')}>Terminal</button>
-            <span onClick={() => setShowChangelog(!showChangelog())} style={{ 'margin-left': 'auto', 'padding-right': '12px', 'font-size': '10px', color: '#444', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>{__BUILD_TIME__}</span>
-          </div>
-        </Show>
-
-        {/* What's New popover */}
-        <Show when={showChangelog()}>
-          <div onClick={() => setShowChangelog(false)} style={{ position: 'fixed', inset: '0', 'z-index': '150' }} />
-          <div style={{ position: 'absolute', right: '12px', top: '100px', width: '320px', 'max-width': '85vw', 'max-height': '60vh', 'overflow-y': 'auto', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '12px', 'box-shadow': '0 8px 24px rgba(0,0,0,0.6)', 'z-index': '151', padding: '16px' }}>
-            <div style={{ display: 'flex', 'justify-content': 'space-between', 'align-items': 'center', 'margin-bottom': '12px' }}>
-              <span style={{ 'font-size': '14px', 'font-weight': '700', color: '#e5e5e5' }}>What's New</span>
-              <button onClick={() => setShowChangelog(false)} style={{ background: 'none', border: 'none', color: '#666', 'font-size': '16px', cursor: 'pointer' }}>&times;</button>
-            </div>
-            <div style={{ 'font-size': '12px', color: '#aaa', 'line-height': '1.6' }}>
-              <div style={{ color: '#4aba6a', 'font-weight': '600', 'margin-bottom': '6px' }}>March 28, 2026</div>
-              <ul style={{ margin: '0', padding: '0 0 0 16px' }}>
-                <li>Auto-generated session titles (via Haiku)</li>
-                <li>Status bar with fun phrases (Razmatazzing!)</li>
-                <li>Page title shows project name + status dot</li>
-                <li>Favicon with "F" and status color</li>
-                <li>Copy button on tool result outputs</li>
-                <li>Clickable timestamps (tap for full date)</li>
-                <li>Auto-create session when you type</li>
-                <li>Typing indicator (bouncing dots)</li>
-                <li>Session time grouping (Today / Yesterday)</li>
-                <li>Expandable tool cards (Agent, Grep, Read)</li>
-                <li>Tool results collapse with line count</li>
-                <li>Project labels in header and sidebar</li>
-                <li>Sidebar rename (double-click or long-press)</li>
-                <li>Image and file preview in messages</li>
-                <li>Collapsible project tree</li>
-                <li>Code block auto-collapse (25+ lines)</li>
-                <li>Keyboard shortcuts (Ctrl+B sidebar)</li>
-                <li>Unread session tracking (blue dot)</li>
-                <li>Character count in input area</li>
-                <li>Scroll-to-bottom button</li>
-                <li>ANSI stripping, URL links open in new tab</li>
-              </ul>
-            </div>
+            <span style={{ 'margin-left': 'auto', 'padding-right': '12px', 'font-size': '10px', color: '#444' }}>{__BUILD_TIME__}</span>
           </div>
         </Show>
 
@@ -899,7 +926,7 @@ export default function App() {
         <Show when={currentId() && tab() === 'chat'}>
           <div style={{ padding: '2px 16px', 'border-top': '1px solid #1e1e1e', background: '#0a0e14', display: 'flex', 'align-items': 'center', gap: '6px', 'flex-shrink': '0' }}>
             <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: working() ? '#f5a742' : '#4aba6a', transition: 'background 0.3s' }} />
-            <span style={{ 'font-size': '10px', color: '#555', 'font-weight': '500' }}>{working() ? 'Working...' : readyPhrase()}</span>
+            <span style={{ 'font-size': '10px', color: '#555', 'font-weight': '500' }}>{working() ? 'Working...' : 'Ready'}</span>
           </div>
         </Show>
 
