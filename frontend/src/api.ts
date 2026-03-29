@@ -7,6 +7,7 @@ export interface SessionMeta {
   isActive: boolean
   projectId?: string
   projectLabel?: string | null
+  cwd?: string | null
 }
 
 export interface Project {
@@ -32,6 +33,11 @@ export interface Message {
   content: ContentBlock[]
   delivery?: 'sent' | 'delivered'
   stopReason?: string
+  cwd?: string
+  model?: string
+  usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
+  version?: string
+  gitBranch?: string
 }
 
 export async function fetchSessions(project?: string | null): Promise<SessionMeta[]> {
@@ -101,8 +107,25 @@ export const saveStarred = (data: Record<string, string[]>) =>
 
 export const exportUrl = (id: string) => `${BASE}/api/sessions/${id}/export`
 
-export const openInEditor = (path: string) =>
-  fetch(`${BASE}/api/open-in-editor`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) }).then(r => r.json())
+export interface SearchResult {
+  id: string
+  title: string
+  snippet: string
+  matchCount: number
+  updatedAt: string
+  isActive: boolean
+  projectId?: string
+  projectLabel?: string | null
+  cwd?: string | null
+}
+
+export async function searchSessions(query: string, project?: string | null): Promise<SearchResult[]> {
+  const params = new URLSearchParams({ q: query })
+  if (project) params.set('project', project)
+  const r = await fetch(`${BASE}/api/search?${params}`)
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return (await r.json()).results
+}
 
 export async function checkAuth(): Promise<{ username: string; admin: boolean } | null> {
   try {

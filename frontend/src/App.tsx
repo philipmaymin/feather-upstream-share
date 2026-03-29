@@ -3,7 +3,8 @@ import { createSignal, createEffect, createMemo, onMount, onCleanup, Show, For }
 import { MessageView } from './components/MessageView'
 import { Terminal } from './components/Terminal'
 import type { SessionMeta, Message, Project } from './api'
-import { fetchSessions, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFile, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, openInEditor, fetchProjects, checkAuth, login, logout } from './api'
+import { fetchSessions, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFile, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, fetchProjects, checkAuth, login, logout, searchSessions } from './api'
+import type { SearchResult } from './api'
 
 interface QuickLink { label: string; url: string }
 
@@ -96,6 +97,8 @@ function setFavicon(color: string) {
   link.href = c.toDataURL()
 }
 
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+
 export default function App() {
   const [authUser, setAuthUser] = createSignal<{ username: string; admin: boolean } | null>(null)
   const [authChecked, setAuthChecked] = createSignal(false)
@@ -116,7 +119,6 @@ export default function App() {
   const [dragging, setDragging] = createSignal(false)
   const [menuOpen, setMenuOpen] = createSignal(false)
   const [historyIdx, setHistoryIdx] = createSignal(-1)
-  const [historyOpen, setHistoryOpen] = createSignal(false)
   const [sseStatus, setSSEStatus] = createSignal<'connected' | 'reconnecting'>('connected')
   const [listening, setListening] = createSignal(false)
   const [hasMore, setHasMore] = createSignal(false)
@@ -133,7 +135,18 @@ export default function App() {
   const [currentProject, setCurrentProject] = createSignal<string | null>(localStorage.getItem('feather-next-project'))
   const [expandedGroups, setExpandedGroups] = createSignal<Record<string, boolean>>(JSON.parse(localStorage.getItem('feather-next-groups') || '{}'))
   const [unreadSessions, setUnreadSessions] = createSignal<Set<string>>(new Set())
+  const [searchOpen, setSearchOpen] = createSignal(false)
+  const [searchQuery, setSearchQuery] = createSignal('')
+  const [searchResults, setSearchResults] = createSignal<SearchResult[]>([])
+  const [searching, setSearching] = createSignal(false)
+  let searchTimer: ReturnType<typeof setTimeout> | undefined
+
   const lastSeenUpdatedAt = new Map<string, string>() // session ID -> last known updatedAt
+  const [updateAvailable, setUpdateAvailable] = createSignal(false)
+  const [updateChanges, setUpdateChanges] = createSignal('')
+  const [showChangelog, setShowChangelog] = createSignal(false)
+  const currentJsFile = document.querySelector<HTMLScriptElement>('script[src*="index-"]')?.src.match(/index-[^.]+\.js/)?.[0] || null
+
   let cleanupSSE: (() => void) | null = null
   let recognition: any = null
   let textareaRef: HTMLTextAreaElement | undefined
@@ -180,7 +193,6 @@ export default function App() {
     touchTracking = false
   }
 
-
   async function addFiles(fileList: FileList | File[]) {
     const added: PendingFile[] = []
     for (const f of fileList) {
@@ -198,6 +210,14 @@ export default function App() {
   const scrollPositions = new Map<string, number>()
   let messageScrollRef: HTMLDivElement | undefined
   let workingTimer: number | undefined
+  let assistantDoneTimer: number | undefined
+
+  function startWorkingTimeout() {
+    clearTimeout(workingTimer)
+    workingTimer = window.setTimeout(() => {
+      if (working()) setWorking(false)
+    }, 5 * 60 * 1000)
+  }
 
   function onGlobalKeyDown(e: KeyboardEvent) {
     // Ctrl+B / Cmd+B: toggle sidebar
@@ -226,12 +246,39 @@ export default function App() {
   }
 
   onMount(async () => {
+    // Set --vh for iOS keyboard handling
+    function setVh() {
+      const vh = (window.visualViewport?.height || window.innerHeight) * 0.01
+      document.documentElement.style.setProperty('--vh', `${vh}px`)
+    }
+    setVh()
+    window.visualViewport?.addEventListener('resize', setVh)
+    window.addEventListener('resize', setVh)
+
     const user = await checkAuth()
     setAuthChecked(true)
     if (user) {
       setAuthUser(user)
       await initApp()
     }
+
+    // Check for updates every 30 seconds
+    async function checkForUpdate() {
+      try {
+        const r = await fetch(`${location.pathname.replace(/\/+$/, '')}/api/version`)
+        if (!r.ok) return
+        const { stagingJs, changes } = await r.json()
+        if (stagingJs && currentJsFile && stagingJs !== currentJsFile) {
+          setUpdateAvailable(true)
+          if (changes) setUpdateChanges(changes)
+        } else {
+          setUpdateAvailable(false)
+        }
+      } catch {}
+    }
+    checkForUpdate()
+    const versionInterval = setInterval(checkForUpdate, 30000)
+    onCleanup(() => clearInterval(versionInterval))
   })
   onCleanup(() => { cleanupSSE?.(); document.removeEventListener('keydown', onGlobalKeyDown) })
 
@@ -260,14 +307,20 @@ export default function App() {
     setWorking(false)
     setText(loadDraft(id))
     setHistoryIdx(-1)
-    setHistoryOpen(false)
     // Clear unread status and update lastSeen timestamp
     const unread = new Set(unreadSessions())
     unread.delete(id)
     setUnreadSessions(unread)
-    const s = sessions().find(s => s.id === id)
+    let s = sessions().find(s => s.id === id)
     if (s) { lastSeenUpdatedAt.set(id, s.updatedAt); setLastSession(s) }
-    else setLastSession({ id, title: 'New session', updatedAt: new Date().toISOString(), isActive: true })
+    else {
+      setLastSession({ id, title: 'New session', updatedAt: new Date().toISOString(), isActive: true })
+      // Session not in filtered list; fetch unfiltered to get full metadata (cwd, title, etc.)
+      fetchSessions().then(all => {
+        const found = all.find(a => a.id === id)
+        if (found) setLastSession(found)
+      }).catch(() => {})
+    }
     cleanupSSE?.()
     clearTimeout(workingTimer)
     try {
@@ -283,6 +336,14 @@ export default function App() {
         if (last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence') setWorking(false)
         else if (last.role === 'user') setWorking(true)
         else setWorking(false) // assistant mid-stream but no new SSE yet; let SSE update it
+        // Extract cwd from last user message and update header
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].cwd) {
+            const ls = lastSession()
+            if (ls && ls.id === id && !ls.cwd) setLastSession({ ...ls, cwd: msgs[i].cwd })
+            break
+          }
+        }
       }
     } catch {}
     setLoading(false)
@@ -295,17 +356,38 @@ export default function App() {
     }
     setSSEStatus('connected')
     cleanupSSE = subscribeMessages(id, (msg) => {
+      // Clear assistant-done debounce on any incoming message
+      clearTimeout(assistantDoneTimer)
       // Use stop_reason to accurately track working state
       if (msg.stopReason === 'end_turn' || msg.stopReason === 'stop_sequence') {
         setWorking(false)
         clearTimeout(workingTimer)
+        // Refresh session list to pick up auto-generated title
+        const cur = sessions().find(s => s.id === id)
+        if (cur && (cur.title === 'New session' || cur.title === id.slice(0, 8))) {
+          setTimeout(() => fetchSessions(currentProject()).then(s => updateSessions(s)).catch(() => {}), 3000)
+        }
       } else if (msg.role === 'user') {
         setWorking(true)
-        // Safety timeout: if no end_turn arrives within 5 minutes, clear working
-        clearTimeout(workingTimer)
-        workingTimer = window.setTimeout(() => {
-          if (working()) setWorking(false)
-        }, 5 * 60 * 1000)
+        startWorkingTimeout()
+      } else if (msg.role === 'assistant' && !msg.stopReason) {
+        // Assistant message without stop_reason: JSONL may never get end_turn.
+        // Debounce: if no more messages arrive in 5s, assume the turn is done.
+        assistantDoneTimer = window.setTimeout(() => {
+          if (working()) {
+            setWorking(false)
+            clearTimeout(workingTimer)
+          }
+        }, 5000)
+      }
+      // Update session cwd from incoming user messages
+      if (msg.cwd && msg.role === 'user') {
+        setSessions(prev => prev.map(s => s.id === id ? { ...s, cwd: msg.cwd } : s))
+        // Also update lastSession directly in case session isn't in the filtered list
+        const ls = lastSession()
+        if (ls && ls.id === id && ls.cwd !== msg.cwd) {
+          setLastSession({ ...ls, cwd: msg.cwd })
+        }
       }
       // Keep lastSeen fresh so the current session doesn't go unread on next poll
       lastSeenUpdatedAt.set(id, new Date().toISOString())
@@ -329,6 +411,55 @@ export default function App() {
     }, setSSEStatus)
   }
 
+  function doSearch(query: string) {
+    clearTimeout(searchTimer)
+    if (query.length < 2) { setSearchResults([]); setSearching(false); return }
+    setSearching(true)
+    searchTimer = setTimeout(async () => {
+      try {
+        const results = await searchSessions(query, currentProject())
+        setSearchResults(results)
+      } catch {}
+      setSearching(false)
+    }, 300)
+  }
+
+  const [starIdx, setStarIdx] = createSignal(-1)
+
+  function jumpToNextStar() {
+    if (!messageScrollRef || !currentId()) return
+    const starredList = starred()[currentId()!] || []
+    if (starredList.length === 0) return
+    const next = (starIdx() + 1) % starredList.length
+    setStarIdx(next)
+    const el = messageScrollRef.querySelector(`[data-uuid="${starredList[next]}"]`)
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    } else {
+      // Message might not be loaded yet, try next
+      if (starredList.length > 1) {
+        const alt = (next + 1) % starredList.length
+        setStarIdx(alt)
+        const el2 = messageScrollRef.querySelector(`[data-uuid="${starredList[alt]}"]`)
+        el2?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+    }
+  }
+
+  function scrollToPrevUserMessage() {
+    if (!messageScrollRef) return
+    const els = messageScrollRef.querySelectorAll('[data-role="user"]')
+    if (!els.length) return
+    const viewTop = messageScrollRef.getBoundingClientRect().top
+    let target: Element | null = null
+    for (let i = els.length - 1; i >= 0; i--) {
+      if (els[i].getBoundingClientRect().top < viewTop + 5) { target = els[i]; break }
+    }
+    if (!target) target = els[0]
+    const offset = target.getBoundingClientRect().top - viewTop - 16
+    messageScrollRef.scrollTo({ top: messageScrollRef.scrollTop + offset })
+  }
+
   async function handleNew(newTab = false) {
     setCreating(true)
     // Open the window synchronously to avoid popup blockers (iOS Safari
@@ -344,8 +475,7 @@ export default function App() {
       } else {
         await select(id)
       }
-    } catch (e) {
-      console.error(e)
+    } catch {
       if (w) w.close()
     }
     finally { setCreating(false) }
@@ -450,8 +580,6 @@ export default function App() {
     if (s && !s.isActive) {
       await resumeSession(s.id)
       updateSessions(await fetchSessions(currentProject()))
-      // Wait for Claude to initialize before sending
-      await new Promise(r => setTimeout(r, 5000))
     }
     setUploading(true)
     setText('')
@@ -477,15 +605,37 @@ export default function App() {
     sendInput(currentId()!, fullText)
     setUploading(false)
     setWorking(true)
-    // Safety timeout: clear working if no end_turn within 5 minutes
-    clearTimeout(workingTimer)
-    workingTimer = window.setTimeout(() => {
-      if (working()) setWorking(false)
-    }, 5 * 60 * 1000)
+    startWorkingTimeout()
   }
 
   const cur = () => sessions().find(s => s.id === currentId())
   const [lastSession, setLastSession] = createSignal<SessionMeta | null>(null)
+
+  // Derive session stats from loaded messages (memoized to avoid re-iterating on every access)
+  const sessionStats = createMemo(() => {
+    const msgs = messages()
+    let cwd: string | undefined
+    let model: string | undefined
+    let version: string | undefined
+    let totalIn = 0
+    let totalOut = 0
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i]
+      if (!cwd && m.cwd) cwd = m.cwd
+      if (!model && m.model) model = m.model
+      if (!version && m.version) version = m.version
+      if (cwd && model && version) break
+    }
+    for (const m of msgs) {
+      if (m.usage) {
+        totalIn += (m.usage.input_tokens || 0)
+        totalOut += (m.usage.output_tokens || 0)
+      }
+    }
+    return { cwd, model, version, totalIn, totalOut }
+  })
+
+  const currentCwd = () => sessionStats().cwd || headerSession()?.cwd || null
 
   // Keep lastSession in sync - persists even when sessions list doesn't contain the session
   createEffect(() => {
@@ -723,7 +873,7 @@ export default function App() {
               </div>
               </Show>
             </div>
-            {/* New session buttons */}
+            {/* New session + search buttons */}
             <div style={{ padding: '8px 16px', display: 'flex', gap: '8px' }}>
               <button onClick={() => handleNew()} disabled={creating()} style={{ flex: '1', padding: '10px', background: creating() ? '#1a1a2e' : '#4aba6a', color: creating() ? '#666' : '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                 {creating() ? 'Starting...' : '+ New Claude'}
@@ -731,9 +881,58 @@ export default function App() {
               <button onClick={() => handleNew(true)} disabled={creating()} title="Open in new tab" style={{ padding: '10px 12px', background: creating() ? '#1a1a2e' : '#3a9a5a', color: creating() ? '#666' : '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                 &#8599;
               </button>
+              <button onClick={() => { setSearchOpen(!searchOpen()); if (!searchOpen()) { setSearchQuery(''); setSearchResults([]) } }} title="Search chats" style={{ padding: '10px 12px', background: searchOpen() ? '#4aba6a' : '#1a1a2e', color: searchOpen() ? '#000' : '#888', border: '1px solid #333', 'border-radius': '8px', 'font-size': '14px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                &#x1F50D;
+              </button>
             </div>
+            {/* Search input */}
+            <Show when={searchOpen()}>
+              <div style={{ padding: '0 16px 8px' }}>
+                <input
+                  placeholder={currentProject() ? 'Search in project...' : 'Search all chats...'}
+                  value={searchQuery()}
+                  onInput={(e) => { setSearchQuery(e.target.value); doSearch(e.target.value) }}
+                  onKeyDown={(e) => { if (e.key === 'Escape') { setSearchOpen(false); setSearchQuery(''); setSearchResults([]) } }}
+                  ref={(el) => setTimeout(() => el.focus(), 50)}
+                  style={{ width: '100%', padding: '8px 12px', background: '#0e0e14', border: '1px solid #333', 'border-radius': '6px', color: '#e5e5e5', 'font-size': '13px', outline: 'none' }}
+                />
+              </div>
+            </Show>
             {/* Session list (filtered by project, grouped by time) */}
             <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', 'overscroll-behavior': 'contain', 'padding-bottom': 'env(safe-area-inset-bottom)' }}>
+              {/* Search results */}
+              <Show when={searchOpen() && searchQuery().length >= 2}>
+                <Show when={searching()}>
+                  <div style={{ padding: '20px 16px', color: '#555', 'font-size': '13px', 'text-align': 'center' }}>Searching...</div>
+                </Show>
+                <Show when={!searching() && searchResults().length === 0 && searchQuery().length >= 2}>
+                  <div style={{ padding: '20px 16px', color: '#555', 'font-size': '13px', 'text-align': 'center' }}>No results found</div>
+                </Show>
+                <Show when={!searching() && searchResults().length > 0}>
+                  <div style={{ padding: '6px 16px 2px', 'font-size': '10px', 'font-weight': '600', color: '#555', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>{searchResults().length} result{searchResults().length !== 1 ? 's' : ''}</div>
+                  <For each={searchResults()}>{(r) => (
+                    <div onClick={() => { select(r.id); setSearchOpen(false); setSearchQuery(''); setSearchResults([]) }}
+                      style={{ padding: '10px 16px', cursor: 'pointer', 'border-left': r.id === currentId() ? '3px solid #4aba6a' : '3px solid transparent', background: r.id === currentId() ? '#1a1a2e' : 'transparent', 'border-bottom': '1px solid #111', '-webkit-tap-highlight-color': 'transparent' }}>
+                      <div style={{ display: 'flex', 'align-items': 'center', gap: '8px' }}>
+                        <Show when={r.isActive}><span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#4aba6a', 'flex-shrink': '0' }} /></Show>
+                        <div style={{ flex: '1', 'min-width': '0' }}>
+                          <div style={{ 'font-size': '13px', 'font-weight': '500', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{r.title}</div>
+                          <Show when={!currentProject() && r.projectLabel}>
+                            <div style={{ 'font-size': '10px', color: '#444', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{r.projectLabel}</div>
+                          </Show>
+                          <div style={{ 'font-size': '11px', color: '#666', 'margin-top': '4px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{r.snippet}</div>
+                        </div>
+                        <div style={{ 'flex-shrink': '0', 'text-align': 'right' }}>
+                          <div style={{ 'font-size': '11px', color: '#555' }}>{timeAgo(r.updatedAt)}</div>
+                          <div style={{ 'font-size': '10px', color: '#444' }}>{r.matchCount} match{r.matchCount !== 1 ? 'es' : ''}</div>
+                        </div>
+                      </div>
+                    </div>
+                  )}</For>
+                </Show>
+              </Show>
+              {/* Regular session list */}
+              <Show when={!searchOpen() || searchQuery().length < 2}>
               {(() => {
                 const filtered = sessions().filter(s => !currentProject() || s.projectId === currentProject())
                 const now = new Date()
@@ -787,6 +986,7 @@ export default function App() {
                   )}</For>
                 </>}</For>
               })()}
+              </Show>
             </div>
           </Show>
           {/* Links tab */}
@@ -817,9 +1017,19 @@ export default function App() {
               <Show when={s().isActive}><span style={{ width: '8px', height: '8px', 'border-radius': '50%', background: '#4aba6a', 'flex-shrink': '0' }} /></Show>
               <Show when={renaming()} fallback={
                 <div style={{ overflow: 'hidden', 'min-width': '0' }}>
-                  <Show when={s().projectLabel || (s().projectId && projects().find(p => p.id === s().projectId)?.label)}>
-                    {(label) => <div style={{ 'font-size': '10px', color: '#666', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{label()}</div>}
-                  </Show>
+                  <div style={{ 'font-size': '10px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', display: 'flex', 'align-items': 'center', gap: '4px' }}>
+                    <Show when={s().projectLabel || (s().projectId && projects().find(p => p.id === s().projectId)?.label)}>
+                      {(label) => <span style={{ color: '#666' }}>{label()}</span>}
+                    </Show>
+                    <Show when={currentCwd()}>
+                      {(cwd) => <>
+                        <Show when={s().projectLabel || (s().projectId && projects().find(p => p.id === s().projectId)?.label)}>
+                          <span style={{ color: '#333' }}>/</span>
+                        </Show>
+                        <span style={{ color: '#555' }} title={cwd()}>{cwd().replace(/^\/home\/[^/]+/, '~')}</span>
+                      </>}
+                    </Show>
+                  </div>
                   <span style={{ overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', 'font-size': '14px', 'font-weight': '600', display: 'block' }}>{s().title}</span>
                 </div>
               }>
@@ -924,9 +1134,50 @@ export default function App() {
 
         {/* Status bar */}
         <Show when={currentId() && tab() === 'chat'}>
-          <div style={{ padding: '2px 16px', 'border-top': '1px solid #1e1e1e', background: '#0a0e14', display: 'flex', 'align-items': 'center', gap: '6px', 'flex-shrink': '0' }}>
-            <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: working() ? '#f5a742' : '#4aba6a', transition: 'background 0.3s' }} />
+          <div style={{ padding: '2px 16px', 'border-top': '1px solid #1e1e1e', background: '#0a0e14', display: 'flex', 'align-items': 'center', gap: '8px', 'flex-shrink': '0', 'overflow-x': 'auto', 'white-space': 'nowrap' }}>
+            <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: working() ? '#f5a742' : '#4aba6a', transition: 'background 0.3s', 'flex-shrink': '0' }} />
             <span style={{ 'font-size': '10px', color: '#555', 'font-weight': '500' }}>{working() ? 'Working...' : 'Ready'}</span>
+            {(() => {
+              const stats = sessionStats()
+              const fmtTokens = (n: number) => n >= 1000 ? (n / 1000).toFixed(0) + 'k' : String(n)
+              return <>
+                <Show when={stats.cwd}>
+                  <span style={{ 'font-size': '10px', color: '#444' }}>{stats.cwd!.replace(/^\/home\/[^/]+/, '~')}</span>
+                </Show>
+                <Show when={stats.model}>
+                  <span style={{ 'font-size': '10px', color: '#444' }}>{stats.model!.replace('claude-', '').replace(/-\d{8}$/, '')}</span>
+                </Show>
+                <Show when={stats.totalIn > 0 || stats.totalOut > 0}>
+                  <span style={{ 'font-size': '10px', color: '#444' }}>{fmtTokens(stats.totalIn)}in / {fmtTokens(stats.totalOut)}out</span>
+                </Show>
+              </>
+            })()}
+            <Show when={updateAvailable()}>
+              <button onClick={() => setShowChangelog(!showChangelog())}
+                style={{ background: showChangelog() ? '#555' : '#4aba6a', color: showChangelog() ? '#ccc' : '#000', border: 'none', 'border-radius': '4px', padding: '1px 8px', 'font-size': '10px', 'font-weight': '600', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent', transition: 'background 0.2s' }}>
+                Update Available
+              </button>
+            </Show>
+          </div>
+        </Show>
+        {/* Changelog + Perform Update panel */}
+        <Show when={showChangelog()}>
+          <div style={{ padding: '8px 16px', 'border-top': '1px solid #1e1e1e', background: '#0d1117', 'flex-shrink': '0', 'max-height': '200px', 'overflow-y': 'auto' }}>
+            <div style={{ display: 'flex', 'justify-content': 'space-between', 'align-items': 'center', 'margin-bottom': '6px' }}>
+              <span style={{ 'font-size': '11px', 'font-weight': '600', color: '#4aba6a' }}>What's New</span>
+              <button onClick={async () => {
+                try {
+                  const r = await fetch(`${location.pathname.replace(/\/+$/, '')}/api/update`, { method: 'POST' })
+                  if (r.ok) location.reload()
+                } catch {}
+              }} style={{ background: '#4aba6a', color: '#000', border: 'none', 'border-radius': '6px', padding: '4px 12px', 'font-size': '11px', 'font-weight': '600', cursor: 'pointer' }}>Perform Update</button>
+            </div>
+            <Show when={updateChanges()}>
+              <pre style={{ 'font-size': '11px', color: '#888', 'white-space': 'pre-wrap', 'word-break': 'break-word', margin: '0', 'font-family': 'inherit' }}>{updateChanges()}</pre>
+            </Show>
+            <Show when={!updateChanges()}>
+              <span style={{ 'font-size': '11px', color: '#666' }}>New build ready. Click Perform Update to apply.</span>
+            </Show>
           </div>
         </Show>
 
@@ -947,20 +1198,24 @@ export default function App() {
               )}</For>
             </div>
           </Show>
-          <div style={{ padding: '8px 12px', 'padding-bottom': 'max(8px, env(safe-area-inset-bottom))', 'border-top': files().length ? 'none' : '1px solid #1e1e1e', background: '#0a0e14', display: 'flex', gap: '8px', 'align-items': 'flex-end', 'flex-shrink': '0', position: 'relative' }}>
-            <Show when={historyOpen()}>
-              <div onClick={() => setHistoryOpen(false)} style={{ position: 'fixed', inset: '0', 'z-index': '49' }} />
-              <div style={{ position: 'absolute', bottom: '100%', left: '0', right: '0', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '8px 8px 0 0', 'max-height': '200px', 'overflow-y': 'auto', 'z-index': '50' }}>
-                <For each={getHistory().slice().reverse()}>{(item) => (
-                  <button onClick={() => { setText(item); setHistoryOpen(false) }}
-                    style={{ display: 'block', width: '100%', padding: '8px 12px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#ccc', 'font-size': '13px', 'text-align': 'left', cursor: 'pointer', 'white-space': 'nowrap', overflow: 'hidden', 'text-overflow': 'ellipsis' }}>{item}</button>
-                )}</For>
-              </div>
-            </Show>
-            <button onClick={() => fileInputRef?.click()} style={{ background: 'none', border: 'none', color: '#666', 'font-size': '20px', cursor: 'pointer', padding: '8px 4px', 'line-height': '1', '-webkit-tap-highlight-color': 'transparent', 'min-width': '32px', 'min-height': '42px' }} title="Attach file">+</button>
-            <button onClick={() => setHistoryOpen(!historyOpen())} style={{ background: 'none', border: 'none', color: '#666', 'font-size': '16px', cursor: 'pointer', padding: '8px 2px', 'line-height': '1', '-webkit-tap-highlight-color': 'transparent', 'min-width': '24px', 'min-height': '42px' }} title="Message history">{'\u2191'}</button>
-            <button onClick={toggleVoice} style={{ background: 'none', border: 'none', color: listening() ? '#d45555' : '#666', 'font-size': '16px', cursor: 'pointer', padding: '8px 2px', 'line-height': '1', '-webkit-tap-highlight-color': 'transparent', 'min-width': '24px', 'min-height': '42px', transition: 'color 0.15s' }} title="Voice input">{'\uD83C\uDF99'}</button>
-            <div style={{ flex: '1', position: 'relative', 'min-width': '0' }}>
+          <div style={{ padding: '8px 12px', 'padding-bottom': 'max(8px, env(safe-area-inset-bottom))', 'border-top': files().length ? 'none' : '1px solid #1e1e1e', background: '#0a0e14', display: 'flex', gap: '6px', 'align-items': 'flex-end', 'flex-shrink': '0', position: 'relative' }}>
+            {/* Toolbar icons left of textarea */}
+            <div style={{ display: 'flex', 'align-items': 'center', gap: '2px', 'flex-shrink': '0', height: '42px' }}>
+              <button onClick={() => fileInputRef?.click()} style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', width: '32px', height: '32px' }} title="Attach file">
+                <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="10" y1="4" x2="10" y2="16" /><line x1="4" y1="10" x2="16" y2="10" /></svg>
+              </button>
+              <Show when={currentId() && (starred()[currentId()!]?.length || 0) > 0}>
+                <button onClick={jumpToNextStar} style={{ background: 'none', border: 'none', color: '#c4993a', cursor: 'pointer', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', gap: '2px', height: '32px' }} title="Jump to starred">
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="#c4993a"><path d="M8 1l2.2 4.5 5 .7-3.6 3.5.9 5L8 12.4 3.5 14.7l.9-5L.8 6.2l5-.7z" /></svg>
+                  <span style={{ 'font-size': '11px', 'font-weight': '600', color: '#c4993a' }}>{starred()[currentId()!]?.length}</span>
+                </button>
+              </Show>
+              <button onClick={toggleVoice} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', width: '32px', height: '32px', transition: 'color 0.15s' }} title="Voice input">
+                <svg width="14" height="18" viewBox="0 0 14 18" fill="none" stroke={listening() ? '#d45555' : '#666'} stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="1" width="6" height="9" rx="3" fill={listening() ? 'rgba(212,85,85,0.2)' : 'none'} /><path d="M1 7.5a6 6 0 0 0 12 0" /><line x1="7" y1="13.5" x2="7" y2="16" /><line x1="4.5" y1="16" x2="9.5" y2="16" /></svg>
+              </button>
+            </div>
+            {/* Textarea */}
+            <div style={{ flex: '1', position: 'relative', 'min-width': '0', display: 'flex', 'flex-direction': 'column', 'justify-content': 'flex-end' }}>
               <textarea ref={textareaRef} value={text()}
                 onInput={(e) => { setText(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px' }}
                 onKeyDown={(e) => {
@@ -977,17 +1232,23 @@ export default function App() {
                     e.preventDefault()
                   }
                 }}
-                onPaste={(e) => { const items = e.clipboardData?.items; if (!items) return; const imgs = [...items].filter(i => i.type.startsWith('image/')); if (imgs.length) { e.preventDefault(); addFiles(imgs.map(i => new File([i.getAsFile()!], 'pasted-image.png', { type: i.type }))) } }}
+                onPaste={(e) => { const items = e.clipboardData?.items; if (!items) return; const imgs = [...items].filter(i => i.type.startsWith('image/')); if (imgs.length) { e.preventDefault(); addFiles(imgs.map(i => new File([i.getAsFile()!], 'pasted-image.png', { type: i.type }))) } if (isMobile) { const ta = e.currentTarget; setTimeout(() => { ta.blur(); ta.focus() }, 50) } }}
+                onFocus={() => { if (messageScrollRef) setTimeout(() => messageScrollRef!.scrollTo({ top: messageScrollRef!.scrollHeight }), 300) }}
                 enterkeyhint="send"
                 placeholder="Send a message..." rows={1}
                 style={{ width: '100%', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '12px', padding: '10px 14px', color: '#e5e5e5', 'font-size': '16px', 'font-family': 'inherit', resize: 'none', outline: 'none', 'line-height': '1.4', 'max-height': '120px', '-webkit-appearance': 'none', 'box-sizing': 'border-box' }} />
               <Show when={text().length > 0}>
-                <div style={{ 'text-align': 'right', 'font-size': '10px', color: text().length >= 500 ? '#fab283' : '#555', padding: '2px 8px 0', 'line-height': '1' }}>
+                <div style={{ position: 'absolute', right: '8px', bottom: '2px', 'font-size': '10px', color: text().length >= 500 ? '#fab283' : '#555', 'line-height': '1', 'pointer-events': 'none' }}>
                   {text().length >= 1000 ? (text().length / 1000).toFixed(1) + 'k' : text().length}
                 </div>
               </Show>
             </div>
-            <button onClick={handleSend} disabled={uploading()} style={{ background: (text().trim() || files().length) ? '#4aba6a' : '#333', color: (text().trim() || files().length) ? '#000' : '#666', border: 'none', 'border-radius': '50%', padding: '0', width: '36px', height: '36px', 'font-size': '16px', 'line-height': '1', cursor: (text().trim() || files().length) ? 'pointer' : 'default', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', 'flex-shrink': '0' }}>{uploading() ? '...' : '\u2191'}</button>
+            {/* Send button (hidden on mobile, keyboard has its own) */}
+            <Show when={!isMobile}>
+              <div style={{ 'flex-shrink': '0', height: '42px', display: 'flex', 'align-items': 'center' }}>
+                <button onClick={handleSend} disabled={uploading()} style={{ background: (text().trim() || files().length) ? '#4aba6a' : '#333', color: (text().trim() || files().length) ? '#000' : '#666', border: 'none', 'border-radius': '50%', padding: '0', width: '36px', height: '36px', cursor: (text().trim() || files().length) ? 'pointer' : 'default', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center' }}>{uploading() ? '...' : <svg width="14" height="16" viewBox="0 0 14 16" fill="currentColor"><polygon points="0,0 14,8 0,16" /></svg>}</button>
+              </div>
+            </Show>
           </div>
         </Show>
       </div>

@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
+    "start": "node server-single.js",
     "build:frontend": "cd frontend && npm install && npm run build",
     "prepare": "npm run build:frontend",
     "test": "node --test test/unit/*.test.js",
@@ -11,7 +11,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "bcryptjs": "^3.0.3",
+    "compression": "^1.8.1",
     "express": "^5.1.0",
     "node-pty": "^1.1.0",
     "ws": "^8.20.0"

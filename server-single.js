@@ -66,12 +66,6 @@ function uploadsDir() {
   return d;
 }
 
-function safePath(filePath) {
-  const resolved = path.resolve(filePath);
-  const home = path.resolve(HOME);
-  return resolved === home || resolved.startsWith(home + '/');
-}
-
 // ── File reading ────────────────────────────────────────────────────────────
 
 function readFileChunk(filePath, offset, length) {
@@ -460,7 +454,7 @@ app.use(express.static(STATIC_DIR, {
 }));
 
 app.use('/uploads', express.static(path.resolve(import.meta.dirname, 'uploads')));
-app.use('/opt/feather/uploads', express.static('/opt/feather/uploads'));
+app.use('/opt/feather/uploads', express.static(path.resolve(import.meta.dirname, 'uploads')));
 app.use('/home/user/feather-uploads', express.static('/home/user/feather-uploads'));
 
 // ── API routes ─────────────────────────────────────────────────────────────
@@ -763,16 +757,6 @@ app.get('/api/sessions/:id/export', (req, res) => {
     res.setHeader('Content-Type', 'text/markdown');
     res.setHeader('Content-Disposition', `attachment; filename="session-${req.params.id.slice(0, 8)}.md"`);
     res.send(lines.join('\n'));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/open-in-editor', (req, res) => {
-  try {
-    const fpath = req.body?.path;
-    if (!fpath || !fpath.startsWith('/')) return res.status(400).json({ error: 'invalid path' });
-    if (!safePath(fpath)) return res.status(403).json({ error: 'access denied' });
-    execFileSync('code-server', [fpath], { stdio: 'ignore', timeout: 3000 });
-    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

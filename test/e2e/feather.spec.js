@@ -91,12 +91,17 @@ async function selectTestSession(page) {
   await page.waitForTimeout(500)
 }
 
+// Send button uses an SVG polygon, no text. Find it by the polygon shape.
+function sendButton(page) {
+  return page.locator('button:has(svg polygon)')
+}
+
 // ── App shell ───────────────────────────────────────────────────────────────
 
 test.describe('App shell', () => {
   test('shows empty state when no session selected', async ({ page }) => {
     await page.goto(BASE)
-    await expect(page.locator('text=Open a session or create a new one')).toBeVisible({ timeout: 10000 })
+    await expect(page.getByText('Select a session', { exact: true })).toBeVisible({ timeout: 10000 })
     // No tabs should be visible
     await expect(page.locator('button:has-text("Chat")')).not.toBeVisible()
     await expect(page.locator('button:has-text("Terminal")')).not.toBeVisible()
@@ -110,16 +115,18 @@ test.describe('App shell', () => {
     await expect(page.locator('button:has-text("+ New Claude")')).toBeVisible()
   })
 
-  test('sidebar closes when X is clicked', async ({ page }) => {
+  test('sidebar closes with Escape key', async ({ page }) => {
     await page.goto(BASE)
     await page.waitForLoadState('networkidle')
+    // Hamburger should be visible initially
+    await expect(page.locator('button:has-text("☰")')).toBeVisible()
     await openSidebar(page)
-    await expect(page.getByText('Feather', { exact: true })).toBeVisible()
-    // Click close button
-    await page.locator('button:has-text("×")').click()
+    // Hamburger hides when sidebar is open
+    await expect(page.locator('button:has-text("☰")')).not.toBeVisible()
+    await page.keyboard.press('Escape')
     await page.waitForTimeout(300)
-    // Sidebar title should be hidden
-    await expect(page.getByText('Feather', { exact: true })).not.toBeVisible()
+    // Hamburger should re-appear after sidebar closes
+    await expect(page.locator('button:has-text("☰")')).toBeVisible()
   })
 
   test('sidebar shows our test session', async ({ page }) => {
@@ -145,14 +152,16 @@ test.describe('Session selection', () => {
     await page.goto(BASE)
     await page.waitForLoadState('networkidle')
     await selectTestSession(page)
-    await expect(page.locator('text=Open a session or create a new one')).not.toBeVisible()
+    // Chat/Terminal tabs should now be visible (empty state is gone)
+    await expect(page.locator('button:has-text("Chat")')).toBeVisible()
   })
 
   test('header shows session title after selection', async ({ page }) => {
     await page.goto(BASE)
     await page.waitForLoadState('networkidle')
     await selectTestSession(page)
-    await expect(page.locator('text=Select a session')).not.toBeVisible()
+    // The header should no longer show the placeholder
+    await expect(page.getByText('Select a session', { exact: true })).not.toBeVisible()
   })
 
   test('SSE stream is established when session is selected', async ({ page }) => {
@@ -252,18 +261,20 @@ test.describe('Message rendering', () => {
     await expect(toolUse).toBeVisible()
   })
 
-  test('tool_result shows Result prefix', async ({ page }) => {
-    const result = page.locator('text=Result:')
+  test('tool_result shows output label', async ({ page }) => {
+    // Tool results render with lowercase "output" label
+    const result = page.locator('summary:has-text("output")')
     await expect(result.first()).toBeVisible()
   })
 
-  test('error tool_result shows Error prefix', async ({ page }) => {
-    const error = page.locator('text=Error:')
+  test('error tool_result shows error label', async ({ page }) => {
+    // Error tool results render with lowercase "error" label
+    const error = page.locator('summary:has-text("error")')
     await expect(error.first()).toBeVisible()
   })
 
   test('timestamps are displayed on messages', async ({ page }) => {
-    // Timestamps are small text under each bubble — look for time patterns
+    // Timestamps are small text under each bubble
     const allText = await page.locator('span').allInnerTexts()
     const timePattern = /\d{1,2}:\d{2}/
     const timestamps = allText.filter(t => timePattern.test(t))
@@ -293,24 +304,22 @@ test.describe('Chat input', () => {
   })
 
   test('send button is dim when input is empty', async ({ page }) => {
-    const sendBtn = page.locator('button:has-text("Send")')
-    const bg = await sendBtn.evaluate(el => getComputedStyle(el).backgroundColor)
+    const btn = sendButton(page)
+    const bg = await btn.evaluate(el => getComputedStyle(el).backgroundColor)
     // Should be gray-ish (not green)
     expect(bg).not.toContain('74, 186, 106')
   })
 
   test('send button changes style when text is entered', async ({ page }) => {
     const textarea = page.locator('textarea[placeholder="Send a message..."]')
-    const sendBtn = page.locator('button:has-text("Send")')
+    const btn = sendButton(page)
 
-    // Get computed background when empty
-    const bgEmpty = await sendBtn.evaluate(el => getComputedStyle(el).backgroundColor)
+    const bgEmpty = await btn.evaluate(el => getComputedStyle(el).backgroundColor)
 
     await textarea.fill('test')
     await page.waitForTimeout(100)
 
-    // Get computed background with text — should be different (green vs gray)
-    const bgFilled = await sendBtn.evaluate(el => getComputedStyle(el).backgroundColor)
+    const bgFilled = await btn.evaluate(el => getComputedStyle(el).backgroundColor)
     expect(bgFilled).not.toEqual(bgEmpty)
   })
 
@@ -319,7 +328,6 @@ test.describe('Chat input', () => {
     const initialHeight = await textarea.evaluate(el => el.offsetHeight)
 
     await textarea.fill('Line 1\nLine 2\nLine 3\nLine 4\nLine 5')
-    // Trigger the input event that drives auto-grow
     await textarea.dispatchEvent('input')
     await page.waitForTimeout(200)
 
@@ -332,8 +340,7 @@ test.describe('Chat input', () => {
     await textarea.fill('test message to clear')
     await page.waitForTimeout(100)
 
-    // Send
-    await page.locator('button:has-text("Send")').click()
+    await sendButton(page).click()
     await page.waitForTimeout(300)
 
     const value = await textarea.inputValue()
@@ -347,7 +354,6 @@ test.describe('Chat input', () => {
     await textarea.fill('line 1')
     await textarea.press('Shift+Enter')
     await page.waitForTimeout(100)
-    // Should still have text
     const val = await textarea.inputValue()
     expect(val.length).toBeGreaterThan(0)
 
@@ -371,12 +377,10 @@ test.describe('Tab switching', () => {
 
   test('chat tab is active by default', async ({ page }) => {
     const chatTab = page.locator('button:has-text("Chat")')
-    // Active tab should have a non-transparent bottom border
     const borderBottom = await chatTab.evaluate(el => {
       const cs = getComputedStyle(el)
       return cs.borderBottomColor
     })
-    // Should NOT be transparent
     expect(borderBottom).not.toBe('rgba(0, 0, 0, 0)')
     expect(borderBottom).not.toBe('transparent')
   })
@@ -385,21 +389,17 @@ test.describe('Tab switching', () => {
     await page.locator('button:has-text("Terminal")').click()
     await page.waitForTimeout(500)
 
-    // Chat input should be hidden
     const textarea = page.locator('textarea[placeholder="Send a message..."]')
     await expect(textarea).not.toBeVisible()
   })
 
   test('switching back to chat shows messages again', async ({ page }) => {
-    // Go to terminal
     await page.locator('button:has-text("Terminal")').click()
     await page.waitForTimeout(300)
 
-    // Back to chat
     await page.locator('button:has-text("Chat")').click()
     await page.waitForTimeout(300)
 
-    // Messages should be visible
     await expect(page.locator('.markdown').first()).toBeVisible()
   })
 })
@@ -413,10 +413,6 @@ test.describe('Live updates', () => {
     await selectTestSession(page)
     await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 5000 })
 
-    // Count current messages
-    const beforeCount = await page.locator('div[style*="margin-bottom: 16px"]').count()
-
-    // Write a new message to the JSONL file
     const liveUuid = `e2e-live-${Date.now()}`
     writeLine({
       type: 'user', uuid: liveUuid, timestamp: '2025-06-15T14:05:00Z',
@@ -424,12 +420,8 @@ test.describe('Live updates', () => {
       message: { role: 'user', content: 'This message arrived via SSE live update!' },
     })
 
-    // Wait for it to appear in the UI
+    // The new message should appear without page reload
     await expect(page.locator('text=This message arrived via SSE live update!')).toBeVisible({ timeout: 10000 })
-
-    // Should have one more message
-    const afterCount = await page.locator('div[style*="margin-bottom: 16px"]').count()
-    expect(afterCount).toBeGreaterThan(beforeCount)
   })
 })
 
@@ -457,10 +449,8 @@ test.describe('Mobile viewport', () => {
     await selectTestSession(page)
     await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 5000 })
 
-    // Check text is visible (not invisible due to color issues)
     const firstMd = page.locator('.markdown').first()
     const color = await firstMd.evaluate(el => getComputedStyle(el).color)
-    // Should not be transparent or same as background
     expect(color).not.toBe('rgba(0, 0, 0, 0)')
   })
 
@@ -472,6 +462,7 @@ test.describe('Mobile viewport', () => {
     const textarea = page.locator('textarea[placeholder="Send a message..."]')
     await expect(textarea).toBeVisible()
     await textarea.fill('mobile test')
-    await expect(page.locator('button:has-text("Send")')).toBeVisible()
+    // On mobile (Playwright uses Chromium UA, not iPhone), send button should still be visible
+    await expect(sendButton(page)).toBeVisible()
   })
 })

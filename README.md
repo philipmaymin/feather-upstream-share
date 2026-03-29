@@ -56,7 +56,7 @@ Open a PR to `inceptel/feather` from your fork. Or don't — your fork is yours.
 
 You're running Claude Code on a remote machine. You want to check on it from your phone, your iPad, another laptop. You want to send a follow-up message without SSH-ing in. You want to see the conversation rendered beautifully — like a texting app, not a terminal dump.
 
-Feather reads Claude's raw JSONL session files, streams updates via SSE, and connects to tmux sessions via WebSocket terminals. No database. No build pipeline beyond Vite. Just `node server.js`.
+Feather reads Claude's raw JSONL session files, streams updates via SSE, and connects to tmux sessions via WebSocket terminals. No database. No build pipeline beyond Vite. Just `node server-single.js`.
 
 ## Quick start
 
@@ -104,7 +104,7 @@ npm start      # → Feather on http://localhost:4870
 
 | File | Purpose |
 |------|---------|
-| `server.js` | Entire backend — API, SSE, WebSocket, JSONL parsing, tmux |
+| `server-single.js` | Entire backend: API, SSE, WebSocket, JSONL parsing, tmux |
 | `frontend/src/App.tsx` | UI shell — sidebar, header, tabs, input bar |
 | `frontend/src/api.ts` | REST + SSE client, types |
 | `frontend/src/components/MessageView.tsx` | Chat bubbles with markdown rendering |
@@ -122,40 +122,30 @@ npm start      # → Feather on http://localhost:4870
 
 ## Deployment
 
-### supervisord
-
-```bash
-sudo cp infra/feather.supervisor.conf /etc/supervisor/conf.d/feather.conf
-supervisorctl reread && supervisorctl update
-```
-
 ### systemd
 
 ```bash
-sudo cp infra/feather.service /etc/systemd/system/
-sudo systemctl enable --now feather
+# Create a service file pointing to server-single.js
+sudo systemctl enable --now feather-next
 ```
 
 ### Reverse proxy (Caddy)
 
 ```
-handle /feather { redir /feather/ permanent }
-handle /feather/api/* {
-    uri strip_prefix /feather
+handle /api/sessions/*/stream {
     reverse_proxy localhost:4870 {
         flush_interval -1    # required for SSE
     }
 }
-handle /feather/* {
-    uri strip_prefix /feather
+handle {
     reverse_proxy localhost:4870
 }
 ```
 
 ## Dependencies
 
-**Backend:** express, node-pty, ws
-**Frontend:** solid-js, @xterm/xterm, @xterm/addon-fit, marked, dompurify
+**Backend:** express, compression, node-pty, ws
+**Frontend:** solid-js, ghostty-web, marked, highlight.js, dompurify, html-to-image
 
 ## License
 

@@ -4,11 +4,11 @@ import solidPlugin from 'vite-plugin-solid'
 export default defineConfig({
   plugins: [solidPlugin()],
   define: {
-    __BUILD_TIME__: JSON.stringify(new Date().toLocaleString('en-US', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })),
+    __BUILD_TIME__: JSON.stringify(new Date().toISOString()),
   },
   base: './',
   build: {
-    outDir: '../static',
+    outDir: '../static-test',
     emptyOutDir: true,
   },
   server: {
