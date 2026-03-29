@@ -164,9 +164,20 @@ function spawnTmuxClaude(name, claudeArgs, dir) {
   const claudeCmd = `claude ${claudeArgs} --dangerously-skip-permissions --disallowed-tools AskUserQuestion`;
   const shellCmd = `tmux new-session -d -s ${name} -c "${dir}" "bash -lc '${claudeCmd}'" \\; set-option -t ${name} prefix M-a`;
   execFileSync('bash', ['-c', shellCmd], { stdio: 'ignore', encoding: 'utf8' });
+  // Auto-dismiss permission/trust prompts that block headless sessions
   for (const delay of [3000, 5000, 8000]) {
     setTimeout(() => {
-      try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
+      try {
+        const pane = execFileSync('tmux', ['capture-pane', '-t', name, '-p'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+        if (/bypass permissions|dangerous|permission mode|trust/i.test(pane)) {
+          execFileSync('tmux', ['send-keys', '-t', name, '1'], { stdio: 'ignore' });
+          setTimeout(() => {
+            try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
+          }, 300);
+        } else {
+          execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' });
+        }
+      } catch {}
     }, delay);
   }
 }
