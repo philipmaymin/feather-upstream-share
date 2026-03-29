@@ -809,6 +809,39 @@ function reapIdleSessions() {
 
 setInterval(reapIdleSessions, 5 * 60 * 1000);
 
+// ── Auto-dismiss permission prompts ────────────────────────────────────────
+// Claude Code sometimes prompts for permissions mid-session (e.g. editing
+// files in ~/.claude/) even with --dangerously-skip-permissions. Detect and
+// auto-answer these so headless Feather sessions don't silently block.
+
+function autoDismissPermissionPrompts() {
+  const active = getActiveTmuxSessions();
+  for (const shortId of active) {
+    const name = `f-${shortId}`;
+    try {
+      const pane = execFileSync('tmux', ['capture-pane', '-t', name, '-p'],
+        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+      // Match numbered-option permission prompts (1/2/3 style)
+      if (/bypass permissions|dangerous|permission mode|trust|do you want to/i.test(pane) &&
+          /^\s*[❯>›]?\s*[123]\./m.test(pane)) {
+        execFileSync('tmux', ['send-keys', '-t', name, '1'], { stdio: 'ignore' });
+        setTimeout(() => {
+          try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
+        }, 300);
+      }
+      // Match yes/no confirmation prompts (Y/n style)
+      else if (/allow claude|do you want to allow|permission.*\(y\/n\)|allow.*edit/i.test(pane)) {
+        execFileSync('tmux', ['send-keys', '-t', name, 'y'], { stdio: 'ignore' });
+        setTimeout(() => {
+          try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
+        }, 300);
+      }
+    } catch {}
+  }
+}
+
+setInterval(autoDismissPermissionPrompts, 5000);
+
 // ── SPA catch-all ───────────────────────────────────────────────────────────
 
 app.get('/{*path}', (_req, res) => {
