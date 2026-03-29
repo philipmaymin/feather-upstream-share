@@ -1,3 +1,8 @@
+## 2026-03-29 - Upstream Merge #3
+- Version stamping: build time shown from version.json
+- Adopted upstream build script with automatic version.json generation
+- All upstream UI/performance commits already integrated
+
 ## 2026-03-29 - Sweep cleanup + upstream sync
 - Search across all chats (magnifying glass in sidebar)
 - Deepgram speech-to-text WebSocket proxy
