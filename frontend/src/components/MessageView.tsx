@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createSignal } from 'solid-js'
 import type { Message, ContentBlock } from '../api'
+import { toBlob } from 'html-to-image'
 import { Marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
 import DOMPurify from 'dompurify'
@@ -60,6 +61,8 @@ function renderMarkdown(text: string): string {
   if (cached !== undefined) return cached
   const html = marked.parse(text.trimEnd()) as string
   const safe = DOMPurify.sanitize(html, { ADD_ATTR: ['class', 'target', 'rel'] })
+    .replace(/<table>/g, '<div class="table-wrap"><table>')
+    .replace(/<\/table>/g, '</table></div>')
   if (mdCache.size >= MD_CACHE_MAX) {
     const first = mdCache.keys().next().value!
     mdCache.delete(first)
@@ -68,17 +71,59 @@ function renderMarkdown(text: string): string {
   return safe
 }
 
-// Copy button handler — attached via event delegation
-function handleCopyClick(e: MouseEvent) {
-  const btn = (e.target as HTMLElement).closest('.copy-btn') as HTMLElement | null
-  if (!btn) return
-  const pre = btn.closest('pre')
-  const code = pre?.querySelector('code')
-  if (!code) return
-  navigator.clipboard.writeText(code.textContent || '').then(() => {
-    btn.textContent = 'Copied!'
-    setTimeout(() => { btn.textContent = 'Copy' }, 1500)
-  })
+// ── Message export helpers ──────────────────────────────────────────────
+
+function getMsgEl(uuid: string, container: HTMLElement): HTMLElement | null {
+  return container.querySelector(`[data-uuid="${uuid}"]`)
+}
+
+async function copyText(uuid: string, container: HTMLElement): Promise<boolean> {
+  const el = getMsgEl(uuid, container)
+  if (!el) return false
+  await navigator.clipboard.writeText(el.textContent || '')
+  return true
+}
+
+async function copyHtml(uuid: string, container: HTMLElement): Promise<boolean> {
+  const el = getMsgEl(uuid, container)
+  if (!el) return false
+  const html = `<div style="background:#1a1a2e;color:#e5e5e5;font-family:-apple-system,system-ui,sans-serif;padding:12px;border-radius:8px">${el.innerHTML}</div>`
+  const htmlBlob = new Blob([html], { type: 'text/html' })
+  const textBlob = new Blob([el.textContent || ''], { type: 'text/plain' })
+  await navigator.clipboard.write([new ClipboardItem({ 'text/html': htmlBlob, 'text/plain': textBlob })])
+  return true
+}
+
+async function copyPng(uuid: string, container: HTMLElement): Promise<boolean> {
+  const el = getMsgEl(uuid, container)
+  if (!el) return false
+  const blob = await toBlob(el, { backgroundColor: '#0a0e14', pixelRatio: 2 })
+  if (!blob) return false
+  await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+  return true
+}
+
+async function shareMsg(uuid: string, container: HTMLElement): Promise<boolean> {
+  const el = getMsgEl(uuid, container)
+  if (!el) return false
+  const blob = await toBlob(el, { backgroundColor: '#0a0e14', pixelRatio: 2 })
+  if (!blob) return false
+  const file = new File([blob], 'message.png', { type: 'image/png' })
+  if (navigator.share && navigator.canShare?.({ files: [file] })) {
+    await navigator.share({ files: [file] })
+    return true
+  }
+  return false
+}
+
+function printMsg(uuid: string, container: HTMLElement, css: string) {
+  const el = getMsgEl(uuid, container)
+  if (!el) return
+  const w = window.open('', '_blank')
+  if (!w) return
+  w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>body{background:#0a0e14;color:#e5e5e5;font-family:-apple-system,system-ui,sans-serif;padding:20px;margin:0;font-size:14px;line-height:1.5;}${css}</style></head><body>${el.innerHTML}</body></html>`)
+  w.document.close()
+  setTimeout(() => w.print(), 300)
 }
 
 // Auto-collapse long code blocks (>25 lines)
@@ -107,23 +152,53 @@ function collapseCodeBlocks(el: HTMLElement) {
   }
 }
 
-// Make all links open in new tab
-function fixLinks(el: HTMLElement) {
+// Make all links open in new tab + linkify file paths
+const FILE_PATH_RE = /((?:\/(?:home|opt|tmp|var|etc|usr)\/[^\s,;:)"'`\]>]+)|(?:~\/[^\s,;:)"'`\]>]+))/g
+const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp'])
+
+function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
   for (const a of el.querySelectorAll('a')) {
     a.setAttribute('target', '_blank')
     a.setAttribute('rel', 'noopener')
   }
-}
-
-// Inject copy buttons into rendered HTML pre blocks
-function injectCopyButtons(el: HTMLElement) {
-  for (const pre of el.querySelectorAll('pre')) {
-    if (pre.querySelector('.copy-btn')) continue
-    pre.style.position = 'relative'
-    const btn = document.createElement('button')
-    btn.className = 'copy-btn'
-    btn.textContent = 'Copy'
-    pre.appendChild(btn)
+  // Linkify file paths in text nodes
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+  const nodes: Text[] = []
+  while (walker.nextNode()) nodes.push(walker.currentNode as Text)
+  for (const node of nodes) {
+    if (node.parentElement?.tagName === 'A' || node.parentElement?.tagName === 'CODE') continue
+    const text = node.textContent || ''
+    if (!text.match(FILE_PATH_RE)) continue
+    const frag = document.createDocumentFragment()
+    let last = 0
+    for (const match of text.matchAll(FILE_PATH_RE)) {
+      const idx = match.index!
+      if (idx > last) frag.appendChild(document.createTextNode(text.slice(last, idx)))
+      const path = match[0]
+      const a = document.createElement('a')
+      a.textContent = path
+      a.style.color = '#73b8ff'
+      a.style.textDecoration = 'none'
+      a.style.cursor = 'pointer'
+      const ext = path.substring(path.lastIndexOf('.')).toLowerCase()
+      if (IMAGE_EXTS.has(ext)) {
+        a.href = path
+        a.onclick = (e) => { e.preventDefault(); onImageClick?.(path) }
+      } else {
+        a.href = '#'
+        a.onclick = (e) => {
+          e.preventDefault()
+          fetch(`${location.pathname.replace(/\/+$/, '')}/api/open-in-editor`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: path.replace(/^~/, '/home/' + (document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user')) })
+          }).catch(() => {})
+        }
+      }
+      frag.appendChild(a)
+      last = idx + path.length
+    }
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)))
+    node.parentNode?.replaceChild(frag, node)
   }
 }
 
@@ -166,7 +241,7 @@ function toolSummary(name: string, input: any): string {
 
 function renderBlock(block: ContentBlock) {
   if (block.type === 'text' && block.text) {
-    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => { injectCopyButtons(el); fixLinks(el); collapseCodeBlocks(el) }} />
+    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }} />
   }
   if (block.type === 'thinking' && block.thinking) {
     return (
@@ -180,30 +255,29 @@ function renderBlock(block: ContentBlock) {
   }
   if (block.type === 'tool_use') {
     const name = block.name || 'tool'
-    const color = TOOL_COLORS[name] || '#73b8ff'
-    const icon = TOOL_ICONS[name] || '⚙'
+    const color = TOOL_COLORS[name] || '#999'
     const summary = toolSummary(name, block.input)
     const inp = block.input || {}
     const hasDetail = name === 'Edit' || name === 'Bash' || name === 'Write' || name === 'Agent' || name === 'Grep' || name === 'Read'
-    const pre = 'white-space:pre-wrap;font-size:11px;font-family:SF Mono,Menlo,monospace;padding:6px 10px;max-height:200px;overflow:auto;margin:0;word-break:break-all;'
+    const pre = 'white-space:pre-wrap;font-size:10px;font-family:SF Mono,Menlo,monospace;padding:3px 0;max-height:160px;overflow:auto;margin:0;word-break:break-all;'
     return (
-      <details style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-left': `3px solid ${color}`, 'border-radius': '6px', margin: '4px 0', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace" }}>
-        <summary style={{ padding: '6px 10px', cursor: hasDetail ? 'pointer' : 'default', 'list-style': hasDetail ? undefined : 'none' }}>
-          <span style={{ color }}>{icon} {name}</span>
-          {summary && <span style={{ color: '#888', 'margin-left': '8px' }}>{summary}</span>}
+      <details style={{ margin: '3px 0', 'font-size': '11px', 'font-family': "'SF Mono', Menlo, monospace", 'border-top': '1px solid #ffffff0a' }}>
+        <summary style={{ padding: '2px 0', cursor: hasDetail ? 'pointer' : 'default', 'list-style': hasDetail ? undefined : 'none', color: '#999' }}>
+          <span style={{ color }}>{name}</span>
+          {summary && <span style={{ color: '#888', 'margin-left': '6px' }}>{summary}</span>}
         </summary>
         {name === 'Edit' && <>
-          {inp.old_string && <pre style={`${pre}color:#d45555;background:#1a0000;border-top:1px solid #1e1e1e`}>{inp.old_string}</pre>}
-          {inp.new_string && <pre style={`${pre}color:#4aba6a;background:#001a00;border-top:1px solid #1e1e1e`}>{inp.new_string}</pre>}
+          {inp.old_string && <pre style={`${pre}color:#e07070`}>{inp.old_string}</pre>}
+          {inp.new_string && <pre style={`${pre}color:#5cc878`}>{inp.new_string}</pre>}
         </>}
-        {name === 'Bash' && inp.command && <pre style={`${pre}color:#e5946b;border-top:1px solid #1e1e1e`}>{inp.command}</pre>}
-        {name === 'Write' && inp.content && <pre style={`${pre}color:#4aba6a;background:#001a00;border-top:1px solid #1e1e1e`}>{(inp.content as string).slice(0, 500)}{(inp.content as string).length > 500 ? '…' : ''}</pre>}
+        {name === 'Bash' && inp.command && <pre style={`${pre}color:#e5a070`}>{inp.command}</pre>}
+        {name === 'Write' && inp.content && <pre style={`${pre}color:#5cc878`}>{(inp.content as string).slice(0, 500)}{(inp.content as string).length > 500 ? '...' : ''}</pre>}
         {name === 'Agent' && <>
-          {inp.subagent_type && <div style={{ padding: '4px 10px', 'border-top': '1px solid #1e1e1e', 'font-size': '11px', color: '#888' }}>Type: <span style={{ color: '#c4993a' }}>{inp.subagent_type}</span></div>}
-          {inp.prompt && <pre style={`${pre}color:#73b8ff;border-top:1px solid #1e1e1e`}>{(inp.prompt as string).slice(0, 800)}{(inp.prompt as string).length > 800 ? '…' : ''}</pre>}
+          {inp.subagent_type && <div style={{ padding: '2px 0', 'font-size': '10px', color: '#888' }}>Type: <span style={{ color: '#c4993a' }}>{inp.subagent_type}</span></div>}
+          {inp.prompt && <pre style={`${pre}color:#88c4ff`}>{(inp.prompt as string).slice(0, 800)}{(inp.prompt as string).length > 800 ? '...' : ''}</pre>}
         </>}
-        {name === 'Grep' && inp.pattern && <pre style={`${pre}color:#b48ead;border-top:1px solid #1e1e1e`}>/{inp.pattern}/{inp.path ? ` in ${inp.path}` : ''}</pre>}
-        {name === 'Read' && inp.file_path && <pre style={`${pre}color:#73b8ff;border-top:1px solid #1e1e1e`}>{inp.file_path}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
+        {name === 'Grep' && inp.pattern && <pre style={`${pre}color:#c4a0c0`}>/{inp.pattern}/{inp.path ? ` in ${inp.path}` : ''}</pre>}
+        {name === 'Read' && inp.file_path && <pre style={`${pre}color:#88c4ff`}>{inp.file_path}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
       </details>
     )
   }
@@ -216,16 +290,12 @@ function renderBlock(block: ContentBlock) {
     const lineCount = raw.split('\n').length
     const label = isErr ? 'error' : `output${isLong ? ` (${lineCount} lines)` : ''}`
     return (
-      <details style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-left': `3px solid ${isErr ? '#d45555' : '#4aba6a'}`, 'border-radius': '6px', margin: '4px 0', overflow: 'hidden' }} open={isErr || !isLong}>
-        <summary style={{ padding: '2px 10px', background: '#111318', 'font-size': '9px', 'font-weight': '600', 'text-transform': 'uppercase', 'letter-spacing': '0.05em', color: isErr ? '#d45555' : '#666', cursor: isLong ? 'pointer' : 'default', 'list-style': isLong ? undefined : 'none' }}>
+      <details style={{ margin: '2px 0', overflow: 'hidden' }} open={isErr || !isLong}>
+        <summary style={{ padding: '1px 0', 'font-size': '9px', 'font-weight': '500', 'text-transform': 'uppercase', 'letter-spacing': '0.05em', color: isErr ? '#e07070' : '#777', cursor: isLong ? 'pointer' : 'default', 'list-style': isLong ? undefined : 'none' }}>
           {label}
-          {isLong && !isErr && <span style={{ 'font-weight': '400', 'text-transform': 'none', 'margin-left': '8px', color: '#555' }}>{preview.split('\n')[0].slice(0, 60)}</span>}
+          {isLong && !isErr && <span style={{ 'font-weight': '400', 'text-transform': 'none', 'margin-left': '6px', color: '#666' }}>{preview.split('\n')[0].slice(0, 60)}</span>}
         </summary>
-        {raw && <div style={{ position: 'relative' }}>
-          <div style={{ padding: '6px 10px', 'font-size': '11px', 'font-family': "'SF Mono', Menlo, monospace", color: isErr ? '#d45555' : '#888', 'white-space': 'pre-wrap', 'max-height': '300px', overflow: 'auto', 'word-break': 'break-all' }}>{raw.length > 3000 ? raw.slice(0, 3000) + '\n… (truncated)' : raw}</div>
-          <button onClick={(e) => { navigator.clipboard.writeText(raw); const b = e.currentTarget; b.textContent = 'Copied!'; setTimeout(() => b.textContent = 'Copy', 1200) }}
-            style={{ position: 'absolute', top: '4px', right: '4px', padding: '1px 6px', background: '#333', border: '1px solid #555', 'border-radius': '4px', color: '#999', 'font-size': '10px', cursor: 'pointer', opacity: '0.6' }}>Copy</button>
-        </div>}
+        {raw && <div style={{ padding: '2px 0', 'font-size': '10px', 'font-family': "'SF Mono', Menlo, monospace", color: isErr ? '#e07070' : '#999', 'white-space': 'pre-wrap', 'max-height': '200px', overflow: 'auto', 'word-break': 'break-all' }}>{raw.length > 3000 ? raw.slice(0, 3000) + '\n... (truncated)' : raw}</div>}
       </details>
     )
   }
@@ -244,10 +314,6 @@ function formatFullDate(iso: string) {
   } catch { return '' }
 }
 
-// Copy message text to clipboard
-function copyMessageText(el: HTMLElement) {
-  navigator.clipboard.writeText(el.textContent || '').catch(() => {})
-}
 
 // ── Markdown styles ─────────────────────────────────────────────────────────
 
@@ -274,7 +340,8 @@ const markdownCSS = `
 .markdown blockquote {
   margin: 6px 0; padding: 4px 12px; border-left: 3px solid #444; color: #999;
 }
-.markdown table { border-collapse: collapse; margin: 8px 0; width: 100%; font-size: 0.9em; }
+.markdown .table-wrap { overflow-x: auto; margin: 8px 0; -webkit-overflow-scrolling: touch; }
+.markdown table { border-collapse: collapse; font-size: 0.9em; white-space: nowrap; }
 .markdown th, .markdown td { border: 1px solid #333; padding: 5px 10px; text-align: left; }
 .markdown th { background: rgba(255,255,255,0.05); font-weight: 600; }
 .markdown a { color: #73b8ff; text-decoration: none; }
@@ -283,27 +350,16 @@ const markdownCSS = `
 .markdown hr { border: none; border-top: 1px solid #333; margin: 12px 0; }
 .markdown strong { font-weight: 600; }
 
-/* Copy button */
-.copy-btn {
-  position: absolute; top: 6px; right: 6px;
-  background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15);
-  color: #999; font-size: 11px; padding: 2px 8px; border-radius: 4px;
-  cursor: pointer; opacity: 0; transition: opacity 0.15s;
-  font-family: -apple-system, system-ui, sans-serif;
-}
-pre:hover .copy-btn { opacity: 1; }
-.copy-btn:hover { background: rgba(255,255,255,0.2); color: #ccc; }
+/* Message action buttons - show on hover */
+.star-btn, .action-menu-btn { -webkit-tap-highlight-color: transparent; }
+div:hover > div > .star-btn, div:hover > div > .action-menu-btn { opacity: 0.6 !important; }
+.star-btn:hover, .action-menu-btn:hover { opacity: 1 !important; }
 
 /* Typing indicator bounce */
 @keyframes typing-bounce {
   0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
   30% { transform: translateY(-4px); opacity: 1; }
 }
-
-/* Star button - show on hover */
-.star-btn { -webkit-tap-highlight-color: transparent; }
-div:hover > div > .star-btn { opacity: 0.6 !important; }
-.star-btn:hover { opacity: 1 !important; }
 
 /* highlight.js dark theme */
 .hljs { color: #c9d1d9; }
@@ -344,8 +400,10 @@ function extractImages(text: string): { cleanText: string; images: string[]; fil
 export function MessageView(props: { messages: Message[], loading: boolean, hasMore?: boolean, loadingMore?: boolean, onLoadEarlier?: () => void, onAnswer?: (text: string) => void, starred?: Set<string>, onToggleStar?: (uuid: string) => void, working?: boolean, scrollRefCb?: (el: HTMLDivElement) => void }) {
   const [lightbox, setLightbox] = createSignal<string | null>(null)
   let scrollRef: HTMLDivElement | undefined
-  const [pinned, setPinned] = createSignal(true) // pinned to bottom by default
+  const [pinned, setPinned] = createSignal(true)
   const [newMsgCount, setNewMsgCount] = createSignal(0)
+  const [actionMenu, setActionMenu] = createSignal<string | null>(null)
+  const [actionFeedback, setActionFeedback] = createSignal<string | null>(null)
   let prevMsgLen = props.messages.length
 
   function onScroll() {
@@ -361,6 +419,23 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
     setNewMsgCount(0)
   }
 
+  async function doAction(action: string, uuid: string) {
+    if (!scrollRef) return
+    setActionMenu(null)
+    try {
+      let ok = false
+      if (action === 'text') ok = await copyText(uuid, scrollRef)
+      else if (action === 'html') ok = await copyHtml(uuid, scrollRef)
+      else if (action === 'png') ok = await copyPng(uuid, scrollRef)
+      else if (action === 'share') ok = await shareMsg(uuid, scrollRef)
+      else if (action === 'pdf') { printMsg(uuid, scrollRef, markdownCSS); return }
+      if (ok) {
+        setActionFeedback(uuid)
+        setTimeout(() => setActionFeedback(null), 1200)
+      }
+    } catch {}
+  }
+
   createEffect(() => {
     const len = props.messages.length
     const delta = len - prevMsgLen
@@ -372,9 +447,13 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
     }
   })
 
+  const canShare = typeof navigator !== 'undefined' && !!navigator.share
+
+  const menuBtnStyle = { display: 'block', width: '100%', padding: '8px 14px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#e5e5e5', 'font-size': '12px', 'text-align': 'left' as const, cursor: 'pointer', 'white-space': 'nowrap' as const }
+
   return (
     <div style={{ position: 'relative', height: '100%' }}>
-    <div ref={(el) => { scrollRef = el; props.scrollRefCb?.(el) }} onScroll={onScroll} onClick={handleCopyClick} style={{ height: '100%', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', 'overscroll-behavior': 'contain', padding: '16px', 'padding-bottom': '80px' }}>
+    <div ref={(el) => { scrollRef = el; props.scrollRefCb?.(el) }} onScroll={onScroll} style={{ height: '100%', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', 'overscroll-behavior': 'contain', padding: '16px', 'padding-bottom': '80px' }}>
       <style>{markdownCSS}</style>
       <Show when={props.loading}>
         <div style={{ color: '#555', 'text-align': 'center', padding: '40px' }}>Loading...</div>
@@ -393,9 +472,12 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
           <img src={lightbox()!} style={{ 'max-width': '95vw', 'max-height': '95vh', 'object-fit': 'contain', 'border-radius': '8px' }} />
         </div>
       </Show>
+      {/* Action menu backdrop */}
+      <Show when={actionMenu()}>
+        <div onClick={() => setActionMenu(null)} style={{ position: 'fixed', inset: '0', 'z-index': '90' }} />
+      </Show>
 
       <For each={props.messages}>{(msg) => {
-        // Extract images from text blocks
         const textBlock = msg.content?.find(b => b.type === 'text' && b.text)
         const { cleanText, images, files } = textBlock?.text ? extractImages(textBlock.text) : { cleanText: textBlock?.text || '', images: [], files: [] }
         const hasImages = images.length > 0
@@ -403,30 +485,27 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
         const hasAttachments = hasImages || hasFiles
 
         return <div style={{ display: 'flex', 'flex-direction': 'column', 'align-items': msg.role === 'user' ? 'flex-end' : 'flex-start', 'margin-bottom': '10px' }}>
-          <div style={{
+          <div data-uuid={msg.uuid} data-role={msg.role} style={{
             'max-width': '85%', padding: hasAttachments ? '6px' : '10px 14px',
             'border-radius': msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
             background: msg.role === 'user' ? 'rgba(74,186,106,0.15)' : '#1a1a2e',
             color: '#e5e5e5', overflow: 'hidden',
             'font-size': '14px', 'line-height': '1.5', 'word-break': 'break-word',
           }}>
-            {/* Inline images */}
             <For each={images}>{(src) => (
               <img src={src} onClick={() => setLightbox(src)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': hasAttachments ? '12px' : '6px', 'margin-bottom': '4px', cursor: 'zoom-in', display: 'block' }} />
             )}</For>
-            {/* File attachments */}
             <For each={files}>{(f) => (
               <a href={f.path} target="_blank" rel="noopener" style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
                 <span style={{ 'font-size': '16px' }}>{f.name.endsWith('.pdf') ? '\uD83D\uDCC4' : '\uD83D\uDCCE'}</span>
                 <span style={{ overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{f.name}</span>
               </a>
             )}</For>
-            {/* Text + other blocks */}
             <div style={hasAttachments ? { padding: '4px 8px 4px' } : {}}>
               <For each={msg.content}>{(block) => {
                 if (block.type === 'text' && block.text) {
                   const display = hasAttachments ? cleanText : block.text
-                  return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => { injectCopyButtons(el); fixLinks(el); collapseCodeBlocks(el) }} /> : null
+                  return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }} /> : null
                 }
                 if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
                   const q = block.input?.question || 'Claude is asking a question...'
@@ -460,6 +539,25 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
                 style={{ background: 'none', border: 'none', cursor: 'pointer', 'font-size': '12px', padding: '0 2px', color: props.starred?.has(msg.uuid) ? '#c4993a' : '#333', opacity: props.starred?.has(msg.uuid) ? '1' : '0', transition: 'opacity 0.15s' }}
                 class="star-btn">{props.starred?.has(msg.uuid) ? '\u2605' : '\u2606'}</button>
             )}
+            {/* Copy / export button */}
+            {!msg.uuid.startsWith('optimistic-') && (
+              <div style={{ position: 'relative', display: 'flex', 'align-items': 'center' }}>
+                <button onClick={() => setActionMenu(actionMenu() === msg.uuid ? null : msg.uuid)}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', 'font-size': '10px', padding: '0 3px', color: actionFeedback() === msg.uuid ? '#4aba6a' : '#444', opacity: actionMenu() === msg.uuid ? '1' : undefined, transition: 'color 0.2s' }}
+                  class="action-menu-btn">{actionFeedback() === msg.uuid ? '\u2713' : 'Copy'}</button>
+                <Show when={actionMenu() === msg.uuid}>
+                  <div style={{ position: 'absolute', bottom: '100%', [msg.role === 'user' ? 'right' : 'left']: '0', 'margin-bottom': '4px', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '8px', 'box-shadow': '0 4px 12px rgba(0,0,0,0.5)', 'z-index': '100', overflow: 'hidden', 'min-width': '120px' }}>
+                    <button onClick={() => doAction('text', msg.uuid)} style={menuBtnStyle}>Copy text</button>
+                    <button onClick={() => doAction('html', msg.uuid)} style={menuBtnStyle}>Copy HTML</button>
+                    <button onClick={() => doAction('png', msg.uuid)} style={menuBtnStyle}>Copy image</button>
+                    <button onClick={() => doAction('pdf', msg.uuid)} style={{ ...menuBtnStyle, 'border-bottom': canShare ? '1px solid #222' : 'none' }}>Save PDF</button>
+                    <Show when={canShare}>
+                      <button onClick={() => doAction('share', msg.uuid)} style={{ ...menuBtnStyle, 'border-bottom': 'none' }}>Share...</button>
+                    </Show>
+                  </div>
+                </Show>
+              </div>
+            )}
           </div>
         </div>
       }}</For>
@@ -476,10 +574,30 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
       </Show>
     </div>
     {/* Scroll to bottom button */}
-    <Show when={!pinned() && newMsgCount() > 0}>
-      <button onClick={scrollToBottom}
-        style={{ position: 'absolute', bottom: '16px', left: '50%', transform: 'translateX(-50%)', background: '#4aba6a', color: '#000', border: 'none', 'border-radius': '20px', padding: '6px 16px', 'font-size': '12px', 'font-weight': '600', cursor: 'pointer', 'box-shadow': '0 2px 8px rgba(0,0,0,0.4)', 'z-index': '10', '-webkit-tap-highlight-color': 'transparent' }}>
-        {newMsgCount()} new {'\u2193'}
+    <Show when={!pinned()}>
+      <button
+        onClick={scrollToBottom}
+        title="Scroll to bottom"
+        style={{
+          position: 'absolute', bottom: '12px', right: '16px', 'z-index': '10',
+          width: '32px', height: '32px', 'border-radius': '50%',
+          background: '#1a1a2e', color: '#e5e5e5',
+          border: '1px solid #333', cursor: 'pointer',
+          'font-size': '16px', display: 'flex', 'align-items': 'center', 'justify-content': 'center',
+          'box-shadow': '0 2px 8px rgba(0,0,0,0.35)', opacity: '0.9',
+          '-webkit-tap-highlight-color': 'transparent',
+        }}
+      >
+        <Show when={newMsgCount() > 0}>
+          <span style={{
+            position: 'absolute', top: '-8px', right: '-8px',
+            'min-width': '20px', height: '20px', padding: '0 5px',
+            background: '#4aba6a', color: '#000',
+            'font-size': '11px', 'font-weight': '600', 'border-radius': '10px',
+            display: 'flex', 'align-items': 'center', 'justify-content': 'center', 'line-height': '1',
+          }}>{newMsgCount() > 99 ? '99+' : newMsgCount()}</span>
+        </Show>
+        {'\u2193'}
       </button>
     </Show>
     </div>
