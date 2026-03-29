@@ -120,6 +120,15 @@ npm start      # → Feather on http://localhost:4870
 - **Byte-offset SSE IDs.** Enables resumable streams and gap-free message delivery.
 - **Mobile-first.** `--vh` viewport fix, safe-area insets, `-webkit-overflow-scrolling: touch`, PWA meta tags.
 
+## Deploying changes
+
+```bash
+cd ~/feather
+npm run deploy    # stamps version.json, builds frontend, restarts server
+```
+
+Both backend (`/api/health`) and frontend (tab bar) show the same version timestamp.
+
 ## Deployment
 
 ### systemd
