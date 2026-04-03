@@ -272,7 +272,8 @@ function renderBlock(block: ContentBlock) {
     const inp = block.input || {}
     const hasDetail = name === 'Edit' || name === 'Bash' || name === 'Write' || name === 'Agent' || name === 'Grep' || name === 'Read'
     const pre = 'white-space:pre-wrap;font-size:10px;font-family:SF Mono,Menlo,monospace;padding:3px 0;max-height:160px;overflow:auto;margin:0;word-break:break-all;'
-    return (
+    const isImageFile = (name === 'Read' || name === 'Write') && inp.file_path && IMAGE_EXTS.has(((inp.file_path as string).substring((inp.file_path as string).lastIndexOf('.')).toLowerCase()))
+    return <>
       <details style={{ margin: '3px 0', 'font-size': '11px', 'font-family': "'SF Mono', Menlo, monospace", 'border-top': '1px solid #ffffff0a' }}>
         <summary style={{ padding: '2px 0', cursor: hasDetail ? 'pointer' : 'default', 'list-style': hasDetail ? undefined : 'none', color: '#999' }}>
           <span style={{ color }}>{name}</span>
@@ -290,14 +291,14 @@ function renderBlock(block: ContentBlock) {
         </>}
         {name === 'Grep' && inp.pattern && <pre style={`${pre}color:#c4a0c0`}>/{inp.pattern}/{inp.path ? ` in ${inp.path}` : ''}</pre>}
         {name === 'Read' && inp.file_path && <pre style={`${pre}color:#88c4ff`}>{inp.file_path}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
-        {(name === 'Read' || name === 'Write') && inp.file_path && IMAGE_EXTS.has(((inp.file_path as string).substring((inp.file_path as string).lastIndexOf('.')).toLowerCase())) && (() => {
-          const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''
-          const resolvedPath = (inp.file_path as string).replace(/^~/, '/home/' + (typeof document !== 'undefined' ? document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user' : 'user'))
-          const imgSrc = `${base}/api/files/raw?path=${encodeURIComponent(resolvedPath)}`
-          return <img src={imgSrc} onClick={() => setLightbox(imgSrc)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '4px', display: 'block', cursor: 'zoom-in' }} />
-        })()}
       </details>
-    )
+      {isImageFile && (() => {
+        const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''
+        const resolvedPath = (inp.file_path as string).replace(/^~/, '/home/' + (typeof document !== 'undefined' ? document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user' : 'user'))
+        const imgSrc = `${base}/api/files/raw?path=${encodeURIComponent(resolvedPath)}`
+        return <img src={imgSrc} onClick={() => setLightbox(imgSrc)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '6px', display: 'block', cursor: 'zoom-in' }} />
+      })()}
+    </>
   }
   if (block.type === 'tool_result') {
     const rawContent = typeof block.content === 'string' ? block.content : Array.isArray(block.content) ? block.content.map((c: any) => c.text || '').join('') : ''
