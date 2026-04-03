@@ -1,3 +1,20 @@
+## 2026-04-03 - Image Auto-Preview
+- Image file paths in assistant messages now render an inline preview automatically
+- Click the preview to open the full-size lightbox
+- No more hunting through the file explorer to see generated images
+
+## 2026-04-01 - Question Popup + Status Cleanup
+- Claude's interactive questions (session reload, yes/no prompts) now pop up as a clickable panel above the status bar
+- Removed redundant status dot character (e.g. "✻ Reading files") since the orange indicator dot already shows working state
+- Single tmux capture shared between activity and question detection (no extra polling cost)
+
+## 2026-03-30 - Link & File Browser Fix
+- File paths in inline code (e.g. `/home/user/file.json`) are now clickable links that open in a new tab
+- File browser in the Files tab: browse directories, click files to view/download
+- File browser shows relative age (e.g. "2h ago", "3d ago") and size for each entry
+- File links use `/api/files/raw` endpoint instead of broken open-in-editor handler
+- Stop button: tap "Stop" in status bar or red stop button (replaces send) to interrupt Claude on mobile
+
 ## 2026-03-29 - Upstream Merge #3
 - Version stamping: build time shown from version.json
 - Adopted upstream build script with automatic version.json generation

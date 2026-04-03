@@ -166,7 +166,9 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
   const nodes: Text[] = []
   while (walker.nextNode()) nodes.push(walker.currentNode as Text)
   for (const node of nodes) {
-    if (node.parentElement?.tagName === 'A' || node.parentElement?.tagName === 'CODE') continue
+    if (node.parentElement?.tagName === 'A') continue
+    // Skip code blocks (<pre><code>) but allow inline <code> to be linkified
+    if (node.parentElement?.tagName === 'CODE' && node.parentElement?.parentElement?.tagName === 'PRE') continue
     const text = node.textContent || ''
     if (!text.match(FILE_PATH_RE)) continue
     const frag = document.createDocumentFragment()
@@ -181,20 +183,30 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
       a.style.textDecoration = 'none'
       a.style.cursor = 'pointer'
       const ext = path.substring(path.lastIndexOf('.')).toLowerCase()
+      const base = location.pathname.replace(/\/+$/, '')
+      const resolvedPath = path.replace(/^~/, '/home/' + (document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user'))
       if (IMAGE_EXTS.has(ext)) {
-        a.href = path
-        a.onclick = (e) => { e.preventDefault(); onImageClick?.(path) }
+        const imgSrc = `${base}/api/files/raw?path=${encodeURIComponent(resolvedPath)}`
+        a.href = imgSrc
+        a.onclick = (e) => { e.preventDefault(); onImageClick?.(imgSrc) }
+        frag.appendChild(a)
+        // Auto-preview: insert inline image below the link
+        const img = document.createElement('img')
+        img.src = imgSrc
+        img.style.maxWidth = '100%'
+        img.style.maxHeight = '300px'
+        img.style.borderRadius = '8px'
+        img.style.marginTop = '4px'
+        img.style.display = 'block'
+        img.style.cursor = 'zoom-in'
+        img.onclick = () => onImageClick?.(imgSrc)
+        frag.appendChild(img)
       } else {
-        a.href = '#'
-        a.onclick = (e) => {
-          e.preventDefault()
-          fetch(`${location.pathname.replace(/\/+$/, '')}/api/open-in-editor`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: path.replace(/^~/, '/home/' + (document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user')) })
-          }).catch(() => {})
-        }
+        a.href = `${base}/api/files/raw?path=${encodeURIComponent(resolvedPath)}`
+        a.target = '_blank'
+        a.rel = 'noopener'
+        frag.appendChild(a)
       }
-      frag.appendChild(a)
       last = idx + path.length
     }
     if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)))
@@ -506,21 +518,6 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
                 if (block.type === 'text' && block.text) {
                   const display = hasAttachments ? cleanText : block.text
                   return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }} /> : null
-                }
-                if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
-                  const q = block.input?.question || 'Claude is asking a question...'
-                  return (
-                    <div style={{ background: '#1a1a2e', border: '1px solid #c4993a', 'border-radius': '8px', padding: '12px', margin: '6px 0' }}>
-                      <div style={{ color: '#c4993a', 'font-size': '11px', 'font-weight': '600', 'margin-bottom': '6px' }}>QUESTION</div>
-                      <div style={{ color: '#e5e5e5', 'font-size': '14px', 'margin-bottom': '10px' }}>{q}</div>
-                      <div style={{ display: 'flex', gap: '6px', 'flex-wrap': 'wrap' }}>
-                        <For each={['Yes', 'No', 'Continue']}>{(label) => (
-                          <button onClick={() => props.onAnswer?.(label)}
-                            style={{ background: '#333', border: '1px solid #555', color: '#e5e5e5', padding: '4px 12px', 'border-radius': '6px', 'font-size': '12px', cursor: 'pointer' }}>{label}</button>
-                        )}</For>
-                      </div>
-                    </div>
-                  )
                 }
                 return renderBlock(block)
               }}</For>
