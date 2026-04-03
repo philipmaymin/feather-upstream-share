@@ -253,7 +253,7 @@ function toolSummary(name: string, input: any): string {
 
 function renderBlock(block: ContentBlock) {
   if (block.type === 'text' && block.text) {
-    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }} />
+    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => setTimeout(() => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }, 0)} />
   }
   if (block.type === 'thinking' && block.thinking) {
     return (
@@ -524,7 +524,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
               <For each={msg.content}>{(block) => {
                 if (block.type === 'text' && block.text) {
                   const display = hasAttachments ? cleanText : block.text
-                  return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }} /> : null
+                  return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => setTimeout(() => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }, 0)} /> : null
                 }
                 return renderBlock(block)
               }}</For>
