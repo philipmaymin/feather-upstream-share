@@ -290,6 +290,12 @@ function renderBlock(block: ContentBlock) {
         </>}
         {name === 'Grep' && inp.pattern && <pre style={`${pre}color:#c4a0c0`}>/{inp.pattern}/{inp.path ? ` in ${inp.path}` : ''}</pre>}
         {name === 'Read' && inp.file_path && <pre style={`${pre}color:#88c4ff`}>{inp.file_path}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
+        {(name === 'Read' || name === 'Write') && inp.file_path && IMAGE_EXTS.has(((inp.file_path as string).substring((inp.file_path as string).lastIndexOf('.')).toLowerCase())) && (() => {
+          const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''
+          const resolvedPath = (inp.file_path as string).replace(/^~/, '/home/' + (typeof document !== 'undefined' ? document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user' : 'user'))
+          const imgSrc = `${base}/api/files/raw?path=${encodeURIComponent(resolvedPath)}`
+          return <img src={imgSrc} onClick={() => setLightbox(imgSrc)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '4px', display: 'block', cursor: 'zoom-in' }} />
+        })()}
       </details>
     )
   }
