@@ -562,31 +562,58 @@ function extractQuestion(lines, hasActivity) {
     const cursorLineCount = tail.filter(l => /^\s*❯\s+\S/.test(l)).length;
     if (cursorLineCount > 1) return null;
 
-    const questionLines = [];
+    let questionLines = [];
     const options = [];
     let inOptions = false;
+    let numberedFormat = false;
+    // Strip a leading "N." or "N. " so the prose-detector doesn't trip on the
+    // numbered prefix (e.g. "1. Yes" has ". " but isn't prose).
+    const stripNum = (s) => s.replace(/^\d+\.\s*/, '');
     for (const line of tail) {
       const trimmed = line.trim();
       if (/^❯\s+/.test(trimmed)) {
         inOptions = true;
         const optText = trimmed.replace(/^❯\s+/, '');
+        const body = stripNum(optText);
         // The selected option in a real menu is a short label, not prose.
-        // If it looks like a sentence (contains ? or . mid-text, or >50 chars), bail.
-        if (optText.length > 50 || /[.!?]\s/.test(optText)) return null;
+        if (body.length > 50 || /[.!?]\s/.test(body)) return null;
+        numberedFormat = /^\d+\.\s*\S/.test(optText);
         options.push(optText);
-      } else if (inOptions && trimmed && !/^Esc\s/.test(trimmed)) {
-        options.push(trimmed);
-      } else if (!inOptions && trimmed) {
-        if (!/^[╭╮╰╯│─┌┐└┘┤├┬┴┼═║╔╗╚╝╌]+$/.test(trimmed)) {
-          questionLines.push(trimmed);
+      } else if (inOptions) {
+        // Footer / chrome terminates option parsing.
+        if (/^Esc\s/.test(trimmed)) break;
+        if (/^[▐▛▜▌▝▘█]/.test(trimmed)) break;
+        if (!trimmed) continue;
+        if (numberedFormat) {
+          // Numbered format: a new option starts with "N.", everything else
+          // is a wrapped continuation of the previous option.
+          if (/^\d+\.\s*\S/.test(trimmed)) {
+            options.push(trimmed);
+          } else if (options.length > 0) {
+            options[options.length - 1] += ' ' + trimmed;
+          }
+        } else {
+          // Plain format: each non-empty line is its own option.
+          options.push(trimmed);
         }
+      } else if (!inOptions && trimmed) {
+        // Box-drawing separator marks the top of the question box; anything
+        // above it is scrollback (e.g. heredoc content) and not the question.
+        if (/^[╭╮╰╯│─┌┐└┘┤├┬┴┼═║╔╗╚╝╌]+$/.test(trimmed)) {
+          questionLines = [];
+          continue;
+        }
+        questionLines.push(trimmed);
       }
     }
     // Require at least 2 options for a real selector (❯ selected + at least one more)
     if (options.length >= 2) {
       // Real Claude Code menu options are short, single-phrase lines. If any
       // "option" looks like prose (too long, or sentence punctuation mid-line), bail.
-      const looksLikeProse = (s) => s.length > 80 || /[.!?]\s+[A-Z]/.test(s);
+      const looksLikeProse = (s) => {
+        const body = stripNum(s);
+        return body.length > 100 || /[.!?]\s+[A-Z]/.test(body);
+      };
       if (options.some(looksLikeProse)) return null;
       // Menu questions are brief. Reject if aggregated question text is prose-length.
       const questionText = questionLines.slice(-3).join('\n');
