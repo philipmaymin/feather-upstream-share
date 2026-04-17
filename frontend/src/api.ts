@@ -148,10 +148,22 @@ export async function logout(): Promise<void> {
   await fetch(`${BASE}/api/logout`, { method: 'POST' })
 }
 
+export interface QuestionData {
+  type: 'selector' | 'yesno' | 'numbered' | 'text'
+  question: string
+  options?: string[]
+  selectedIndex?: number
+}
+
+export const answerQuestion = (id: string, body: { type: string; index?: number; text?: string }) =>
+  fetch(`${BASE}/api/sessions/${id}/answer`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json())
+
 export function subscribeMessages(
   id: string,
   onMessage: (msg: Message) => void,
   onStatus?: (status: 'connected' | 'reconnecting') => void,
+  onActivity?: (activity: string | null) => void,
+  onQuestion?: (question: QuestionData | null) => void,
 ): () => void {
   let es: EventSource | null = null
   let closed = false
@@ -183,6 +195,12 @@ export function subscribeMessages(
     es.addEventListener('message', (e) => {
       if (e.lastEventId) lastEventId = e.lastEventId
       try { onMessage(JSON.parse(e.data)) } catch {}
+    })
+    es.addEventListener('activity', (e) => {
+      try { onActivity?.(JSON.parse(e.data).activity) } catch {}
+    })
+    es.addEventListener('question', (e) => {
+      try { onQuestion?.(JSON.parse(e.data).question) } catch {}
     })
     es.onerror = () => {
       es?.close(); es = null

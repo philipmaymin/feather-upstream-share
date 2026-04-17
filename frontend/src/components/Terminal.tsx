@@ -1,10 +1,8 @@
-import { onMount, onCleanup, createEffect, createSignal, Show } from 'solid-js'
-import { init, Terminal as GhosttyTerm, FitAddon } from 'ghostty-web'
+import { onMount, onCleanup, createEffect, createSignal } from 'solid-js'
+import { init, Terminal as GhosttyTerm, FitAddon, UrlRegexProvider, OSC8LinkProvider } from 'ghostty-web'
 
 const basePath = location.pathname.replace(/\/+$/, '')
 const BASE_WS = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}${basePath}/api/terminal`
-
-const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
 
 let wasmReady: Promise<void> | null = null
 function ensureInit() {
@@ -36,6 +34,40 @@ export function Terminal(props: { sessionId: string | null }) {
     if (containerRef) {
       term.open(containerRef)
       fitAddon.fit()
+
+      // Register link providers so URLs are clickable (Ctrl/Cmd+click opens them)
+      try {
+        // URL regex provider detects http/https links
+        const urlProvider = new UrlRegexProvider(term as any)
+        term.registerLinkProvider(urlProvider)
+        // OSC 8 hyperlinks (explicit terminal hyperlinks)
+        const osc8Provider = new OSC8LinkProvider(term as any)
+        term.registerLinkProvider(osc8Provider)
+      } catch {}
+
+      // Also allow plain click on links (no modifier) for mobile/convenience
+      const canvas = containerRef.querySelector('canvas')
+      if (canvas) {
+        canvas.addEventListener('click', async (e) => {
+          if (e.ctrlKey || e.metaKey) return // already handled by ghostty
+          if (!term) return
+          const rect = canvas.getBoundingClientRect()
+          const renderer = (term as any).renderer
+          if (!renderer || !renderer.charWidth || !renderer.charHeight) return
+          const col = Math.floor((e.clientX - rect.left) / renderer.charWidth)
+          const row = Math.floor((e.clientY - rect.top) / renderer.charHeight)
+          const detector = (term as any).linkDetector
+          if (!detector) return
+          const scrollback = (term as any).wasmTerm?.getScrollbackLength?.() || 0
+          const absRow = scrollback + row
+          const link = await detector.getLinkAt(col, absRow)
+          if (link) {
+            window.open(link.text, '_blank', 'noopener,noreferrer')
+            e.preventDefault()
+            e.stopPropagation()
+          }
+        })
+      }
     }
 
     // Track selection changes
@@ -133,16 +165,14 @@ export function Terminal(props: { sessionId: string | null }) {
 
   return (
     <div style={{ height: '100%', width: '100%', display: 'flex', 'flex-direction': 'column', background: '#0a0e14' }}>
-      {/* Mobile toolbar */}
-      <Show when={isMobile}>
-        <div style={{ display: 'flex', gap: '6px', padding: '6px 8px', 'border-bottom': '1px solid #1e1e1e', 'flex-shrink': '0', 'overflow-x': 'auto' }}>
-          <button onClick={handleSelectAll} style={btnStyle}>Select All</button>
-          <button onClick={handleCopy} style={{ ...btnStyle, color: copied() ? '#4aba6a' : '#aaa' }}>
-            {copied() ? 'Copied!' : hasSelection() ? 'Copy Selection' : 'Copy All'}
-          </button>
-          <button onClick={handlePaste} style={btnStyle}>Paste</button>
-        </div>
-      </Show>
+      {/* Terminal toolbar */}
+      <div style={{ display: 'flex', gap: '6px', padding: '6px 8px', 'border-bottom': '1px solid #1e1e1e', 'flex-shrink': '0', 'overflow-x': 'auto' }}>
+        <button onClick={handleSelectAll} style={btnStyle}>Select All</button>
+        <button onClick={handleCopy} style={{ ...btnStyle, color: copied() ? '#4aba6a' : '#aaa' }}>
+          {copied() ? 'Copied!' : hasSelection() ? 'Copy Selection' : 'Copy All'}
+        </button>
+        <button onClick={handlePaste} style={btnStyle}>Paste</button>
+      </div>
       <div ref={containerRef}
         onKeyDown={(e) => e.stopPropagation()}
         onKeyPress={(e) => e.stopPropagation()}

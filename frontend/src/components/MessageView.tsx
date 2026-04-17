@@ -251,9 +251,9 @@ function toolSummary(name: string, input: any): string {
 
 // ── Block renderers ─────────────────────────────────────────────────────────
 
-function renderBlock(block: ContentBlock) {
+function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void) {
   if (block.type === 'text' && block.text) {
-    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => setTimeout(() => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }, 0)} />
+    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => setTimeout(() => { fixLinks(el, onImageClick); collapseCodeBlocks(el) }, 0)} />
   }
   if (block.type === 'thinking' && block.thinking) {
     return (
@@ -296,7 +296,7 @@ function renderBlock(block: ContentBlock) {
         const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''
         const resolvedPath = (inp.file_path as string).replace(/^~/, '/home/' + (typeof document !== 'undefined' ? document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user' : 'user'))
         const imgSrc = `${base}/api/files/raw?path=${encodeURIComponent(resolvedPath)}`
-        return <img src={imgSrc} onClick={() => setLightbox(imgSrc)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '6px', display: 'block', cursor: 'zoom-in' }} />
+        return <img src={imgSrc} onClick={() => onImageClick?.(imgSrc)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '6px', display: 'block', cursor: 'zoom-in' }} />
       })()}
     </>
   }
@@ -526,7 +526,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
                   const display = hasAttachments ? cleanText : block.text
                   return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => setTimeout(() => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }, 0)} /> : null
                 }
-                return renderBlock(block)
+                return renderBlock(block, (src) => setLightbox(src))
               }}</For>
             </div>
           </div>

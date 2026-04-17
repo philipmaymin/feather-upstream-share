@@ -90,6 +90,13 @@ function findJsonlPath(sessionId) {
   return null;
 }
 
+function findSessionCwd(sessionId) {
+  const jsonlPath = findJsonlPath(sessionId);
+  if (!jsonlPath) return null;
+  const projectId = path.basename(path.dirname(jsonlPath));
+  return projectIdToCwd(projectId);
+}
+
 // ── Session metadata ────────────────────────────────────────────────────────
 
 function metaFilePath() {
@@ -161,47 +168,55 @@ function tmuxIsActive(id) {
 
 function spawnTmuxClaude(name, claudeArgs, dir) {
   try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
-  const claudeCmd = `claude ${claudeArgs} --dangerously-skip-permissions --disallowed-tools AskUserQuestion`;
+  const claudeCmd = `claude ${claudeArgs} --dangerously-skip-permissions --disallowed-tools "AskUserQuestion,EnterPlanMode,ExitPlanMode"`;
   const shellCmd = `tmux new-session -d -s ${name} -c "${dir}" "bash -lc '${claudeCmd}'" \\; set-option -t ${name} prefix M-a`;
   execFileSync('bash', ['-c', shellCmd], { stdio: 'ignore', encoding: 'utf8' });
-  // Auto-dismiss permission/trust prompts that block headless sessions
-  for (const delay of [3000, 5000, 8000]) {
-    setTimeout(() => {
-      try {
-        const pane = execFileSync('tmux', ['capture-pane', '-t', name, '-p'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-        if (/bypass permissions|dangerous|permission mode|trust/i.test(pane)) {
-          execFileSync('tmux', ['send-keys', '-t', name, '1'], { stdio: 'ignore' });
-          setTimeout(() => {
-            try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
-          }, 300);
-        } else {
-          execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' });
-        }
-      } catch {}
-    }, delay);
-  }
 }
 
 function spawnOrResume(id, cwd, resume = false) {
-  const dir = cwd || HOME;
+  const dir = cwd || (resume ? findSessionCwd(id) : null) || HOME;
   const args = resume ? `--resume ${id}` : `--session-id ${id}`;
   spawnTmuxClaude(tmuxName(id), args, dir);
 }
 
-function sendText(name, text) {
-  if (text.length > 500) {
+function inputStillContainsMarker(name, marker) {
+  try {
+    const content = execFileSync('tmux', ['capture-pane', '-t', name, '-p'],
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000 });
+    const lines = content.trimEnd().split('\n');
+    const tail = lines.slice(Math.max(0, lines.length - 8));
+    for (const line of tail) {
+      if (line.includes(marker) && /[>❯│]/.test(line)) return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
+async function sendText(name, text) {
+  // Use file-based paste for long text OR text with newlines (crossterm TUI
+  // doesn't handle literal newlines from send-keys -l; they become line breaks
+  // in the input area instead of being submitted)
+  const isLong = text.length > 500 || text.includes('\n');
+  if (isLong) {
     const tmp = `/tmp/feather-send-${Date.now()}.txt`;
     fs.writeFileSync(tmp, text);
     try {
       execFileSync('tmux', ['load-buffer', tmp], { stdio: 'ignore' });
       execFileSync('tmux', ['paste-buffer', '-t', name], { stdio: 'ignore' });
     } finally { try { fs.unlinkSync(tmp); } catch {} }
-    setTimeout(() => {
-      try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
-    }, 500);
+    await new Promise(r => setTimeout(r, 500));
   } else {
     execFileSync('tmux', ['send-keys', '-t', name, '-l', text], { stdio: 'ignore' });
-    execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' });
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  // Send Enter with retry verification: if text is still visible in input box,
+  // re-send Enter. Handles the race where TUI isn't fully ready post-spawn.
+  const marker = text.replace(/\s+/g, ' ').trim().slice(0, 40);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
+    await new Promise(r => setTimeout(r, 500));
+    if (!marker || !inputStillContainsMarker(name, marker)) return;
   }
 }
 
@@ -212,19 +227,76 @@ function isClaudeRunning(name) {
   } catch { return false; }
 }
 
-function sendInputToSession(id, text) {
+function isClaudeAtPrompt(name) {
+  try {
+    const content = execFileSync('tmux', ['capture-pane', '-t', name, '-p'],
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const lines = content.trimEnd().split('\n');
+    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 8); i--) {
+      const line = lines[i];
+      // Claude Code prompt: line starts with ❯ or > (input prompt)
+      if (/^\s*[>❯]\s*$/.test(line)) return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
+function waitForClaudeReady(name, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    let processDetected = false;
+    let firstPromptSeenAt = 0;
+    const STABILITY_MS = 800; // prompt must be present this long before we trust it
+    function check() {
+      try {
+        execFileSync('tmux', ['has-session', '-t', name], { stdio: 'ignore' });
+      } catch {
+        return reject(new Error('session_gone'));
+      }
+      if (!processDetected && isClaudeRunning(name)) {
+        processDetected = true;
+      }
+      if (processDetected && isClaudeAtPrompt(name)) {
+        if (!firstPromptSeenAt) firstPromptSeenAt = Date.now();
+        if (Date.now() - firstPromptSeenAt >= STABILITY_MS) return resolve();
+      } else {
+        firstPromptSeenAt = 0;
+      }
+      if (Date.now() - start > timeoutMs) {
+        if (processDetected) return resolve();
+        return reject(new Error('timeout'));
+      }
+      setTimeout(check, 250);
+    }
+    setTimeout(check, 250);
+  });
+}
+
+async function sendInputToSession(id, text) {
   const name = tmuxName(id);
-  let needsResume = false;
+  let sessionExists = false;
   try {
     execFileSync('tmux', ['has-session', '-t', name], { stdio: 'ignore' });
-    if (!isClaudeRunning(name)) needsResume = true;
-  } catch { needsResume = true; }
+    sessionExists = true;
+  } catch {}
 
-  if (needsResume) {
+  if (!sessionExists) {
     spawnOrResume(id, null, true);
-    setTimeout(() => { try { sendText(name, text); } catch {} }, 3000);
-  } else {
-    sendText(name, text);
+  }
+  // If session exists, Claude may be starting up; don't kill it, just wait
+
+  try {
+    await waitForClaudeReady(name);
+    await sendText(name, text);
+  } catch {
+    // Timed out or session died; respawn and try once more
+    spawnOrResume(id, null, true);
+    try {
+      await waitForClaudeReady(name);
+      await sendText(name, text);
+    } catch {
+      throw new Error('Failed to resume session after retry');
+    }
   }
 }
 
@@ -376,6 +448,221 @@ function broadcast(sessionId, line, offset) {
     try { res.write(chunk); } catch { clients.delete(res); }
   }
 }
+
+// ── Activity + question polling (single tmux capture per session) ───────────
+
+const lastActivity = new Map(); // sessionId -> last broadcast activity string
+const lastQuestion = new Map(); // sessionId -> last broadcast question JSON
+const lastPaneHash = new Map(); // sessionId -> hash of last pane content
+const paneStableCount = new Map(); // sessionId -> consecutive polls with same content
+
+function capturePaneLines(tmuxName) {
+  const content = execFileSync('tmux', ['capture-pane', '-t', tmuxName, '-p'],
+    { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000 });
+  return { lines: content.split('\n'), raw: content };
+}
+
+function simpleHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) - h + str.charCodeAt(i)) | 0;
+  return h;
+}
+
+// Build a stability key: strip lines that change every second (status bar,
+// spinner animations, runtime/cost counters) so pane-stability polling can
+// actually converge. Without this, Claude's live status bar flips the hash
+// every poll and question detection never fires.
+function paneStabilityKey(raw) {
+  return raw.split('\n').filter(line => {
+    const t = line.trim();
+    if (!t) return false;
+    if (/bypass permissions/i.test(t)) return false;
+    if (/\bctx\s*[\[(]/i.test(t)) return false;
+    if (/\$\d+(\.\d+)?(\s|$)/.test(t)) return false;
+    if (/\b\d+h\s*\d+(\.\d+)?m\b/.test(t)) return false;
+    if (/\b\d+(\.\d+)?s\b.*tokens?\b/i.test(t)) return false;
+    if (/\(esc to interrupt\)/i.test(t)) return false;
+    if (/^[✻·●✶⧫◆▸►▹☆★✦⏳◉⊛+*]\s+\S.*(ing\.{3}|…)/.test(t)) return false;
+    return true;
+  }).join('\n');
+}
+
+function extractActivity(lines) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/^\s*[❯>]\s*$/.test(lines[i])) {
+      for (let j = i - 1; j >= Math.max(0, i - 8); j--) {
+        const line = lines[j].trim();
+        if (!line || /^[─━═─]+$/.test(line)) continue;
+        if (/^⎿/.test(line) || /^Tip:/.test(line) || /bypass permissions/.test(line)) continue;
+        if (/^[✻·*●✶⧫◆▸►▹☆★✦⏳◉⊛]/.test(line) || /\(\d+[sm]\s/.test(line)) {
+          return line;
+        }
+        break;
+      }
+      break;
+    }
+  }
+  return null;
+}
+
+function extractQuestion(lines, hasActivity) {
+  // If Claude is actively working (spinner visible), it's not asking a question
+  if (hasActivity) return null;
+
+  // If at normal input prompt (empty ❯ or >), no question
+  // Note: bypass permissions is part of Claude's status bar and is always visible,
+  // so it should NOT prevent question detection.
+  // Check a wider window (25 lines) to handle status bar content below the prompt
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 25); i--) {
+    const line = lines[i];
+    if (/^\s*[❯>]\s*$/.test(line)) return null;
+    if (/^⎿/.test(line.trim())) return null;
+    // User message display lines ("> text") in scrollback mean we're in conversation, not a menu
+    if (/^\s*>\s+\S/.test(line) && line.trim().length > 10) return null;
+  }
+
+  const tail = [];
+  for (let i = lines.length - 1; i >= 0 && tail.length < 20; i--) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) continue;
+    // Skip Claude's status bar lines (always present at bottom of pane)
+    if (/bypass permissions/.test(trimmed)) continue;
+    if (/\bctx\s*\[/.test(trimmed)) continue;
+    if (/^⏵⏵/.test(trimmed)) continue;
+    if (/^Opus|^Sonnet|^Haiku/.test(trimmed) && /\bctx\b|\$\d/.test(trimmed)) continue;
+    if (/weekly limit|resets \d/.test(trimmed)) continue;
+    if (/^Claude Code v\d/.test(trimmed)) continue;
+    if (/^Tip:/.test(trimmed)) continue;
+    tail.unshift(lines[i]);
+  }
+  if (tail.length === 0) return null;
+
+  const tailJoined = tail.join('\n');
+  // Queued-input state: idle prompt is replaced by this indicator. Not a menu.
+  if (/Press up to edit queued messages/i.test(tailJoined)) return null;
+  // Spinner/activity text that extractActivity's anchor-based logic may miss
+  if (/\(thinking\b|\(esc to interrupt\)|tokens?\)/i.test(tailJoined)) return null;
+  if (/^[✻·●✶⧫◆▸►▹☆★✦⏳◉⊛+*]\s+\S.*(ing\.{3}|…)/m.test(tailJoined)) return null;
+
+  // Pattern 1: Interactive selector (❯ followed by text = CLI menu)
+  // Distinguished from empty prompt (bare ❯) by the \S after whitespace
+  // Only check the last 8 tail lines to avoid matching ❯ in scrolled output
+  const bottomTail = tail.slice(-8);
+  // Reject if the input-box placeholder is visible, that's not a menu
+  const tailText = tail.join('\n');
+  if (/Send a message/i.test(tailText)) return null;
+  if (bottomTail.some(l => /^\s*❯\s+\S/.test(l))) {
+    // Real selector menus are wrapped in box-drawing characters. If none are present
+    // in the tail, this is conversation scrollback, not a menu.
+    const hasBoxDrawing = tail.some(l => /[╭╮╰╯│─┌┐└┘┤├┬┴┼═║╔╗╚╝╌]/.test(l));
+    if (!hasBoxDrawing) return null;
+
+    // Real selector menus have exactly ONE ❯ line (the selected option).
+    // Multiple ❯ lines means we're seeing conversation scrollback (user messages), not a menu.
+    const cursorLineCount = tail.filter(l => /^\s*❯\s+\S/.test(l)).length;
+    if (cursorLineCount > 1) return null;
+
+    const questionLines = [];
+    const options = [];
+    let inOptions = false;
+    for (const line of tail) {
+      const trimmed = line.trim();
+      if (/^❯\s+/.test(trimmed)) {
+        inOptions = true;
+        const optText = trimmed.replace(/^❯\s+/, '');
+        // The selected option in a real menu is a short label, not prose.
+        // If it looks like a sentence (contains ? or . mid-text, or >50 chars), bail.
+        if (optText.length > 50 || /[.!?]\s/.test(optText)) return null;
+        options.push(optText);
+      } else if (inOptions && trimmed && !/^Esc\s/.test(trimmed)) {
+        options.push(trimmed);
+      } else if (!inOptions && trimmed) {
+        if (!/^[╭╮╰╯│─┌┐└┘┤├┬┴┼═║╔╗╚╝╌]+$/.test(trimmed)) {
+          questionLines.push(trimmed);
+        }
+      }
+    }
+    // Require at least 2 options for a real selector (❯ selected + at least one more)
+    if (options.length >= 2) {
+      // Real Claude Code menu options are short, single-phrase lines. If any
+      // "option" looks like prose (too long, or sentence punctuation mid-line), bail.
+      const looksLikeProse = (s) => s.length > 80 || /[.!?]\s+[A-Z]/.test(s);
+      if (options.some(looksLikeProse)) return null;
+      // Menu questions are brief. Reject if aggregated question text is prose-length.
+      const questionText = questionLines.slice(-3).join('\n');
+      if (questionText.length > 200) return null;
+      return { type: 'selector', question: questionText, options, selectedIndex: 0 };
+    }
+  }
+
+  // Pattern 2: Y/n or y/N prompt (must be at the very end of the last line)
+  const lastLine = tail[tail.length - 1].trim();
+  if (/\([Yy]\/[Nn]\)\s*$/.test(lastLine)) {
+    return { type: 'yesno', question: tail.join('\n').trim() };
+  }
+
+  return null;
+}
+
+function broadcastActivity(sessionId, activity) {
+  const clients = sseClients.get(sessionId);
+  if (!clients || clients.size === 0) return;
+  const chunk = `event: activity\ndata: ${JSON.stringify({ activity })}\n\n`;
+  for (const res of clients) {
+    try { res.write(chunk); } catch { clients.delete(res); }
+  }
+}
+
+function broadcastQuestion(sessionId, question) {
+  const clients = sseClients.get(sessionId);
+  if (!clients || clients.size === 0) return;
+  const chunk = `event: question\ndata: ${JSON.stringify({ question })}\n\n`;
+  for (const res of clients) {
+    try { res.write(chunk); } catch { clients.delete(res); }
+  }
+}
+
+setInterval(() => {
+  try {
+    for (const [sid, clients] of sseClients.entries()) {
+      if (clients.size === 0) continue;
+      const name = tmuxName(sid);
+      let pane;
+      try { pane = capturePaneLines(name); } catch { continue; }
+      const lines = pane.lines;
+
+      // Track pane stability: only detect questions when pane is unchanged for 2+ polls.
+      // Hash only the non-dynamic content (status bar timer/cost/ctx updates every
+      // second and would otherwise prevent stability from ever being reached).
+      const hash = simpleHash(paneStabilityKey(pane.raw));
+      const prevHash = lastPaneHash.get(sid);
+      if (hash === prevHash) {
+        paneStableCount.set(sid, (paneStableCount.get(sid) || 0) + 1);
+      } else {
+        paneStableCount.set(sid, 0);
+        lastPaneHash.set(sid, hash);
+      }
+
+      // Activity
+      const activity = extractActivity(lines);
+      const prevAct = lastActivity.get(sid);
+      if (activity !== prevAct) {
+        lastActivity.set(sid, activity);
+        broadcastActivity(sid, activity);
+      }
+
+      // Question: only when not actively working AND pane has been stable (not mid-generation)
+      const stable = (paneStableCount.get(sid) || 0) >= 2;
+      const question = stable ? extractQuestion(lines, !!activity) : null;
+      const qJson = question ? JSON.stringify(question) : null;
+      const prevQ = lastQuestion.get(sid);
+      if (qJson !== prevQ) {
+        lastQuestion.set(sid, qJson);
+        broadcastQuestion(sid, question);
+      }
+    }
+  } catch (e) { console.error('Activity poll error:', e.message); }
+}, 2000);
 
 // ── File watcher ───────────────────────────────────────────────────────────
 
@@ -642,6 +929,13 @@ app.get('/api/sessions/:id/stream', (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.write('event: connected\ndata: {}\n\n');
 
+  // Send current activity immediately on connect
+  const curActivity = lastActivity.get(sid) ?? extractActivity(tmuxName(sid));
+  if (curActivity) {
+    res.write(`event: activity\ndata: ${JSON.stringify({ activity: curActivity })}\n\n`);
+    if (!lastActivity.has(sid)) lastActivity.set(sid, curActivity);
+  }
+
   const lastId = parseInt(req.query.lastEventId || req.headers['last-event-id'] || '0');
   if (lastId > 0) {
     const fpath = findJsonlPath(sid);
@@ -674,19 +968,55 @@ app.post('/api/sessions', (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/sessions/:id/send', (req, res) => {
-  try { sendInputToSession(req.params.id, req.body.text); res.json({ ok: true, sentAt: new Date().toISOString() }); }
+app.post('/api/sessions/:id/send', async (req, res) => {
+  try {
+    await sendInputToSession(req.params.id, req.body.text);
+    // Reset pane stability so question detection doesn't fire on stale state
+    paneStableCount.set(req.params.id, 0);
+    res.json({ ok: true, sentAt: new Date().toISOString() });
+  }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/sessions/:id/resume', (req, res) => {
-  try { spawnOrResume(req.params.id, req.body?.cwd, true); res.json({ ok: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+app.post('/api/sessions/:id/resume', async (req, res) => {
+  try {
+    spawnOrResume(req.params.id, req.body?.cwd, true);
+    try { await waitForClaudeReady(tmuxName(req.params.id)); } catch {}
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/sessions/:id/interrupt', (req, res) => {
   try { execFileSync('tmux', ['send-keys', '-t', tmuxName(req.params.id), 'C-c'], { stdio: 'ignore' }); res.json({ ok: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/sessions/:id/answer', (req, res) => {
+  try {
+    const name = tmuxName(req.params.id);
+    const { type, index, text } = req.body;
+    if (type === 'selector' && typeof index === 'number') {
+      // For selector: send Down arrow `index` times, then Enter
+      for (let i = 0; i < index; i++) {
+        execFileSync('tmux', ['send-keys', '-t', name, 'Down'], { stdio: 'ignore' });
+      }
+      execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' });
+    } else if (type === 'numbered' && typeof index === 'number') {
+      // For numbered choices: type the number + Enter
+      execFileSync('tmux', ['send-keys', '-t', name, '-l', String(index + 1)], { stdio: 'ignore' });
+      execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' });
+    } else if (type === 'yesno') {
+      execFileSync('tmux', ['send-keys', '-t', name, '-l', text || 'y'], { stdio: 'ignore' });
+      execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' });
+    } else if (text) {
+      execFileSync('tmux', ['send-keys', '-t', name, '-l', text], { stdio: 'ignore' });
+      execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' });
+    }
+    // Clear the cached question and reset pane stability so it doesn't re-broadcast
+    lastQuestion.delete(req.params.id);
+    paneStableCount.set(req.params.id, 0);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/sessions/:id/delete', (req, res) => {
@@ -809,6 +1139,75 @@ function reapIdleSessions() {
 
 setInterval(reapIdleSessions, 5 * 60 * 1000);
 
+// ── File browser API ──────────────────────────────────────────────────────
+
+const ALLOWED_ROOTS = [HOME, '/tmp', '/opt'];
+
+function isPathAllowed(p) {
+  const resolved = path.resolve(p);
+  return ALLOWED_ROOTS.some(root => resolved.startsWith(root));
+}
+
+app.get('/api/files/list', (req, res) => {
+  try {
+    const dir = req.query.dir || HOME;
+    if (!isPathAllowed(dir)) return res.status(403).json({ error: 'Access denied' });
+    const resolved = path.resolve(dir);
+    if (!fs.existsSync(resolved)) return res.status(404).json({ error: 'Not found' });
+    const stat = fs.statSync(resolved);
+    if (!stat.isDirectory()) return res.status(400).json({ error: 'Not a directory' });
+    const entries = [];
+    for (const name of fs.readdirSync(resolved)) {
+      if (name.startsWith('.')) continue; // skip hidden by default
+      try {
+        const full = path.join(resolved, name);
+        const s = fs.statSync(full);
+        entries.push({
+          name,
+          path: full,
+          isDir: s.isDirectory(),
+          size: s.isDirectory() ? null : s.size,
+          mtime: s.mtime.toISOString(),
+        });
+      } catch {}
+    }
+    entries.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    res.json({ dir: resolved, parent: path.dirname(resolved), entries });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/files/raw', (req, res) => {
+  try {
+    const filePath = req.query.path;
+    if (!filePath) return res.status(400).json({ error: 'path required' });
+    if (!isPathAllowed(filePath)) return res.status(403).json({ error: 'Access denied' });
+    const resolved = path.resolve(filePath);
+    if (!fs.existsSync(resolved)) return res.status(404).json({ error: 'Not found' });
+    const stat = fs.statSync(resolved);
+    if (stat.isDirectory()) return res.status(400).json({ error: 'Is a directory' });
+    if (stat.size > 10 * 1024 * 1024) return res.status(413).json({ error: 'File too large (>10MB)' });
+    const ext = path.extname(resolved).toLowerCase();
+    const textExts = new Set(['.txt', '.md', '.js', '.ts', '.tsx', '.jsx', '.json', '.html', '.css', '.py', '.rb', '.go', '.rs', '.sh', '.yml', '.yaml', '.toml', '.cfg', '.conf', '.ini', '.env', '.sql', '.csv', '.xml', '.log', '.jsonl', '.svelte', '.vue', '.astro', '.mjs', '.cjs']);
+    const imageExts = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico']);
+    if (imageExts.has(ext)) {
+      return res.sendFile(resolved);
+    }
+    if (textExts.has(ext) || ext === '') {
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      return res.sendFile(resolved);
+    }
+    // Default: download
+    res.download(resolved);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Legacy route redirects ──────────────────────────────────────────────────
+app.get('/code', (_req, res) => res.redirect('/'));
+app.get('/terminal', (_req, res) => res.redirect('/'));
+
 // ── SPA catch-all ───────────────────────────────────────────────────────────
 
 app.get('/{*path}', (_req, res) => {
@@ -916,3 +1315,12 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => console.log(`Feather (single-user) on http://0.0.0.0:${PORT}`));
+
+// Graceful shutdown: close server so port is released before systemd restarts us
+function shutdown(sig) {
+  console.log(`${sig} received, shutting down...`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 3000);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

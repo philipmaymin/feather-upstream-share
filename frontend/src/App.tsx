@@ -2,8 +2,8 @@ declare const __BUILD_TIME__: string
 import { createSignal, createEffect, createMemo, onMount, onCleanup, Show, For } from 'solid-js'
 import { MessageView } from './components/MessageView'
 import { Terminal } from './components/Terminal'
-import type { SessionMeta, Message, Project } from './api'
-import { fetchSessions, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFile, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, fetchProjects, checkAuth, login, logout, searchSessions } from './api'
+import type { SessionMeta, Message, Project, QuestionData } from './api'
+import { fetchSessions, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFile, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, fetchProjects, checkAuth, login, logout, searchSessions, answerQuestion } from './api'
 import type { SearchResult } from './api'
 
 interface QuickLink { label: string; url: string }
@@ -120,6 +120,8 @@ export default function App() {
   const [menuOpen, setMenuOpen] = createSignal(false)
   const [historyIdx, setHistoryIdx] = createSignal(-1)
   const [sseStatus, setSSEStatus] = createSignal<'connected' | 'reconnecting'>('connected')
+  const [activity, setActivity] = createSignal<string | null>(null)
+  const [question, setQuestion] = createSignal<QuestionData | null>(null)
   const [listening, setListening] = createSignal(false)
   const [hasMore, setHasMore] = createSignal(false)
   const [loadingMore, setLoadingMore] = createSignal(false)
@@ -128,7 +130,7 @@ export default function App() {
   const [sidebarRenaming, setSidebarRenaming] = createSignal<string | null>(null)
   const [sidebarRenameText, setSidebarRenameText] = createSignal('')
   const [sidebarTab, setSidebarTab] = createSignal<'sessions' | 'links'>('sessions')
-  const [projectsExpanded, setProjectsExpanded] = createSignal(false)
+  const [projectsExpanded, setProjectsExpanded] = createSignal(true)
   const [links, setLinks] = createSignal<QuickLink[]>([])
   const [starred, setStarred] = createSignal<Record<string, string[]>>({})
   const [projects, setProjects] = createSignal<Project[]>([])
@@ -140,6 +142,29 @@ export default function App() {
   const [searchResults, setSearchResults] = createSignal<SearchResult[]>([])
   const [searching, setSearching] = createSignal(false)
   let searchTimer: ReturnType<typeof setTimeout> | undefined
+
+  // File browser state
+  interface DirEntry { name: string; path: string; isDir: boolean; size: number | null; mtime: string }
+  const [browseDir, setBrowseDir] = createSignal<string | null>(null)
+  const [browseEntries, setBrowseEntries] = createSignal<DirEntry[]>([])
+  const [browseParent, setBrowseParent] = createSignal<string | null>(null)
+  const [browseLoading, setBrowseLoading] = createSignal(false)
+
+  async function openFileBrowser(dir?: string) {
+    const target = dir || sessionStats().cwd || '/home/user'
+    setBrowseLoading(true)
+    try {
+      const base = location.pathname.replace(/\/+$/, '')
+      const resp = await fetch(`${base}/api/files/list?dir=${encodeURIComponent(target)}`)
+      const data = await resp.json()
+      if (resp.ok) {
+        setBrowseDir(data.dir)
+        setBrowseParent(data.parent !== data.dir ? data.parent : null)
+        setBrowseEntries(data.entries)
+      }
+    } catch {}
+    setBrowseLoading(false)
+  }
 
   const lastSeenUpdatedAt = new Map<string, string>() // session ID -> last known updatedAt
   const [updateAvailable, setUpdateAvailable] = createSignal(false)
@@ -305,6 +330,8 @@ export default function App() {
     setLoading(true)
     setMessages([])
     setWorking(false)
+    setActivity(null)
+    setQuestion(null)
     setText(loadDraft(id))
     setHistoryIdx(-1)
     // Clear unread status and update lastSeen timestamp
@@ -327,13 +354,16 @@ export default function App() {
       const result = await fetchMessages(id)
       setMessages(result.messages)
       setHasMore(result.hasMore)
-      // Determine working state from loaded messages: if last message is
-      // from the assistant with a stopReason, Claude is done. If last message
-      // is from the user (or assistant without stopReason), Claude may still be working.
+      // Determine working state from loaded messages.
+      // Only mark as working if the session is actually active (has a running tmux process).
+      // Inactive/timed-out sessions should never show as working.
+      const sessionMeta = sessions().find(x => x.id === id) || lastSession()
+      const isActive = sessionMeta?.isActive ?? false
       const msgs = result.messages
       if (msgs.length > 0) {
         const last = msgs[msgs.length - 1]
-        if (last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence') setWorking(false)
+        if (!isActive) setWorking(false)
+        else if (last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence') setWorking(false)
         else if (last.role === 'user') setWorking(true)
         else setWorking(false) // assistant mid-stream but no new SSE yet; let SSE update it
         // Extract cwd from last user message and update header
@@ -358,6 +388,8 @@ export default function App() {
     cleanupSSE = subscribeMessages(id, (msg) => {
       // Clear assistant-done debounce on any incoming message
       clearTimeout(assistantDoneTimer)
+      // If new content arrives while a question is showing, it was a false positive
+      if (question() && msg.role === 'assistant' && !msg.stopReason) setQuestion(null)
       // Use stop_reason to accurately track working state
       if (msg.stopReason === 'end_turn' || msg.stopReason === 'stop_sequence') {
         setWorking(false)
@@ -408,7 +440,7 @@ export default function App() {
         }
         return [...prev, msg]
       })
-    }, setSSEStatus)
+    }, setSSEStatus, setActivity, setQuestion)
   }
 
   function doSearch(query: string) {
@@ -482,7 +514,8 @@ export default function App() {
   }
 
   async function handleResume(id: string) {
-    await resumeSession(id)
+    const sess = sessions().find(s => s.id === id)
+    await resumeSession(id, sess?.cwd ?? undefined)
     updateSessions(await fetchSessions(currentProject()))
     await select(id)
   }
@@ -576,9 +609,9 @@ export default function App() {
     }
     if (!currentId()) return
     // Auto-resume if session is inactive
-    const s = cur()
+    const s = cur() || lastSession()
     if (s && !s.isActive) {
-      await resumeSession(s.id)
+      await resumeSession(s.id, s.cwd ?? undefined)
       updateSessions(await fetchSessions(currentProject()))
     }
     setUploading(true)
@@ -756,6 +789,8 @@ export default function App() {
   )
 
   return (
+    <>
+    <style>{`textarea::-webkit-scrollbar { display: none; }`}</style>
     <Show when={authChecked()} fallback={<div style={{ display: 'flex', 'align-items': 'center', 'justify-content': 'center', height: '100vh', background: '#0a0e14', color: '#555', 'font-family': "-apple-system, system-ui, sans-serif" }}>Loading...</div>}>
     <Show when={authUser()} fallback={<LoginScreen />}>
     <div
@@ -817,7 +852,7 @@ export default function App() {
                 </Show>
               </div>
               <Show when={projectsExpanded()}>
-              <div style={{ 'max-height': '35vh', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch' }}>
+              <div style={{ 'max-height': '50vh', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch' }}>
               {/* All projects button */}
               <div onClick={() => { setCurrentProject(null); localStorage.removeItem('feather-next-project'); setProjectsExpanded(false) }}
                 style={{ padding: '4px 16px', cursor: 'pointer', 'font-size': '11px', 'font-weight': '600', color: currentProject() === null ? '#4aba6a' : '#888', '-webkit-tap-highlight-color': 'transparent' }}>
@@ -1074,7 +1109,7 @@ export default function App() {
         <Show when={currentId()}>
           <div style={{ display: 'flex', 'align-items': 'center', 'border-bottom': '1px solid #1e1e1e', 'padding-left': '16px', 'flex-shrink': '0' }}>
             <button onClick={() => setTab('chat')} style={tabStyle('chat')}>Chat</button>
-            <button onClick={() => setTab('files')} style={tabStyle('files')}>Files{touchedFiles().length > 0 ? ` (${touchedFiles().length})` : ''}</button>
+            <button onClick={() => { setTab('files'); if (!browseDir()) openFileBrowser() }} style={tabStyle('files')}>Files{touchedFiles().length > 0 ? ` (${touchedFiles().length})` : ''}</button>
             <button onClick={() => setTab('terminal')} style={tabStyle('terminal')}>Terminal</button>
             <span style={{ 'margin-left': 'auto', 'padding-right': '12px', 'font-size': '10px', color: '#444' }}>{__BUILD_TIME__}</span>
           </div>
@@ -1099,25 +1134,67 @@ export default function App() {
             <div style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
               <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (currentId()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (currentId()) toggleStar(currentId()!, uuid) }} working={working()} scrollRefCb={(el) => { messageScrollRef = el }} />
             </div>
-            <div style={{ display: tab() === 'files' ? 'block' : 'none', height: '100%', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '8px 0' }}>
-              <Show when={touchedFiles().length === 0}>
-                <div style={{ color: '#555', 'text-align': 'center', padding: '40px', 'font-size': '13px' }}>No files touched yet</div>
+            <div style={{ display: tab() === 'files' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%' }}>
+              {/* File browser */}
+              <Show when={browseDir()}>
+                <div style={{ padding: '6px 16px', display: 'flex', 'align-items': 'center', gap: '8px', 'border-bottom': '1px solid #111', 'flex-shrink': '0' }}>
+                  <Show when={browseParent()}>
+                    <button onClick={() => openFileBrowser(browseParent()!)} style={{ background: 'none', border: 'none', color: '#73b8ff', cursor: 'pointer', 'font-size': '12px', padding: '0', '-webkit-tap-highlight-color': 'transparent' }}>
+                      ..
+                    </button>
+                  </Show>
+                  <span style={{ 'font-size': '11px', color: '#888', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1' }}>{browseDir()}</span>
+                </div>
               </Show>
-              <For each={touchedFiles()}>{(f) => {
-                const short = f.path.split('/').slice(-2).join('/')
-                const actionColors: Record<string, string> = { Read: '#73b8ff', Write: '#4aba6a', Edit: '#c4993a', Grep: '#b48ead', Glob: '#88c0d0' }
-                return (
-                  <div style={{ padding: '8px 16px', 'border-bottom': '1px solid #111', 'font-size': '13px' }}>
-                    <div style={{ display: 'flex', 'align-items': 'center', gap: '6px' }}>
-                      <span style={{ color: '#e5e5e5', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1' }} title={f.path}>{short}</span>
-                      <For each={f.actions}>{(a) => (
-                        <span style={{ 'font-size': '10px', padding: '1px 5px', 'border-radius': '3px', background: 'rgba(255,255,255,0.05)', color: actionColors[a] || '#888' }}>{a}</span>
-                      )}</For>
-                    </div>
-                    <div style={{ color: '#444', 'font-size': '11px', 'font-family': "'SF Mono', Menlo, monospace", 'margin-top': '2px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{f.path}</div>
-                  </div>
-                )
-              }}</For>
+              <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch' }}>
+                <Show when={browseLoading()}>
+                  <div style={{ padding: '12px 16px', color: '#555', 'font-size': '12px' }}>Loading...</div>
+                </Show>
+                <Show when={!browseLoading() && browseDir()}>
+                  <For each={browseEntries()}>{(entry) => {
+                    const base = location.pathname.replace(/\/+$/, '')
+                    const fmtSize = (s: number | null) => {
+                      if (s === null) return ''
+                      if (s < 1024) return `${s}B`
+                      if (s < 1024 * 1024) return `${(s / 1024).toFixed(0)}K`
+                      return `${(s / (1024 * 1024)).toFixed(1)}M`
+                    }
+                    const fmtAge = (mtime: string) => {
+                      if (!mtime) return ''
+                      const ms = Date.now() - new Date(mtime).getTime()
+                      const sec = Math.floor(ms / 1000)
+                      if (sec < 60) return 'just now'
+                      const min = Math.floor(sec / 60)
+                      if (min < 60) return `${min}m ago`
+                      const hr = Math.floor(min / 60)
+                      if (hr < 24) return `${hr}h ago`
+                      const days = Math.floor(hr / 24)
+                      if (days < 30) return `${days}d ago`
+                      const months = Math.floor(days / 30)
+                      if (months < 12) return `${months}mo ago`
+                      return `${Math.floor(months / 12)}y ago`
+                    }
+                    return (
+                      <div style={{ padding: '4px 16px', 'font-size': '12px', display: 'flex', 'align-items': 'center', gap: '8px', 'border-bottom': '1px solid #0a0a0a' }}>
+                        {entry.isDir ? (
+                          <button onClick={() => openFileBrowser(entry.path)} style={{ background: 'none', border: 'none', color: '#c4993a', cursor: 'pointer', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", padding: '0', 'text-align': 'left', flex: '1', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', '-webkit-tap-highlight-color': 'transparent' }}>
+                            {entry.name}/
+                          </button>
+                        ) : (
+                          <a href={`${base}/api/files/raw?path=${encodeURIComponent(entry.path)}`} target="_blank" rel="noopener" style={{ color: '#e5e5e5', 'text-decoration': 'none', 'font-family': "'SF Mono', Menlo, monospace", flex: '1', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>
+                            {entry.name}
+                          </a>
+                        )}
+                        <span style={{ color: '#555', 'font-size': '10px', 'flex-shrink': '0' }}>{fmtAge(entry.mtime)}</span>
+                        <span style={{ color: '#444', 'font-size': '10px', 'flex-shrink': '0', 'min-width': '30px', 'text-align': 'right' }}>{fmtSize(entry.size)}</span>
+                      </div>
+                    )
+                  }}</For>
+                  <Show when={browseEntries().length === 0}>
+                    <div style={{ padding: '12px 16px', color: '#444', 'font-size': '12px' }}>Empty directory</div>
+                  </Show>
+                </Show>
+              </div>
             </div>
             <div style={{ display: tab() === 'terminal' ? 'block' : 'none', height: '100%' }}>
               <Terminal sessionId={tab() === 'terminal' ? currentId() : null} />
@@ -1132,11 +1209,84 @@ export default function App() {
           </div>
         </Show>
 
+        {/* Question popup */}
+        <Show when={question() && currentId() && tab() === 'chat'}>
+          {(() => {
+            const q = question()!
+            const handleAnswer = async (type: string, index?: number, text?: string) => {
+              const id = currentId()!
+              try { await answerQuestion(id, { type, index, text }) } catch {}
+              setQuestion(null)
+            }
+            return (
+              <div style={{ padding: '10px 16px', 'border-top': '1px solid #c4993a', background: '#1a1a2e', 'flex-shrink': '0' }}>
+                <div style={{ display: 'flex', 'justify-content': 'space-between', 'align-items': 'center', 'margin-bottom': '6px' }}>
+                  <span style={{ color: '#c4993a', 'font-size': '11px', 'font-weight': '600' }}>QUESTION</span>
+                  <button onClick={() => setQuestion(null)} style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', 'font-size': '14px', padding: '0 4px' }}>&times;</button>
+                </div>
+                <div style={{ color: '#e5e5e5', 'font-size': '13px', 'margin-bottom': '8px', 'white-space': 'pre-wrap', 'line-height': '1.4' }}>{q.question}</div>
+                <Show when={q.type === 'selector' && q.options}>
+                  <div style={{ display: 'flex', 'flex-direction': 'column', gap: '4px' }}>
+                    {q.options!.map((opt, i) => (
+                      <button onClick={() => handleAnswer('selector', i)}
+                        style={{ background: i === 0 ? '#2a2a4e' : '#1e1e3a', border: '1px solid ' + (i === 0 ? '#c4993a' : '#333'), color: '#e5e5e5', padding: '6px 12px', 'border-radius': '6px', 'font-size': '12px', cursor: 'pointer', 'text-align': 'left' }}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                </Show>
+                <Show when={q.type === 'numbered' && q.options}>
+                  <div style={{ display: 'flex', 'flex-direction': 'column', gap: '4px' }}>
+                    {q.options!.map((opt, i) => (
+                      <button onClick={() => handleAnswer('numbered', i)}
+                        style={{ background: '#1e1e3a', border: '1px solid #333', color: '#e5e5e5', padding: '6px 12px', 'border-radius': '6px', 'font-size': '12px', cursor: 'pointer', 'text-align': 'left' }}>
+                        {i + 1}. {opt}
+                      </button>
+                    ))}
+                  </div>
+                </Show>
+                <Show when={q.type === 'yesno'}>
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    <button onClick={() => handleAnswer('yesno', undefined, 'y')}
+                      style={{ background: '#2a4a2e', border: '1px solid #4aba6a', color: '#e5e5e5', padding: '6px 16px', 'border-radius': '6px', 'font-size': '12px', cursor: 'pointer' }}>Yes</button>
+                    <button onClick={() => handleAnswer('yesno', undefined, 'n')}
+                      style={{ background: '#4a2a2e', border: '1px solid #a44', color: '#e5e5e5', padding: '6px 16px', 'border-radius': '6px', 'font-size': '12px', cursor: 'pointer' }}>No</button>
+                  </div>
+                </Show>
+                <Show when={q.type === 'text'}>
+                  {(() => {
+                    let inputRef: HTMLInputElement | undefined
+                    return (
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        <input ref={inputRef} type="text" placeholder="Type your answer..."
+                          onKeyDown={(e) => { if (e.key === 'Enter' && inputRef?.value) handleAnswer('text', undefined, inputRef.value) }}
+                          style={{ flex: '1', background: '#111', border: '1px solid #333', color: '#e5e5e5', padding: '6px 10px', 'border-radius': '6px', 'font-size': '12px', outline: 'none' }} />
+                        <button onClick={() => { if (inputRef?.value) handleAnswer('text', undefined, inputRef.value) }}
+                          style={{ background: '#333', border: '1px solid #555', color: '#e5e5e5', padding: '6px 12px', 'border-radius': '6px', 'font-size': '12px', cursor: 'pointer' }}>Send</button>
+                      </div>
+                    )
+                  })()}
+                </Show>
+              </div>
+            )
+          })()}
+        </Show>
+
         {/* Status bar */}
         <Show when={currentId() && tab() === 'chat'}>
           <div style={{ padding: '2px 16px', 'border-top': '1px solid #1e1e1e', background: '#0a0e14', display: 'flex', 'align-items': 'center', gap: '8px', 'flex-shrink': '0', 'overflow-x': 'auto', 'white-space': 'nowrap' }}>
-            <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: working() ? '#f5a742' : '#4aba6a', transition: 'background 0.3s', 'flex-shrink': '0' }} />
-            <span style={{ 'font-size': '10px', color: '#555', 'font-weight': '500' }}>{working() ? 'Working...' : 'Ready'}</span>
+            {(() => {
+              const s = cur()
+              const inactive = s && !s.isActive && !working()
+              const dotColor = working() ? '#f5a742' : inactive ? '#666' : '#4aba6a'
+              const act = activity()?.replace(/^[^a-zA-Z]+/, '')
+              const label = working() ? (act || 'Working...') : inactive ? 'Inactive' : 'Ready'
+              const labelColor = working() ? '#f5a742' : inactive ? '#666' : '#555'
+              return <>
+                <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: dotColor, transition: 'background 0.3s', 'flex-shrink': '0', cursor: working() ? 'pointer' : 'default' }} onClick={() => { if (working() && currentId()) handleInterrupt(currentId()!) }} />
+                <span onClick={() => { if (working() && currentId()) handleInterrupt(currentId()!) }} style={{ 'font-size': '10px', color: labelColor, 'font-weight': '500', cursor: working() ? 'pointer' : 'default', '-webkit-tap-highlight-color': 'transparent', 'white-space': 'nowrap', overflow: 'hidden', 'text-overflow': 'ellipsis', 'max-width': '300px' }}>{label}</span>
+              </>
+            })()}
             {(() => {
               const stats = sessionStats()
               const fmtTokens = (n: number) => n >= 1000 ? (n / 1000).toFixed(0) + 'k' : String(n)
@@ -1236,7 +1386,7 @@ export default function App() {
                 onFocus={() => { if (messageScrollRef) setTimeout(() => messageScrollRef!.scrollTo({ top: messageScrollRef!.scrollHeight }), 300) }}
                 enterkeyhint="send"
                 placeholder="Send a message..." rows={1}
-                style={{ width: '100%', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '12px', padding: '10px 14px', color: '#e5e5e5', 'font-size': '16px', 'font-family': 'inherit', resize: 'none', outline: 'none', 'line-height': '1.4', 'max-height': '120px', '-webkit-appearance': 'none', 'box-sizing': 'border-box' }} />
+                style={{ width: '100%', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '12px', padding: '10px 14px', color: '#e5e5e5', 'font-size': '16px', 'font-family': 'inherit', resize: 'none', outline: 'none', 'line-height': '1.4', 'max-height': '120px', '-webkit-appearance': 'none', 'box-sizing': 'border-box', overflow: 'auto', 'scrollbar-width': 'none' }} />
               <Show when={text().length > 0}>
                 <div style={{ position: 'absolute', right: '8px', bottom: '2px', 'font-size': '10px', color: text().length >= 500 ? '#fab283' : '#555', 'line-height': '1', 'pointer-events': 'none' }}>
                   {text().length >= 1000 ? (text().length / 1000).toFixed(1) + 'k' : text().length}
@@ -1255,5 +1405,6 @@ export default function App() {
     </div>
     </Show>
     </Show>
+    </>
   )
 }

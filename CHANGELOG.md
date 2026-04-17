@@ -1,3 +1,36 @@
+## 2026-04-17 - Resume Race + Question Propagation Fixes
+- Fixed Enter not submitting when resuming a stale chat (message sat in input until user pressed Enter manually in terminal tab)
+- /resume endpoint now awaits Claude Code TUI ready-state before responding, so the follow-up send does not race the spawn
+- waitForClaudeReady requires the input prompt to be stable for 800ms (eliminates false-positive readiness during boot transients)
+- sendText now verifies Enter landed: if the typed text is still in the input box, re-sends Enter up to 3 times
+- Fixed question banner never firing: pane-stability hash now excludes the live status bar (ctx%, cost, runtime timer) so question detection can reach its 2-poll stability threshold
+
+## 2026-04-16 - Upstream Merge #5: Expanded Editor + Pinch-Zoom
+- Expanded editor: tap the new expand icon to get a fullscreen text editor for composing longer messages
+- Collapse button and Escape key to return to the normal input bar
+- Pinch-to-zoom blocked on iOS (prevents accidental zoom during touch interaction)
+- Viewport layout preserved during pinch zoom (no layout reflow)
+- Batch voice transcription with recording timer, audio level indicator, and transcribing state
+- Table overflow: tables now scroll horizontally on mobile without needing a wrapper div
+- File serving: /api/file endpoint for viewing attachments, /api/open-in-editor for code-server
+- Batch Deepgram transcription: /api/transcribe endpoint for voice-to-text
+
+## 2026-04-11 - Question Detection False Positives
+- QUESTION banner no longer fires on assistant prose that happens to contain a question mark
+- Rejects any tail containing the "Send a message" input-box placeholder
+- Requires menu options to be short, non-prose phrases (≤80 chars, no sentence breaks)
+- Caps question text at 200 chars so chat prose cannot masquerade as a selector prompt
+
+## 2026-04-05 - Upstream Merge #4
+- Voice recording: replaced browser SpeechRecognition with MediaRecorder batch transcription (more reliable, works on all browsers)
+- Recording UI: audio level meter, recording timer, transcribing indicator
+- Inline images: tool_result blocks with base64 images now render inline with click-to-zoom
+- PDF viewer: clickable .pdf file paths open in an embedded viewer
+- File serving: /api/file endpoint serves any local file (for PDF viewer, etc.)
+- Idle session reaper: tmux sessions inactive for 1 hour are automatically cleaned up
+- New upstream files: remote-server.js (remote agent), boxes.json (box config), supervisor config
+- Visibility refresh: session list auto-refreshes when you switch back to the tab
+
 ## 2026-04-03 - Image Auto-Preview
 - Image file paths in assistant messages now render an inline preview automatically
 - Click the preview to open the full-size lightbox
