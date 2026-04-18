@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createSignal } from 'solid-js'
+import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
 import type { Message, ContentBlock } from '../api'
 import { toBlob } from 'html-to-image'
 import { Marked } from 'marked'
@@ -423,6 +423,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
   const [newMsgCount, setNewMsgCount] = createSignal(0)
   const [actionMenu, setActionMenu] = createSignal<string | null>(null)
   const [actionFeedback, setActionFeedback] = createSignal<string | null>(null)
+  const [expandedRuns, setExpandedRuns] = createSignal<Set<string>>(new Set())
   let prevMsgLen = props.messages.length
 
   function onScroll() {
@@ -470,6 +471,95 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
 
   const menuBtnStyle = { display: 'block', width: '100%', padding: '8px 14px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#e5e5e5', 'font-size': '12px', 'text-align': 'left' as const, cursor: 'pointer', 'white-space': 'nowrap' as const }
 
+  // Auto-collapse consecutive internal-only messages (tool_use / tool_result /
+  // thinking with no visible text) into a single expandable group so that a
+  // long agent run doesn't drown out the user/assistant signal.
+  const RUN_COLLAPSE_THRESHOLD = 3
+  const hasVisibleText = (msg: Message) =>
+    (msg.content || []).some(b => b.type === 'text' && (b.text || '').trim().length > 0)
+
+  type GroupedItem = { kind: 'msg'; msg: Message } | { kind: 'run'; msgs: Message[] }
+  const groupedItems = createMemo<GroupedItem[]>(() => {
+    const result: GroupedItem[] = []
+    let run: Message[] = []
+    const flush = () => { if (run.length) { result.push({ kind: 'run', msgs: run }); run = [] } }
+    for (const msg of props.messages) {
+      if (hasVisibleText(msg)) { flush(); result.push({ kind: 'msg', msg }) }
+      else run.push(msg)
+    }
+    flush()
+    return result
+  })
+
+  const renderMsg = (msg: Message) => {
+    const textBlock = msg.content?.find(b => b.type === 'text' && b.text)
+    const { cleanText, images, files } = textBlock?.text ? extractImages(textBlock.text) : { cleanText: textBlock?.text || '', images: [], files: [] }
+    const hasImages = images.length > 0
+    const hasFiles = files.length > 0
+    const hasAttachments = hasImages || hasFiles
+
+    return <div style={{ display: 'flex', 'flex-direction': 'column', 'align-items': msg.role === 'user' ? 'flex-end' : 'flex-start', 'margin-bottom': '10px' }}>
+      <div data-uuid={msg.uuid} data-role={msg.role} style={{
+        'max-width': '85%', padding: hasAttachments ? '6px' : '10px 14px',
+        'border-radius': msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+        background: msg.role === 'user' ? 'rgba(74,186,106,0.15)' : '#1a1a2e',
+        color: '#e5e5e5', overflow: 'hidden',
+        'font-size': '14px', 'line-height': '1.5', 'word-break': 'break-word',
+      }}>
+        <For each={images}>{(src) => (
+          <img src={src} onClick={() => setLightbox(src)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': hasAttachments ? '12px' : '6px', 'margin-bottom': '4px', cursor: 'zoom-in', display: 'block' }} />
+        )}</For>
+        <For each={files}>{(f) => (
+          <a href={f.path} target="_blank" rel="noopener" style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
+            <span style={{ 'font-size': '16px' }}>{f.name.endsWith('.pdf') ? '\uD83D\uDCC4' : '\uD83D\uDCCE'}</span>
+            <span style={{ overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{f.name}</span>
+          </a>
+        )}</For>
+        <div style={hasAttachments ? { padding: '4px 8px 4px' } : {}}>
+          <For each={msg.content}>{(block) => {
+            if (block.type === 'text' && block.text) {
+              const display = hasAttachments ? cleanText : block.text
+              return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => setTimeout(() => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }, 0)} /> : null
+            }
+            return renderBlock(block, (src) => setLightbox(src))
+          }}</For>
+        </div>
+      </div>
+      <div style={{ display: 'flex', 'align-items': 'center', gap: '4px', 'margin-top': '4px', padding: '0 4px', 'justify-content': msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
+        <span onClick={(e) => { const el = e.currentTarget; el.textContent = el.textContent === formatTime(msg.timestamp) ? formatFullDate(msg.timestamp) : formatTime(msg.timestamp) }}
+          style={{ 'font-size': '10px', color: '#444', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>{formatTime(msg.timestamp)}</span>
+        {msg.role === 'user' && msg.delivery && (
+          <span style={{ 'font-size': '11px', color: msg.delivery === 'delivered' ? '#4aba6a' : '#555' }}>
+            {msg.delivery === 'delivered' ? '\u2713\u2713' : '\u2713'}
+          </span>
+        )}
+        {!msg.uuid.startsWith('optimistic-') && (
+          <button onClick={() => props.onToggleStar?.(msg.uuid)}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', 'font-size': '12px', padding: '0 2px', color: props.starred?.has(msg.uuid) ? '#c4993a' : '#333', opacity: props.starred?.has(msg.uuid) ? '1' : '0', transition: 'opacity 0.15s' }}
+            class="star-btn">{props.starred?.has(msg.uuid) ? '\u2605' : '\u2606'}</button>
+        )}
+        {!msg.uuid.startsWith('optimistic-') && (
+          <div style={{ position: 'relative', display: 'flex', 'align-items': 'center' }}>
+            <button onClick={() => setActionMenu(actionMenu() === msg.uuid ? null : msg.uuid)}
+              style={{ background: 'none', border: 'none', cursor: 'pointer', 'font-size': '10px', padding: '0 3px', color: actionFeedback() === msg.uuid ? '#4aba6a' : '#444', opacity: actionMenu() === msg.uuid ? '1' : undefined, transition: 'color 0.2s' }}
+              class="action-menu-btn">{actionFeedback() === msg.uuid ? '\u2713' : 'Copy'}</button>
+            <Show when={actionMenu() === msg.uuid}>
+              <div style={{ position: 'absolute', bottom: '100%', [msg.role === 'user' ? 'right' : 'left']: '0', 'margin-bottom': '4px', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '8px', 'box-shadow': '0 4px 12px rgba(0,0,0,0.5)', 'z-index': '100', overflow: 'hidden', 'min-width': '120px' }}>
+                <button onClick={() => doAction('text', msg.uuid)} style={menuBtnStyle}>Copy text</button>
+                <button onClick={() => doAction('html', msg.uuid)} style={menuBtnStyle}>Copy HTML</button>
+                <button onClick={() => doAction('png', msg.uuid)} style={menuBtnStyle}>Copy image</button>
+                <button onClick={() => doAction('pdf', msg.uuid)} style={{ ...menuBtnStyle, 'border-bottom': canShare ? '1px solid #222' : 'none' }}>Save PDF</button>
+                <Show when={canShare}>
+                  <button onClick={() => doAction('share', msg.uuid)} style={{ ...menuBtnStyle, 'border-bottom': 'none' }}>Share...</button>
+                </Show>
+              </div>
+            </Show>
+          </div>
+        )}
+      </div>
+    </div>
+  }
+
   return (
     <div style={{ position: 'relative', height: '100%' }}>
     <div ref={(el) => { scrollRef = el; props.scrollRefCb?.(el) }} onScroll={onScroll} style={{ height: '100%', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', 'overscroll-behavior': 'contain', padding: '16px', 'padding-bottom': '80px' }}>
@@ -496,74 +586,32 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
         <div onClick={() => setActionMenu(null)} style={{ position: 'fixed', inset: '0', 'z-index': '90' }} />
       </Show>
 
-      <For each={props.messages}>{(msg) => {
-        const textBlock = msg.content?.find(b => b.type === 'text' && b.text)
-        const { cleanText, images, files } = textBlock?.text ? extractImages(textBlock.text) : { cleanText: textBlock?.text || '', images: [], files: [] }
-        const hasImages = images.length > 0
-        const hasFiles = files.length > 0
-        const hasAttachments = hasImages || hasFiles
-
-        return <div style={{ display: 'flex', 'flex-direction': 'column', 'align-items': msg.role === 'user' ? 'flex-end' : 'flex-start', 'margin-bottom': '10px' }}>
-          <div data-uuid={msg.uuid} data-role={msg.role} style={{
-            'max-width': '85%', padding: hasAttachments ? '6px' : '10px 14px',
-            'border-radius': msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
-            background: msg.role === 'user' ? 'rgba(74,186,106,0.15)' : '#1a1a2e',
-            color: '#e5e5e5', overflow: 'hidden',
-            'font-size': '14px', 'line-height': '1.5', 'word-break': 'break-word',
-          }}>
-            <For each={images}>{(src) => (
-              <img src={src} onClick={() => setLightbox(src)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': hasAttachments ? '12px' : '6px', 'margin-bottom': '4px', cursor: 'zoom-in', display: 'block' }} />
-            )}</For>
-            <For each={files}>{(f) => (
-              <a href={f.path} target="_blank" rel="noopener" style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
-                <span style={{ 'font-size': '16px' }}>{f.name.endsWith('.pdf') ? '\uD83D\uDCC4' : '\uD83D\uDCCE'}</span>
-                <span style={{ overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{f.name}</span>
-              </a>
-            )}</For>
-            <div style={hasAttachments ? { padding: '4px 8px 4px' } : {}}>
-              <For each={msg.content}>{(block) => {
-                if (block.type === 'text' && block.text) {
-                  const display = hasAttachments ? cleanText : block.text
-                  return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => setTimeout(() => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }, 0)} /> : null
-                }
-                return renderBlock(block, (src) => setLightbox(src))
-              }}</For>
-            </div>
-          </div>
-          <div style={{ display: 'flex', 'align-items': 'center', gap: '4px', 'margin-top': '4px', padding: '0 4px', 'justify-content': msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
-            <span onClick={(e) => { const el = e.currentTarget; el.textContent = el.textContent === formatTime(msg.timestamp) ? formatFullDate(msg.timestamp) : formatTime(msg.timestamp) }}
-              style={{ 'font-size': '10px', color: '#444', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>{formatTime(msg.timestamp)}</span>
-            {msg.role === 'user' && msg.delivery && (
-              <span style={{ 'font-size': '11px', color: msg.delivery === 'delivered' ? '#4aba6a' : '#555' }}>
-                {msg.delivery === 'delivered' ? '\u2713\u2713' : '\u2713'}
+      <For each={groupedItems()}>{(item) => {
+        if (item.kind === 'msg') return renderMsg(item.msg)
+        if (item.msgs.length < RUN_COLLAPSE_THRESHOLD) {
+          return <For each={item.msgs}>{(msg) => renderMsg(msg)}</For>
+        }
+        const key = item.msgs[0].uuid
+        const expanded = () => expandedRuns().has(key)
+        const toggle = () => setExpandedRuns(prev => {
+          const next = new Set(prev)
+          if (next.has(key)) next.delete(key); else next.add(key)
+          return next
+        })
+        return (
+          <div style={{ margin: '6px 0' }}>
+            <div onClick={toggle} style={{ 'text-align': 'center', cursor: 'pointer', padding: '4px 0', '-webkit-tap-highlight-color': 'transparent' }}>
+              <span style={{ display: 'inline-block', padding: '3px 10px', background: '#14141c', border: '1px solid #2a2a3a', color: '#888', 'font-size': '11px', 'border-radius': '12px' }}>
+                {expanded() ? '\u25BE' : '\u25B8'} {item.msgs.length} tool steps
               </span>
-            )}
-            {!msg.uuid.startsWith('optimistic-') && (
-              <button onClick={() => props.onToggleStar?.(msg.uuid)}
-                style={{ background: 'none', border: 'none', cursor: 'pointer', 'font-size': '12px', padding: '0 2px', color: props.starred?.has(msg.uuid) ? '#c4993a' : '#333', opacity: props.starred?.has(msg.uuid) ? '1' : '0', transition: 'opacity 0.15s' }}
-                class="star-btn">{props.starred?.has(msg.uuid) ? '\u2605' : '\u2606'}</button>
-            )}
-            {/* Copy / export button */}
-            {!msg.uuid.startsWith('optimistic-') && (
-              <div style={{ position: 'relative', display: 'flex', 'align-items': 'center' }}>
-                <button onClick={() => setActionMenu(actionMenu() === msg.uuid ? null : msg.uuid)}
-                  style={{ background: 'none', border: 'none', cursor: 'pointer', 'font-size': '10px', padding: '0 3px', color: actionFeedback() === msg.uuid ? '#4aba6a' : '#444', opacity: actionMenu() === msg.uuid ? '1' : undefined, transition: 'color 0.2s' }}
-                  class="action-menu-btn">{actionFeedback() === msg.uuid ? '\u2713' : 'Copy'}</button>
-                <Show when={actionMenu() === msg.uuid}>
-                  <div style={{ position: 'absolute', bottom: '100%', [msg.role === 'user' ? 'right' : 'left']: '0', 'margin-bottom': '4px', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '8px', 'box-shadow': '0 4px 12px rgba(0,0,0,0.5)', 'z-index': '100', overflow: 'hidden', 'min-width': '120px' }}>
-                    <button onClick={() => doAction('text', msg.uuid)} style={menuBtnStyle}>Copy text</button>
-                    <button onClick={() => doAction('html', msg.uuid)} style={menuBtnStyle}>Copy HTML</button>
-                    <button onClick={() => doAction('png', msg.uuid)} style={menuBtnStyle}>Copy image</button>
-                    <button onClick={() => doAction('pdf', msg.uuid)} style={{ ...menuBtnStyle, 'border-bottom': canShare ? '1px solid #222' : 'none' }}>Save PDF</button>
-                    <Show when={canShare}>
-                      <button onClick={() => doAction('share', msg.uuid)} style={{ ...menuBtnStyle, 'border-bottom': 'none' }}>Share...</button>
-                    </Show>
-                  </div>
-                </Show>
+            </div>
+            <Show when={expanded()}>
+              <div style={{ 'border-left': '2px solid #2a2a3a', 'margin-left': '12px', 'padding-left': '10px', 'margin-top': '4px' }}>
+                <For each={item.msgs}>{(msg) => renderMsg(msg)}</For>
               </div>
-            )}
+            </Show>
           </div>
-        </div>
+        )
       }}</For>
 
       {/* Typing indicator */}
