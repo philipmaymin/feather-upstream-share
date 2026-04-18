@@ -112,6 +112,13 @@ function writeMeta(meta) {
   fs.writeFileSync(metaFilePath(), JSON.stringify(meta, null, 2));
 }
 
+// A message "counts" toward the page size only if it has visible user/assistant
+// text. Internal-only messages (tool_use, tool_result, thinking) ride along for
+// free so the UI can still group and collapse them without eating the window.
+function hasVisibleText(msg) {
+  return (msg.content || []).some(b => b.type === 'text' && (b.text || '').trim().length > 0);
+}
+
 function getMessages(sessionId, limit = 100, before = 0) {
   const fpath = findJsonlPath(sessionId);
   if (!fpath) return { messages: [], hasMore: false };
@@ -123,13 +130,22 @@ function getMessages(sessionId, limit = 100, before = 0) {
     const m = parseMessage(line);
     if (m) msgs.push(m);
   }
-  if (before > 0) {
-    const end = Math.max(0, msgs.length - before);
-    const start = Math.max(0, end - limit);
-    return { messages: msgs.slice(start, end), hasMore: start > 0 };
+  const end = Math.max(0, msgs.length - before);
+  let start = end;
+  let visibleCount = 0;
+  for (let i = end - 1; i >= 0; i--) {
+    const v = hasVisibleText(msgs[i]);
+    if (v && visibleCount >= limit) break;
+    start = i;
+    if (v) visibleCount++;
   }
-  const start = Math.max(0, msgs.length - limit);
-  return { messages: msgs.slice(start), hasMore: start > 0 };
+  const hasMore = start > 0;
+  // Drop orphan internal messages at the head of the chunk — they'll come back
+  // attached to their preceding visible message on the next "Load earlier".
+  if (visibleCount > 0) {
+    while (start < end && !hasVisibleText(msgs[start])) start++;
+  }
+  return { messages: msgs.slice(start, end), hasMore };
 }
 
 // ── Per-user JSON helpers ──────────────────────────────────────────────────
