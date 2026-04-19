@@ -426,27 +426,19 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
   const [expandedRuns, setExpandedRuns] = createSignal<Set<string>>(new Set())
   let prevMsgLen = props.messages.length
 
-  // Scroll writers (pin-maintain, smooth-jump, restore) can all fire in the
-  // same frame from different sources (length effect, ResizeObserver, user
-  // click, SSE burst). We coalesce them into one scrollTo per frame and skip
-  // no-op writes when already within a few px of target — that was the
-  // primary source of the herky-jerky "snap on every image load".
-  let pendingPin = false
+  // ResizeObserver fires after layout and before paint, so we can set
+  // scrollTop synchronously inside it — the adjusted position lands in the
+  // same frame as the size change, eliminating the one-frame flicker where
+  // new content paints at the old scroll position first.
   let selfScrollUntil = 0
   let smoothScrollUntil = 0
-  function pinToBottom() {
-    if (pendingPin) return
-    pendingPin = true
-    requestAnimationFrame(() => {
-      pendingPin = false
-      if (!scrollRef) return
-      // A smooth scroll in progress owns the viewport; don't stomp it.
-      if (performance.now() < smoothScrollUntil) return
-      const target = scrollRef.scrollHeight - scrollRef.clientHeight
-      if (Math.abs(scrollRef.scrollTop - target) < 2) return
-      selfScrollUntil = performance.now() + 120
-      scrollRef.scrollTo({ top: target })
-    })
+  function pinSync() {
+    if (!scrollRef) return
+    if (performance.now() < smoothScrollUntil) return
+    const target = scrollRef.scrollHeight - scrollRef.clientHeight
+    if (Math.abs(scrollRef.scrollTop - target) < 2) return
+    selfScrollUntil = performance.now() + 120
+    scrollRef.scrollTop = target
   }
 
   function onScroll() {
@@ -488,15 +480,13 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
     } catch {}
   }
 
-  // Only react to length changes; reading pinned() reactively would cause the
-  // effect to re-fire on every scroll-driven pin flip, producing extra pin
-  // writes unrelated to new messages.
+  // Length effect only updates the new-msg badge when unpinned. Pin writes
+  // happen through ResizeObserver (pinSync) so they stay in the same frame
+  // as the layout change — no flicker.
   createEffect(on(() => props.messages.length, (len) => {
     const delta = len - prevMsgLen
     prevMsgLen = len
-    if (untrack(pinned)) {
-      pinToBottom()
-    } else if (delta > 0) {
+    if (!untrack(pinned) && delta > 0) {
       setNewMsgCount(c => c + delta)
     }
   }))
@@ -509,15 +499,15 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
     setPinned(true)
   }, { defer: true }))
 
-  // ResizeObserver catches every size change inside the scroll container —
-  // collapse/expand transitions, async image loads, typing indicator growth,
-  // etc. All callbacks funnel through pinToBottom() which rAF-coalesces so
-  // rapid-fire resizes produce at most one scroll per frame.
+  // ResizeObserver is the single pin writer — it catches every size change
+  // (collapse/expand, image load, typing indicator growth, new message) and
+  // runs after layout, before paint, in the same frame as the size change.
+  // Setting scrollTop directly here lands before the next paint.
   let contentRef: HTMLDivElement | undefined
   onMount(() => {
     if (!contentRef) return
     const ro = new ResizeObserver(() => {
-      if (untrack(pinned) && scrollRef) pinToBottom()
+      if (untrack(pinned) && scrollRef) pinSync()
     })
     ro.observe(contentRef)
     onCleanup(() => ro.disconnect())

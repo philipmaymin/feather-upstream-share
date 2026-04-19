@@ -1,3 +1,7 @@
+## 2026-04-19 - Scroll Flicker Fix (Iter 3)
+- Pin writes now happen synchronously inside the ResizeObserver callback (scrollTop assignment, no rAF). ResizeObserver fires after layout and before paint, so the adjusted position lands in the same frame as the size change — the one-frame "content paints at old position, then snaps" flicker is gone.
+- Length-change effect no longer calls pinToBottom — ResizeObserver is the single pin writer, removing the double-scroll race when a new message and its ResizeObserver event both arrived in the same frame.
+
 ## 2026-04-19 - Scroll Herky-Jerky Fixes (Iter 2)
 - Coalesced scroll writers: pin, smooth-jump, and ResizeObserver now all route through a single rAF scheduler with epsilon skip (<2px no-op), killing the double-scroll judder when images and typing indicators changed in the same frame.
 - Typing indicator reserves its layout slot even when idle (opacity toggle instead of conditional mount), so the bubble no longer shifts 26px up/down when Claude starts/stops a turn.
