@@ -504,6 +504,8 @@ function paneStabilityKey(raw) {
 }
 
 function extractActivity(lines) {
+  // Anchor-based search: walk back from the empty input prompt looking for
+  // a spinner/activity line. Works in the common case (idle prompt visible).
   for (let i = lines.length - 1; i >= 0; i--) {
     if (/^\s*[❯>]\s*$/.test(lines[i])) {
       for (let j = i - 1; j >= Math.max(0, i - 8); j--) {
@@ -516,6 +518,19 @@ function extractActivity(lines) {
         break;
       }
       break;
+    }
+  }
+  // Fallback: when there's no idle ❯ (queued input, typed text in box, or
+  // compaction has redrawn the input area), scan the bottom of the pane for
+  // a spinner line. The activity is always near the bottom, just above the
+  // input/status area.
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 20); i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (/bypass permissions/.test(line) || /\bctx\s*[\[(]/.test(line)) continue;
+    if (/Claude Code v\d/.test(line) || /^Tip:/.test(line)) continue;
+    if (/^[✻·*●✶⧫◆▸►▹☆★✦⏳◉⊛]\s+\S.*(ing\.{3}|…|\(\d+[sm]\s)/.test(line)) {
+      return line;
     }
   }
   return null;

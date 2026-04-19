@@ -1,3 +1,8 @@
+## 2026-04-19 - Activity Status: Detect Compaction + Queued-Input States
+- Status bar now shows "Compacting conversation..." (and other spinner-driven activity) even when the idle ❯ prompt isn't visible. Previously, queued input or a redrawn input area would knock out the anchor extractActivity uses, leaving the status bar stuck on bare "Working".
+- Added a fallback bottom-up scan of the last 20 lines for the spinner pattern when no anchor is found.
+- Server change — takes effect on next natural restart, not the live session.
+
 ## 2026-04-19 - Scroll Flicker Fix (Iter 3)
 - Pin writes now happen synchronously inside the ResizeObserver callback (scrollTop assignment, no rAF). ResizeObserver fires after layout and before paint, so the adjusted position lands in the same frame as the size change — the one-frame "content paints at old position, then snaps" flicker is gone.
 - Length-change effect no longer calls pinToBottom — ResizeObserver is the single pin writer, removing the double-scroll race when a new message and its ResizeObserver event both arrived in the same frame.
