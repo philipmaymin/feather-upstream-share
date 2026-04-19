@@ -1,3 +1,19 @@
+## 2026-04-19 - Scroll Pin Fix + Collapse Compact Summaries
+- Scroll stays pinned to the bottom through collapse/expand transitions, async image loads, and typing indicator changes (not just on new-message count). Replaces the rAF-after-length-change approach with a ResizeObserver on the scroll content.
+- Context-compaction summaries (the "This session is being continued..." message that Claude Code inserts on auto-compact) now join the tool-steps collapse group instead of rendering as a giant prose wall.
+
+## 2026-04-19 - Upstream Merge: Pinch-Zoom + PDF Viewer + Inline Images
+- Pinch-to-zoom and double-tap zoom in the image lightbox (mobile touch)
+- PDF attachments open in an in-app viewer (no more download-then-open)
+- Tool results that return images (screenshots, plots) render inline instead of as text
+- iOS: blocks accidental pinch-zoom of the app chrome and skips viewport resize while zoomed
+- Skipped from upstream: theme-vars refactor, oh-my-pi backend, remote-server agent, box proxy, voice batch-transcription rewrite (kept our Web Speech API implementation)
+
+## 2026-04-18 - Instant Send + Hidden Files Toggle + Staging Safety
+- Send feels instant: input clears and the optimistic message renders on the first frame, before resume/uploads run. No more 800-1800ms wait to see your own message.
+- Files tab: toggle button to show/hide dotfiles (.bashrc, .claude, etc.). Preference persists per browser.
+- Fixed latent bug where kids' "Perform Update" could install a broken build (missing assets) and black-screen. /api/update now validates staging before copy and wipes stale assets.
+
 ## 2026-04-17 - Resume Race + Question Propagation Fixes
 - Fixed Enter not submitting when resuming a stale chat (message sat in input until user pressed Enter manually in terminal tab)
 - /resume endpoint now awaits Claude Code TUI ready-state before responding, so the follow-up send does not race the spawn

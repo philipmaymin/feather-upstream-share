@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal } from 'solid-js'
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import type { Message, ContentBlock } from '../api'
 import { toBlob } from 'html-to-image'
 import { Marked } from 'marked'
@@ -467,6 +467,20 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
     }
   })
 
+  // ResizeObserver catches every size change inside the scroll container —
+  // collapse/expand transitions, async image loads, typing indicator growth,
+  // etc. Without this, rAF after a length change reads scrollHeight before
+  // those follow-on layout changes commit, so the view ends up short of bottom.
+  let contentRef: HTMLDivElement | undefined
+  onMount(() => {
+    if (!contentRef) return
+    const ro = new ResizeObserver(() => {
+      if (pinned() && scrollRef) scrollRef.scrollTo({ top: scrollRef.scrollHeight })
+    })
+    ro.observe(contentRef)
+    onCleanup(() => ro.disconnect())
+  })
+
   const canShare = typeof navigator !== 'undefined' && !!navigator.share
 
   const menuBtnStyle = { display: 'block', width: '100%', padding: '8px 14px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#e5e5e5', 'font-size': '12px', 'text-align': 'left' as const, cursor: 'pointer', 'white-space': 'nowrap' as const }
@@ -476,6 +490,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
   // long agent run doesn't drown out the user/assistant signal.
   const RUN_COLLAPSE_THRESHOLD = 3
   const hasVisibleText = (msg: Message) =>
+    !msg.internal &&
     (msg.content || []).some(b => b.type === 'text' && (b.text || '').trim().length > 0)
 
   type GroupedItem = { kind: 'msg'; msg: Message } | { kind: 'run'; msgs: Message[] }
@@ -564,6 +579,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
     <div style={{ position: 'relative', height: '100%' }}>
     <div ref={(el) => { scrollRef = el; props.scrollRefCb?.(el) }} onScroll={onScroll} style={{ height: '100%', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', 'overscroll-behavior': 'contain', padding: '16px', 'padding-bottom': '80px' }}>
       <style>{markdownCSS}</style>
+      <div ref={contentRef}>
       <Show when={props.loading}>
         <div style={{ color: '#555', 'text-align': 'center', padding: '40px' }}>Loading...</div>
       </Show>
@@ -624,6 +640,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
           </div>
         </div>
       </Show>
+      </div>
     </div>
     {/* Scroll to bottom button */}
     <Show when={!pinned()}>

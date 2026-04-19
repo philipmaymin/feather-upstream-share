@@ -38,6 +38,7 @@ export interface Message {
   usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
   version?: string
   gitBranch?: string
+  internal?: boolean
 }
 
 export async function fetchSessions(project?: string | null): Promise<SessionMeta[]> {
