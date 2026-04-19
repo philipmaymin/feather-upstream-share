@@ -1,3 +1,11 @@
+## 2026-04-19 - Scroll Herky-Jerky Fixes (Iter 2)
+- Coalesced scroll writers: pin, smooth-jump, and ResizeObserver now all route through a single rAF scheduler with epsilon skip (<2px no-op), killing the double-scroll judder when images and typing indicators changed in the same frame.
+- Typing indicator reserves its layout slot even when idle (opacity toggle instead of conditional mount), so the bubble no longer shifts 26px up/down when Claude starts/stops a turn.
+- Load-earlier anchors viewport: previously scrolling to the top and clicking "Load earlier" could bounce the viewport. Now the visible content stays put after the prepend.
+- Session switch resets pinned state cleanly (sessionId prop) so returning to a session does not get stuck auto-pinning over your saved scroll position.
+- Length-change effect decoupled from `pinned()` signal (untrack), so pin decisions no longer re-fire on user scroll.
+- DOM-mutation side effects (fixLinks, collapseCodeBlocks) moved from `setTimeout(0)` to `queueMicrotask` to batch with the paint rather than trigger a second layout.
+
 ## 2026-04-19 - Scroll Pin Fix + Collapse Compact Summaries
 - Scroll stays pinned to the bottom through collapse/expand transitions, async image loads, and typing indicator changes (not just on new-message count). Replaces the rAF-after-length-change approach with a ResizeObserver on the scroll content.
 - Context-compaction summaries (the "This session is being continued..." message that Claude Code inserts on auto-compact) now join the tool-steps collapse group instead of rendering as a giant prose wall.

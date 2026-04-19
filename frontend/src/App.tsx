@@ -149,13 +149,15 @@ export default function App() {
   const [browseEntries, setBrowseEntries] = createSignal<DirEntry[]>([])
   const [browseParent, setBrowseParent] = createSignal<string | null>(null)
   const [browseLoading, setBrowseLoading] = createSignal(false)
+  const [showHidden, setShowHidden] = createSignal(localStorage.getItem('feather-show-hidden') === '1')
 
   async function openFileBrowser(dir?: string) {
-    const target = dir || sessionStats().cwd || '/home/user'
+    const target = dir || browseDir() || sessionStats().cwd || '/home/user'
     setBrowseLoading(true)
     try {
       const base = location.pathname.replace(/\/+$/, '')
-      const resp = await fetch(`${base}/api/files/list?dir=${encodeURIComponent(target)}`)
+      const hidden = showHidden() ? '&showHidden=1' : ''
+      const resp = await fetch(`${base}/api/files/list?dir=${encodeURIComponent(target)}${hidden}`)
       const data = await resp.json()
       if (resp.ok) {
         setBrowseDir(data.dir)
@@ -164,6 +166,13 @@ export default function App() {
       }
     } catch {}
     setBrowseLoading(false)
+  }
+
+  function toggleHidden() {
+    const next = !showHidden()
+    setShowHidden(next)
+    localStorage.setItem('feather-show-hidden', next ? '1' : '0')
+    if (browseDir()) openFileBrowser(browseDir()!)
   }
 
   const lastSeenUpdatedAt = new Map<string, string>() // session ID -> last known updatedAt
@@ -548,10 +557,22 @@ export default function App() {
     const id = currentId()
     if (!id || loadingMore()) return
     setLoadingMore(true)
+    // Capture viewport anchor so prepending older messages doesn't jump the
+    // view. After setMessages resolves on the next frame, we restore by
+    // shifting scrollTop by the grown height delta.
+    const anchor = messageScrollRef
+      ? { scrollTop: messageScrollRef.scrollTop, scrollHeight: messageScrollRef.scrollHeight }
+      : null
     try {
       const result = await fetchMessages(id, messages().length)
       setMessages(prev => [...result.messages, ...prev])
       setHasMore(result.hasMore)
+      if (anchor && messageScrollRef) {
+        const el = messageScrollRef
+        requestAnimationFrame(() => {
+          el.scrollTop = anchor.scrollTop + (el.scrollHeight - anchor.scrollHeight)
+        })
+      }
     } catch {}
     setLoadingMore(false)
   }
@@ -599,7 +620,11 @@ export default function App() {
     const val = text().trim()
     const pending = files()
     if (!val && !pending.length) return
-    // Auto-create session if none selected
+
+    setText('')
+    setFiles([])
+    if (textareaRef) textareaRef.style.height = 'auto'
+
     if (!currentId()) {
       try {
         const id = await createSession()
@@ -608,17 +633,24 @@ export default function App() {
       } catch { return }
     }
     if (!currentId()) return
-    // Auto-resume if session is inactive
+
+    const tempId = `optimistic-${Date.now()}`
+    const optimisticText = val + (pending.length ? `\n[attaching ${pending.length} file${pending.length > 1 ? 's' : ''}...]` : '')
+    setMessages(prev => [...prev, {
+      uuid: tempId, role: 'user', timestamp: new Date().toISOString(),
+      content: [{ type: 'text', text: optimisticText }], delivery: 'sent',
+    }])
+    saveDraft(currentId()!, '')
+    setWorking(true)
+    startWorkingTimeout()
+
     const s = cur() || lastSession()
     if (s && !s.isActive) {
       await resumeSession(s.id, s.cwd ?? undefined)
       updateSessions(await fetchSessions(currentProject()))
     }
-    setUploading(true)
-    setText('')
-    setFiles([])
-    if (textareaRef) textareaRef.style.height = 'auto'
 
+    setUploading(pending.length > 0)
     const parts: string[] = val ? [val] : []
     for (const f of pending) {
       try {
@@ -628,17 +660,15 @@ export default function App() {
     }
     const fullText = parts.join('\n')
     pushHistory(fullText)
-    saveDraft(currentId()!, '')
 
-    const tempId = `optimistic-${Date.now()}`
-    setMessages(prev => [...prev, {
-      uuid: tempId, role: 'user', timestamp: new Date().toISOString(),
-      content: [{ type: 'text', text: fullText }], delivery: 'sent',
-    }])
+    if (fullText !== optimisticText) {
+      setMessages(prev => prev.map(m => m.uuid === tempId
+        ? { ...m, content: [{ type: 'text', text: fullText }] }
+        : m))
+    }
+
     sendInput(currentId()!, fullText)
     setUploading(false)
-    setWorking(true)
-    startWorkingTimeout()
   }
 
   const cur = () => sessions().find(s => s.id === currentId())
@@ -1132,7 +1162,7 @@ export default function App() {
             </div>
           }>
             <div style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
-              <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (currentId()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (currentId()) toggleStar(currentId()!, uuid) }} working={working()} scrollRefCb={(el) => { messageScrollRef = el }} />
+              <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (currentId()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (currentId()) toggleStar(currentId()!, uuid) }} working={working()} scrollRefCb={(el) => { messageScrollRef = el }} sessionId={currentId()} />
             </div>
             <div style={{ display: tab() === 'files' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%' }}>
               {/* File browser */}
@@ -1144,6 +1174,9 @@ export default function App() {
                     </button>
                   </Show>
                   <span style={{ 'font-size': '11px', color: '#888', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1' }}>{browseDir()}</span>
+                  <button onClick={toggleHidden} title={showHidden() ? 'Hide dotfiles' : 'Show dotfiles'} style={{ background: showHidden() ? '#1e3a5f' : 'transparent', border: `1px solid ${showHidden() ? '#73b8ff' : '#444'}`, color: showHidden() ? '#73b8ff' : '#999', cursor: 'pointer', 'font-size': '12px', padding: '4px 10px', 'border-radius': '4px', '-webkit-tap-highlight-color': 'transparent', 'flex-shrink': '0', 'font-family': "'SF Mono', Menlo, monospace", 'user-select': 'none' }}>
+                    {showHidden() ? '☑ .hidden' : '☐ .hidden'}
+                  </button>
                 </div>
               </Show>
               <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch' }}>

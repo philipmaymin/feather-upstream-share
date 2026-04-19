@@ -802,21 +802,34 @@ app.use('/home/user/feather-uploads', express.static('/home/user/feather-uploads
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 
+// Verify that staging is a coherent build: index.html points to a JS bundle
+// that actually exists in staging/assets. Returns the matched JS filename, or null.
+function validateStaging() {
+  const stagingHtml = path.join(STAGING_DIR, 'index.html');
+  if (!fs.existsSync(stagingHtml)) return { ok: false, reason: 'no index.html' };
+  const html = fs.readFileSync(stagingHtml, 'utf8');
+  const match = html.match(/assets\/(index-[^.]+\.js)/);
+  if (!match) return { ok: false, reason: 'no JS bundle in index.html' };
+  const jsPath = path.join(STAGING_DIR, 'assets', match[1]);
+  if (!fs.existsSync(jsPath)) return { ok: false, reason: `missing asset ${match[1]}` };
+  return { ok: true, stagingJs: match[1] };
+}
+
 app.get('/api/version', (_req, res) => {
   try {
-    // Check staging for a newer version
-    const stagingHtml = path.join(STAGING_DIR, 'index.html');
-    if (!fs.existsSync(stagingHtml)) return res.json({ stagingJs: null, changes: '' });
-    const html = fs.readFileSync(stagingHtml, 'utf8');
-    const match = html.match(/assets\/(index-[^.]+\.js)/);
+    const v = validateStaging();
     const changelog = path.join(import.meta.dirname, 'CHANGELOG.md');
     const changes = fs.existsSync(changelog) ? fs.readFileSync(changelog, 'utf8') : '';
-    res.json({ stagingJs: match ? match[1] : null, changes });
+    // Only advertise staging if it's coherent (assets exist to match index.html)
+    res.json({ stagingJs: v.ok ? v.stagingJs : null, changes });
   } catch { res.json({ stagingJs: null, changes: '' }); }
 });
 
 app.post('/api/update', (_req, res) => {
   try {
+    if (!fs.existsSync(STAGING_DIR)) return res.status(400).json({ error: 'No staging build' });
+    const v = validateStaging();
+    if (!v.ok) return res.status(400).json({ error: `Staging invalid: ${v.reason}` });
     // Backup current static to rollback
     const rollbackDir = path.join(STATIC_DIR, 'rollback', Date.now().toString());
     fs.mkdirSync(rollbackDir, { recursive: true });
@@ -830,8 +843,10 @@ app.post('/api/update', (_req, res) => {
         fs.copyFileSync(src, dest);
       }
     }
+    // Replace assets wholesale (remove stale hashed bundles that staging doesn't have)
+    const staticAssets = path.join(STATIC_DIR, 'assets');
+    if (fs.existsSync(staticAssets)) fs.rmSync(staticAssets, { recursive: true, force: true });
     // Copy staging to static
-    if (!fs.existsSync(STAGING_DIR)) return res.status(400).json({ error: 'No staging build' });
     for (const f of fs.readdirSync(STAGING_DIR)) {
       const src = path.join(STAGING_DIR, f);
       const dest = path.join(STATIC_DIR, f);
@@ -1194,6 +1209,7 @@ function isPathAllowed(p) {
 app.get('/api/files/list', (req, res) => {
   try {
     const dir = req.query.dir || HOME;
+    const showHidden = req.query.showHidden === '1' || req.query.showHidden === 'true';
     if (!isPathAllowed(dir)) return res.status(403).json({ error: 'Access denied' });
     const resolved = path.resolve(dir);
     if (!fs.existsSync(resolved)) return res.status(404).json({ error: 'Not found' });
@@ -1201,7 +1217,7 @@ app.get('/api/files/list', (req, res) => {
     if (!stat.isDirectory()) return res.status(400).json({ error: 'Not a directory' });
     const entries = [];
     for (const name of fs.readdirSync(resolved)) {
-      if (name.startsWith('.')) continue; // skip hidden by default
+      if (!showHidden && name.startsWith('.')) continue;
       try {
         const full = path.join(resolved, name);
         const s = fs.statSync(full);

@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
+import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, onMount, untrack } from 'solid-js'
 import type { Message, ContentBlock } from '../api'
 import { toBlob } from 'html-to-image'
 import { Marked } from 'marked'
@@ -253,7 +253,7 @@ function toolSummary(name: string, input: any): string {
 
 function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void) {
   if (block.type === 'text' && block.text) {
-    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => setTimeout(() => { fixLinks(el, onImageClick); collapseCodeBlocks(el) }, 0)} />
+    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => queueMicrotask(() => { fixLinks(el, onImageClick); collapseCodeBlocks(el) })} />
   }
   if (block.type === 'thinking' && block.thinking) {
     return (
@@ -416,7 +416,7 @@ function extractImages(text: string): { cleanText: string; images: string[]; fil
 
 // ── Component ───────────────────────────────────────────────────────────────
 
-export function MessageView(props: { messages: Message[], loading: boolean, hasMore?: boolean, loadingMore?: boolean, onLoadEarlier?: () => void, onAnswer?: (text: string) => void, starred?: Set<string>, onToggleStar?: (uuid: string) => void, working?: boolean, scrollRefCb?: (el: HTMLDivElement) => void }) {
+export function MessageView(props: { messages: Message[], loading: boolean, hasMore?: boolean, loadingMore?: boolean, onLoadEarlier?: () => void, onAnswer?: (text: string) => void, starred?: Set<string>, onToggleStar?: (uuid: string) => void, working?: boolean, scrollRefCb?: (el: HTMLDivElement) => void, sessionId?: string | null }) {
   const [lightbox, setLightbox] = createSignal<string | null>(null)
   let scrollRef: HTMLDivElement | undefined
   const [pinned, setPinned] = createSignal(true)
@@ -426,16 +426,48 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
   const [expandedRuns, setExpandedRuns] = createSignal<Set<string>>(new Set())
   let prevMsgLen = props.messages.length
 
+  // Scroll writers (pin-maintain, smooth-jump, restore) can all fire in the
+  // same frame from different sources (length effect, ResizeObserver, user
+  // click, SSE burst). We coalesce them into one scrollTo per frame and skip
+  // no-op writes when already within a few px of target — that was the
+  // primary source of the herky-jerky "snap on every image load".
+  let pendingPin = false
+  let selfScrollUntil = 0
+  let smoothScrollUntil = 0
+  function pinToBottom() {
+    if (pendingPin) return
+    pendingPin = true
+    requestAnimationFrame(() => {
+      pendingPin = false
+      if (!scrollRef) return
+      // A smooth scroll in progress owns the viewport; don't stomp it.
+      if (performance.now() < smoothScrollUntil) return
+      const target = scrollRef.scrollHeight - scrollRef.clientHeight
+      if (Math.abs(scrollRef.scrollTop - target) < 2) return
+      selfScrollUntil = performance.now() + 120
+      scrollRef.scrollTo({ top: target })
+    })
+  }
+
   function onScroll() {
     if (!scrollRef) return
     const { scrollTop, scrollHeight, clientHeight } = scrollRef
     const near = scrollHeight - scrollTop - clientHeight < 80
+    // Ignore scroll events caused by our own pin writes — they don't mean
+    // the user took over the viewport.
+    if (performance.now() < selfScrollUntil) {
+      if (near) setNewMsgCount(0)
+      return
+    }
     setPinned(near)
     if (near) setNewMsgCount(0)
   }
 
   function scrollToBottom() {
-    scrollRef?.scrollTo({ top: scrollRef!.scrollHeight, behavior: 'smooth' })
+    if (!scrollRef) return
+    const target = scrollRef.scrollHeight - scrollRef.clientHeight
+    smoothScrollUntil = performance.now() + 600
+    scrollRef.scrollTo({ top: target, behavior: 'smooth' })
     setNewMsgCount(0)
   }
 
@@ -456,26 +488,36 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
     } catch {}
   }
 
-  createEffect(() => {
-    const len = props.messages.length
+  // Only react to length changes; reading pinned() reactively would cause the
+  // effect to re-fire on every scroll-driven pin flip, producing extra pin
+  // writes unrelated to new messages.
+  createEffect(on(() => props.messages.length, (len) => {
     const delta = len - prevMsgLen
     prevMsgLen = len
-    if (pinned()) {
-      requestAnimationFrame(() => scrollRef?.scrollTo({ top: scrollRef!.scrollHeight }))
+    if (untrack(pinned)) {
+      pinToBottom()
     } else if (delta > 0) {
       setNewMsgCount(c => c + delta)
     }
-  })
+  }))
+
+  // Reset delta counter on session switch so a new session's load doesn't
+  // get interpreted as a huge burst of "new messages since last time".
+  createEffect(on(() => props.sessionId, () => {
+    prevMsgLen = props.messages.length
+    setNewMsgCount(0)
+    setPinned(true)
+  }, { defer: true }))
 
   // ResizeObserver catches every size change inside the scroll container —
   // collapse/expand transitions, async image loads, typing indicator growth,
-  // etc. Without this, rAF after a length change reads scrollHeight before
-  // those follow-on layout changes commit, so the view ends up short of bottom.
+  // etc. All callbacks funnel through pinToBottom() which rAF-coalesces so
+  // rapid-fire resizes produce at most one scroll per frame.
   let contentRef: HTMLDivElement | undefined
   onMount(() => {
     if (!contentRef) return
     const ro = new ResizeObserver(() => {
-      if (pinned() && scrollRef) scrollRef.scrollTo({ top: scrollRef.scrollHeight })
+      if (untrack(pinned) && scrollRef) pinToBottom()
     })
     ro.observe(contentRef)
     onCleanup(() => ro.disconnect())
@@ -534,7 +576,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
           <For each={msg.content}>{(block) => {
             if (block.type === 'text' && block.text) {
               const display = hasAttachments ? cleanText : block.text
-              return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => setTimeout(() => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) }, 0)} /> : null
+              return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => queueMicrotask(() => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) })} /> : null
             }
             return renderBlock(block, (src) => setLightbox(src))
           }}</For>
@@ -630,16 +672,15 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
         )
       }}</For>
 
-      {/* Typing indicator */}
-      <Show when={props.working}>
-        <div style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px' }}>
-          <div style={{ padding: '10px 16px', 'border-radius': '16px 16px 16px 4px', background: '#1a1a2e', display: 'flex', gap: '4px', 'align-items': 'center' }}>
-            <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out infinite' }} />
-            <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.2s infinite' }} />
-            <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.4s infinite' }} />
-          </div>
+      {/* Typing indicator — always mounted, opacity-toggled so mount/unmount
+          doesn't shift layout and trigger a pin-scroll every time working flips. */}
+      <div style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px', opacity: props.working ? '1' : '0', transition: 'opacity 0.12s', 'pointer-events': props.working ? 'auto' : 'none' }}>
+        <div style={{ padding: '10px 16px', 'border-radius': '16px 16px 16px 4px', background: '#1a1a2e', display: 'flex', gap: '4px', 'align-items': 'center' }}>
+          <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out infinite' }} />
+          <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.2s infinite' }} />
+          <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.4s infinite' }} />
         </div>
-      </Show>
+      </div>
       </div>
     </div>
     {/* Scroll to bottom button */}
