@@ -1,3 +1,40 @@
+## 2026-06-06 - Upstream Merge: Codex actually works + oh-my-pi backend
+- **Codex now works end to end.** Two bugs had it broken even though the code was there:
+  - The server looks up `codex` (and `omp`) through your interactive shell (`~/.bashrc`) now, so it finds binaries installed in `~/.npm-global/bin`. Before, it only searched the login PATH, so the "+ Codex" button never appeared and a spawned Codex session died with "command not found".
+  - Live updates are parsed per backend. The streamer used to assume every line was Claude-format, so Codex (and oh-my-pi) messages were silently dropped mid-session and only showed up on reload. They stream live now.
+- **oh-my-pi (omp) backend** ported from upstream as a third agent next to Claude and Codex. Sessions live under `~/.feather/omp-sessions/<id>/`. The "+ omp" option only appears once `oh-my-pi` is installed; until then it is listed as unavailable. (We kept this on `server-single.js`; we did not adopt upstream's `server.js` rename, theme-vars refactor, remote-server, or box proxy.)
+- **Codex tool rendering** improved: `apply_patch` shows the diff and `write_stdin` shows the piped input as their own colored blocks, matching how Bash/Edit/Read already render.
+- **Clickable file paths in tool calls.** File arguments in Bash, Write, Read, apply_patch, and sub-agent tool blocks (and in tool output) are now links, same as paths in chat text.
+- **Delete files from the Files tab.** Browse mode gained a trash button on each row (with a confirm prompt). Guarded by the same path-allowlist the rest of the file API uses.
+- Server change: takes effect on next natural restart.
+
+## 2026-04-30 - Files tab: type-aware viewer + Download button
+- The file viewer modal no longer fetches binary files as text. PDFs previously rendered as a raw byte-dump in a `<pre>` block; they now embed as an inline iframe (same approach as the message-attachment PDF viewer). Images preview inline (`<img>`), other binaries show a download card, text and markdown render as before.
+- Every viewer header now has a real **Download** button (uses `<a download>` so it saves to disk regardless of how the server frames the response).
+- Sexier title: filename in 14px semibold white, parent dir in dim monospace below, kind pill (TEXT / IMAGE / PDF / BINARY) on the left in a colored badge. Backdrop got a soft blur.
+
+## 2026-04-30 - Auto Tab + File Viewer + Worker Exclusion
+- New **Auto** tab in the sidebar: manage autonomous improvement loops without leaving Feather. Create a named instance with a goal, then Start/Stop, Set focus, BTW (heads-up to the next iteration), or Link a Feather chat as the steering wheel. Detail view shows iterations / keeps / reverts / crashes, recent activity, worker sessions, and the rendered program.md. Three default pipelines ship: `simple` (claude, 1 phase), `all-claude` (5 phases + 1/10 reviewer), `claude-codex` (6 phases, claude+codex). Drop a JSON file in `templates/auto/` to add your own.
+- New **/auto** skill (`skills/auto/SKILL.md`) — symlink it into `~/.claude/skills/auto` to drive the same endpoints from CLI: `/auto status`, `/auto new`, `/auto start`, `/auto focus`, `/auto btw`, `/auto link`. Uses `localhost:$PORT` (configurable; defaults to 4870).
+- **Files tab** now has a Changed / Browse mode toggle. Changed mode shows files touched by tool calls in this session (with action pills). Browse mode is the existing directory tree. Click any file in either mode to open it in an in-app viewer modal (.md rendered with marked, other text shown as monospace pre); previously the only option was opening in a new tab.
+- **Sessions list excludes workers** automatically. Auto worker sessions (created under `~/auto-NAME/` or legacy `~/autoweb-NAME/`) used to bury real chats when a loop was busy. They're now filtered out by both project path (`-home-user-auto-*`) and content (the `AUTO_WORKER=TRUE` canary in the prompt).
+- Server change: takes effect on next natural restart.
+
+## 2026-04-27 - Textarea Autoresize Fix
+- The composer text box now grows to fit its content (up to 120px) when text is set programmatically: draft restore on session select, voice dictation transcripts, and Up/Down arrow history navigation. Previously these paths skipped the autoresize, so a long restored draft would be pinned at 1 row and scroll behind a tiny viewport — you could see only the top 1-2 lines of what was actually there.
+
+## 2026-04-26 - Codex Sessions
+- Added Codex (OpenAI) as a second backend alongside Claude Code. A purple "+ Codex" button appears next to "+ New Claude" when codex is installed (run `npm install -g @openai/codex` to enable). Codex sessions show a small "codex" pill in the sidebar.
+- Codex sessions live at `~/.codex/sessions/YYYY/MM/DD/rollout-*-<UUID>.jsonl` and are listed alongside Claude sessions in the chat list. Existing rollouts auto-discovered on server start.
+- Codex doesn't accept a preset session id (issue openai/codex#15767), so we snapshot existing rollouts on spawn, then poll for the new file and adopt its UUID into session-meta. Codex resume passes `--cd` to skip the cwd picker.
+- Codex's tool calls (shell/exec) render the same way as Claude's Bash blocks. The `cmd` array form is normalized to a single command string for display.
+- Codex needs paste-buffer for every message — Enter stops submitting after the first turn if you use `send-keys -l`. We route through bracketed paste with a 300ms delay before Enter.
+- Server change: takes effect on next natural restart.
+
+## 2026-04-26 - Upstream Merge: PDF Viewer
+- PDF attachments in messages now open in an in-app iframe viewer with a close button, instead of the browser trying to navigate to a filesystem path. Other file types still open in a new tab.
+- Skipped from upstream (didn't fit our single-user/Authelia architecture): server-single.js to server.js rename, theme-vars refactor, oh-my-pi (omp) multi-backend, remote-server agent, box proxy, batch voice transcription rewrite (we kept our Web Speech API). Voice/editor/inline-image/pinch-zoom features were already integrated in earlier merges.
+
 ## 2026-04-19 - Activity Status: Detect Compaction + Queued-Input States
 - Status bar now shows "Compacting conversation..." (and other spinner-driven activity) even when the idle ❯ prompt isn't visible. Previously, queued input or a redrawn input area would knock out the anchor extractActivity uses, leaving the status bar stuck on bare "Working".
 - Added a fallback bottom-up scan of the last 20 lines for the spinner pattern when no anchor is found.

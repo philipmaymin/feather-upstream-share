@@ -231,6 +231,65 @@ const TOOL_COLORS: Record<string, string> = {
   Bash: '#e5946b', Read: '#73b8ff', Write: '#4aba6a', Edit: '#c4993a',
   Grep: '#b48ead', Glob: '#88c0d0', WebFetch: '#88c0d0', WebSearch: '#b48ead',
   Agent: '#73b8ff', Skill: '#b48ead',
+  Patch: '#c4993a', Input: '#73b8ff',
+}
+
+// Codex emits tool_use blocks with names like 'shell', 'exec', or 'exec_command'
+// (the latter may arrive truncated as 'exec_comman'). Map them onto our
+// canonical names so the summary/color lookups work uniformly.
+const TOOL_ALIASES: Record<string, string> = {
+  shell: 'Bash', exec: 'Bash', exec_command: 'Bash', exec_comman: 'Bash',
+  local_shell_call: 'Bash',
+  apply_patch: 'Patch', write_stdin: 'Input',
+  bash: 'Bash', read: 'Read', write: 'Write', edit: 'Edit',
+  grep: 'Grep', glob: 'Glob', find: 'Glob',
+  task: 'Agent', agent: 'Agent',
+  webfetch: 'WebFetch', fetch: 'WebFetch',
+  websearch: 'WebSearch', web_search: 'WebSearch',
+}
+
+function canonicalName(raw: string): string {
+  if (!raw) return 'tool'
+  const stripped = raw.replace(/^mcp__.+?__/, '').split('.').pop() || raw
+  return TOOL_ALIASES[stripped.toLowerCase()] || stripped.charAt(0).toUpperCase() + stripped.slice(1)
+}
+
+// Codex shell inputs use `command` (array or string), `cmd`, or already-joined
+// strings — normalize them.
+function commandText(input: any): string {
+  const v = input?.command ?? input?.cmd
+  if (Array.isArray(v)) return v.join(' ').trim()
+  return ((v as string) || '').trim()
+}
+
+// Codex apply_patch / write_stdin tool helpers.
+function patchText(input: any): string {
+  return ((input?.raw || input?.input || input?.patch) as string || '').trim()
+}
+
+function stdinText(input: any): string {
+  return ((input?.chars || input?.input) as string || '')
+}
+
+function patchSummary(input: any): string {
+  const text = patchText(input)
+  if (!text) return ''
+  const firstFile = text.match(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/m)?.[1]
+  const changeCount = (text.match(/^\*\*\* (?:Update|Add|Delete) File: /gm) || []).length
+  if (firstFile) {
+    const short = firstFile.split('/').slice(-2).join('/')
+    return changeCount > 1 ? `${short} +${changeCount - 1}` : short
+  }
+  const firstLine = text.split('\n').find(Boolean) || ''
+  return firstLine.length > 80 ? firstLine.slice(0, 80) + '…' : firstLine
+}
+
+function stdinSummary(input: any): string {
+  const chars = stdinText(input)
+  if (!chars) return input?.session_id != null ? `session ${input.session_id}` : ''
+  const visible = chars.replace(/\u0003/g, '^C').replace(/\r/g, '\\r').replace(/\n/g, '\\n')
+  const prefix = input?.session_id != null ? `session ${input.session_id}: ` : ''
+  return prefix + (visible.length > 60 ? visible.slice(0, 60) + '…' : visible)
 }
 
 function toolSummary(name: string, input: any): string {
@@ -241,7 +300,9 @@ function toolSummary(name: string, input: any): string {
     case 'Read': return short + (input.offset ? ` L${input.offset}` : '')
     case 'Write': return short
     case 'Edit': return short + (input.replace_all ? ' ×all' : '')
-    case 'Bash': { const c = (input.command || '').split('\n')[0].trim(); return c.length > 80 ? c.slice(0, 80) + '…' : c }
+    case 'Bash': { const c = commandText(input).split('\n')[0]; return c.length > 80 ? c.slice(0, 80) + '…' : c }
+    case 'Patch': return patchSummary(input)
+    case 'Input': return stdinSummary(input)
     case 'Grep': return `${input.pattern || ''}${input.path ? ' in ' + input.path : ''}`
     case 'Glob': return input.pattern || ''
     case 'Agent': return input.description || ''
@@ -250,6 +311,10 @@ function toolSummary(name: string, input: any): string {
 }
 
 // ── Block renderers ─────────────────────────────────────────────────────────
+
+// Linkify file paths inside tool input pres and tool result output. Deferred to
+// the next microtask so text children are mounted before fixLinks walks them.
+const linkifyRef = (el: HTMLElement) => queueMicrotask(() => fixLinks(el))
 
 function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void) {
   if (block.type === 'text' && block.text) {
@@ -266,11 +331,11 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void) 
     )
   }
   if (block.type === 'tool_use') {
-    const name = block.name || 'tool'
+    const name = canonicalName(block.name || 'tool')
     const color = TOOL_COLORS[name] || '#999'
     const summary = toolSummary(name, block.input)
     const inp = block.input || {}
-    const hasDetail = name === 'Edit' || name === 'Bash' || name === 'Write' || name === 'Agent' || name === 'Grep' || name === 'Read'
+    const hasDetail = name === 'Edit' || name === 'Bash' || name === 'Patch' || name === 'Input' || name === 'Write' || name === 'Agent' || name === 'Grep' || name === 'Read'
     const pre = 'white-space:pre-wrap;font-size:10px;font-family:SF Mono,Menlo,monospace;padding:3px 0;max-height:160px;overflow:auto;margin:0;word-break:break-all;'
     const isImageFile = (name === 'Read' || name === 'Write') && inp.file_path && IMAGE_EXTS.has(((inp.file_path as string).substring((inp.file_path as string).lastIndexOf('.')).toLowerCase()))
     return <>
@@ -283,14 +348,16 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void) 
           {inp.old_string && <pre style={`${pre}color:#e07070`}>{inp.old_string}</pre>}
           {inp.new_string && <pre style={`${pre}color:#5cc878`}>{inp.new_string}</pre>}
         </>}
-        {name === 'Bash' && inp.command && <pre style={`${pre}color:#e5a070`}>{inp.command}</pre>}
-        {name === 'Write' && inp.content && <pre style={`${pre}color:#5cc878`}>{(inp.content as string).slice(0, 500)}{(inp.content as string).length > 500 ? '...' : ''}</pre>}
+        {name === 'Bash' && commandText(inp) && <pre style={`${pre}color:#e5a070`} ref={linkifyRef}>{commandText(inp)}</pre>}
+        {name === 'Patch' && patchText(inp) && <pre style={`${pre}color:#c4993a`} ref={linkifyRef}>{patchText(inp).slice(0, 2000)}{patchText(inp).length > 2000 ? '\n…' : ''}</pre>}
+        {name === 'Input' && <pre style={`${pre}color:#73b8ff`} ref={linkifyRef}>{stdinText(inp).replace(/\u0003/g, '^C') || '(empty stdin)'}{inp.session_id != null ? `\n\nsession: ${inp.session_id}` : ''}</pre>}
+        {name === 'Write' && inp.content && <pre style={`${pre}color:#5cc878`} ref={linkifyRef}>{(inp.content as string).slice(0, 500)}{(inp.content as string).length > 500 ? '...' : ''}</pre>}
         {name === 'Agent' && <>
           {inp.subagent_type && <div style={{ padding: '2px 0', 'font-size': '10px', color: '#888' }}>Type: <span style={{ color: '#c4993a' }}>{inp.subagent_type}</span></div>}
-          {inp.prompt && <pre style={`${pre}color:#88c4ff`}>{(inp.prompt as string).slice(0, 800)}{(inp.prompt as string).length > 800 ? '...' : ''}</pre>}
+          {inp.prompt && <pre style={`${pre}color:#88c4ff`} ref={linkifyRef}>{(inp.prompt as string).slice(0, 800)}{(inp.prompt as string).length > 800 ? '...' : ''}</pre>}
         </>}
         {name === 'Grep' && inp.pattern && <pre style={`${pre}color:#c4a0c0`}>/{inp.pattern}/{inp.path ? ` in ${inp.path}` : ''}</pre>}
-        {name === 'Read' && inp.file_path && <pre style={`${pre}color:#88c4ff`}>{inp.file_path}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
+        {name === 'Read' && inp.file_path && <pre style={`${pre}color:#88c4ff`} ref={linkifyRef}>{inp.file_path}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
       </details>
       {isImageFile && (() => {
         const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''
@@ -314,7 +381,7 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void) 
           {label}
           {isLong && !isErr && <span style={{ 'font-weight': '400', 'text-transform': 'none', 'margin-left': '6px', color: '#666' }}>{preview.split('\n')[0].slice(0, 60)}</span>}
         </summary>
-        {raw && <div style={{ padding: '2px 0', 'font-size': '10px', 'font-family': "'SF Mono', Menlo, monospace", color: isErr ? '#e07070' : '#999', 'white-space': 'pre-wrap', 'max-height': '200px', overflow: 'auto', 'word-break': 'break-all' }}>{raw.length > 3000 ? raw.slice(0, 3000) + '\n... (truncated)' : raw}</div>}
+        {raw && <div style={{ padding: '2px 0', 'font-size': '10px', 'font-family': "'SF Mono', Menlo, monospace", color: isErr ? '#e07070' : '#999', 'white-space': 'pre-wrap', 'max-height': '200px', overflow: 'auto', 'word-break': 'break-all' }} ref={linkifyRef}>{raw.length > 3000 ? raw.slice(0, 3000) + '\n... (truncated)' : raw}</div>}
       </details>
     )
   }
@@ -418,6 +485,7 @@ function extractImages(text: string): { cleanText: string; images: string[]; fil
 
 export function MessageView(props: { messages: Message[], loading: boolean, hasMore?: boolean, loadingMore?: boolean, onLoadEarlier?: () => void, onAnswer?: (text: string) => void, starred?: Set<string>, onToggleStar?: (uuid: string) => void, working?: boolean, scrollRefCb?: (el: HTMLDivElement) => void, sessionId?: string | null }) {
   const [lightbox, setLightbox] = createSignal<string | null>(null)
+  const [pdfViewer, setPdfViewer] = createSignal<string | null>(null)
   let scrollRef: HTMLDivElement | undefined
   const [pinned, setPinned] = createSignal(true)
   const [newMsgCount, setNewMsgCount] = createSignal(0)
@@ -557,7 +625,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
           <img src={src} onClick={() => setLightbox(src)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': hasAttachments ? '12px' : '6px', 'margin-bottom': '4px', cursor: 'zoom-in', display: 'block' }} />
         )}</For>
         <For each={files}>{(f) => (
-          <a href={f.path} target="_blank" rel="noopener" style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
+          <a href={f.path} target="_blank" rel="noopener" onClick={(e) => { if (f.name.toLowerCase().endsWith('.pdf')) { e.preventDefault(); const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''; setPdfViewer(`${base}/api/files/raw?path=${encodeURIComponent(f.path)}`) } }} style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
             <span style={{ 'font-size': '16px' }}>{f.name.endsWith('.pdf') ? '\uD83D\uDCC4' : '\uD83D\uDCCE'}</span>
             <span style={{ overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{f.name}</span>
           </a>
@@ -627,6 +695,16 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
       <Show when={lightbox()}>
         <div onClick={() => setLightbox(null)} style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.85)', 'z-index': '200', display: 'flex', 'align-items': 'center', 'justify-content': 'center', cursor: 'zoom-out' }}>
           <img src={lightbox()!} style={{ 'max-width': '95vw', 'max-height': '95vh', 'object-fit': 'contain', 'border-radius': '8px' }} />
+        </div>
+      </Show>
+      {/* PDF viewer */}
+      <Show when={pdfViewer()}>
+        <div style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.92)', 'z-index': '200', display: 'flex', 'flex-direction': 'column' }}>
+          <div style={{ display: 'flex', 'align-items': 'center', 'justify-content': 'space-between', padding: '8px 12px', background: '#111' }}>
+            <span style={{ color: '#999', 'font-size': '13px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1' }}>{pdfViewer()!.split('/').pop()}</span>
+            <button onClick={() => setPdfViewer(null)} style={{ background: 'none', border: 'none', color: '#e5e5e5', 'font-size': '24px', cursor: 'pointer', padding: '4px 8px', 'line-height': '1' }}>&times;</button>
+          </div>
+          <iframe src={pdfViewer()!} style={{ flex: '1', border: 'none', width: '100%', background: '#fff' }} />
         </div>
       </Show>
       {/* Action menu backdrop */}

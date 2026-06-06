@@ -1,9 +1,10 @@
 declare const __BUILD_TIME__: string
 import { createSignal, createEffect, createMemo, onMount, onCleanup, Show, For } from 'solid-js'
+import { marked } from 'marked'
 import { MessageView } from './components/MessageView'
 import { Terminal } from './components/Terminal'
 import type { SessionMeta, Message, Project, QuestionData } from './api'
-import { fetchSessions, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFile, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, fetchProjects, checkAuth, login, logout, searchSessions, answerQuestion } from './api'
+import { fetchSessions, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFile, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, fetchProjects, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents } from './api'
 import type { SearchResult } from './api'
 
 interface QuickLink { label: string; url: string }
@@ -113,6 +114,18 @@ export default function App() {
   const [creating, setCreating] = createSignal(false)
   const [text, setText] = createSignal('')
   const [tab, setTab] = createSignal<'chat' | 'files' | 'terminal'>('chat')
+  const [filesMode, setFilesMode] = createSignal<'changed' | 'browse'>('browse')
+  const [viewingFile, setViewingFile] = createSignal<{ path: string; content: string; error?: string } | null>(null)
+  async function openFile(filePath: string) {
+    setViewingFile({ path: filePath, content: '' })
+    try {
+      const r = await fetch(`/api/files/raw?path=${encodeURIComponent(filePath)}`)
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+      setViewingFile({ path: filePath, content: await r.text() })
+    } catch (e: any) {
+      setViewingFile({ path: filePath, content: '', error: e.message || 'failed to load' })
+    }
+  }
   const [files, setFiles] = createSignal<PendingFile[]>([])
   const [uploading, setUploading] = createSignal(false)
   const [working, setWorking] = createSignal(false)
@@ -129,11 +142,81 @@ export default function App() {
   const [renameText, setRenameText] = createSignal('')
   const [sidebarRenaming, setSidebarRenaming] = createSignal<string | null>(null)
   const [sidebarRenameText, setSidebarRenameText] = createSignal('')
-  const [sidebarTab, setSidebarTab] = createSignal<'sessions' | 'links'>('sessions')
+  const [sidebarTab, setSidebarTab] = createSignal<'sessions' | 'links' | 'auto'>('sessions')
+  interface AutoInstance {
+    name: string; dir: string; running: boolean; current: string;
+    keeps: number; reverts: number; crashes: number; skips: number; iterations: number;
+    last: { timestamp: string; status: string; description: string } | null;
+    mainChat: string | null;
+  }
+  interface WorkerSession { id: string; agent: string; mtime: string }
+  const [autoInstances, setAutoInstances] = createSignal<AutoInstance[]>([])
+  const [currentAuto, setCurrentAuto] = createSignal<string | null>(null)
+  const [autoDetail, setAutoDetail] = createSignal<(AutoInstance & { program?: string; results?: string; workerSessions?: WorkerSession[] }) | null>(null)
+  const [autoNewName, setAutoNewName] = createSignal('')
+  const [autoNewGoal, setAutoNewGoal] = createSignal('')
+  const [autoCreating, setAutoCreating] = createSignal(false)
+  const [autoBusy, setAutoBusy] = createSignal<string | null>(null)
+  function autoLastTs(i: AutoInstance): number {
+    return i.last ? new Date(i.last.timestamp).getTime() : 0
+  }
+  const sortedAutos = () => [...autoInstances()].sort((a, b) => autoLastTs(b) - autoLastTs(a))
+  async function loadAutoInstances() {
+    try {
+      const r = await fetch('/api/auto/instances')
+      const d = await r.json()
+      setAutoInstances(d.instances || [])
+    } catch {}
+  }
+  async function loadAutoDetail(name: string) {
+    try {
+      const r = await fetch(`/api/auto/instances/${name}`)
+      if (r.ok) setAutoDetail(await r.json())
+    } catch {}
+  }
+  async function autoAction(name: string, action: 'start' | 'stop') {
+    setAutoBusy(name + ':' + action)
+    try { await fetch(`/api/auto/instances/${name}/${action}`, { method: 'POST' }); await loadAutoInstances() }
+    finally { setAutoBusy(null) }
+  }
+  async function autoFocus(name: string, focus: string) {
+    if (!focus.trim()) return
+    await fetch(`/api/auto/instances/${name}/focus`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ focus }) })
+    await loadAutoInstances()
+  }
+  async function autoBtw(name: string, note: string) {
+    if (!note.trim()) return
+    await fetch(`/api/auto/instances/${name}/btw`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note }) })
+    await loadAutoInstances()
+  }
+  async function autoLink(name: string, sessionId: string) {
+    await fetch(`/api/auto/instances/${name}/link`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId }) })
+    await loadAutoInstances()
+  }
+  async function autoCreate() {
+    const name = autoNewName().trim()
+    const goal = autoNewGoal().trim()
+    if (!name || !goal) return
+    setAutoCreating(true)
+    try {
+      const r = await fetch('/api/auto/instances', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, template: 'simple', goal }) })
+      if (!r.ok) { const e = await r.json().catch(() => ({})); alert('Create failed: ' + (e.error || r.status)); return }
+      try {
+        const sessionId = await createSession(undefined, 'claude')
+        await fetch(`/api/auto/instances/${name}/link`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId }) })
+        fetchSessions().then(s => setSessions(s)).catch(() => {})
+      } catch {}
+      setAutoNewName(''); setAutoNewGoal('')
+      await loadAutoInstances()
+      setCurrentAuto(name)
+      setSidebar(false)
+    } finally { setAutoCreating(false) }
+  }
   const [projectsExpanded, setProjectsExpanded] = createSignal(true)
   const [links, setLinks] = createSignal<QuickLink[]>([])
   const [starred, setStarred] = createSignal<Record<string, string[]>>({})
   const [projects, setProjects] = createSignal<Project[]>([])
+  const [codexAvailable, setCodexAvailable] = createSignal(false)
   const [currentProject, setCurrentProject] = createSignal<string | null>(localStorage.getItem('feather-next-project'))
   const [expandedGroups, setExpandedGroups] = createSignal<Record<string, boolean>>(JSON.parse(localStorage.getItem('feather-next-groups') || '{}'))
   const [unreadSessions, setUnreadSessions] = createSignal<Set<string>>(new Set())
@@ -173,6 +256,17 @@ export default function App() {
     setShowHidden(next)
     localStorage.setItem('feather-show-hidden', next ? '1' : '0')
     if (browseDir()) openFileBrowser(browseDir()!)
+  }
+
+  async function deleteBrowseEntry(full: string, name: string, isDir: boolean) {
+    const what = isDir ? 'directory (and all its contents)' : 'file'
+    if (!confirm(`Delete ${what}?\n\n${full}\n\nThis cannot be undone.`)) return
+    try {
+      await deletePath(full)
+      if (browseDir()) openFileBrowser(browseDir()!)
+    } catch (e: any) {
+      alert(`Delete failed: ${e.message || e}`)
+    }
   }
 
   const lastSeenUpdatedAt = new Map<string, string>() // session ID -> last known updatedAt
@@ -272,6 +366,7 @@ export default function App() {
     document.addEventListener('keydown', onGlobalKeyDown)
     updateSessions(await fetchSessions(currentProject()))
     fetchProjects().then(setProjects).catch(() => {})
+    fetchAgents().then(r => setCodexAvailable(r.agents.some(a => a.id === 'codex' && a.available))).catch(() => {})
     const base = location.pathname.replace(/\/+$/, '')
     fetch(`${base}/api/quick-links`).then(r => r.ok ? r.json() : []).then(setLinks).catch(() => {})
     fetchStarred().then(setStarred).catch(() => {})
@@ -324,6 +419,20 @@ export default function App() {
       prevProject = proj
       fetchSessions(proj).then(s => updateSessions(s)).catch(() => {})
     }
+  })
+
+  // Autoresize textarea on programmatic text changes (draft restore on session
+  // select, voice dictation, history navigation). The onInput handler covers
+  // typing/pasting; this effect covers the rest. Without it the textarea stays
+  // pinned at rows=1 and long restored text scrolls behind a 1-line viewport.
+  createEffect(() => {
+    text() // subscribe
+    if (!textareaRef) return
+    queueMicrotask(() => {
+      if (!textareaRef) return
+      textareaRef.style.height = 'auto'
+      textareaRef.style.height = Math.min(textareaRef.scrollHeight, 120) + 'px'
+    })
   })
 
   async function select(id: string) {
@@ -501,14 +610,14 @@ export default function App() {
     messageScrollRef.scrollTo({ top: messageScrollRef.scrollTop + offset })
   }
 
-  async function handleNew(newTab = false) {
+  async function handleNew(newTab = false, agent: 'claude' | 'codex' = 'claude') {
     setCreating(true)
     // Open the window synchronously to avoid popup blockers (iOS Safari
     // blocks window.open after an await breaks the user-gesture chain)
     const w = newTab ? window.open('', '_blank') : null
     try {
       const proj = currentProject() ? projects().find(p => p.id === currentProject()) : null
-      const id = await createSession(proj?.cwd ?? undefined)
+      const id = await createSession(proj?.cwd ?? undefined, agent)
       // Fetch without project filter since the new session has no project yet
       updateSessions(await fetchSessions())
       if (w) {
@@ -719,6 +828,22 @@ export default function App() {
     else setFavicon('#666')                    // Gray when inactive
   })
 
+  createEffect(() => {
+    const needList = (sidebarTab() === 'auto' && sidebar()) || currentAuto() !== null
+    if (!needList) return
+    loadAutoInstances()
+    const id = setInterval(loadAutoInstances, 5000)
+    onCleanup(() => clearInterval(id))
+  })
+
+  createEffect(() => {
+    const name = currentAuto()
+    if (!name) { setAutoDetail(null); return }
+    loadAutoDetail(name)
+    const id = setInterval(() => loadAutoDetail(name), 4000)
+    onCleanup(() => clearInterval(id))
+  })
+
   // Page title: feather icon + status dot + project name
   createEffect(() => {
     const s = headerSession()
@@ -863,6 +988,7 @@ export default function App() {
           {/* Sidebar tabs */}
           <div style={{ display: 'flex', 'border-bottom': '1px solid #1e1e1e' }}>
             <button onClick={() => setSidebarTab('sessions')} style={{ flex: '1', padding: '8px', border: 'none', 'border-bottom': sidebarTab() === 'sessions' ? '2px solid #4aba6a' : '2px solid transparent', background: 'none', color: sidebarTab() === 'sessions' ? '#e5e5e5' : '#666', 'font-size': '12px', 'font-weight': '600', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Sessions</button>
+            <button onClick={() => setSidebarTab('auto')} style={{ flex: '1', padding: '8px', border: 'none', 'border-bottom': sidebarTab() === 'auto' ? '2px solid #4aba6a' : '2px solid transparent', background: 'none', color: sidebarTab() === 'auto' ? '#e5e5e5' : '#666', 'font-size': '12px', 'font-weight': '600', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Auto</button>
             <button onClick={() => setSidebarTab('links')} style={{ flex: '1', padding: '8px', border: 'none', 'border-bottom': sidebarTab() === 'links' ? '2px solid #4aba6a' : '2px solid transparent', background: 'none', color: sidebarTab() === 'links' ? '#e5e5e5' : '#666', 'font-size': '12px', 'font-weight': '600', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Links</button>
           </div>
           {/* Sessions tab */}
@@ -946,6 +1072,11 @@ export default function App() {
               <button onClick={() => handleNew(true)} disabled={creating()} title="Open in new tab" style={{ padding: '10px 12px', background: creating() ? '#1a1a2e' : '#3a9a5a', color: creating() ? '#666' : '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                 &#8599;
               </button>
+              <Show when={codexAvailable()}>
+                <button onClick={() => handleNew(false, 'codex')} disabled={creating()} title="New Codex session" style={{ padding: '10px 12px', background: creating() ? '#1a1a2e' : '#c084fc', color: creating() ? '#666' : '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                  + Codex
+                </button>
+              </Show>
               <button onClick={() => { setSearchOpen(!searchOpen()); if (!searchOpen()) { setSearchQuery(''); setSearchResults([]) } }} title="Search chats" style={{ padding: '10px 12px', background: searchOpen() ? '#4aba6a' : '#1a1a2e', color: searchOpen() ? '#000' : '#888', border: '1px solid #333', 'border-radius': '8px', 'font-size': '14px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                 &#x1F50D;
               </button>
@@ -1034,6 +1165,9 @@ export default function App() {
                               <div style={{ 'font-size': '10px', color: '#444', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{s.projectLabel}</div>
                             </Show>
                           </div>
+                          <Show when={s.agent === 'codex'}>
+                            <span style={{ 'font-size': '9px', padding: '1px 5px', 'border-radius': '3px', background: '#2a1e3a', color: '#c084fc', 'flex-shrink': '0', 'font-weight': '600' }}>codex</span>
+                          </Show>
                           <span style={{ 'font-size': '11px', color: '#555', 'flex-shrink': '0' }}>{timeAgo(s.updatedAt)}</span>
                         </div>
                       }>
@@ -1070,11 +1204,135 @@ export default function App() {
               </Show>
             </div>
           </Show>
+          {/* Auto tab */}
+          <Show when={sidebarTab() === 'auto'}>
+            <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', 'overscroll-behavior': 'contain', 'padding-bottom': 'env(safe-area-inset-bottom)' }}>
+              <div style={{ padding: '12px 16px', 'border-bottom': '1px solid #1e1e1e' }}>
+                <input value={autoNewName()} onInput={(e) => setAutoNewName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))} placeholder="name (lowercase)" style={{ width: '100%', padding: '6px 8px', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '6px', color: '#e5e5e5', 'font-size': '12px', 'margin-bottom': '6px', outline: 'none' }} />
+                <textarea value={autoNewGoal()} onInput={(e) => setAutoNewGoal(e.target.value)} placeholder="goal (what should it loop on?)" rows={2} style={{ width: '100%', padding: '6px 8px', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '6px', color: '#e5e5e5', 'font-size': '12px', resize: 'vertical', 'font-family': 'inherit', outline: 'none' }} />
+                <button onClick={autoCreate} disabled={autoCreating() || !autoNewName() || !autoNewGoal()} style={{ width: '100%', 'margin-top': '6px', padding: '6px', background: autoCreating() ? '#1a1a2e' : '#4aba6a', color: autoCreating() ? '#666' : '#000', border: 'none', 'border-radius': '6px', 'font-size': '12px', 'font-weight': '600', cursor: autoCreating() ? 'wait' : 'pointer' }}>{autoCreating() ? 'Creating...' : '+ New auto'}</button>
+              </div>
+              <Show when={autoInstances().length === 0}>
+                <div style={{ padding: '20px 16px', color: '#555', 'font-size': '13px' }}>No autos yet.</div>
+              </Show>
+              <For each={sortedAutos()}>{(inst) => (
+                <div onClick={() => { setCurrentAuto(inst.name); setSidebar(false) }}
+                  style={{ padding: '10px 16px', cursor: 'pointer', 'border-bottom': '1px solid #111', 'border-left': currentAuto() === inst.name ? '3px solid #4aba6a' : '3px solid transparent', background: currentAuto() === inst.name ? '#1a1a2e' : 'transparent', '-webkit-tap-highlight-color': 'transparent' }}>
+                  <div style={{ display: 'flex', 'align-items': 'center', gap: '6px' }}>
+                    <span style={{ width: '8px', height: '8px', 'border-radius': '50%', background: inst.running ? '#4aba6a' : '#555', 'flex-shrink': '0' }} />
+                    <span style={{ 'font-size': '13px', 'font-weight': '600', flex: '1', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{inst.name}</span>
+                    <span style={{ 'font-size': '10px', color: '#888', 'flex-shrink': '0' }}>k{inst.keeps}/r{inst.reverts}/c{inst.crashes}</span>
+                  </div>
+                  <Show when={inst.last}>
+                    <div style={{ 'font-size': '10px', color: '#555', 'margin-top': '2px' }}>{timeAgo(inst.last!.timestamp)} — {inst.last!.status}</div>
+                  </Show>
+                </div>
+              )}</For>
+            </div>
+          </Show>
         </div>
       </div>
 
       {/* Main */}
-      <div style={{ flex: '1', display: 'flex', 'flex-direction': 'column', 'min-width': '0', height: '100%' }}>
+      <div style={{ flex: '1', display: 'flex', 'flex-direction': 'column', 'min-width': '0', height: '100%', position: 'relative' }}>
+        {/* Auto detail overlay */}
+        <Show when={currentAuto()}>{(name) => {
+          const inst = () => autoDetail() || autoInstances().find(i => i.name === name())
+          const recent = () => {
+            const r = autoDetail()?.results
+            if (!r) return [] as { ts: string; status: string; desc: string }[]
+            return r.split('\n').slice(1).filter(Boolean).slice(-15).reverse().map(line => {
+              const [ts, status, ...rest] = line.split('\t')
+              return { ts, status, desc: rest.join('\t') }
+            })
+          }
+          return (
+            <div style={{ position: 'absolute', inset: '0', background: '#0a0a0a', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', 'padding-top': 'max(8px, env(safe-area-inset-top))', 'z-index': '50' }}>
+              <div style={{ padding: '12px 24px 12px 56px', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'align-items': 'center', gap: '12px', 'flex-wrap': 'wrap' }}>
+                <span style={{ width: '12px', height: '12px', 'border-radius': '50%', background: inst()?.running ? '#4aba6a' : '#555' }} />
+                <span style={{ 'font-size': '20px', 'font-weight': '700' }}>{name()}</span>
+                <span style={{ 'font-size': '12px', color: '#888', padding: '2px 8px', background: '#1a1a2e', 'border-radius': '4px' }}>{inst()?.running ? 'RUNNING' : 'STOPPED'}</span>
+                <div style={{ flex: '1' }} />
+                <Show when={inst()?.mainChat}>
+                  <button onClick={(e) => { e.preventDefault(); const m = inst()?.mainChat; if (m) { setCurrentAuto(null); select(m) } }} style={{ background: 'none', border: '1px solid #2a3a55', color: '#73b8ff', padding: '4px 10px', 'border-radius': '6px', 'font-size': '13px', cursor: 'pointer' }}>&rarr; main chat</button>
+                </Show>
+                <button onClick={() => setCurrentAuto(null)} style={{ background: 'none', border: 'none', color: '#888', 'font-size': '20px', cursor: 'pointer', padding: '4px 8px' }}>&times;</button>
+              </div>
+              <div style={{ padding: '20px 24px 20px 56px', 'max-width': '900px' }}>
+                <div style={{ display: 'grid', 'grid-template-columns': 'repeat(auto-fit, minmax(120px, 1fr))', gap: '12px', 'margin-bottom': '20px' }}>
+                  <div style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '8px', padding: '12px' }}>
+                    <div style={{ 'font-size': '11px', color: '#666', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>Iterations</div>
+                    <div style={{ 'font-size': '24px', 'font-weight': '700', 'margin-top': '4px' }}>{inst()?.iterations ?? 0}</div>
+                  </div>
+                  <div style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '8px', padding: '12px' }}>
+                    <div style={{ 'font-size': '11px', color: '#666', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>Keeps</div>
+                    <div style={{ 'font-size': '24px', 'font-weight': '700', color: '#4aba6a', 'margin-top': '4px' }}>{inst()?.keeps ?? 0}</div>
+                  </div>
+                  <div style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '8px', padding: '12px' }}>
+                    <div style={{ 'font-size': '11px', color: '#666', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>Reverts</div>
+                    <div style={{ 'font-size': '24px', 'font-weight': '700', color: '#d4a050', 'margin-top': '4px' }}>{inst()?.reverts ?? 0}</div>
+                  </div>
+                  <div style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '8px', padding: '12px' }}>
+                    <div style={{ 'font-size': '11px', color: '#666', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>Crashes</div>
+                    <div style={{ 'font-size': '24px', 'font-weight': '700', color: '#d45555', 'margin-top': '4px' }}>{inst()?.crashes ?? 0}</div>
+                  </div>
+                </div>
+                <Show when={inst()?.current}>
+                  <div style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '8px', padding: '12px 16px', 'margin-bottom': '16px', 'font-size': '13px', color: '#aaa' }}>
+                    <span style={{ color: '#666', 'font-size': '11px', 'text-transform': 'uppercase', 'letter-spacing': '0.05em', 'margin-right': '8px' }}>Now</span>
+                    {inst()!.current}
+                  </div>
+                </Show>
+                <div style={{ display: 'flex', gap: '8px', 'margin-bottom': '16px' }}>
+                  <Show when={!inst()?.running} fallback={
+                    <button onClick={() => autoAction(name(), 'stop')} disabled={autoBusy() !== null} style={{ padding: '10px 20px', background: '#d45555', color: '#fff', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: 'pointer' }}>{autoBusy() === name() + ':stop' ? '...' : 'Stop'}</button>
+                  }>
+                    <button onClick={() => autoAction(name(), 'start')} disabled={autoBusy() !== null} style={{ padding: '10px 20px', background: '#4aba6a', color: '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: 'pointer' }}>{autoBusy() === name() + ':start' ? '...' : 'Start'}</button>
+                  </Show>
+                  <Show when={!inst()?.mainChat}>
+                    <button onClick={() => { const id = currentId(); if (id) autoLink(name(), id); else alert('Open a chat first to link.') }} style={{ padding: '10px 16px', background: 'none', border: '1px solid #333', 'border-radius': '8px', color: '#888', 'font-size': '13px', cursor: 'pointer' }}>Link current chat</button>
+                  </Show>
+                </div>
+                <div style={{ 'margin-bottom': '16px' }}>
+                  <div style={{ 'font-size': '11px', color: '#666', 'text-transform': 'uppercase', 'letter-spacing': '0.05em', 'margin-bottom': '6px' }}>Set focus</div>
+                  <input placeholder="What should it work on next?" onKeyDown={async (e) => { if (e.key === 'Enter') { await autoFocus(name(), e.currentTarget.value); e.currentTarget.value = ''; loadAutoDetail(name()) } }} style={{ width: '100%', padding: '10px 12px', background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '8px', color: '#e5e5e5', 'font-size': '13px', outline: 'none' }} />
+                </div>
+                <div style={{ 'margin-bottom': '24px' }}>
+                  <div style={{ 'font-size': '11px', color: '#666', 'text-transform': 'uppercase', 'letter-spacing': '0.05em', 'margin-bottom': '6px' }}>BTW (heads-up to the worker)</div>
+                  <input placeholder="Add a note for the next iteration..." onKeyDown={async (e) => { if (e.key === 'Enter') { await autoBtw(name(), e.currentTarget.value); e.currentTarget.value = ''; loadAutoDetail(name()) } }} style={{ width: '100%', padding: '10px 12px', background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '8px', color: '#e5e5e5', 'font-size': '13px', outline: 'none' }} />
+                </div>
+                <Show when={recent().length > 0}>
+                  <div style={{ 'font-size': '11px', color: '#666', 'text-transform': 'uppercase', 'letter-spacing': '0.05em', 'margin-bottom': '8px' }}>Recent activity</div>
+                  <div style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '8px', overflow: 'hidden' }}>
+                    <For each={recent()}>{(r) => (
+                      <div style={{ padding: '8px 12px', 'border-bottom': '1px solid #1a1a2e', 'font-size': '12px', display: 'flex', gap: '8px', 'align-items': 'flex-start' }}>
+                        <span style={{ color: '#555', 'flex-shrink': '0', 'font-family': 'monospace' }}>{timeAgo(r.ts)}</span>
+                        <span style={{ color: r.status === 'keep' ? '#4aba6a' : r.status === 'revert' ? '#d4a050' : '#d45555', 'font-weight': '600', 'flex-shrink': '0', 'min-width': '50px' }}>{r.status}</span>
+                        <span style={{ color: '#aaa', flex: '1', 'word-break': 'break-word' }}>{r.desc}</span>
+                      </div>
+                    )}</For>
+                  </div>
+                </Show>
+                <Show when={autoDetail()?.workerSessions && autoDetail()!.workerSessions!.length > 0}>
+                  <div style={{ 'margin-top': '24px', 'margin-bottom': '8px', 'font-size': '11px', color: '#666', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>Worker sessions</div>
+                  <div style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '8px', overflow: 'hidden' }}>
+                    <For each={autoDetail()!.workerSessions!}>{(w) => (
+                      <div onClick={() => { setCurrentAuto(null); select(w.id) }} style={{ padding: '8px 12px', 'border-bottom': '1px solid #1a1a2e', 'font-size': '12px', display: 'flex', gap: '8px', 'align-items': 'center', cursor: 'pointer' }}>
+                        <span style={{ color: '#555', 'flex-shrink': '0', 'font-family': 'monospace', 'min-width': '34px' }}>{timeAgo(w.mtime)}</span>
+                        <span style={{ 'font-size': '9px', padding: '1px 5px', 'border-radius': '3px', background: w.agent === 'codex' ? '#2a1e3a' : '#1e2a3a', color: w.agent === 'codex' ? '#c084fc' : '#73b8ff', 'flex-shrink': '0', 'font-weight': '600' }}>{w.agent}</span>
+                        <span style={{ color: '#888', 'font-family': 'monospace', 'font-size': '11px' }}>{w.id.slice(0, 8)}</span>
+                      </div>
+                    )}</For>
+                  </div>
+                </Show>
+                <Show when={autoDetail()?.program}>
+                  <div style={{ 'margin-top': '24px', 'margin-bottom': '8px', 'font-size': '11px', color: '#666', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>Program</div>
+                  <div class="prose" style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '8px', padding: '4px 20px', color: '#d0d0d0', 'font-size': '14px', 'line-height': '1.55' }} innerHTML={marked.parse(autoDetail()!.program!) as string} />
+                </Show>
+              </div>
+            </div>
+          )
+        }}</Show>
         {/* Header */}
         <div style={{ padding: '8px 16px 0 56px', 'padding-top': 'max(8px, env(safe-area-inset-top))', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'align-items': 'center', gap: '8px', 'min-height': '48px', 'flex-shrink': '0' }}>
           <Show when={headerSession()} fallback={<span style={{ color: '#666', 'font-size': '14px' }}>{currentId() ? 'Loading...' : 'Select a session'}</span>}>
@@ -1165,69 +1423,105 @@ export default function App() {
               <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (currentId()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (currentId()) toggleStar(currentId()!, uuid) }} working={working()} scrollRefCb={(el) => { messageScrollRef = el }} sessionId={currentId()} />
             </div>
             <div style={{ display: tab() === 'files' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%' }}>
-              {/* File browser */}
-              <Show when={browseDir()}>
-                <div style={{ padding: '6px 16px', display: 'flex', 'align-items': 'center', gap: '8px', 'border-bottom': '1px solid #111', 'flex-shrink': '0' }}>
-                  <Show when={browseParent()}>
-                    <button onClick={() => openFileBrowser(browseParent()!)} style={{ background: 'none', border: 'none', color: '#73b8ff', cursor: 'pointer', 'font-size': '12px', padding: '0', '-webkit-tap-highlight-color': 'transparent' }}>
-                      ..
-                    </button>
+              {/* Mode toggle */}
+              <div style={{ display: 'flex', gap: '4px', padding: '8px 12px', 'border-bottom': '1px solid #1e1e1e', 'flex-shrink': '0' }}>
+                <button onClick={() => setFilesMode('changed')}
+                  style={{ background: filesMode() === 'changed' ? '#1e1e1e' : 'transparent', border: '1px solid #333', color: filesMode() === 'changed' ? '#e5e5e5' : '#888', 'font-size': '12px', padding: '4px 10px', 'border-radius': '6px', cursor: 'pointer' }}>
+                  Changed{touchedFiles().length > 0 ? ` (${touchedFiles().length})` : ''}
+                </button>
+                <button onClick={() => setFilesMode('browse')}
+                  style={{ background: filesMode() === 'browse' ? '#1e1e1e' : 'transparent', border: '1px solid #333', color: filesMode() === 'browse' ? '#e5e5e5' : '#888', 'font-size': '12px', padding: '4px 10px', 'border-radius': '6px', cursor: 'pointer' }}>
+                  Browse
+                </button>
+              </div>
+              {/* Changed mode */}
+              <Show when={filesMode() === 'changed'}>
+                <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '8px 0' }}>
+                  <Show when={touchedFiles().length === 0}>
+                    <div style={{ color: '#555', 'text-align': 'center', padding: '40px', 'font-size': '13px' }}>No files touched yet</div>
                   </Show>
-                  <span style={{ 'font-size': '11px', color: '#888', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1' }}>{browseDir()}</span>
-                  <button onClick={toggleHidden} title={showHidden() ? 'Hide dotfiles' : 'Show dotfiles'} style={{ background: showHidden() ? '#1e3a5f' : 'transparent', border: `1px solid ${showHidden() ? '#73b8ff' : '#444'}`, color: showHidden() ? '#73b8ff' : '#999', cursor: 'pointer', 'font-size': '12px', padding: '4px 10px', 'border-radius': '4px', '-webkit-tap-highlight-color': 'transparent', 'flex-shrink': '0', 'font-family': "'SF Mono', Menlo, monospace", 'user-select': 'none' }}>
-                    {showHidden() ? '☑ .hidden' : '☐ .hidden'}
-                  </button>
-                </div>
-              </Show>
-              <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch' }}>
-                <Show when={browseLoading()}>
-                  <div style={{ padding: '12px 16px', color: '#555', 'font-size': '12px' }}>Loading...</div>
-                </Show>
-                <Show when={!browseLoading() && browseDir()}>
-                  <For each={browseEntries()}>{(entry) => {
-                    const base = location.pathname.replace(/\/+$/, '')
-                    const fmtSize = (s: number | null) => {
-                      if (s === null) return ''
-                      if (s < 1024) return `${s}B`
-                      if (s < 1024 * 1024) return `${(s / 1024).toFixed(0)}K`
-                      return `${(s / (1024 * 1024)).toFixed(1)}M`
-                    }
-                    const fmtAge = (mtime: string) => {
-                      if (!mtime) return ''
-                      const ms = Date.now() - new Date(mtime).getTime()
-                      const sec = Math.floor(ms / 1000)
-                      if (sec < 60) return 'just now'
-                      const min = Math.floor(sec / 60)
-                      if (min < 60) return `${min}m ago`
-                      const hr = Math.floor(min / 60)
-                      if (hr < 24) return `${hr}h ago`
-                      const days = Math.floor(hr / 24)
-                      if (days < 30) return `${days}d ago`
-                      const months = Math.floor(days / 30)
-                      if (months < 12) return `${months}mo ago`
-                      return `${Math.floor(months / 12)}y ago`
-                    }
+                  <For each={touchedFiles()}>{(f) => {
+                    const short = f.path.split('/').slice(-2).join('/')
+                    const actionColors: Record<string, string> = { Read: '#73b8ff', Write: '#4aba6a', Edit: '#c4993a', Grep: '#b48ead', Glob: '#88c0d0' }
                     return (
-                      <div style={{ padding: '4px 16px', 'font-size': '12px', display: 'flex', 'align-items': 'center', gap: '8px', 'border-bottom': '1px solid #0a0a0a' }}>
-                        {entry.isDir ? (
-                          <button onClick={() => openFileBrowser(entry.path)} style={{ background: 'none', border: 'none', color: '#c4993a', cursor: 'pointer', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", padding: '0', 'text-align': 'left', flex: '1', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', '-webkit-tap-highlight-color': 'transparent' }}>
-                            {entry.name}/
-                          </button>
-                        ) : (
-                          <a href={`${base}/api/files/raw?path=${encodeURIComponent(entry.path)}`} target="_blank" rel="noopener" style={{ color: '#e5e5e5', 'text-decoration': 'none', 'font-family': "'SF Mono', Menlo, monospace", flex: '1', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>
-                            {entry.name}
-                          </a>
-                        )}
-                        <span style={{ color: '#555', 'font-size': '10px', 'flex-shrink': '0' }}>{fmtAge(entry.mtime)}</span>
-                        <span style={{ color: '#444', 'font-size': '10px', 'flex-shrink': '0', 'min-width': '30px', 'text-align': 'right' }}>{fmtSize(entry.size)}</span>
+                      <div onClick={() => openFile(f.path)} style={{ padding: '8px 16px', 'border-bottom': '1px solid #111', 'font-size': '13px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                        <div style={{ display: 'flex', 'align-items': 'center', gap: '6px' }}>
+                          <span style={{ color: '#e5e5e5', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1' }} title={f.path}>{short}</span>
+                          <For each={f.actions}>{(a) => (
+                            <span style={{ 'font-size': '10px', padding: '1px 5px', 'border-radius': '3px', background: 'rgba(255,255,255,0.05)', color: actionColors[a] || '#888' }}>{a}</span>
+                          )}</For>
+                        </div>
+                        <div style={{ color: '#444', 'font-size': '11px', 'font-family': "'SF Mono', Menlo, monospace", 'margin-top': '2px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{f.path}</div>
                       </div>
                     )
                   }}</For>
-                  <Show when={browseEntries().length === 0}>
-                    <div style={{ padding: '12px 16px', color: '#444', 'font-size': '12px' }}>Empty directory</div>
-                  </Show>
+                </div>
+              </Show>
+              {/* Browse mode */}
+              <Show when={filesMode() === 'browse'}>
+                <Show when={browseDir()}>
+                  <div style={{ padding: '6px 16px', display: 'flex', 'align-items': 'center', gap: '8px', 'border-bottom': '1px solid #111', 'flex-shrink': '0' }}>
+                    <Show when={browseParent()}>
+                      <button onClick={() => openFileBrowser(browseParent()!)} style={{ background: 'none', border: 'none', color: '#73b8ff', cursor: 'pointer', 'font-size': '12px', padding: '0', '-webkit-tap-highlight-color': 'transparent' }}>
+                        ..
+                      </button>
+                    </Show>
+                    <span style={{ 'font-size': '11px', color: '#888', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1' }}>{browseDir()}</span>
+                    <button onClick={toggleHidden} title={showHidden() ? 'Hide dotfiles' : 'Show dotfiles'} style={{ background: showHidden() ? '#1e3a5f' : 'transparent', border: `1px solid ${showHidden() ? '#73b8ff' : '#444'}`, color: showHidden() ? '#73b8ff' : '#999', cursor: 'pointer', 'font-size': '12px', padding: '4px 10px', 'border-radius': '4px', '-webkit-tap-highlight-color': 'transparent', 'flex-shrink': '0', 'font-family': "'SF Mono', Menlo, monospace", 'user-select': 'none' }}>
+                      {showHidden() ? '☑ .hidden' : '☐ .hidden'}
+                    </button>
+                  </div>
                 </Show>
-              </div>
+                <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch' }}>
+                  <Show when={browseLoading()}>
+                    <div style={{ padding: '12px 16px', color: '#555', 'font-size': '12px' }}>Loading...</div>
+                  </Show>
+                  <Show when={!browseLoading() && browseDir()}>
+                    <For each={browseEntries()}>{(entry) => {
+                      const fmtSize = (s: number | null) => {
+                        if (s === null) return ''
+                        if (s < 1024) return `${s}B`
+                        if (s < 1024 * 1024) return `${(s / 1024).toFixed(0)}K`
+                        return `${(s / (1024 * 1024)).toFixed(1)}M`
+                      }
+                      const fmtAge = (mtime: string) => {
+                        if (!mtime) return ''
+                        const ms = Date.now() - new Date(mtime).getTime()
+                        const sec = Math.floor(ms / 1000)
+                        if (sec < 60) return 'just now'
+                        const min = Math.floor(sec / 60)
+                        if (min < 60) return `${min}m ago`
+                        const hr = Math.floor(min / 60)
+                        if (hr < 24) return `${hr}h ago`
+                        const days = Math.floor(hr / 24)
+                        if (days < 30) return `${days}d ago`
+                        const months = Math.floor(days / 30)
+                        if (months < 12) return `${months}mo ago`
+                        return `${Math.floor(months / 12)}y ago`
+                      }
+                      return (
+                        <div style={{ padding: '4px 16px', 'font-size': '12px', display: 'flex', 'align-items': 'center', gap: '8px', 'border-bottom': '1px solid #0a0a0a' }}>
+                          {entry.isDir ? (
+                            <button onClick={() => openFileBrowser(entry.path)} style={{ background: 'none', border: 'none', color: '#c4993a', cursor: 'pointer', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", padding: '0', 'text-align': 'left', flex: '1', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', '-webkit-tap-highlight-color': 'transparent' }}>
+                              {entry.name}/
+                            </button>
+                          ) : (
+                            <button onClick={() => openFile(entry.path)} style={{ background: 'none', border: 'none', color: '#e5e5e5', cursor: 'pointer', 'font-family': "'SF Mono', Menlo, monospace", padding: '0', 'text-align': 'left', flex: '1', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', 'font-size': '12px', '-webkit-tap-highlight-color': 'transparent' }}>
+                              {entry.name}
+                            </button>
+                          )}
+                          <span style={{ color: '#555', 'font-size': '10px', 'flex-shrink': '0' }}>{fmtAge(entry.mtime)}</span>
+                          <span style={{ color: '#444', 'font-size': '10px', 'flex-shrink': '0', 'min-width': '30px', 'text-align': 'right' }}>{fmtSize(entry.size)}</span>
+                          <button onClick={(ev) => { ev.stopPropagation(); deleteBrowseEntry(entry.path, entry.name, entry.isDir) }} title={`Delete ${entry.name}`} style={{ background: 'none', border: 'none', color: '#664', cursor: 'pointer', 'font-size': '11px', padding: '0 2px', 'flex-shrink': '0', '-webkit-tap-highlight-color': 'transparent' }}>🗑</button>
+                        </div>
+                      )
+                    }}</For>
+                    <Show when={browseEntries().length === 0}>
+                      <div style={{ padding: '12px 16px', color: '#444', 'font-size': '12px' }}>Empty directory</div>
+                    </Show>
+                  </Show>
+                </div>
+              </Show>
             </div>
             <div style={{ display: tab() === 'terminal' ? 'block' : 'none', height: '100%' }}>
               <Terminal sessionId={tab() === 'terminal' ? currentId() : null} />
@@ -1240,6 +1534,38 @@ export default function App() {
           <div style={{ position: 'absolute', inset: '0', background: 'rgba(74,186,106,0.1)', border: '2px dashed #4aba6a', 'border-radius': '12px', 'z-index': '100', display: 'flex', 'align-items': 'center', 'justify-content': 'center', 'pointer-events': 'none' }}>
             <span style={{ color: '#4aba6a', 'font-size': '18px', 'font-weight': '600' }}>Drop files to attach</span>
           </div>
+        </Show>
+
+        {/* File viewer modal */}
+        <Show when={viewingFile()}>
+          {(() => {
+            const v = viewingFile()!
+            const isMd = v.path.toLowerCase().endsWith('.md')
+            return (
+              <div onClick={() => setViewingFile(null)} style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.6)', 'z-index': '200', display: 'flex', 'align-items': 'stretch', 'justify-content': 'center', padding: 'max(20px, env(safe-area-inset-top)) 16px max(20px, env(safe-area-inset-bottom))' }}>
+                <div onClick={(e) => e.stopPropagation()} style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '12px', 'max-width': '900px', width: '100%', display: 'flex', 'flex-direction': 'column', overflow: 'hidden' }}>
+                  <div style={{ display: 'flex', 'align-items': 'center', gap: '8px', padding: '10px 14px', 'border-bottom': '1px solid #1e1e1e', background: '#0a0e14', 'flex-shrink': '0' }}>
+                    <span style={{ color: '#888', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1' }} title={v.path}>{v.path}</span>
+                    <button onClick={() => setViewingFile(null)} style={{ background: 'transparent', border: 'none', color: '#888', 'font-size': '20px', cursor: 'pointer', padding: '0 4px', 'line-height': '1' }}>&times;</button>
+                  </div>
+                  <div style={{ 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', flex: '1' }}>
+                    <Show when={v.error}>
+                      <div style={{ padding: '20px', color: '#c44', 'font-size': '13px' }}>{v.error}</div>
+                    </Show>
+                    <Show when={!v.error && !v.content}>
+                      <div style={{ padding: '20px', color: '#666', 'font-size': '13px' }}>Loading…</div>
+                    </Show>
+                    <Show when={!v.error && v.content && isMd}>
+                      <div class="prose" style={{ padding: '4px 24px', color: '#d0d0d0', 'font-size': '14px', 'line-height': '1.55' }} innerHTML={marked.parse(v.content) as string} />
+                    </Show>
+                    <Show when={!v.error && v.content && !isMd}>
+                      <pre style={{ margin: '0', padding: '16px 20px', color: '#d0d0d0', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{v.content}</pre>
+                    </Show>
+                  </div>
+                </div>
+              </div>
+            )
+          })()}
         </Show>
 
         {/* Question popup */}

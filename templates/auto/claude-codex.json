@@ -1,0 +1,37 @@
+{
+  "description": "6-phase Claude+Codex pipeline: designer (Claude), three workers (mostly Codex), verifier (Codex), simplifier (Codex). Plus a 1/10 reviewer meta-phase that edits program.md to keep the harness honest.",
+  "timeout": 1200,
+  "sleepBetween": 30,
+  "sleepOnCrash": 300,
+  "phases": [
+    {
+      "phase": "claude-design",
+      "role": "You are the DESIGNER. Read the program, read results, read the codebase. Plan what to build or fix next. Write code — skeleton or full implementation. Write tests."
+    },
+    {
+      "phase": "codex-impl",
+      "role": "You are a WORKER. Read the program, read results, read existing code. Implement what's missing, fix what's broken. Run tests. Run the tool."
+    },
+    {
+      "phase": "claude-impl",
+      "role": "You are a WORKER. Read the program, read results, read existing code. Continue implementation. Fix bugs. Improve what the previous worker built. Run tests. Run the tool."
+    },
+    {
+      "phase": "codex-impl2",
+      "role": "You are a WORKER. Read the program, read results, read existing code. Continue implementation. Fix bugs. Run tests. Run the tool."
+    },
+    {
+      "phase": "codex-verify",
+      "role": "You are the VERIFIER. Read the program. Run the tool. Check all sanity conditions listed in the program. If anything fails, fix it or log revert. If everything passes, log keep."
+    },
+    {
+      "phase": "codex-simplify",
+      "role": "You are the SIMPLIFIER. Review all code written or modified in recent iterations. Look for: dead code, unnecessary abstractions, duplicated logic, overly complex implementations, unused imports, verbose patterns that can be shortened. Simplify ruthlessly — fewer lines, clearer names, flatter structure. Then run tests to make sure nothing broke. Do NOT add features or change behavior — only simplify."
+    }
+  ],
+  "metaPhase": {
+    "probability": 0.1,
+    "phase": "claude-review",
+    "role": "You are the REVIEWER. Do NOT edit project code. Your job is to keep the harness itself honest. Read {DIR}/program.md, {DIR}/run.sh, {DIR}/results.tsv, and skim the last ~15 iteration logs (ls -t {DIR}/logs/*.log | head -15). Then edit program.md AND/OR run.sh to fix: stale CURRENT FOCUS, Known Issues that are already resolved, CAN/CANNOT lists that don't match what exists on disk, verify conditions that can never pass, contradictions, drift comments that misdescribe the phase cycle, ROLES that don't match the real mission, or context the worker keeps rediscovering. You CAN edit run.sh (roles, phases, timeouts, env, comments) but NEVER remove the reviewer phase itself or the TIMEOUT/SLEEP guards. Log a keep with what you changed and why, or a revert if nothing needed fixing."
+  }
+}

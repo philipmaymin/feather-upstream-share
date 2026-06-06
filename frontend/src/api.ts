@@ -5,10 +5,20 @@ export interface SessionMeta {
   title: string
   updatedAt: string
   isActive: boolean
-  projectId?: string
+  projectId?: string | null
   projectLabel?: string | null
   cwd?: string | null
+  agent?: 'claude' | 'codex'
 }
+
+export interface AgentInfo {
+  id: 'claude' | 'codex'
+  label: string
+  available: boolean
+}
+
+export const fetchAgents = (): Promise<{ agents: AgentInfo[] }> =>
+  fetch(`${BASE}/api/agents`).then(r => r.json())
 
 export interface Project {
   id: string
@@ -56,6 +66,11 @@ export async function fetchProjects(): Promise<Project[]> {
   return (await r.json()).projects
 }
 
+export async function deletePath(path: string): Promise<void> {
+  const r = await fetch(`${BASE}/api/files/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' })
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`)
+}
+
 export async function fetchMessages(id: string, before = 0): Promise<{ messages: Message[], hasMore: boolean }> {
   const url = before > 0
     ? `${BASE}/api/sessions/${id}/messages?before=${before}`
@@ -69,9 +84,9 @@ export const sendInput = (id: string, text: string): Promise<{ ok: boolean, sent
   fetch(`${BASE}/api/sessions/${id}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) })
     .then(r => r.json())
 
-export async function createSession(cwd?: string): Promise<string> {
+export async function createSession(cwd?: string, agent?: 'claude' | 'codex'): Promise<string> {
   const id = crypto.randomUUID()
-  await fetch(`${BASE}/api/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, cwd }) })
+  await fetch(`${BASE}/api/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, cwd, agent }) })
   return id
 }
 

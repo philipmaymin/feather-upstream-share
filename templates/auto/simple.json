@@ -1,0 +1,12 @@
+{
+  "description": "Single-phase Claude loop. Trivial goals, harness tests.",
+  "timeout": 600,
+  "sleepBetween": 15,
+  "sleepOnCrash": 60,
+  "phases": [
+    {
+      "phase": "claude",
+      "role": "Read the program. Do one iteration. Log result."
+    }
+  ]
+}
