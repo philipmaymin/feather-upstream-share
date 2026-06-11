@@ -115,15 +115,44 @@ export default function App() {
   const [text, setText] = createSignal('')
   const [tab, setTab] = createSignal<'chat' | 'files' | 'terminal'>('chat')
   const [filesMode, setFilesMode] = createSignal<'changed' | 'browse'>('browse')
-  const [viewingFile, setViewingFile] = createSignal<{ path: string; content: string; error?: string } | null>(null)
+  const TEXT_EXTS = new Set(['.txt', '.md', '.js', '.ts', '.tsx', '.jsx', '.json', '.html', '.css', '.py', '.rb', '.go', '.rs', '.sh', '.yml', '.yaml', '.toml', '.cfg', '.conf', '.ini', '.env', '.sql', '.csv', '.xml', '.log', '.jsonl', '.svelte', '.vue', '.astro', '.mjs', '.cjs'])
+  const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico'])
+  function fileKind(p: string): 'text' | 'image' | 'pdf' | 'binary' {
+    const i = p.lastIndexOf('.')
+    const ext = i >= 0 ? p.slice(i).toLowerCase() : ''
+    if (ext === '.pdf') return 'pdf'
+    if (IMAGE_EXTS.has(ext)) return 'image'
+    if (TEXT_EXTS.has(ext) || ext === '') return 'text'
+    return 'binary'
+  }
+  const [viewingFile, setViewingFile] = createSignal<{ path: string; kind: 'text' | 'image' | 'pdf' | 'binary'; content: string; blobUrl?: string; size?: number; error?: string } | null>(null)
+  function closeViewer() {
+    const v = viewingFile()
+    if (v?.blobUrl) URL.revokeObjectURL(v.blobUrl)
+    setViewingFile(null)
+  }
   async function openFile(filePath: string) {
-    setViewingFile({ path: filePath, content: '' })
-    try {
-      const r = await fetch(`/api/files/raw?path=${encodeURIComponent(filePath)}`)
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
-      setViewingFile({ path: filePath, content: await r.text() })
-    } catch (e: any) {
-      setViewingFile({ path: filePath, content: '', error: e.message || 'failed to load' })
+    const kind = fileKind(filePath)
+    setViewingFile({ path: filePath, kind, content: '' })
+    if (kind === 'text') {
+      try {
+        const r = await fetch(`/api/files/raw?path=${encodeURIComponent(filePath)}`)
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+        const sizeHeader = r.headers.get('content-length')
+        setViewingFile({ path: filePath, kind, content: await r.text(), size: sizeHeader ? parseInt(sizeHeader, 10) : undefined })
+      } catch (e: any) {
+        setViewingFile({ path: filePath, kind, content: '', error: e.message || 'failed to load' })
+      }
+    } else if (kind === 'pdf') {
+      try {
+        const r = await fetch(`/api/files/raw?path=${encodeURIComponent(filePath)}`)
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+        const buf = await r.arrayBuffer()
+        const blobUrl = URL.createObjectURL(new Blob([buf], { type: 'application/pdf' }))
+        setViewingFile({ path: filePath, kind, content: '', blobUrl })
+      } catch (e: any) {
+        setViewingFile({ path: filePath, kind, content: '', error: e.message || 'failed to load' })
+      }
     }
   }
   const [files, setFiles] = createSignal<PendingFile[]>([])
@@ -1450,6 +1479,9 @@ export default function App() {
                           <For each={f.actions}>{(a) => (
                             <span style={{ 'font-size': '10px', padding: '1px 5px', 'border-radius': '3px', background: 'rgba(255,255,255,0.05)', color: actionColors[a] || '#888' }}>{a}</span>
                           )}</For>
+                          <a href={`/api/files/raw?path=${encodeURIComponent(f.path)}&download=1`} download={f.path.split('/').pop()} title={`Download ${f.path.split('/').pop()}`} onClick={(ev) => ev.stopPropagation()} style={{ color: '#73b8ff', display: 'flex', 'align-items': 'center', padding: '0 2px', 'flex-shrink': '0', '-webkit-tap-highlight-color': 'transparent' }}>
+                            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0l-3-3m3 3l3-3M3 13h10" /></svg>
+                          </a>
                         </div>
                         <div style={{ color: '#444', 'font-size': '11px', 'font-family': "'SF Mono', Menlo, monospace", 'margin-top': '2px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{f.path}</div>
                       </div>
@@ -1512,6 +1544,13 @@ export default function App() {
                           )}
                           <span style={{ color: '#555', 'font-size': '10px', 'flex-shrink': '0' }}>{fmtAge(entry.mtime)}</span>
                           <span style={{ color: '#444', 'font-size': '10px', 'flex-shrink': '0', 'min-width': '30px', 'text-align': 'right' }}>{fmtSize(entry.size)}</span>
+                          {entry.isDir ? (
+                            <span style={{ width: '17px', 'flex-shrink': '0' }} />
+                          ) : (
+                            <a href={`/api/files/raw?path=${encodeURIComponent(entry.path)}&download=1`} download={entry.name} title={`Download ${entry.name}`} onClick={(ev) => ev.stopPropagation()} style={{ color: '#73b8ff', display: 'flex', 'align-items': 'center', padding: '0 2px', 'flex-shrink': '0', '-webkit-tap-highlight-color': 'transparent' }}>
+                              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0l-3-3m3 3l3-3M3 13h10" /></svg>
+                            </a>
+                          )}
                           <button onClick={(ev) => { ev.stopPropagation(); deleteBrowseEntry(entry.path, entry.name, entry.isDir) }} title={`Delete ${entry.name}`} style={{ background: 'none', border: 'none', color: '#664', cursor: 'pointer', 'font-size': '11px', padding: '0 2px', 'flex-shrink': '0', '-webkit-tap-highlight-color': 'transparent' }}>🗑</button>
                         </div>
                       )
@@ -1541,24 +1580,56 @@ export default function App() {
           {(() => {
             const v = viewingFile()!
             const isMd = v.path.toLowerCase().endsWith('.md')
+            const slash = v.path.lastIndexOf('/')
+            const name = slash >= 0 ? v.path.slice(slash + 1) : v.path
+            const dir = slash >= 0 ? v.path.slice(0, slash) : ''
+            const rawUrl = `/api/files/raw?path=${encodeURIComponent(v.path)}`
+            const kindLabel = v.kind === 'pdf' ? 'PDF' : v.kind === 'image' ? 'IMAGE' : v.kind === 'binary' ? 'BINARY' : 'TEXT'
+            const kindColor = v.kind === 'pdf' ? '#e57373' : v.kind === 'image' ? '#81c784' : v.kind === 'binary' ? '#ba68c8' : '#73b8ff'
             return (
-              <div onClick={() => setViewingFile(null)} style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.6)', 'z-index': '200', display: 'flex', 'align-items': 'stretch', 'justify-content': 'center', padding: 'max(20px, env(safe-area-inset-top)) 16px max(20px, env(safe-area-inset-bottom))' }}>
-                <div onClick={(e) => e.stopPropagation()} style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '12px', 'max-width': '900px', width: '100%', display: 'flex', 'flex-direction': 'column', overflow: 'hidden' }}>
-                  <div style={{ display: 'flex', 'align-items': 'center', gap: '8px', padding: '10px 14px', 'border-bottom': '1px solid #1e1e1e', background: '#0a0e14', 'flex-shrink': '0' }}>
-                    <span style={{ color: '#888', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1' }} title={v.path}>{v.path}</span>
-                    <button onClick={() => setViewingFile(null)} style={{ background: 'transparent', border: 'none', color: '#888', 'font-size': '20px', cursor: 'pointer', padding: '0 4px', 'line-height': '1' }}>&times;</button>
+              <div onClick={closeViewer} style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.6)', 'backdrop-filter': 'blur(4px)', 'z-index': '200', display: 'flex', 'align-items': 'stretch', 'justify-content': 'center', padding: 'max(20px, env(safe-area-inset-top)) 16px max(20px, env(safe-area-inset-bottom))' }}>
+                <div onClick={(e) => e.stopPropagation()} style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '12px', 'max-width': '900px', width: '100%', display: 'flex', 'flex-direction': 'column', overflow: 'hidden', 'box-shadow': '0 12px 40px rgba(0,0,0,0.5)' }}>
+                  <div style={{ display: 'flex', 'align-items': 'center', gap: '10px', padding: '12px 16px', 'border-bottom': '1px solid #1e1e1e', background: 'linear-gradient(180deg, #11161e 0%, #0a0e14 100%)', 'flex-shrink': '0' }}>
+                    <span style={{ 'font-size': '9px', 'font-weight': '700', 'letter-spacing': '0.08em', color: kindColor, border: `1px solid ${kindColor}55`, background: `${kindColor}15`, padding: '2px 6px', 'border-radius': '4px', 'flex-shrink': '0' }}>{kindLabel}</span>
+                    <div style={{ flex: '1', 'min-width': '0', display: 'flex', 'flex-direction': 'column', gap: '1px' }}>
+                      <span style={{ color: '#f0f0f0', 'font-size': '14px', 'font-weight': '600', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }} title={v.path}>{name}</span>
+                      <Show when={dir}>
+                        <span style={{ color: '#666', 'font-size': '11px', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{dir}</span>
+                      </Show>
+                    </div>
+                    <a href={`${rawUrl}&download=1`} download={name} title="Download" style={{ color: '#73b8ff', 'text-decoration': 'none', 'font-size': '13px', padding: '6px 10px', 'border-radius': '6px', border: '1px solid #1e3a5f', background: '#0e1a2a', display: 'flex', 'align-items': 'center', gap: '4px', 'flex-shrink': '0' }}>↓ Download</a>
+                    <button onClick={closeViewer} title="Close" style={{ background: 'transparent', border: 'none', color: '#888', 'font-size': '22px', cursor: 'pointer', padding: '0 4px', 'line-height': '1', 'flex-shrink': '0' }}>&times;</button>
                   </div>
                   <div style={{ 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', flex: '1' }}>
                     <Show when={v.error}>
                       <div style={{ padding: '20px', color: '#c44', 'font-size': '13px' }}>{v.error}</div>
                     </Show>
-                    <Show when={!v.error && !v.content}>
+                    <Show when={v.kind === 'image' && !v.error}>
+                      <div style={{ padding: '16px', display: 'flex', 'align-items': 'center', 'justify-content': 'center', background: '#070a0e' }}>
+                        <img src={rawUrl} alt={name} style={{ 'max-width': '100%', 'max-height': '70vh', 'object-fit': 'contain', 'border-radius': '4px' }} />
+                      </div>
+                    </Show>
+                    <Show when={v.kind === 'pdf' && !v.error && !v.blobUrl}>
+                      <div style={{ padding: '40px 20px', 'text-align': 'center', color: '#666', 'font-size': '13px' }}>Loading PDF…</div>
+                    </Show>
+                    <Show when={v.kind === 'pdf' && !v.error && v.blobUrl}>
+                      <iframe src={v.blobUrl} style={{ display: 'block', width: '100%', height: '70vh', border: 'none', background: '#fff' }} title={name} />
+                    </Show>
+                    <Show when={v.kind === 'binary' && !v.error}>
+                      <div style={{ padding: '40px 20px', 'text-align': 'center', color: '#aaa' }}>
+                        <div style={{ 'font-size': '48px', 'margin-bottom': '12px', opacity: '0.6' }}>📦</div>
+                        <div style={{ 'font-size': '14px', 'margin-bottom': '6px', color: '#d0d0d0' }}>{name}</div>
+                        <div style={{ 'font-size': '12px', color: '#666', 'margin-bottom': '20px' }}>Binary file. No inline preview available.</div>
+                        <a href={`${rawUrl}&download=1`} download={name} style={{ display: 'inline-block', color: '#73b8ff', 'text-decoration': 'none', 'font-size': '13px', padding: '8px 16px', 'border-radius': '6px', border: '1px solid #1e3a5f', background: '#0e1a2a' }}>↓ Download</a>
+                      </div>
+                    </Show>
+                    <Show when={v.kind === 'text' && !v.error && !v.content}>
                       <div style={{ padding: '20px', color: '#666', 'font-size': '13px' }}>Loading…</div>
                     </Show>
-                    <Show when={!v.error && v.content && isMd}>
+                    <Show when={v.kind === 'text' && !v.error && v.content && isMd}>
                       <div class="prose" style={{ padding: '4px 24px', color: '#d0d0d0', 'font-size': '14px', 'line-height': '1.55' }} innerHTML={marked.parse(v.content) as string} />
                     </Show>
-                    <Show when={!v.error && v.content && !isMd}>
+                    <Show when={v.kind === 'text' && !v.error && v.content && !isMd}>
                       <pre style={{ margin: '0', padding: '16px 20px', color: '#d0d0d0', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{v.content}</pre>
                     </Show>
                   </div>

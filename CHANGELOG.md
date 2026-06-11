@@ -1,3 +1,8 @@
+## 2026-06-11 - Files tab: download buttons + real PDF preview
+- **Download button on every file row** (Browse and Changed modes, plus the viewer header). Tapping it saves the file directly instead of opening it.
+- **PDF preview fixed.** Clicking a file name opens the type-aware viewer again: PDFs render in a real inline viewer (no more garbled byte-dump), images preview inline, other binaries show a download card, text and markdown render as before. This viewer shipped 2026-04-30 but was lost in the 2026-06-06 upstream merge.
+- Server: `/api/files/raw` accepts `download=1` to force save-as, and serves PDFs inline so direct links preview properly too. Takes effect on next natural restart.
+
 ## 2026-06-06 - Upstream Merge: Codex actually works + oh-my-pi backend
 - **Codex now works end to end.** Two bugs had it broken even though the code was there:
   - The server looks up `codex` (and `omp`) through your interactive shell (`~/.bashrc`) now, so it finds binaries installed in `~/.npm-global/bin`. Before, it only searched the login PATH, so the "+ Codex" button never appeared and a spawned Codex session died with "command not found".

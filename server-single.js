@@ -1703,10 +1703,13 @@ app.get('/api/files/raw', (req, res) => {
     const stat = fs.statSync(resolved);
     if (stat.isDirectory()) return res.status(400).json({ error: 'Is a directory' });
     if (stat.size > 10 * 1024 * 1024) return res.status(413).json({ error: 'File too large (>10MB)' });
+    if (req.query.download === '1') return res.download(resolved);
     const ext = path.extname(resolved).toLowerCase();
     const textExts = new Set(['.txt', '.md', '.js', '.ts', '.tsx', '.jsx', '.json', '.html', '.css', '.py', '.rb', '.go', '.rs', '.sh', '.yml', '.yaml', '.toml', '.cfg', '.conf', '.ini', '.env', '.sql', '.csv', '.xml', '.log', '.jsonl', '.svelte', '.vue', '.astro', '.mjs', '.cjs']);
     const imageExts = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico']);
-    if (imageExts.has(ext)) {
+    // .pdf inline (no attachment disposition): iOS standalone PWA renders the
+    // attachment variant as garbled bytes in the target=_blank overlay
+    if (imageExts.has(ext) || ext === '.pdf') {
       return res.sendFile(resolved);
     }
     if (textExts.has(ext) || ext === '') {
