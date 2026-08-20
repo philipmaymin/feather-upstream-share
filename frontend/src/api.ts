@@ -8,11 +8,13 @@ export interface SessionMeta {
   projectId?: string | null
   projectLabel?: string | null
   cwd?: string | null
-  agent?: 'claude' | 'codex'
+  agent?: 'claude' | 'codex' | 'omp'
+  outcome?: 'finished' | 'errored' | null
+  summary?: string | null
 }
 
 export interface AgentInfo {
-  id: 'claude' | 'codex'
+  id: 'claude' | 'codex' | 'omp'
   label: string
   available: boolean
 }
@@ -26,11 +28,50 @@ export interface Project {
   cwd?: string | null
 }
 
+export interface RoomInfo {
+  name: string
+  cwd: string
+  sessions: SessionMeta[]
+  active: boolean
+  latest: { role: string; text: string } | null
+  updatedAt: string | null
+}
+
+export async function fetchRooms(): Promise<RoomInfo[]> {
+  const response = await fetch(`${BASE}/api/rooms`)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return (await response.json()).rooms
+}
+
+export async function createRoom(name: string): Promise<{ name: string; cwd: string }> {
+  const response = await fetch(`${BASE}/api/rooms`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+  const body = await response.json().catch(() => ({}))
+  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`)
+  return body
+}
+
+export const assignSessionToRoom = (room: string, sessionId: string, remove = false) =>
+  fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/assign`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId, remove }),
+  }).then(async response => {
+    const body = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`)
+    return body
+  })
+
 export interface ContentBlock {
   type: string
   text?: string
   thinking?: string
   name?: string
+  id?: string
+  tool_use_id?: string
   input?: any
   content?: any
   is_error?: boolean
@@ -84,9 +125,13 @@ export const sendInput = (id: string, text: string): Promise<{ ok: boolean, sent
   fetch(`${BASE}/api/sessions/${id}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) })
     .then(r => r.json())
 
-export async function createSession(cwd?: string, agent?: 'claude' | 'codex'): Promise<string> {
+export async function createSession(cwd?: string, agent?: 'claude' | 'codex' | 'omp'): Promise<string> {
   const id = crypto.randomUUID()
-  await fetch(`${BASE}/api/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, cwd, agent }) })
+  const response = await fetch(`${BASE}/api/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, cwd, agent }) })
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}))
+    throw new Error(body.error || `HTTP ${response.status}`)
+  }
   return id
 }
 
@@ -173,6 +218,82 @@ export interface QuestionData {
 
 export const answerQuestion = (id: string, body: { type: string; index?: number; text?: string }) =>
   fetch(`${BASE}/api/sessions/${id}/answer`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json())
+
+// ── Rooms (upstream Sidecar) ───────────────────────────────────────
+
+export interface SidecarMessage {
+  ts: number
+  seq: number
+  from: string
+  to: string
+  text: string
+}
+
+export interface SidecarMember {
+  sessionId: string
+  role: string
+  spawned?: boolean
+}
+
+export interface SidecarGroup {
+  id: string
+  members: SidecarMember[]
+  agent: string
+  task: string
+  status: 'active' | 'done'
+  createdAt: number
+}
+
+async function sidecarJson<T>(request: Promise<Response>): Promise<T> {
+  const response = await request
+  const body = await response.json().catch(() => ({}))
+  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`)
+  return body as T
+}
+
+export const fetchSidecars = (): Promise<{ groups: SidecarGroup[] }> =>
+  sidecarJson(fetch(`${BASE}/api/sidecar`))
+
+export const fetchSidecar = (id: string): Promise<{ group: SidecarGroup; thread: SidecarMessage[] }> =>
+  sidecarJson(fetch(`${BASE}/api/sidecar/${id}`))
+
+export const createSidecar = (
+  driverSessionId: string,
+  opts: { agent?: string; task?: string; cwd?: string; driverRole?: string; peerRole?: string } = {},
+): Promise<{ group: SidecarGroup; peerSessionId: string; peers: Array<{ role: string; sessionId: string }> }> =>
+  sidecarJson(fetch(`${BASE}/api/sidecar`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ driverSessionId, ...opts }),
+  }))
+
+export const postSidecar = (id: string, to: string, text: string, from = 'driver') =>
+  sidecarJson<{ ok: boolean; group: string; seq: number }>(fetch(`${BASE}/api/sidecar/${id}/post`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from, to, text }),
+  }))
+
+export const deleteSidecar = (id: string) =>
+  sidecarJson<{ ok: boolean }>(fetch(`${BASE}/api/sidecar/${id}/delete`, { method: 'POST' }))
+
+export const addSidecarPeer = (id: string, role: string, opts: { agent?: string; task?: string } = {}) =>
+  sidecarJson<{ ok: boolean; role: string; sessionId: string }>(fetch(`${BASE}/api/sidecar/${id}/peers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role, ...opts }),
+  }))
+
+export const removeSidecarPeer = (id: string, role: string) =>
+  sidecarJson<{ ok: boolean }>(fetch(`${BASE}/api/sidecar/${id}/peers/${encodeURIComponent(role)}/delete`, { method: 'POST' }))
+
+export function subscribeSidecar(id: string, onMessage: (message: SidecarMessage) => void): () => void {
+  let source: EventSource | null = new EventSource(`${BASE}/api/sidecar/${id}/stream`)
+  source.addEventListener('message', (event) => {
+    try { onMessage(JSON.parse(event.data)) } catch {}
+  })
+  return () => { source?.close(); source = null }
+}
 
 export function subscribeMessages(
   id: string,

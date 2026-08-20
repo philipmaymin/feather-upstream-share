@@ -7,7 +7,11 @@ import { execFileSync, execFile, spawn } from 'child_process';
 import { WebSocketServer, WebSocket as WS } from 'ws';
 import pty from 'node-pty';
 import { parseMessage, parseCodexMessage, parseMessageForAgent } from './lib/parse.js';
-import { generateRunSh, listPipelines } from './lib/auto-runsh.js';
+import * as sidecar from './lib/sidecar.js';
+import { createKeyedLock } from './lib/sendlock.js';
+import { sessionIsActive, lastMessageMs } from './lib/sessions.js';
+import { resolveCodexWatchId } from './lib/codex-watch.js';
+import * as webpush from './lib/webpush.js';
 
 // Load ~/.env if present
 try {
@@ -27,6 +31,9 @@ const STATIC_DIR = path.resolve(import.meta.dirname, STATIC_OVERRIDE || 'static'
 const STAGING_DIR = path.resolve(import.meta.dirname, 'static-staging');
 const MAX_SSE_PER_SESSION = 10;
 const CODEX_SESSIONS_ROOT = path.join(HOME || '/home/user', '.codex/sessions');
+// Codex now writes large context/permissions preambles before the first real
+// prompt. Keep enough headroom to find cwd, titles, and worker markers.
+const CODEX_HEAD_BYTES = 256 * 1024;
 const OMP_SESSIONS = path.join(HOME || '/home/user', '.feather/omp-sessions');
 try { fs.mkdirSync(OMP_SESSIONS, { recursive: true }); } catch {}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -257,14 +264,14 @@ function extractOmpTitle(buf) {
   for (const line of buf.toString('utf8').split('\n').filter(Boolean)) {
     try {
       const d = JSON.parse(line);
-      if (d.type === 'session' && d.title) return d.title.slice(0, 80);
+      if (d.type === 'session' && d.title) return d.title.slice(0, 240);
       if (d.type === 'message' && d.message?.role === 'user') {
         const content = d.message.content;
         let text = '';
         if (typeof content === 'string') text = content;
         else if (Array.isArray(content)) text = content.filter(b => b.type === 'text' && b.text).map(b => b.text).join(' ');
         text = text.trim();
-        if (text) return text.slice(0, 80);
+        if (text) return text.slice(0, 240);
       }
     } catch {}
   }
@@ -298,8 +305,8 @@ function extractCodexTitle(buf) {
         .filter(b => b.type === 'input_text' && b.text)
         .map(b => b.text).join(' ').trim();
       if (!text) continue;
-      if (text.startsWith('<environment_context>') || text.startsWith('<permissions instructions>') || text.startsWith('<skills_instructions>') || text.startsWith('<user_instructions>')) continue;
-      return text.slice(0, 80);
+      if (text.startsWith('<environment_context>') || text.startsWith('<permissions instructions>') || text.startsWith('<skills_instructions>') || text.startsWith('<user_instructions>') || text.startsWith('<recommended_plugins>') || text.startsWith('# AGENTS.md instructions for ')) continue;
+      return text.slice(0, 240);
     } catch {}
   }
   return null;
@@ -385,12 +392,23 @@ function spawnTmuxOmp(name, ompArgs, dir) {
 // Codex doesn't accept a preset session id. We snapshot existing rollout files,
 // spawn codex, then poll for the new rollout file and adopt its UUID into
 // session-meta so future messages/resumes can find it.
-function adoptNewCodexUuid(featherId, beforeUuids, attempts = 30) {
+function adoptNewCodexUuid(featherId, beforeUuids, spawnCwd = null, attempts = 320) {
   let n = 0;
   const tick = () => {
     n++;
     const after = listCodexJsonlFiles();
-    const fresh = after.filter(f => !beforeUuids.has(f.uuid));
+    let fresh = after.filter(f => !beforeUuids.has(f.uuid));
+    if (spawnCwd && fresh.length > 0) {
+      fresh = fresh.filter(file => {
+        try {
+          const fd = fs.openSync(file.fpath, 'r');
+          const buf = Buffer.alloc(Math.min(CODEX_HEAD_BYTES, fs.fstatSync(fd).size));
+          fs.readSync(fd, buf, 0, buf.length, 0);
+          fs.closeSync(fd);
+          return extractCodexCwd(buf) === spawnCwd;
+        } catch { return false; }
+      });
+    }
     if (fresh.length > 0) {
       fresh.sort((a, b) => b.mtime - a.mtime);
       const uuid = fresh[0].uuid;
@@ -401,7 +419,7 @@ function adoptNewCodexUuid(featherId, beforeUuids, attempts = 30) {
       watchCodexFile(fresh[0].fpath, featherId);
       return;
     }
-    if (n < attempts) setTimeout(tick, 500);
+    if (n < attempts) setTimeout(tick, n < 20 ? 500 : 2000);
     else console.warn(`[codex] failed to adopt UUID for ${featherId} after ${attempts} attempts`);
   };
   setTimeout(tick, 500);
@@ -418,7 +436,7 @@ function spawnOrResume(id, cwd, resume = false, agent = null) {
       const fpath = findCodexJsonlPath(id);
       let sessionCwd = cwd;
       if (!sessionCwd && fpath) {
-        try { sessionCwd = extractCodexCwd(fs.readFileSync(fpath).slice(0, 65536)); } catch {}
+        try { sessionCwd = extractCodexCwd(fs.readFileSync(fpath).slice(0, CODEX_HEAD_BYTES)); } catch {}
       }
       sessionCwd = (sessionCwd || HOME).replace(/[^a-zA-Z0-9._\-/]/g, '');
       ensureCodexTrust(sessionCwd);
@@ -430,10 +448,10 @@ function spawnOrResume(id, cwd, resume = false, agent = null) {
       ensureCodexTrust(dir);
       const before = new Set(listCodexJsonlFiles().map(f => f.uuid));
       const meta = readMeta();
-      meta[id] = { ...(meta[id] || {}), agent: 'codex' };
+      meta[id] = { ...(meta[id] || {}), agent: 'codex', cwd: dir };
       writeMeta(meta);
       spawnTmuxCodex(name, '', dir);
-      adoptNewCodexUuid(id, before);
+      adoptNewCodexUuid(id, before, dir);
     }
     return;
   }
@@ -448,7 +466,7 @@ function spawnOrResume(id, cwd, resume = false, agent = null) {
       spawnTmuxOmp(name, `${resumeArg} --session-dir ${sessionDir}`, cwd || HOME);
     } else {
       const meta = readMeta();
-      meta[id] = { ...(meta[id] || {}), agent: 'omp' };
+      meta[id] = { ...(meta[id] || {}), agent: 'omp', cwd: cwd || HOME };
       writeMeta(meta);
       spawnTmuxOmp(name, `--session-dir ${sessionDir}`, cwd || HOME);
     }
@@ -460,17 +478,23 @@ function spawnOrResume(id, cwd, resume = false, agent = null) {
   spawnTmuxClaude(name, args, dir);
 }
 
-function inputStillContainsMarker(name, marker) {
+// Read only the text in Claude Code's input box. A submitted or queued message
+// clears that box; looking for the marker in the whole pane can mistake the
+// queued-message echo for unsent text and press Enter several more times.
+function inputBoxText(name) {
   try {
     const content = execFileSync('tmux', ['capture-pane', '-t', name, '-p'],
       { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 2000 });
-    const lines = content.trimEnd().split('\n');
-    const tail = lines.slice(Math.max(0, lines.length - 8));
-    for (const line of tail) {
-      if (line.includes(marker) && /[>❯│]/.test(line)) return true;
-    }
-    return false;
-  } catch { return false; }
+    const lines = content.replace(/\s+$/, '').split('\n');
+    const borders = [];
+    for (let i = 0; i < lines.length; i++) if (/^\s*─{10,}/.test(lines[i])) borders.push(i);
+    if (borders.length < 2) return null;
+    const top = borders[borders.length - 2];
+    const bottom = borders[borders.length - 1];
+    let text = lines.slice(top + 1, bottom).join('\n').replace(/^\s*[>❯]\s?/, '').trim();
+    if (/^Try ["“]/.test(text)) text = '';
+    return text;
+  } catch { return null; }
 }
 
 async function sendText(name, text) {
@@ -491,13 +515,15 @@ async function sendText(name, text) {
     await new Promise(r => setTimeout(r, 300));
   }
 
-  // Send Enter with retry verification: if text is still visible in input box,
-  // re-send Enter. Handles the race where TUI isn't fully ready post-spawn.
+  // Re-send Enter only while the exact text remains in the input box. Once the
+  // box clears, the message has either submitted or queued and must not be sent
+  // again.
   const marker = text.replace(/\s+/g, ' ').trim().slice(0, 40);
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 2; attempt++) {
     try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
     await new Promise(r => setTimeout(r, 500));
-    if (!marker || !inputStillContainsMarker(name, marker)) return;
+    const box = inputBoxText(name);
+    if (!box || !marker || !box.replace(/\s+/g, ' ').includes(marker)) return;
   }
 }
 
@@ -569,7 +595,16 @@ async function sendCodexText(name, text) {
   try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
 }
 
+// Serialize the complete paste-and-submit sequence for each session. Rooms can
+// fan several peer replies into one driver at once; without a keyed lock their
+// tmux writes can interleave. Different sessions still send concurrently.
+const sendLock = createKeyedLock();
+
 async function sendInputToSession(id, text) {
+  return sendLock(id, () => sendInputToSessionUnlocked(id, text));
+}
+
+async function sendInputToSessionUnlocked(id, text) {
   const name = tmuxName(id);
   const agent = getAgentForSession(id);
   let sessionExists = false;
@@ -590,18 +625,19 @@ async function sendInputToSession(id, text) {
     return;
   }
 
+  // Complete all readiness retries before delivery. Retrying this whole block
+  // after a partially successful send can create a second distinct turn.
   try {
     await waitForClaudeReady(name);
-    await sendText(name, text);
   } catch {
     spawnOrResume(id, null, true, agent);
     try {
       await waitForClaudeReady(name);
-      await sendText(name, text);
     } catch {
       throw new Error('Failed to resume session after retry');
     }
   }
+  await sendText(name, text);
 }
 
 // ── Extract first user message from JSONL ─────────────────────────────────
@@ -631,7 +667,7 @@ function extractSessionInfo(fpath) {
         text = text.replace(/\[Attached (?:image|file): [^\]]+\]\s*(?:\([^)]*\))?/g, '').trim();
         if (text && text.length > 3 && !text.startsWith('<') && !text.startsWith('Generate a concise title')) {
           const cmdMatch = text.match(/<command-name>\/?([^<]+)</);
-          firstUserText = cmdMatch ? '/' + cmdMatch[1].trim() : text.slice(0, 80);
+          firstUserText = cmdMatch ? '/' + cmdMatch[1].trim() : text.slice(0, 240);
           break;
         }
       } catch {}
@@ -639,6 +675,8 @@ function extractSessionInfo(fpath) {
   } catch {}
 
   let cwd = null;
+  let outcome = null;
+  let summary = null;
   try {
     const fd = fs.openSync(fpath, 'r');
     const totalSize = fs.fstatSync(fd).size;
@@ -647,15 +685,47 @@ function extractSessionInfo(fpath) {
     fs.readSync(fd, buf, 0, readSize, totalSize - readSize);
     fs.closeSync(fd);
     const lines = buf.toString('utf8').split('\n').filter(Boolean);
+    let sawError = false;
+    let sawAssistant = false;
+    let turnDone = false;
     for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const d = JSON.parse(lines[i]);
-        if (d.type === 'user' && d.cwd) { cwd = d.cwd; break; }
-      } catch {}
+      let d;
+      try { d = JSON.parse(lines[i]); } catch { continue; }
+      if (!cwd && d.type === 'user' && d.cwd) cwd = d.cwd;
+      if (!turnDone) {
+        const content = d.message?.content;
+        const blocks = Array.isArray(content) ? content : [];
+        if (blocks.some(block => block.is_error)) sawError = true;
+        if (d.type === 'assistant' && !d.isSidechain) {
+          sawAssistant = true;
+          const text = blocks.filter(block => block.type === 'text' && block.text).map(block => block.text).join(' ');
+          if (/^API Error/i.test(text.trim())) sawError = true;
+          if (!summary) summary = summarizeReply(text);
+        }
+        const isHumanPrompt = d.type === 'user' && !d.isMeta && !d.isSidechain
+          && (typeof content === 'string' || (blocks.length > 0 && !blocks.some(block => block.type === 'tool_result')));
+        if (isHumanPrompt) turnDone = true;
+      }
+      if (cwd && turnDone) break;
     }
+    if (sawError) outcome = 'errored';
+    else if (sawAssistant) outcome = 'finished';
   } catch {}
 
-  return { firstUserText, cwd, isTitleGen, isWorker };
+  return { firstUserText, cwd, isTitleGen, isWorker, outcome, summary };
+}
+
+function summarizeReply(text) {
+  if (!text) return null;
+  const body = text.replace(/```[\s\S]*?```/g, ' ').replace(/`([^`]*)`/g, '$1');
+  for (let line of body.split('\n')) {
+    line = line.replace(/^\s*(?:[#>]+|[-*+]|\d+\.)\s*/, '').replace(/\*\*|__|\*|_/g, '').trim();
+    if (line.length < 8) continue;
+    const stop = line.search(/[.!?](?:\s|$)/);
+    const sentence = stop > 0 ? line.slice(0, stop + 1) : line;
+    return sentence.length > 100 ? sentence.slice(0, 97).trimEnd() + '...' : sentence;
+  }
+  return null;
 }
 
 // ── Session discovery ──────────────────────────────────────────────────────
@@ -663,6 +733,11 @@ function extractSessionInfo(fpath) {
 function discoverSessions(limit = 50, projectFilter) {
   const projDir = projectsDir();
   const candidates = [];
+  const meta = readMeta();
+  const codexLocalIds = new Map();
+  for (const [localId, entry] of Object.entries(meta)) {
+    if (entry?.codexUuid) codexLocalIds.set(entry.codexUuid, localId);
+  }
 
   if (fs.existsSync(projDir)) {
     const dirs = projectFilter ? [projectFilter] : fs.readdirSync(projDir);
@@ -690,7 +765,7 @@ function discoverSessions(limit = 50, projectFilter) {
       try {
         const stat = fs.statSync(fpath);
         if (stat.size < 50) continue;
-        candidates.push({ id: uuid, fpath, mtime, projectId: null, agent: 'codex' });
+        candidates.push({ id: codexLocalIds.get(uuid) || uuid, fpath, mtime, projectId: null, agent: 'codex' });
       } catch {}
     }
   }
@@ -721,38 +796,75 @@ function discoverSessions(limit = 50, projectFilter) {
       let buf;
       try {
         const fd = fs.openSync(c.fpath, 'r');
-        buf = Buffer.alloc(Math.min(65536, fs.fstatSync(fd).size));
+        buf = Buffer.alloc(Math.min(CODEX_HEAD_BYTES, fs.fstatSync(fd).size));
         fs.readSync(fd, buf, 0, buf.length, 0);
         fs.closeSync(fd);
       } catch { buf = Buffer.alloc(0); }
+      const cwd = extractCodexCwd(buf) || meta[c.id]?.cwd || null;
       const isWorker = buf.includes('AUTO_WORKER=TRUE')
-        || buf.includes('/home/user/auto-')
-        || buf.includes('/home/user/autoweb-');
-      return { ...c, info: { firstUserText: extractCodexTitle(buf), cwd: extractCodexCwd(buf), isTitleGen: false, isWorker } };
+        || /^\/home\/[^/]+\/(?:auto|autoweb)-/.test(cwd || '')
+        || /^\/home\/[^/]+\/\.feather\/room-runs\//.test(cwd || '');
+      return { ...c, info: { firstUserText: extractCodexTitle(buf), cwd, isTitleGen: false, isWorker } };
     }
     if (c.agent === 'omp') {
       let buf;
       try { buf = fs.readFileSync(c.fpath).slice(0, 65536); } catch { buf = Buffer.alloc(0); }
-      return { ...c, info: { firstUserText: extractOmpTitle(buf), cwd: null, isTitleGen: false, isWorker: false } };
+      const cwd = meta[c.id]?.cwd || null;
+      const isWorker = /^\/home\/[^/]+\/(?:auto|autoweb)-/.test(cwd || '')
+        || /^\/home\/[^/]+\/\.feather\/room-runs\//.test(cwd || '');
+      return { ...c, info: { firstUserText: extractOmpTitle(buf), cwd, isTitleGen: false, isWorker } };
     }
-    return { ...c, info: extractSessionInfo(c.fpath) };
+    const info = extractSessionInfo(c.fpath);
+    if (/^\/home\/[^/]+\/\.feather\/room-runs\//.test(info.cwd || '')) info.isWorker = true;
+    return { ...c, info };
   });
 
   const filtered = withInfo.filter(c => !c.info.isTitleGen && !c.info.isWorker);
   const top = filtered.slice(0, limit).sort((a, b) => b.mtime - a.mtime);
   const active = getActiveTmuxSessions();
-  const meta = readMeta();
+  const now = Date.now();
   const labels = readUserJson('project-labels.json', {});
 
-  return top.map(({ id, fpath, mtime, projectId, agent, info }) => ({
-    id, title: meta[id]?.title || info.firstUserText || id.slice(0, 8),
-    updatedAt: mtime.toISOString(),
-    isActive: active.has(id.slice(0, 8)),
-    projectId,
-    projectLabel: projectId ? (labels[projectId] || null) : null,
-    cwd: info.cwd || (projectId ? projectIdToCwd(projectId) : null) || null,
-    agent,
-  }));
+  const sessions = top.map(({ id, fpath, mtime, projectId: candidateProjectId, agent, info }) => {
+    const cwd = info.cwd || meta[id]?.cwd || (candidateProjectId ? projectIdToCwd(candidateProjectId) : null) || null;
+    const projectId = candidateProjectId || (cwd ? cwd.replace(/[/.]/g, '-') : null);
+    const activityMs = lastActivityMs(fpath, agent, mtime.getTime());
+    return {
+      id, title: meta[id]?.title || info.firstUserText || id.slice(0, 8),
+      updatedAt: new Date(activityMs).toISOString(),
+      isActive: sessionIsActive(active, id, activityMs, now),
+      projectId,
+      projectLabel: projectId ? (labels[projectId] || null) : null,
+      cwd,
+      agent,
+      outcome: info.outcome || null,
+      summary: info.summary || null,
+    };
+  });
+  sessions.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  return sessions;
+}
+
+// Agents can append status/bookkeeping for days after their last real message.
+// Grow the tail until a user/assistant timestamp is found so activity dots,
+// ordering, Rooms, and the idle reaper agree on actual conversation activity.
+const ACTIVITY_TAILS = [512 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024];
+function lastActivityMs(fpath, agent, fallbackMs) {
+  try {
+    const size = fs.statSync(fpath).size;
+    const fd = fs.openSync(fpath, 'r');
+    try {
+      for (const tail of ACTIVITY_TAILS) {
+        const readLength = Math.min(size, tail);
+        const buf = Buffer.alloc(readLength);
+        fs.readSync(fd, buf, 0, readLength, size - readLength);
+        const timestamp = lastMessageMs(buf.toString('utf8'), agent, size > readLength);
+        if (timestamp) return timestamp;
+        if (readLength >= size) break;
+      }
+    } finally { fs.closeSync(fd); }
+  } catch {}
+  return fallbackMs;
 }
 
 // ── Auto-title generation ───────────────────────────────────────────────────
@@ -1190,10 +1302,12 @@ function initCodexWatchers() {
   // Watch the most recent ~100 codex sessions on startup. Limiting fanout
   // because fs.watch on every historical date dir is wasteful.
   const recent = listCodexJsonlFiles().sort((a, b) => b.mtime - a.mtime).slice(0, 100);
+  const meta = readMeta();
   for (const { uuid, fpath } of recent) {
     try {
-      fileOffsets.set(uuid, fs.statSync(fpath).size);
-      watchCodexFile(fpath, uuid);
+      const featherId = resolveCodexWatchId(uuid, meta);
+      fileOffsets.set(featherId, fs.statSync(fpath).size);
+      watchCodexFile(fpath, featherId);
     } catch {}
   }
 }
@@ -1243,6 +1357,169 @@ app.get('/api/agents', (_req, res) => {
   const ompVer = agentVersion('omp');
   agents.push(ompVer ? { id: 'omp', label: `oh-my-pi ${ompVer}`, available: true } : { id: 'omp', label: 'oh-my-pi', available: false });
   res.json({ agents });
+});
+
+// ── Rooms: durable workspaces backed by ~/rooms/<name> ─────────────────
+
+const ROOMS_HOME_DIR = path.join(HOME, 'rooms');
+const ROOM_ASSIGN_FILE = path.join(HOME, '.feather', 'room-sessions.json');
+const ROOM_TAILS = [512 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024];
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function readRoomAssignments() {
+  try { return JSON.parse(fs.readFileSync(ROOM_ASSIGN_FILE, 'utf8')); }
+  catch { return {}; }
+}
+
+function listRoomDirs() {
+  try {
+    return fs.readdirSync(ROOMS_HOME_DIR).filter(name => {
+      if (name.startsWith('_') || name.startsWith('.')) return false;
+      try {
+        return fs.statSync(path.join(ROOMS_HOME_DIR, name)).isDirectory()
+          && fs.existsSync(path.join(ROOMS_HOME_DIR, name, 'AGENTS.md'));
+      } catch { return false; }
+    }).sort();
+  } catch { return []; }
+}
+
+function ensureRoomsDoctrine() {
+  fs.mkdirSync(ROOMS_HOME_DIR, { recursive: true });
+  const doctrinePath = path.join(ROOMS_HOME_DIR, '_doctrine.md');
+  if (fs.existsSync(doctrinePath)) return;
+  fs.writeFileSync(doctrinePath, [
+    '# Shared room doctrine',
+    '',
+    '- Read the room\'s `AGENTS.md` and `notes.md` before acting.',
+    '- Treat `notes.md` as durable memory: record decisions, state, and open threads as work proceeds.',
+    '- Verify important claims mechanically and keep evidence close to the decision.',
+    '- Delegate only when it materially helps. A `WORKER:` is a focused hand and must not recursively delegate.',
+    '',
+  ].join('\n'));
+}
+
+// Last normalized user/assistant text in a session. Tail reads grow only when
+// bookkeeping appended after the real conversation hides the final message.
+function lastRoomMessageSnippet(sessionId, agent) {
+  const fpath = findJsonlPath(sessionId, agent);
+  if (!fpath) return null;
+  try {
+    const size = fs.statSync(fpath).size;
+    for (const tail of ROOM_TAILS) {
+      const start = Math.max(0, size - tail);
+      const fd = fs.openSync(fpath, 'r');
+      const buf = Buffer.alloc(size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      fs.closeSync(fd);
+      let lines = buf.toString('utf8').split('\n').filter(Boolean);
+      if (start > 0) lines = lines.slice(1);
+      for (let index = lines.length - 1; index >= 0; index--) {
+        let message;
+        try { message = parseMessageForAgent(lines[index], agent); } catch { continue; }
+        if (!message || (message.role !== 'user' && message.role !== 'assistant')) continue;
+        const text = (message.content || [])
+          .filter(block => block && block.type === 'text' && block.text)
+          .map(block => block.text).join(' ')
+          .replace(/\s+/g, ' ').trim();
+        if (text) return { role: message.role, text: text.slice(0, 200) };
+      }
+      if (start === 0) break;
+    }
+  } catch {}
+  return null;
+}
+
+app.get('/api/rooms', (_req, res) => {
+  try {
+    const names = listRoomDirs();
+    const assignments = readRoomAssignments();
+    const allSessions = discoverSessions(300);
+    const byRoom = new Map(names.map(name => [name, []]));
+
+    for (const session of allSessions) {
+      let room = assignments[session.id];
+      if (!room) {
+        room = names.find(name => {
+          const roomProjectId = path.join(ROOMS_HOME_DIR, name).replace(/[/.]/g, '-');
+          return session.projectId === roomProjectId;
+        });
+      }
+      if (room && byRoom.has(room)) byRoom.get(room).push(session);
+    }
+
+    const rooms = names.map(name => {
+      const sessions = byRoom.get(name);
+      const newest = sessions[0] || null;
+      let latest = newest ? lastRoomMessageSnippet(newest.id, newest.agent || 'claude') : null;
+      let updatedAt = newest?.updatedAt || null;
+      if (!latest) {
+        try {
+          const notesPath = path.join(ROOMS_HOME_DIR, name, 'notes.md');
+          const noteLines = fs.readFileSync(notesPath, 'utf8').split('\n')
+            .map(line => line.trim())
+            .filter(line => /^- \d{4}-\d{2}-\d{2}/.test(line));
+          if (noteLines.length) latest = { role: 'notes', text: noteLines[noteLines.length - 1].slice(0, 200) };
+          if (!updatedAt) updatedAt = fs.statSync(notesPath).mtime.toISOString();
+        } catch {}
+      }
+      return {
+        name,
+        cwd: path.join(ROOMS_HOME_DIR, name),
+        sessions,
+        active: sessions.some(session => session.isActive),
+        latest,
+        updatedAt,
+      };
+    });
+    rooms.sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
+    res.json({ rooms });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/rooms', (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(name)) {
+      throw httpError(400, 'bad room name (lowercase, digits, dashes)');
+    }
+    ensureRoomsDoctrine();
+    const dir = path.join(ROOMS_HOME_DIR, name);
+    if (fs.existsSync(dir)) throw httpError(409, 'room exists');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'AGENTS.md'), [
+      `# Room: #${name}`,
+      '',
+      '<!-- Two lines on what this room is about. Edit me. -->',
+      '',
+      'Follow the shared room doctrine: read ~/rooms/_doctrine.md now.',
+      'On start, read notes.md — it is the room\'s memory; this chat is not.',
+      '',
+    ].join('\n'));
+    fs.symlinkSync('AGENTS.md', path.join(dir, 'CLAUDE.md'));
+    fs.writeFileSync(path.join(dir, 'notes.md'),
+      `# #${name} — notes\n\nWorking memory for this room. Sessions append decisions and open\nthreads as they happen (\`room note "..."\`). Newest at the bottom.\n`);
+    res.json({ name, cwd: dir });
+  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
+});
+
+app.post('/api/rooms/:name/assign', (req, res) => {
+  try {
+    const { name } = req.params;
+    const sessionId = String(req.body?.sessionId || '').trim();
+    if (!sessionId) throw httpError(400, 'sessionId required');
+    if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
+    const assignments = readRoomAssignments();
+    if (req.body?.remove) delete assignments[sessionId];
+    else assignments[sessionId] = name;
+    fs.mkdirSync(path.dirname(ROOM_ASSIGN_FILE), { recursive: true });
+    fs.writeFileSync(ROOM_ASSIGN_FILE, JSON.stringify(assignments, null, 2));
+    res.json({ ok: true, assignments });
+  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
 // Verify that staging is a coherent build: index.html points to a JS bundle
@@ -1393,6 +1670,149 @@ app.get('/api/sessions', (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Cross-project live queue retained from the deployed tree.
+app.get('/api/running', (req, res) => {
+  try {
+    const items = [];
+    for (const session of discoverSessions(parseInt(req.query.limit) || 100, null)) {
+      if (!session.isActive) continue;
+      let question = null;
+      let activity = null;
+      try {
+        const { lines } = capturePaneLines(tmuxName(session.id));
+        activity = extractActivity(lines);
+        question = extractQuestion(lines, !!activity);
+      } catch {}
+      items.push({
+        ...session,
+        status: question ? 'waiting' : activity ? 'working' : 'idle',
+        question: question?.question,
+        activity: !question ? activity || undefined : undefined,
+      });
+    }
+    const counts = items.reduce((acc, item) => {
+      acc[item.status] = (acc[item.status] || 0) + 1;
+      return acc;
+    }, {});
+    res.json({ counts, items });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+const USAGE_RATES = [
+  ['opus', { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 }],
+  ['haiku', { in: 1, out: 5, cacheRead: 0.1, cacheWrite: 1.25 }],
+  ['sonnet', { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 }],
+];
+const rateFor = model => (USAGE_RATES.find(([key]) => (model || '').includes(key)) || USAGE_RATES[2])[1];
+const usageCache = new Map();
+const USAGE_FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite', 'cost', 'messages'];
+const usageBucket = extra => ({ ...extra, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, messages: 0 });
+
+function usageForFile(fpath) {
+  let stat;
+  try { stat = fs.statSync(fpath); } catch { return []; }
+  const key = `${fpath}:${stat.mtimeMs}:${stat.size}`;
+  const cached = usageCache.get(fpath);
+  if (cached?.key === key) return cached.days;
+  const byDay = new Map();
+  try {
+    for (const line of fs.readFileSync(fpath, 'utf8').split('\n')) {
+      if (!line || !line.includes('"usage"')) continue;
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      const usage = event.type === 'assistant' && event.message?.usage;
+      if (!usage) continue;
+      const day = (event.timestamp || stat.mtime.toISOString()).slice(0, 10);
+      const rate = rateFor(event.message.model);
+      const input = usage.input_tokens || 0;
+      const output = usage.output_tokens || 0;
+      const cacheRead = usage.cache_read_input_tokens || 0;
+      const cacheWrite = usage.cache_creation_input_tokens || 0;
+      const bucket = byDay.get(day) || usageBucket({ day });
+      bucket.input += input;
+      bucket.output += output;
+      bucket.cacheRead += cacheRead;
+      bucket.cacheWrite += cacheWrite;
+      bucket.cost += (input * rate.in + output * rate.out + cacheRead * rate.cacheRead + cacheWrite * rate.cacheWrite) / 1e6;
+      bucket.messages += 1;
+      byDay.set(day, bucket);
+    }
+  } catch { return []; }
+  const days = [...byDay.values()];
+  usageCache.set(fpath, { key, days });
+  return days;
+}
+
+app.get('/api/usage', (req, res) => {
+  try {
+    const days = Math.min(90, Math.max(1, parseInt(req.query.days) || 7));
+    const cutoff = Date.now() - days * 86400000;
+    const labels = readUserJson('project-labels.json', {});
+    const byProject = new Map();
+    const byDay = new Map();
+    const total = usageBucket({});
+    for (const dir of fs.existsSync(projectsDir()) ? fs.readdirSync(projectsDir()) : []) {
+      let files;
+      try { files = fs.readdirSync(path.join(projectsDir(), dir)); } catch { continue; }
+      for (const file of files) {
+        if (!file.endsWith('.jsonl')) continue;
+        const fpath = path.join(projectsDir(), dir, file);
+        try { if (fs.statSync(fpath).mtimeMs < cutoff) continue; } catch { continue; }
+        for (const entry of usageForFile(fpath)) {
+          if (Date.parse(entry.day + 'T23:59:59Z') < cutoff) continue;
+          const buckets = [
+            byProject.get(dir) || usageBucket({ projectId: dir, label: labels[dir] || null }),
+            byDay.get(entry.day) || usageBucket({ day: entry.day }),
+            total,
+          ];
+          for (const bucket of buckets) for (const field of USAGE_FIELDS) bucket[field] += entry[field];
+          byProject.set(dir, buckets[0]);
+          byDay.set(entry.day, buckets[1]);
+        }
+      }
+    }
+    res.json({
+      days,
+      total,
+      projects: [...byProject.values()].sort((a, b) => b.cost - a.cost),
+      daily: [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day)),
+    });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+function digestItems(since, limit) {
+  const items = [];
+  for (const session of discoverSessions(limit || 50, null)) {
+    let question = null;
+    let working = false;
+    if (session.isActive) {
+      try {
+        const { lines } = capturePaneLines(tmuxName(session.id));
+        const activity = extractActivity(lines);
+        question = extractQuestion(lines, !!activity);
+        working = !question && !!activity;
+      } catch {}
+    }
+    if (question) items.push({ ...session, status: 'waiting', question: question.question });
+    else if (working) items.push({ ...session, status: 'working' });
+    else if (Number.isNaN(since) || Date.parse(session.updatedAt) > since) {
+      items.push({ ...session, status: session.outcome === 'errored' ? 'errored' : 'finished' });
+    }
+  }
+  return items;
+}
+
+app.get('/api/digest', (req, res) => {
+  try {
+    const items = digestItems(Date.parse(req.query.since || ''), parseInt(req.query.limit));
+    const counts = items.reduce((acc, item) => {
+      acc[item.status] = (acc[item.status] || 0) + 1;
+      return acc;
+    }, {});
+    res.json({ since: req.query.since || null, counts, items });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // ── Auth (trust Authelia Remote-User header) ────────────────────────────────
 
 app.get('/api/me', (req, res) => {
@@ -1451,7 +1871,7 @@ app.get('/api/sessions/:id/stream', (req, res) => {
           let offset = lastId;
           for (const line of buf.toString('utf8').split('\n').filter(Boolean)) {
             offset += Buffer.byteLength(line + '\n');
-            const parsed = parseMessage(line);
+            const parsed = parseMessageForAgent(line, getAgentForSession(sid));
             if (parsed) res.write(`id: ${offset}\nevent: message\ndata: ${JSON.stringify(parsed)}\n\n`);
           }
         }
@@ -1554,6 +1974,206 @@ app.post('/api/sessions/:id/fork', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Rooms (upstream Sidecar): grouped agent threads with a chat channel ──
+
+const sidecarClients = new Map(); // groupId -> Set<res>
+
+function sidecarBroadcast(groupId, msg) {
+  const clients = sidecarClients.get(groupId);
+  if (!clients || clients.size === 0) return;
+  const chunk = `event: message\ndata: ${JSON.stringify(msg)}\n\n`;
+  for (const client of clients) {
+    try { client.write(chunk); } catch { clients.delete(client); }
+  }
+}
+
+function sidecarGcIfDriverGone(group) {
+  const driver = group.members.find(member => !member.spawned);
+  if (!driver || tmuxIsActive(driver.sessionId)) return false;
+  for (const member of group.members) {
+    if (!member.spawned) continue;
+    try { execFileSync('tmux', ['kill-session', '-t', tmuxName(member.sessionId)], { stdio: 'ignore' }); } catch {}
+  }
+  sidecar.teardownGroup(group.id);
+  sidecarClients.delete(group.id);
+  console.log(`[sidecar] GC'd group ${group.id} — driver gone`);
+  return true;
+}
+
+function sidecarDeliver(group, fromRole, to, text) {
+  const { targets, missing } = sidecar.resolveRecipients(group, to, fromRole);
+  if (missing.length) return { error: `unknown recipient role(s): ${missing.join(', ')}` };
+  if (!targets.length) return { error: `no recipients for "${to}"` };
+  const message = sidecar.appendMessage(group.id, { from: fromRole, to, text });
+  sidecarBroadcast(group.id, message);
+  for (const target of targets) {
+    sendInputToSession(target.sessionId, sidecar.formatInbound(fromRole, text))
+      .catch(error => console.warn('[sidecar] route failed:', error.message));
+  }
+  return { ok: true, message };
+}
+
+app.get('/api/sidecar', (_req, res) => {
+  res.json({ groups: sidecar.listGroups() });
+});
+
+app.get('/api/sidecar/:id', (req, res) => {
+  const group = sidecar.getGroup(req.params.id);
+  if (!group) return res.status(404).json({ error: 'not found' });
+  res.json({ group, thread: sidecar.readThread(group.id) });
+});
+
+app.get('/api/sidecar/:id/stream', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write('event: connected\ndata: {}\n\n');
+  const id = req.params.id;
+  for (const message of sidecar.readThread(id)) {
+    res.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
+  }
+  if (!sidecarClients.has(id)) sidecarClients.set(id, new Set());
+  sidecarClients.get(id).add(res);
+  const heartbeat = setInterval(() => {
+    try { res.write('event: heartbeat\ndata: {}\n\n'); } catch { clearInterval(heartbeat); }
+  }, 15000);
+  res.on('close', () => {
+    clearInterval(heartbeat);
+    sidecarClients.get(id)?.delete(res);
+  });
+});
+
+// Create one room with a driver plus one or more newly spawned peers.
+app.post('/api/sidecar', (req, res) => {
+  const body = req.body || {};
+  const {
+    driverSessionId,
+    driverRole = 'driver',
+    agent = 'claude',
+    task = '',
+  } = body;
+  if (!driverSessionId) return res.status(400).json({ error: 'driverSessionId required' });
+  const peerSpecs = Array.isArray(body.peers) && body.peers.length
+    ? body.peers
+    : [{ role: body.peerRole || 'peer', task, agent }];
+  const peers = peerSpecs.map(peer => ({
+    id: crypto.randomUUID(),
+    role: peer.role || 'peer',
+    task: peer.task || task || '',
+    agent: peer.agent || agent,
+  }));
+  const members = [
+    { sessionId: driverSessionId, role: driverRole, spawned: false },
+    ...peers.map(peer => ({ sessionId: peer.id, role: peer.role, spawned: true })),
+  ];
+  let group;
+  try {
+    group = sidecar.createGroup({ id: crypto.randomUUID(), members, agent, task });
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+
+  const cwd = body.cwd || findSessionCwd(driverSessionId) || HOME;
+  const roster = members.map(member => member.role);
+  for (const peer of peers) {
+    try { spawnOrResume(peer.id, cwd, false, peer.agent); }
+    catch (error) { console.warn('[sidecar] spawn failed:', error.message); }
+    const prime = sidecar.priming({ selfRole: peer.role, roster, task: peer.task });
+    setTimeout(() => {
+      sendInputToSession(peer.id, prime).catch(error => console.warn('[sidecar] prime failed:', error.message));
+    }, 7000);
+  }
+  res.json({
+    group,
+    peerSessionId: peers[0]?.id || null,
+    peers: peers.map(peer => ({ role: peer.role, sessionId: peer.id })),
+  });
+});
+
+// CLI entrypoint: resolve the sender by its f-<8-char> tmux prefix.
+app.post('/api/sidecar/post', (req, res) => {
+  try {
+    const { group: groupId, fromPrefix, from, to, text } = req.body || {};
+    if (!to || !text) return res.status(400).json({ error: 'to and text required' });
+    const group = groupId
+      ? sidecar.getGroup(groupId)
+      : (fromPrefix ? sidecar.groupForSenderAndRole(fromPrefix, to) : null);
+    if (!group || group.status !== 'active') {
+      return res.status(404).json({ error: 'no active room for sender (you may be in several — pass --group)' });
+    }
+    if (sidecarGcIfDriverGone(group)) return res.status(410).json({ error: 'driver gone; room torn down' });
+    const fromRole = from || (fromPrefix ? sidecar.roleForPrefix(group, fromPrefix) : null) || 'unknown';
+    const result = sidecarDeliver(group, fromRole, to, text);
+    if (result.error) return res.status(400).json(result);
+    res.json({ ok: true, group: group.id, seq: result.message.seq });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+// Browser entrypoint: the group and sender role are already known.
+app.post('/api/sidecar/:id/post', (req, res) => {
+  try {
+    const { from, to, text } = req.body || {};
+    if (!to || !text) return res.status(400).json({ error: 'to and text required' });
+    const group = sidecar.getGroup(req.params.id);
+    if (!group || group.status !== 'active') return res.status(404).json({ error: 'no active room' });
+    if (sidecarGcIfDriverGone(group)) return res.status(410).json({ error: 'driver gone; room torn down' });
+    const result = sidecarDeliver(group, from || 'driver', to, text);
+    if (result.error) return res.status(400).json(result);
+    res.json({ ok: true, group: group.id, seq: result.message.seq });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/sidecar/:id/peers', (req, res) => {
+  try {
+    const group = sidecar.getGroup(req.params.id);
+    if (!group || group.status !== 'active') return res.status(404).json({ error: 'no active room' });
+    const { role = 'peer', agent = group.agent || 'claude', task = '' } = req.body || {};
+    const peerId = crypto.randomUUID();
+    sidecar.addMember(group.id, { sessionId: peerId, role, spawned: true });
+    const driver = group.members.find(member => !member.spawned);
+    const cwd = req.body?.cwd || (driver ? findSessionCwd(driver.sessionId) : null) || HOME;
+    spawnOrResume(peerId, cwd, false, agent);
+    const roster = sidecar.getGroup(group.id).members.map(member => member.role);
+    setTimeout(() => {
+      sendInputToSession(peerId, sidecar.priming({ selfRole: role, roster, task }))
+        .catch(error => console.warn('[sidecar] prime failed:', error.message));
+    }, 7000);
+    res.json({ ok: true, role, sessionId: peerId });
+  } catch (error) {
+    res.status(/role/.test(error.message) ? 400 : 500).json({ error: error.message });
+  }
+});
+
+app.post('/api/sidecar/:id/peers/:role/delete', (req, res) => {
+  try {
+    const group = sidecar.getGroup(req.params.id);
+    if (!group) return res.status(404).json({ error: 'not found' });
+    const member = group.members.find(candidate => candidate.role === req.params.role);
+    if (!member) return res.status(404).json({ error: `no member with role ${req.params.role}` });
+    if (!member.spawned) return res.status(400).json({ error: 'the driver cannot be removed' });
+    try { execFileSync('tmux', ['kill-session', '-t', tmuxName(member.sessionId)], { stdio: 'ignore' }); } catch {}
+    sidecar.removeMember(group.id, req.params.role);
+    res.json({ ok: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/sidecar/:id/delete', (req, res) => {
+  try {
+    const group = sidecar.getGroup(req.params.id);
+    if (!group) return res.status(404).json({ error: 'not found' });
+    for (const member of group.members) {
+      if (!member.spawned) continue;
+      try { execFileSync('tmux', ['kill-session', '-t', tmuxName(member.sessionId)], { stdio: 'ignore' }); } catch {}
+    }
+    sidecar.teardownGroup(group.id);
+    sidecarClients.delete(group.id);
+    res.json({ ok: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 app.post('/api/upload', async (req, res) => {
   try {
     const dir = uploadsDir();
@@ -1576,11 +2196,155 @@ app.post('/api/quick-links', (req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/api/mute', (_req, res) => res.json({ muted: readUserJson('muted.json', []) }));
+
+app.put('/api/mute', (req, res) => {
+  const list = req.body?.muted;
+  if (!Array.isArray(list) || list.some(id => typeof id !== 'string')) {
+    return res.status(400).json({ error: 'expected { muted: string[] }' });
+  }
+  const muted = [...new Set(list)];
+  try { writeUserJson('muted.json', muted); res.json({ ok: true, muted }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+function pushKeys() {
+  const stored = readUserJson('push-keys.json', {});
+  if (stored.publicKey && stored.privateKey) return stored;
+  const keys = webpush.generateKeys();
+  writeUserJson('push-keys.json', keys);
+  return keys;
+}
+
+app.get('/api/push/key', (_req, res) => {
+  try { res.json({ key: pushKeys().publicKey }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.get('/api/push/subscribe', (_req, res) => {
+  res.json({ subscriptions: readUserJson('push-subscriptions.json', []) });
+});
+
+app.post('/api/push/subscribe', (req, res) => {
+  const sub = req.body;
+  if (!sub || typeof sub.endpoint !== 'string' || !sub.endpoint) {
+    return res.status(400).json({ error: 'expected { endpoint, keys }' });
+  }
+  const subs = readUserJson('push-subscriptions.json', []).filter(item => item.endpoint !== sub.endpoint);
+  subs.push({ endpoint: sub.endpoint, keys: sub.keys || {}, at: new Date().toISOString() });
+  try { writeUserJson('push-subscriptions.json', subs); res.json({ ok: true, count: subs.length }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.delete('/api/push/subscribe', (req, res) => {
+  const endpoint = req.body?.endpoint;
+  if (typeof endpoint !== 'string') return res.status(400).json({ error: 'expected { endpoint }' });
+  const subs = readUserJson('push-subscriptions.json', []).filter(item => item.endpoint !== endpoint);
+  try { writeUserJson('push-subscriptions.json', subs); res.json({ ok: true, count: subs.length }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+async function pushToAll(payload) {
+  const subs = readUserJson('push-subscriptions.json', []);
+  if (!subs.length) return [];
+  const results = await Promise.all(subs.map(sub => webpush.send(sub, payload, pushKeys())));
+  const gone = new Set(results.filter(result => result.gone).map(result => result.endpoint));
+  if (gone.size) {
+    try { writeUserJson('push-subscriptions.json', subs.filter(sub => !gone.has(sub.endpoint))); } catch {}
+  }
+  return results;
+}
+
+app.post('/api/push/test', async (_req, res) => {
+  try {
+    const results = await pushToAll({ title: 'Feather', body: 'Push notifications are working.', tag: 'feather-test' });
+    res.json({ sent: results.filter(result => result.ok).length, results });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+let pushSeen = {};
+async function pushCheck() {
+  try {
+    if (!readUserJson('push-subscriptions.json', []).length) return;
+    const muted = new Set(readUserJson('muted.json', []));
+    const items = digestItems(Date.now() - 5 * 60000, 30)
+      .filter(item => item.status !== 'working' && !muted.has(item.id));
+    const seen = {};
+    for (const item of items) {
+      seen[item.id] = item.status;
+      if (pushSeen[item.id] === item.status) continue;
+      const body = item.status === 'waiting' ? item.question || 'Waiting on you'
+        : item.status === 'errored' ? 'Session errored' : 'Session finished';
+      await pushToAll({ title: item.title || 'Feather session', body, tag: `feather-${item.id}`, url: `./?session=${item.id}` });
+    }
+    pushSeen = seen;
+  } catch {}
+}
+
+if (process.env.FEATHER_PUSH_POLL !== '0') setInterval(pushCheck, 60000).unref();
+
 app.get('/api/starred', (_req, res) => res.json(readUserJson('starred.json', {})));
 
 app.post('/api/starred', (req, res) => {
   try { writeUserJson('starred.json', req.body); res.json({ ok: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+function starPreview(blocks) {
+  for (const block of blocks || []) {
+    const text = block.text || block.thinking || '';
+    if (text.trim()) return text.trim().slice(0, 240);
+  }
+  const tool = (blocks || []).find(block => block.type === 'tool_use');
+  return tool ? `[${tool.name}]` : '';
+}
+
+app.get('/api/starred/album', (_req, res) => {
+  try {
+    const starred = readUserJson('starred.json', {});
+    const meta = readMeta();
+    const labels = readUserJson('project-labels.json', {});
+    const items = [];
+    for (const [sessionId, uuids] of Object.entries(starred)) {
+      if (!Array.isArray(uuids) || !uuids.length) continue;
+      const agent = getAgentForSession(sessionId, meta);
+      const fpath = findJsonlPath(sessionId, agent);
+      if (!fpath) continue;
+      let content;
+      try { content = fs.readFileSync(fpath, 'utf8'); } catch { continue; }
+      const wanted = new Set(uuids);
+      const projectId = agent === 'claude' ? path.basename(path.dirname(fpath)) : null;
+      let info = { firstUserText: null, cwd: meta[sessionId]?.cwd || null };
+      if (agent === 'claude') info = extractSessionInfo(fpath);
+      else {
+        let buf;
+        try { buf = fs.readFileSync(fpath).slice(0, CODEX_HEAD_BYTES); } catch { buf = Buffer.alloc(0); }
+        info = {
+          firstUserText: agent === 'codex' ? extractCodexTitle(buf) : extractOmpTitle(buf),
+          cwd: agent === 'codex' ? extractCodexCwd(buf) : meta[sessionId]?.cwd || null,
+        };
+      }
+      const title = meta[sessionId]?.title || info.firstUserText || sessionId.slice(0, 8);
+      for (const line of content.split('\n')) {
+        if (!line) continue;
+        const message = parseMessageForAgent(line, agent);
+        if (!message || !wanted.has(message.uuid)) continue;
+        items.push({
+          uuid: message.uuid,
+          sessionId,
+          sessionTitle: title,
+          projectId,
+          projectLabel: projectId ? labels[projectId] || null : null,
+          cwd: info.cwd || (projectId ? projectIdToCwd(projectId) : null) || null,
+          role: message.role,
+          timestamp: message.timestamp || null,
+          snippet: starPreview(message.content),
+        });
+      }
+    }
+    items.sort((a, b) => Date.parse(b.timestamp || 0) - Date.parse(a.timestamp || 0));
+    res.json({ count: items.length, items });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/api/sessions/:id/export', (req, res) => {
@@ -1622,11 +2386,32 @@ function reapIdleSessions() {
 
   // Reap codex sessions
   try {
+    const meta = readMeta();
     for (const { uuid, fpath, mtime } of listCodexJsonlFiles()) {
-      if (!active.has(uuid.slice(0, 8))) continue;
-      if (now - mtime.getTime() > IDLE_MS) {
-        const name = tmuxName(uuid);
+      const id = resolveCodexWatchId(uuid, meta);
+      if (!active.has(id.slice(0, 8))) continue;
+      const activity = lastActivityMs(fpath, 'codex', mtime.getTime());
+      if (now - activity > IDLE_MS) {
+        const name = tmuxName(id);
         try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
+        console.log(`[reaper] killed idle Codex session ${name} (inactive ${Math.round((now - activity) / 60000)}m)`);
+      }
+    }
+  } catch {}
+
+  // Reap omp sessions.
+  try {
+    for (const id of fs.readdirSync(OMP_SESSIONS)) {
+      if (!active.has(id.slice(0, 8))) continue;
+      const dirPath = path.join(OMP_SESSIONS, id);
+      const files = fs.readdirSync(dirPath).filter(file => file.endsWith('.jsonl')).sort().reverse();
+      if (!files.length) continue;
+      const fpath = path.join(dirPath, files[0]);
+      const activity = lastActivityMs(fpath, 'omp', fs.statSync(fpath).mtimeMs);
+      if (now - activity > IDLE_MS) {
+        const name = tmuxName(id);
+        try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
+        console.log(`[reaper] killed idle OMP session ${name} (inactive ${Math.round((now - activity) / 60000)}m)`);
       }
     }
   } catch {}
@@ -1640,10 +2425,12 @@ function reapIdleSessions() {
         if (!file.endsWith('.jsonl')) continue;
         const id = file.replace('.jsonl', '');
         if (!active.has(id.slice(0, 8))) continue;
-        const stat = fs.statSync(path.join(dirPath, file));
-        if (now - stat.mtimeMs > IDLE_MS) {
+        const fpath = path.join(dirPath, file);
+        const activity = lastActivityMs(fpath, 'claude', fs.statSync(fpath).mtimeMs);
+        if (now - activity > IDLE_MS) {
           const name = tmuxName(id);
           try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
+          console.log(`[reaper] killed idle Claude session ${name} (inactive ${Math.round((now - activity) / 60000)}m)`);
         }
       }
     } catch {}
@@ -1655,15 +2442,18 @@ setInterval(reapIdleSessions, 5 * 60 * 1000);
 // ── File browser API ──────────────────────────────────────────────────────
 
 const ALLOWED_ROOTS = [HOME, '/tmp', '/opt'];
+const expandTilde = value => value === '~'
+  ? HOME
+  : (typeof value === 'string' && value.startsWith('~/') ? path.join(HOME, value.slice(2)) : value);
 
 function isPathAllowed(p) {
   const resolved = path.resolve(p);
-  return ALLOWED_ROOTS.some(root => resolved.startsWith(root));
+  return ALLOWED_ROOTS.some(root => resolved === root || resolved.startsWith(root + path.sep));
 }
 
 app.get('/api/files/list', (req, res) => {
   try {
-    const dir = req.query.dir || HOME;
+    const dir = expandTilde(req.query.dir) || HOME;
     const showHidden = req.query.showHidden === '1' || req.query.showHidden === 'true';
     if (!isPathAllowed(dir)) return res.status(403).json({ error: 'Access denied' });
     const resolved = path.resolve(dir);
@@ -1695,7 +2485,7 @@ app.get('/api/files/list', (req, res) => {
 
 app.get('/api/files/raw', (req, res) => {
   try {
-    const filePath = req.query.path;
+    const filePath = expandTilde(req.query.path);
     if (!filePath) return res.status(400).json({ error: 'path required' });
     if (!isPathAllowed(filePath)) return res.status(403).json({ error: 'Access denied' });
     const resolved = path.resolve(filePath);
@@ -1721,10 +2511,33 @@ app.get('/api/files/raw', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Opt-in HTML artifact preview. A restrictive sandbox permits styling and
+// outbound links without giving the artifact access to Feather's origin.
+app.get('/api/files/html', (req, res) => {
+  try {
+    const filePath = expandTilde(req.query.path);
+    if (!filePath) return res.status(400).json({ error: 'path required' });
+    if (!isPathAllowed(filePath)) return res.status(403).json({ error: 'Access denied' });
+    const resolved = path.resolve(filePath);
+    if (!fs.existsSync(resolved)) return res.status(404).json({ error: 'Not found' });
+    const stat = fs.statSync(resolved);
+    if (!stat.isFile()) return res.status(400).json({ error: 'Not a file' });
+    if (stat.size > 10 * 1024 * 1024) return res.status(413).json({ error: 'File too large (>10MB)' });
+    if (!['.html', '.htm'].includes(path.extname(resolved).toLowerCase())) {
+      return res.status(415).json({ error: 'Only HTML files can be previewed' });
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Content-Disposition', 'inline');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "sandbox allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation; default-src 'none'; style-src 'unsafe-inline'; img-src data: https:; font-src data: https:; object-src 'none'; base-uri 'none'; form-action 'none'");
+    return res.sendFile(resolved);
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 // Delete a file or directory. Gated by isPathAllowed (stricter than upstream,
 // which only required a leading slash) so deletes stay within ALLOWED_ROOTS.
 app.delete('/api/files/delete', (req, res) => {
-  const fpath = req.query.path;
+  const fpath = expandTilde(req.query.path);
   if (!fpath || !isPathAllowed(fpath)) return res.status(403).json({ error: 'Access denied' });
   const resolved = path.resolve(fpath);
   if (!fs.existsSync(resolved)) return res.status(404).json({ error: 'not found' });
@@ -1734,281 +2547,6 @@ app.delete('/api/files/delete', (req, res) => {
     else fs.unlinkSync(resolved);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── /api/auto: instances ────────────────────────────────────────────────────
-
-// New instances live at ~/auto-NAME/. Legacy instances (created before the
-// rename) live at ~/autoweb-NAME/ and are still resolved for back-compat.
-const AUTO_PREFIX = 'auto-';
-const LEGACY_PREFIX = 'autoweb-';
-
-function autoDir(name) {
-  const fresh = path.join(HOME, AUTO_PREFIX + name);
-  if (fs.existsSync(fresh)) return fresh;
-  const legacy = path.join(HOME, LEGACY_PREFIX + name);
-  if (fs.existsSync(legacy)) return legacy;
-  return fresh;
-}
-
-const safeAutoName = (n) => /^[a-z0-9][a-z0-9-]{0,30}$/.test(n);
-
-function readSafe(p, fallback = '') {
-  try { return fs.readFileSync(p, 'utf8'); } catch { return fallback; }
-}
-
-function isAutoRunning(pidPath) {
-  const pid = parseInt(readSafe(pidPath).trim());
-  if (!pid) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
-function summarizeAutoInstance(name) {
-  const dir = autoDir(name);
-  if (!fs.existsSync(path.join(dir, 'run.sh'))) return null;
-  const tsv = readSafe(path.join(dir, 'results.tsv'));
-  const rows = tsv.split('\n').slice(1).filter(Boolean);
-  let keeps = 0, reverts = 0, crashes = 0, skips = 0;
-  for (const r of rows) {
-    const status = r.split('\t')[1];
-    if (status === 'keep') keeps++;
-    else if (status === 'revert') reverts++;
-    else if (status === 'crash') crashes++;
-    else if (status === 'skip') skips++;
-  }
-  const last = rows.slice(-1)[0]?.split('\t') || [];
-  const mainChat = readSafe(path.join(dir, 'main_chat.txt')).trim() || null;
-  return {
-    name,
-    dir,
-    running: isAutoRunning(path.join(dir, 'auto.pid')),
-    current: readSafe(path.join(dir, 'current.txt')).trim(),
-    keeps, reverts, crashes, skips,
-    iterations: rows.length,
-    last: last.length ? { timestamp: last[0], status: last[1], description: last[2] } : null,
-    mainChat,
-  };
-}
-
-function listAutoInstances() {
-  const out = [];
-  const seen = new Set();
-  let entries;
-  try { entries = fs.readdirSync(HOME); } catch { return out; }
-  for (const entry of entries) {
-    let name;
-    if (entry.startsWith(AUTO_PREFIX)) name = entry.slice(AUTO_PREFIX.length);
-    else if (entry.startsWith(LEGACY_PREFIX)) name = entry.slice(LEGACY_PREFIX.length);
-    else continue;
-    if (!safeAutoName(name) || seen.has(name)) continue;
-    seen.add(name);
-    const s = summarizeAutoInstance(name);
-    if (s) out.push(s);
-  }
-  return out.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function listAutoWorkerSessions(name, limit = 20) {
-  const out = [];
-  const projDir = projectsDir();
-  const projDirs = [
-    path.join(projDir, `-home-user-${AUTO_PREFIX}${name}`),
-    path.join(projDir, `-home-user-${LEGACY_PREFIX}${name}`),
-  ];
-  for (const pd of projDirs) {
-    if (!fs.existsSync(pd)) continue;
-    try {
-      for (const f of fs.readdirSync(pd)) {
-        if (!f.endsWith('.jsonl')) continue;
-        const fp = path.join(pd, f);
-        const st = fs.statSync(fp);
-        if (st.size < 50) continue;
-        out.push({ id: f.replace('.jsonl', ''), agent: 'claude', mtime: st.mtime.toISOString() });
-      }
-    } catch {}
-  }
-  for (const { uuid, fpath, mtime } of listCodexJsonlFiles().slice(0, 200)) {
-    try {
-      const fd = fs.openSync(fpath, 'r');
-      const buf = Buffer.alloc(Math.min(65536, fs.fstatSync(fd).size));
-      fs.readSync(fd, buf, 0, buf.length, 0);
-      fs.closeSync(fd);
-      if (buf.includes(`${AUTO_PREFIX}${name}`) || buf.includes(`${LEGACY_PREFIX}${name}`)) {
-        out.push({ id: uuid, agent: 'codex', mtime: mtime.toISOString() });
-      }
-    } catch {}
-  }
-  out.sort((a, b) => b.mtime.localeCompare(a.mtime));
-  return out.slice(0, limit);
-}
-
-app.get('/api/auto/instances', (_req, res) => {
-  res.json({ instances: listAutoInstances() });
-});
-
-app.get('/api/auto/instances/:name', (req, res) => {
-  const { name } = req.params;
-  if (!safeAutoName(name)) return res.status(400).json({ error: 'bad name' });
-  const s = summarizeAutoInstance(name);
-  if (!s) return res.status(404).json({ error: 'not found' });
-  s.program = readSafe(path.join(s.dir, 'program.md'));
-  s.results = readSafe(path.join(s.dir, 'results.tsv'));
-  s.workerSessions = listAutoWorkerSessions(name);
-  res.json(s);
-});
-
-app.get('/api/auto/pipelines', (_req, res) => {
-  res.json({ pipelines: listPipelines() });
-});
-
-function resolveAutoPipelineName({ pipeline, template }) {
-  if (pipeline) return pipeline;
-  if (!template || template === 'full') return 'claude-codex';
-  if (template === 'simple') return 'simple';
-  return template;
-}
-
-app.post('/api/auto/instances', express.json(), (req, res) => {
-  const { name, target, url, repo, template, pipeline, goal } = req.body || {};
-  if (!safeAutoName(name)) return res.status(400).json({ error: 'bad name (lowercase, digits, dashes)' });
-
-  const dir = path.join(HOME, AUTO_PREFIX + name);
-  const legacyDir = path.join(HOME, LEGACY_PREFIX + name);
-  if (fs.existsSync(dir) || fs.existsSync(legacyDir)) {
-    return res.status(409).json({ error: 'already exists' });
-  }
-
-  const pipelineName = resolveAutoPipelineName({ pipeline, template });
-  const available = listPipelines();
-  if (!available.includes(pipelineName)) {
-    return res.status(400).json({ error: `unknown pipeline: ${pipelineName}. Available: ${available.join(', ')}` });
-  }
-
-  fs.mkdirSync(path.join(dir, 'logs'), { recursive: true });
-
-  let runSh;
-  try {
-    runSh = generateRunSh({ pipelineName, instanceName: name, instanceDir: dir, repo });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
-
-  const programParts = [
-    `# auto — ${name}`,
-    `Pipeline: ${pipelineName}`,
-    '',
-    '## Goal',
-    goal || target || '(set me)',
-    '',
-  ];
-  if (target) programParts.push('## Target file', target, '');
-  if (url) programParts.push('## Target URL', url, '');
-  if (repo) programParts.push('## Repo', repo, '');
-  programParts.push(
-    '## CURRENT FOCUS',
-    'general',
-    '',
-    '## Known issues',
-    '(none)',
-    '',
-    '## CAN',
-    '- (list)',
-    '',
-    '## CANNOT',
-    '- Break the page',
-    '',
-    '## How to verify',
-    url ? 'Screenshot the URL, sanity check.' : 'Run tests, check sanity conditions.',
-    '',
-  );
-
-  fs.writeFileSync(path.join(dir, 'run.sh'), runSh, { mode: 0o755 });
-  fs.writeFileSync(path.join(dir, 'program.md'), programParts.join('\n'));
-  fs.writeFileSync(path.join(dir, 'results.tsv'), 'timestamp\tstatus\tdescription\n');
-  res.json({ ok: true, instance: summarizeAutoInstance(name) });
-});
-
-app.post('/api/auto/instances/:name/start', (req, res) => {
-  const { name } = req.params;
-  if (!safeAutoName(name)) return res.status(400).json({ error: 'bad name' });
-  const dir = autoDir(name);
-  if (!fs.existsSync(path.join(dir, 'run.sh'))) return res.status(404).json({ error: 'not found' });
-  const pidPath = path.join(dir, 'auto.pid');
-  if (isAutoRunning(pidPath)) return res.json({ ok: true, alreadyRunning: true });
-  const out = fs.openSync(path.join(dir, 'auto.log'), 'a');
-  const child = spawn('bash', [path.join(dir, 'run.sh')], {
-    detached: true,
-    stdio: ['ignore', out, out],
-    cwd: dir,
-  });
-  fs.writeFileSync(pidPath, String(child.pid));
-  child.unref();
-  res.json({ ok: true, pid: child.pid });
-});
-
-app.post('/api/auto/instances/:name/stop', (req, res) => {
-  const { name } = req.params;
-  if (!safeAutoName(name)) return res.status(400).json({ error: 'bad name' });
-  const pidPath = path.join(autoDir(name), 'auto.pid');
-  const pid = parseInt(readSafe(pidPath).trim());
-  if (!pid) return res.json({ ok: true, alreadyStopped: true });
-  try { process.kill(-pid, 'SIGTERM'); } catch {}
-  try { process.kill(pid, 'SIGTERM'); } catch {}
-  try { fs.unlinkSync(pidPath); } catch {}
-  res.json({ ok: true });
-});
-
-app.post('/api/auto/instances/:name/focus', express.json(), (req, res) => {
-  const { name } = req.params;
-  const { focus } = req.body || {};
-  if (!safeAutoName(name) || !focus) return res.status(400).json({ error: 'bad input' });
-  const programPath = path.join(autoDir(name), 'program.md');
-  let p = readSafe(programPath);
-  if (!p) return res.status(404).json({ error: 'not found' });
-  if (/^## CURRENT FOCUS\n.*$/m.test(p)) {
-    p = p.replace(/^## CURRENT FOCUS\n.*$/m, `## CURRENT FOCUS\n${focus}`);
-  } else {
-    p += `\n## CURRENT FOCUS\n${focus}\n`;
-  }
-  fs.writeFileSync(programPath, p);
-  res.json({ ok: true });
-});
-
-app.post('/api/auto/instances/:name/btw', express.json(), (req, res) => {
-  const { name } = req.params;
-  const { note } = req.body || {};
-  if (!safeAutoName(name) || !note) return res.status(400).json({ error: 'bad input' });
-  const programPath = path.join(autoDir(name), 'program.md');
-  let p = readSafe(programPath);
-  if (!p) return res.status(404).json({ error: 'not found' });
-  const stamp = new Date().toISOString();
-  const line = `- (${stamp}) ${note}`;
-  if (/^## Known issues\n/m.test(p)) {
-    p = p.replace(/^## Known issues\n(\(none\)\n)?/m, `## Known issues\n${line}\n`);
-  } else {
-    p += `\n## Known issues\n${line}\n`;
-  }
-  fs.writeFileSync(programPath, p);
-  res.json({ ok: true });
-});
-
-app.post('/api/auto/instances/:name/link', express.json(), (req, res) => {
-  const { name } = req.params;
-  const { sessionId } = req.body || {};
-  if (!safeAutoName(name) || !sessionId) return res.status(400).json({ error: 'bad input' });
-  const dir = autoDir(name);
-  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'not found' });
-  fs.writeFileSync(path.join(dir, 'main_chat.txt'), sessionId);
-  res.json({ ok: true });
-});
-
-app.delete('/api/auto/instances/:name', (req, res) => {
-  const { name } = req.params;
-  if (!safeAutoName(name)) return res.status(400).json({ error: 'bad name' });
-  const dir = autoDir(name);
-  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'not found' });
-  if (isAutoRunning(path.join(dir, 'auto.pid'))) return res.status(409).json({ error: 'still running, stop first' });
-  res.json({ ok: true, hint: 'rm -rf ' + dir + ' to remove on disk (server does not delete)' });
 });
 
 // ── Legacy route redirects ──────────────────────────────────────────────────

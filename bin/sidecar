@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# sidecar — talk to your Feather sidecar peers from inside an agent session.
+# Self-identifies via this deployment's tmux session name (f-<id8>); Feather resolves
+# which group this session belongs to.
+#
+#   sidecar post --to <role|a,b|all> <text...>   send to a peer, several, or all
+#   sidecar read [--since <seq>] [--from <role>]  print the thread (optionally filtered)
+#   sidecar wait --from <role|all> --count <N> [--timeout <S>]   block until N replies land
+#   sidecar whoami                                show this session's group(s)
+#
+# When this session is in several groups, pass --group <id> (or set SIDECAR_GROUP).
+# Install: ln -s <feather>/bin/sidecar ~/.local/bin/sidecar   (must be on PATH)
+# Override the backend with FEATHER_URL (else it probes $PORT, the account's
+# deployed Feather port, then the conventional local ports).
+set -euo pipefail
+
+die() { echo "sidecar: $*" >&2; exit 1; }
+command -v jq   >/dev/null || die "jq is required"
+command -v curl >/dev/null || die "curl is required"
+
+resolve_base() {
+  if [ -n "${FEATHER_URL:-}" ]; then printf '%s' "$FEATHER_URL"; return; fi
+  local account_port p
+  case "${USER:-$(id -un)}" in
+    user)   account_port=4871 ;;
+    tobin)  account_port=4872 ;;
+    maya)   account_port=4873 ;;
+    stella) account_port=4874 ;;
+    allan)  account_port=4875 ;;
+    *)      account_port=4870 ;;
+  esac
+  for p in "${PORT:-}" "$account_port" 4870 3300; do
+    [ -n "$p" ] || continue
+    if curl -fsS -o /dev/null "http://127.0.0.1:$p/api/health" 2>/dev/null; then
+      printf '%s' "http://127.0.0.1:$p"; return
+    fi
+  done
+  printf '%s' "http://127.0.0.1:${PORT:-$account_port}"
+}
+BASE="$(resolve_base)"
+
+self_prefix() {
+  local s
+  s=$(tmux display-message -p '#S' 2>/dev/null) || die "not inside a tmux session"
+  case "$s" in
+    f-*) printf '%s' "${s#f-}" ;;
+    *) die "not a feather session (tmux session: $s)" ;;
+  esac
+}
+
+# Resolve a concrete group id for read/wait: explicit --group, then $SIDECAR_GROUP,
+# then the (unique) active group containing this session.
+resolve_group() {
+  local prefix="$1" forced="$2"
+  if [ -n "$forced" ]; then printf '%s' "$forced"; return; fi
+  if [ -n "${SIDECAR_GROUP:-}" ]; then printf '%s' "$SIDECAR_GROUP"; return; fi
+  local ids
+  ids=$(curl -fsS "$BASE/api/sidecar" \
+    | jq -r --arg p "$prefix" \
+      '.groups[] | select(.status=="active") | select(any(.members[]; .sessionId[0:8]==$p)) | .id')
+  local n; n=$(printf '%s\n' "$ids" | grep -c . || true)
+  [ "$n" -ge 1 ] || die "no active sidecar group for this session"
+  [ "$n" -eq 1 ] || die "this session is in $n active groups — pass --group <id> (sidecar whoami to list)"
+  printf '%s' "$ids"
+}
+
+self_role() { # $1 prefix, $2 gid
+  curl -fsS "$BASE/api/sidecar/$2" \
+    | jq -r --arg p "$1" '.group.members[] | select(.sessionId[0:8]==$p) | .role' | head -1
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  post)
+    to=""; group=""; text=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --to) to="${2:-}"; shift 2 ;;
+        --group) group="${2:-}"; shift 2 ;;
+        *) text="${text:+$text }$1"; shift ;;
+      esac
+    done
+    [ -n "$to" ] && [ -n "$text" ] || die "usage: sidecar post --to <role|a,b|all> <text>"
+    prefix=$(self_prefix)
+    [ -n "$group" ] || group="${SIDECAR_GROUP:-}"
+    resp=$(curl -sS -X POST "$BASE/api/sidecar/post" \
+      -H 'Content-Type: application/json' \
+      -d "$(jq -nc --arg p "$prefix" --arg to "$to" --arg t "$text" --arg g "$group" \
+            '{fromPrefix:$p, to:$to, text:$t} + (if $g=="" then {} else {group:$g} end)')") \
+      || die "could not reach Feather at $BASE"
+    err=$(printf '%s' "$resp" | jq -r '.error // empty' 2>/dev/null)
+    [ -z "$err" ] || die "$err"
+    echo "sent → $to" >&2
+    # stdout = the posted message's seq, so a generator can:
+    #   s=$(sidecar post --to all "candidate"); sidecar wait --from all --count 3 --since "$s"
+    printf '%s\n' "$(printf '%s' "$resp" | jq -r '.seq // empty')"
+    ;;
+  read|log)
+    since=0; from=""; group=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --since) since="${2:-0}"; shift 2 ;;
+        --from) from="${2:-}"; shift 2 ;;
+        --group) group="${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    prefix=$(self_prefix); gid=$(resolve_group "$prefix" "$group")
+    curl -fsS "$BASE/api/sidecar/$gid" \
+      | jq -r --argjson since "$since" --arg from "$from" \
+        '.thread[] | select(.seq > $since) | select($from=="" or .from==$from) | "[\(.seq)] \(.from) → \(.to): \(.text)"'
+    ;;
+  wait)
+    from=""; count=1; timeout=60; group=""; since=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --from) from="${2:-}"; shift 2 ;;
+        --count) count="${2:-1}"; shift 2 ;;
+        --timeout) timeout="${2:-60}"; shift 2 ;;
+        --group) group="${2:-}"; shift 2 ;;
+        --since) since="${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [ -n "$from" ] || die "usage: sidecar wait --from <role|all> --count <N> [--timeout <S>] [--since <seq>]"
+    prefix=$(self_prefix); gid=$(resolve_group "$prefix" "$group")
+    me=$(self_role "$prefix" "$gid")
+    # Capture --since BEFORE posting the candidate to avoid missing a fast reply.
+    if [ -n "$since" ]; then start="$since"
+    else start=$(curl -fsS "$BASE/api/sidecar/$gid" | jq -r '[.thread[].seq] | max // 0'); fi
+    deadline=$(( $(date +%s) + timeout ))
+    while :; do
+      thread=$(curl -fsS "$BASE/api/sidecar/$gid")
+      if [ "$from" = "all" ]; then
+        matched=$(printf '%s' "$thread" | jq -r --argjson s "$start" --arg me "$me" \
+          '[.thread[] | select(.seq > $s) | select(.from != $me) | .from] | unique | length')
+      else
+        matched=$(printf '%s' "$thread" | jq -r --argjson s "$start" --arg f "$from" \
+          '[.thread[] | select(.seq > $s) | select(.from == $f)] | length')
+      fi
+      if [ "${matched:-0}" -ge "$count" ]; then
+        printf '%s' "$thread" | jq -r --argjson s "$start" --arg f "$from" --arg me "$me" \
+          '.thread[] | select(.seq > $s) | select($f=="all" or .from==$f) | select(.from != $me) | "[\(.seq)] \(.from): \(.text)"'
+        exit 0
+      fi
+      [ "$(date +%s)" -lt "$deadline" ] || { echo "sidecar: timed out (${matched:-0}/$count after ${timeout}s)" >&2; exit 1; }
+      sleep 2
+    done
+    ;;
+  whoami)
+    prefix=$(self_prefix)
+    echo "session prefix: $prefix"
+    curl -fsS "$BASE/api/sidecar" \
+      | jq -r --arg p "$prefix" \
+        '.groups[] | select(any(.members[]; .sessionId[0:8]==$p)) | "group \(.id) [\(.status)] roles: \([.members[].role] | join(", "))"'
+    ;;
+  ""|-h|--help|help)
+    echo "usage: sidecar {post --to <role|a,b|all> <text> | read [--since N] [--from role] | wait --from <role|all> --count N [--timeout S] | whoami} [--group <id>]"
+    ;;
+  *)
+    die "unknown command: $cmd (try: sidecar help)"
+    ;;
+esac

@@ -58,6 +58,21 @@ You're running Claude Code on a remote machine. You want to check on it from you
 
 Feather reads Claude's raw JSONL session files, streams updates via SSE, and connects to tmux sessions via WebSocket terminals. No database. No build pipeline beyond Vite. Just `node server-single.js`.
 
+## Rooms — durable workspaces
+
+A Room is a folder under `~/rooms/` that gives related Feather chats a shared
+working directory and durable notes. The Rooms home groups Claude, Codex, and
+oh-my-pi sessions by working directory, and lets you create or explicitly assign
+chats without maintaining a separate Projects tree.
+
+Each room contains an `AGENTS.md`, a matching `CLAUDE.md` symlink, and a
+`notes.md` working memory. From a room chat, `room note "..."` appends a durable
+decision or open thread. The optional `room` CLI also supports lookups, sealed
+councils, second opinions, spawned sessions, and handoffs.
+
+Feather's former Auto surface is retired. Existing `~/auto-*` directories are
+left untouched.
+
 ## Quick start
 
 ```bash
@@ -97,7 +112,7 @@ npm start      # → Feather on http://localhost:4870
            │ filesystem
            ▼
   ~/.claude/projects/<hash>/<session>.jsonl
-  tmux sessions: feather-<8chars>
+  tmux sessions: f-<8chars>
 ```
 
 ## Files

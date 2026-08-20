@@ -1,3 +1,10 @@
+## 2026-08-21 - Rooms-first home, shared context, and sidecars
+- **Rooms are now the home screen.** A Room is a real folder under `~/rooms/`, with durable `AGENTS.md`/`CLAUDE.md` instructions and `notes.md` memory shared by its Claude, Codex, and oh-my-pi chats.
+- **Create rooms and chats from Feather.** Room cards show their latest activity, expand to all chats, and can start a new Claude or Codex session in the room. Explicit assignment covers sessions whose working directory is not yet visible.
+- **The old Projects tree and Auto surface are retired.** Existing `~/auto-*` working directories are not touched. The normal Sessions/Links sidebar, Files viewer, search, notifications, usage, staged updater, and terminal controls remain available.
+- **Sidecars are nested under their parent chat.** Multi-peer sidecars, durable threads, per-session send locking, and more reliable Codex discovery/activity tracking are included.
+- **New `room` and `sidecar` CLIs.** Each deployed account resolves its own Feather port automatically. Backend routes take effect on the next natural service restart; no running service is restarted by this update.
+
 ## 2026-06-11 - Files tab: download buttons + real PDF preview
 - **Download button on every file row** (Browse and Changed modes, plus the viewer header). Tapping it saves the file directly instead of opening it.
 - **PDF preview fixed.** Clicking a file name opens the type-aware viewer again: PDFs render in a real inline viewer (no more garbled byte-dump), images preview inline, other binaries show a download card, text and markdown render as before. This viewer shipped 2026-04-30 but was lost in the 2026-06-06 upstream merge.

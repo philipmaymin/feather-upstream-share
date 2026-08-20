@@ -111,7 +111,7 @@ export function Terminal(props: { sessionId: string | null }) {
       // Select all and copy
       term.selectAll()
       text = term.getSelection()
-      term.deselect()
+      ;(term as any).deselect()
     }
     if (text) {
       try {
@@ -135,6 +135,21 @@ export function Terminal(props: { sessionId: string | null }) {
     term.selectAll()
     setHasSelection(true)
   }
+
+  // A phone keyboard has no arrow or escape keys. Send the same bytes a
+  // physical key would write, then return focus to the terminal.
+  function sendKey(seq: string) {
+    try { ws?.send(seq) } catch {}
+    try { (term as any)?.focus?.() } catch {}
+  }
+
+  const KEYS: [string, string, string][] = [
+    ['\x1b', 'ESC', 'Escape'],
+    ['\x1b[D', '←', 'Left arrow'],
+    ['\x1b[B', '↓', 'Down arrow'],
+    ['\x1b[A', '↑', 'Up arrow'],
+    ['\x1b[C', '→', 'Right arrow'],
+  ]
 
   createEffect(() => {
     const sid = props.sessionId
@@ -163,6 +178,16 @@ export function Terminal(props: { sessionId: string | null }) {
     gap: '4px',
   }
 
+  const keyStyle = {
+    ...btnStyle,
+    'font-size': '15px',
+    padding: '8px 0',
+    'min-width': '44px',
+    'min-height': '40px',
+    'justify-content': 'center',
+    'flex-shrink': '0',
+  }
+
   return (
     <div style={{ height: '100%', width: '100%', display: 'flex', 'flex-direction': 'column', background: '#0a0e14' }}>
       {/* Terminal toolbar */}
@@ -172,6 +197,15 @@ export function Terminal(props: { sessionId: string | null }) {
           {copied() ? 'Copied!' : hasSelection() ? 'Copy Selection' : 'Copy All'}
         </button>
         <button onClick={handlePaste} style={btnStyle}>Paste</button>
+        {KEYS.map(([seq, label, aria]) => (
+          <button
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => sendKey(seq)}
+            aria-label={aria}
+            title={aria}
+            style={keyStyle}
+          >{label}</button>
+        ))}
       </div>
       <div ref={containerRef}
         onKeyDown={(e) => e.stopPropagation()}

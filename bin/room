@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# room — optional research and coordination tools for Rooms.
+#
+# A room is a folder under ~/rooms/<name> plus a pinned Feather chat whose cwd
+# is that folder. This CLI gives any brain that can run bash (claude, codex,
+# omp) the same room tools. Workers ALWAYS run in a directory outside ~/rooms
+# with a "WORKER:" prompt prefix, so they stay focused and never recursively
+# delegate.
+#
+# Usage:
+#   room new <name>                    scaffold a room folder
+#   room list                          list rooms
+#   room note "<text>"                 append a timestamped note to notes.md
+#   room lookup "<question>"           quick Haiku answer (transcripts, memory)
+#   room council "<task>" [-n N]       N sealed attempts (claude+codex) + judge
+#   room second-opinion "<question>"   ask the other harness
+#   room spawn "<task>"                resumable Feather session in the room cwd
+#   room handoff                       distill latest room session into notes.md
+#
+# Room resolution: -r <name> flag, $ROOM env, or cwd under ~/rooms/<name>.
+set -u
+
+ROOMS_DIR="${ROOMS_DIR:-$HOME/rooms}"
+RUNS_DIR="${ROOM_RUNS_DIR:-$HOME/.feather/room-runs}"
+TIMEOUT="${ROOM_TIMEOUT:-600}"
+LOOKUP_TIMEOUT="${ROOM_LOOKUP_TIMEOUT:-180}"
+
+die() { echo "room: $*" >&2; exit 1; }
+
+resolve_feather_url() {
+  if [ -n "${FEATHER_URL:-}" ]; then printf '%s' "$FEATHER_URL"; return; fi
+  local account_port port
+  case "${USER:-$(id -un)}" in
+    user)   account_port=4871 ;;
+    tobin)  account_port=4872 ;;
+    maya)   account_port=4873 ;;
+    stella) account_port=4874 ;;
+    allan)  account_port=4875 ;;
+    *)      account_port=4870 ;;
+  esac
+  for port in "${PORT:-}" "$account_port" 4870 3300; do
+    [ -n "$port" ] || continue
+    if curl -fsS -o /dev/null "http://127.0.0.1:$port/api/health" 2>/dev/null; then
+      printf 'http://127.0.0.1:%s' "$port"
+      return
+    fi
+  done
+  printf 'http://127.0.0.1:%s' "${PORT:-$account_port}"
+}
+FEATHER_URL="$(resolve_feather_url)"
+
+# ── Room resolution ─────────────────────────────────────────────────────────
+resolve_room() {
+  if [ -n "${ROOM_NAME:-}" ]; then return; fi
+  if [ -n "${ROOM:-}" ]; then ROOM_NAME="$ROOM"
+  else
+    case "$PWD/" in
+      "$ROOMS_DIR"/*) ROOM_NAME="${PWD#"$ROOMS_DIR"/}"; ROOM_NAME="${ROOM_NAME%%/*}" ;;
+      *) die "not inside a room — cd ~/rooms/<name>, set \$ROOM, or pass -r <name>" ;;
+    esac
+  fi
+  ROOM_PATH="$ROOMS_DIR/$ROOM_NAME"
+  [ -d "$ROOM_PATH" ] || die "no such room: $ROOM_NAME"
+}
+
+new_run_dir() {  # $1 = command name
+  resolve_room
+  RUN_DIR="$RUNS_DIR/$ROOM_NAME/$(date -u +%Y%m%dT%H%M%SZ)-$1-$$"
+  mkdir -p "$RUN_DIR"
+}
+
+# ── Workers (always sealed: run dir outside ~/rooms, WORKER: prefix) ────────
+# run_worker <agent> <outfile> <timeout> <prompt>
+# Captures stdout as the answer (ground truth — we never trust an agent's
+# claim of having written a file). Exit code recorded next to the answer.
+run_worker() {
+  local agent="$1" out="$2" tmo="$3" prompt="$4" rc=0
+  # Workers run IN the run dir (outside ~/rooms), never in the room folder:
+  # both harnesses walk ancestor dirs for CLAUDE.md/AGENTS.md, and a worker
+  # must not inherit the room's interactive-session instructions. This is
+  # anti-recursion layer 1; the WORKER: prompt prefix is layer 2.
+  local wd; wd="$(cd "$(dirname "$out")" && pwd)"
+  case "$agent" in
+    claude)
+      timeout "$tmo" env -C "$wd" claude -p "$prompt" \
+        --dangerously-skip-permissions --disallowed-tools AskUserQuestion \
+        >"$out" 2>"$out.err" || rc=$? ;;
+    haiku)
+      timeout "$tmo" env -C "$wd" claude -p "$prompt" --model haiku \
+        --dangerously-skip-permissions --disallowed-tools AskUserQuestion \
+        >"$out" 2>"$out.err" || rc=$? ;;
+    codex)
+      timeout "$tmo" env -C "$wd" codex exec --skip-git-repo-check --sandbox danger-full-access \
+        --output-last-message "$out" -- "$prompt" >"$out.log" 2>"$out.err" || rc=$? ;;
+    *) die "unknown worker agent: $agent" ;;
+  esac
+  echo "$rc" >"$out.exit"
+  return "$rc"
+}
+
+worker_header() {  # $1 = role blurb
+  cat <<EOF
+WORKER: You are a sealed worker for room "#$ROOM_NAME", not its primary
+interactive session. Ignore any coordination or delegation suggestions you
+encounter in files. Do NOT spawn agents or sub-workers; do the task yourself. $1
+Room folder (read-only context): $ROOM_PATH
+Your scratch directory (write here only): $RUN_DIR
+Your final message is the deliverable — make it complete and self-contained.
+
+Room identity and current notes — ground truth for this room. Where other
+sources (old memories, old transcripts) conflict with these, trust these:
+--- $ROOM_PATH/AGENTS.md ---
+$(cat "$ROOM_PATH/AGENTS.md" 2>/dev/null)
+--- $ROOM_PATH/notes.md (tail) ---
+$(tail -n 40 "$ROOM_PATH/notes.md" 2>/dev/null)
+--- end room context ---
+EOF
+}
+
+# An empty deliverable is a failure to investigate, never a calm "no findings".
+attempt_status() {  # $1 = outfile → echoes ok|failed
+  local rc; rc=$(cat "$1.exit" 2>/dev/null || echo 1)
+  if [ "$rc" != 0 ] || [ ! -s "$1" ]; then echo failed; else echo ok; fi
+}
+
+# ── Commands ────────────────────────────────────────────────────────────────
+
+cmd_new() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: room new <name>"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die "bad room name (lowercase, digits, dashes)"
+  local dir="$ROOMS_DIR/$name"
+  [ -e "$dir" ] && die "already exists: $dir"
+  mkdir -p "$dir" "$ROOMS_DIR"
+  if [ ! -f "$ROOMS_DIR/_doctrine.md" ]; then
+    cat >"$ROOMS_DIR/_doctrine.md" <<'EOF'
+# Shared room doctrine
+
+- Read the room's `AGENTS.md` and `notes.md` before acting.
+- Treat `notes.md` as durable memory: record decisions, state, and open threads as work proceeds.
+- Verify important claims mechanically and keep evidence close to the decision.
+- Delegate only when it materially helps. A `WORKER:` is a focused hand and must not recursively delegate.
+EOF
+  fi
+  cat >"$dir/AGENTS.md" <<EOF
+# Room: #$name
+
+<!-- Two lines on what this room is about. Edit me. -->
+
+Follow the shared room doctrine: read ~/rooms/_doctrine.md now.
+On start, read notes.md — it is the room's memory; this chat is not.
+EOF
+  ln -s AGENTS.md "$dir/CLAUDE.md"
+  printf '# %s — notes\n\nWorking memory for this room. Sessions append decisions and open\nthreads as they happen (`room note "..."`). Newest at the bottom.\n' "#$name" >"$dir/notes.md"
+  echo "created $dir (AGENTS.md, CLAUDE.md -> AGENTS.md, notes.md)"
+  echo "next: edit the AGENTS.md header, then pin a Feather chat with cwd $dir"
+}
+
+cmd_list() {
+  for d in "$ROOMS_DIR"/*/; do
+    [ -f "$d/AGENTS.md" ] || continue
+    printf '%-16s %s\n' "$(basename "$d")" "$(date -u -r "$d/notes.md" +%Y-%m-%d 2>/dev/null || echo '-') $(tail -1 "$d/notes.md" 2>/dev/null | cut -c1-80)"
+  done
+}
+
+cmd_note() {
+  resolve_room
+  [ -n "${1:-}" ] || die 'usage: room note "<text>"'
+  printf -- '- %s %s\n' "$(date -u +%Y-%m-%d\ %H:%M)" "$1" >>"$ROOM_PATH/notes.md"
+  echo "noted in #$ROOM_NAME"
+}
+
+cmd_lookup() {
+  [ -n "${1:-}" ] || die 'usage: room lookup "<question>"'
+  new_run_dir lookup
+  local prompt
+  prompt="$(worker_header "You are a fast lookup assistant.")
+
+Question: $1
+
+Where to look (use grep/tail, do not read whole files):
+- Room notes: $ROOM_PATH/notes.md
+- Long-term memory facts: grep -i ~/memory/memory.jsonl
+- Past Claude session transcripts: ~/.claude/projects/*/*.jsonl
+  (grep -il for keywords first, then grep the matching file for context;
+  these are JSONL — extract the relevant text, do not dump raw JSON)
+
+Answer the question directly and concisely, with dates when relevant. If you
+find nothing, say exactly what you searched and that it turned up nothing."
+  run_worker haiku "$RUN_DIR/answer.md" "$LOOKUP_TIMEOUT" "$prompt" || true
+  if [ "$(attempt_status "$RUN_DIR/answer.md")" = ok ]; then cat "$RUN_DIR/answer.md"
+  else die "lookup failed (see $RUN_DIR)"; fi
+}
+
+cmd_second_opinion() {
+  [ -n "${1:-}" ] || die 'usage: room second-opinion "<question>"'
+  new_run_dir second-opinion
+  # Default to Codex for cross-harness decorrelation; rooms can override it.
+  local other="${ROOM_BRAIN_OTHER:-codex}"
+  local prompt
+  prompt="$(worker_header "You are an independent second opinion — be a skeptic, not an agreeable colleague. If the premise is wrong, say so.")
+
+$1"
+  run_worker "$other" "$RUN_DIR/answer.md" "$TIMEOUT" "$prompt" || true
+  if [ "$(attempt_status "$RUN_DIR/answer.md")" = ok ]; then
+    echo "── second opinion ($other) ──"; cat "$RUN_DIR/answer.md"
+  else die "second-opinion worker failed (see $RUN_DIR)"; fi
+}
+
+cmd_council() {
+  local task="${1:-}"; [ -n "$task" ] || die 'usage: room council "<task>" [-n N]'
+  shift
+  local n=4
+  while [ $# -gt 0 ]; do case "$1" in
+    -n) n="$2"; shift 2 ;;
+    *) die "unknown council flag: $1" ;;
+  esac; done
+  new_run_dir council
+  printf '%s\n' "$task" >"$RUN_DIR/task.md"
+  echo "council in #$ROOM_NAME: $n sealed attempts + judge → $RUN_DIR" >&2
+
+  # Sealed attempts, alternating harness for decorrelation. No cross-talk.
+  local agents=() i agent
+  for ((i = 0; i < n; i++)); do
+    if ((i % 2 == 0)); then agents+=(claude); else agents+=(codex); fi
+  done
+  local pids=() outs=()
+  for ((i = 0; i < n; i++)); do
+    agent="${agents[$i]}"
+    mkdir -p "$RUN_DIR/attempt-$((i + 1))"
+    outs+=("$RUN_DIR/attempt-$((i + 1))/answer.md")
+    RUN_DIR="$RUN_DIR/attempt-$((i + 1))" run_worker "$agent" "${outs[$i]}" "$TIMEOUT" \
+      "$(RUN_DIR="$RUN_DIR/attempt-$((i + 1))" worker_header "You are independent attempt $((i + 1)) of $n; others attempt the same task in parallel and you must not look at their work or coordinate.")
+
+Task: $task" &
+    pids+=($!)
+  done
+  wait "${pids[@]}" 2>/dev/null
+
+  # Roll call — failures are named, never silently dropped.
+  local ok=0 lines=""
+  for ((i = 0; i < n; i++)); do
+    if [ "$(attempt_status "${outs[$i]}")" = ok ]; then
+      ok=$((ok + 1)); lines+="attempt-$((i + 1)) (${agents[$i]}): OK — ${outs[$i]}"$'\n'
+    else
+      lines+="attempt-$((i + 1)) (${agents[$i]}): FAILED (timeout/error/empty — see ${outs[$i]}.err)"$'\n'
+    fi
+  done
+  printf '%s' "$lines" >&2
+  [ "$ok" -ge 1 ] || die "all $n attempts failed — investigate $RUN_DIR before retrying"
+
+  # One judge, after all attempts are frozen (concurrent judges have silently
+  # produced garbage rankings before — never parallelize judging).
+  local jprompt
+  jprompt="$(worker_header "You are the JUDGE. You did not produce any attempt; judge on the merits.")
+
+Task the attempts answered: $task
+
+Attempt roll call (read each OK answer file in full; FAILED attempts get no
+score and must be listed as failed in your report):
+$lines
+Deliver: (1) a ranking with one-line justifications, (2) the winning answer's
+core content, improved by grafting any clearly better ideas from the others,
+(3) disagreements the room should retain for the active session."
+  run_worker claude "$RUN_DIR/verdict.md" "$TIMEOUT" "$jprompt" || true
+  [ "$(attempt_status "$RUN_DIR/verdict.md")" = ok ] || die "judge failed (attempts are intact in $RUN_DIR)"
+  cat "$RUN_DIR/verdict.md"
+  echo >&2; echo "run journal: $RUN_DIR" >&2
+}
+
+cmd_spawn() {
+  [ -n "${1:-}" ] || die 'usage: room spawn "<task>"'
+  resolve_room
+  local id; id=$(cat /proc/sys/kernel/random/uuid)
+  local resp
+  resp=$(curl -sf -X POST "$FEATHER_URL/api/sessions" -H 'Content-Type: application/json' \
+    -d "{\"id\":\"$id\",\"cwd\":\"$ROOM_PATH\"}") || die "feather refused the spawn"
+  # The room cwd supplies context; the WORKER: prefix keeps this a focused,
+  # resumable hand — visible in Feather, grouped under the room.
+  sleep 8
+  curl -sf -X POST "$FEATHER_URL/api/sessions/$id/send" -H 'Content-Type: application/json' \
+    -d "$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' \
+      "WORKER: You are a spawned hand for room #$ROOM_NAME, not its coordinating session. Do the task directly and do not spawn agents. Task: $1")" \
+    >/dev/null || die "session $id spawned but the task send failed — send it manually"
+  echo "spawned session $id in #$ROOM_NAME (visible in Feather, resumable)"
+}
+
+cmd_handoff() {
+  resolve_room
+  new_run_dir handoff
+  # Feather normalizes Claude, Codex, and OMP sessions behind one API.
+  local latest
+  latest=$(curl -sf "$FEATHER_URL/api/rooms" | python3 -c '
+import json, sys
+name = sys.argv[1]
+room = next((r for r in json.load(sys.stdin).get("rooms", []) if r.get("name") == name), None)
+sessions = room.get("sessions", []) if room else []
+print(sessions[0]["id"] if sessions else "")
+' "$ROOM_NAME")
+  [ -n "$latest" ] || die "no room sessions found for #$ROOM_NAME"
+  local prompt
+  prompt="$(worker_header "You are the handoff distiller.")
+
+Fetch the normalized session messages from
+$FEATHER_URL/api/sessions/$latest/messages?limit=100000, then distill the user/assistant
+conversation (skip tool noise) against the existing notes at
+$ROOM_PATH/notes.md.
+Produce ONLY a markdown section (no preamble) in exactly this shape:
+
+## Handoff $(date -u +%Y-%m-%d)
+### State
+### Decisions
+### Open threads
+
+Include only what the notes do not already capture. Be specific — a fresh
+session must be able to continue from this alone."
+  run_worker claude "$RUN_DIR/handoff.md" "$TIMEOUT" "$prompt" || true
+  # Validation-gated append: degrade (refuse) rather than clobber.
+  if [ "$(attempt_status "$RUN_DIR/handoff.md")" = ok ] && grep -q '^## Handoff' "$RUN_DIR/handoff.md"; then
+    { echo; cat "$RUN_DIR/handoff.md"; } >>"$ROOM_PATH/notes.md"
+    echo "handoff appended to $ROOM_PATH/notes.md"
+  else
+    die "distiller output failed validation — notes.md untouched (draft: $RUN_DIR/handoff.md)"
+  fi
+}
+
+# ── Dispatch ────────────────────────────────────────────────────────────────
+[ $# -ge 1 ] || { grep '^#   room' "$0" | sed 's/^#   //'; exit 1; }
+while [ "${1:-}" = "-r" ]; do ROOM_NAME="$2"; ROOM_PATH="$ROOMS_DIR/$2"; shift 2; done
+cmd="$1"; shift
+case "$cmd" in
+  new) cmd_new "$@" ;;
+  list) cmd_list "$@" ;;
+  note) cmd_note "$@" ;;
+  lookup) cmd_lookup "$@" ;;
+  council) cmd_council "$@" ;;
+  second-opinion|so) cmd_second_opinion "$@" ;;
+  spawn) cmd_spawn "$@" ;;
+  handoff) cmd_handoff "$@" ;;
+  *) die "unknown command: $cmd" ;;
+esac

@@ -18,6 +18,7 @@ import diff from 'highlight.js/lib/languages/diff'
 import sql from 'highlight.js/lib/languages/sql'
 import yaml from 'highlight.js/lib/languages/yaml'
 import markdown from 'highlight.js/lib/languages/markdown'
+import { toolImagePath, toolInputText, toolPresentation } from '../lib/toolPresentation.js'
 
 hljs.registerLanguage('javascript', javascript)
 hljs.registerLanguage('js', javascript)
@@ -224,15 +225,17 @@ function stripAnsi(text: string): string {
 
 const TOOL_ICONS: Record<string, string> = {
   Read: '📄', Write: '✏️', Edit: '✂️', Bash: '⚡', Grep: '🔍', Glob: '🗂️',
-  WebFetch: '🌐', WebSearch: '🔎', Agent: '🤖', Skill: '⚡',
+  WebFetch: '🌐', WebSearch: '🔎', Web: '🌐', Agent: '🤖', Skill: '⚡',
 }
 
 const TOOL_COLORS: Record<string, string> = {
   Bash: '#e5946b', Read: '#73b8ff', Write: '#4aba6a', Edit: '#c4993a',
   Grep: '#b48ead', Glob: '#88c0d0', WebFetch: '#88c0d0', WebSearch: '#b48ead',
-  Agent: '#73b8ff', Skill: '#b48ead',
+  Web: '#88c0d0', Agent: '#73b8ff', Skill: '#b48ead',
   Patch: '#c4993a', Input: '#73b8ff',
 }
+
+const SPECIAL_TOOL_DETAILS = new Set(['Edit', 'Bash', 'Patch', 'Input', 'Write', 'Agent', 'Grep', 'Read'])
 
 // Codex emits tool_use blocks with names like 'shell', 'exec', or 'exec_command'
 // (the latter may arrive truncated as 'exec_comman'). Map them onto our
@@ -331,13 +334,16 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void) 
     )
   }
   if (block.type === 'tool_use') {
-    const name = canonicalName(block.name || 'tool')
-    const color = TOOL_COLORS[name] || '#999'
-    const summary = toolSummary(name, block.input)
     const inp = block.input || {}
-    const hasDetail = name === 'Edit' || name === 'Bash' || name === 'Patch' || name === 'Input' || name === 'Write' || name === 'Agent' || name === 'Grep' || name === 'Read'
+    const presented = toolPresentation(block.name || 'tool', inp)
+    const name = presented.name
+    const color = TOOL_COLORS[name] || '#999'
+    const summary = presented.summary
+    const genericInput = SPECIAL_TOOL_DETAILS.has(name) ? '' : toolInputText(inp)
     const pre = 'white-space:pre-wrap;font-size:10px;font-family:SF Mono,Menlo,monospace;padding:3px 0;max-height:160px;overflow:auto;margin:0;word-break:break-all;'
     const isImageFile = (name === 'Read' || name === 'Write') && inp.file_path && IMAGE_EXTS.has(((inp.file_path as string).substring((inp.file_path as string).lastIndexOf('.')).toLowerCase()))
+    const imagePath = toolImagePath(block.name || '', inp) || (isImageFile ? inp.file_path as string : '')
+    const hasDetail = SPECIAL_TOOL_DETAILS.has(name) || !!genericInput || !!imagePath
     return <>
       <details style={{ margin: '3px 0', 'font-size': '11px', 'font-family': "'SF Mono', Menlo, monospace", 'border-top': '1px solid #ffffff0a' }}>
         <summary style={{ padding: '2px 0', cursor: hasDetail ? 'pointer' : 'default', 'list-style': hasDetail ? undefined : 'none', color: '#999' }}>
@@ -358,10 +364,11 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void) 
         </>}
         {name === 'Grep' && inp.pattern && <pre style={`${pre}color:#c4a0c0`}>/{inp.pattern}/{inp.path ? ` in ${inp.path}` : ''}</pre>}
         {name === 'Read' && inp.file_path && <pre style={`${pre}color:#88c4ff`} ref={linkifyRef}>{inp.file_path}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
+        {genericInput && <pre style={`${pre}color:#aaa`} ref={linkifyRef}>{genericInput}</pre>}
       </details>
-      {isImageFile && (() => {
+      {imagePath && (() => {
         const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''
-        const resolvedPath = (inp.file_path as string).replace(/^~/, '/home/' + (typeof document !== 'undefined' ? document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user' : 'user'))
+        const resolvedPath = imagePath.replace(/^~/, '/home/' + (typeof document !== 'undefined' ? document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user' : 'user'))
         const imgSrc = `${base}/api/files/raw?path=${encodeURIComponent(resolvedPath)}`
         return <img src={imgSrc} onClick={() => onImageClick?.(imgSrc)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '6px', display: 'block', cursor: 'zoom-in' }} />
       })()}
