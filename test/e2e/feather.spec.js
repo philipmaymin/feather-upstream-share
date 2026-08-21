@@ -10,6 +10,7 @@ const CLAUDE_PROJECTS = path.join(HOME, '.claude/projects')
 // ── Synthetic session setup ─────────────────────────────────────────────────
 
 const TEST_SESSION_ID = `e2e-feather-${Date.now()}`
+const HTML_ARTIFACT_PATH = path.join('/tmp', `${TEST_SESSION_ID}-artifact.html`)
 let testSessionPath
 
 function writeLine(obj) {
@@ -23,6 +24,7 @@ test.beforeAll(() => {
   if (dirs.length === 0) throw new Error('No project dirs in ~/.claude/projects/')
 
   testSessionPath = path.join(CLAUDE_PROJECTS, dirs[0], `${TEST_SESSION_ID}.jsonl`)
+  fs.writeFileSync(HTML_ARTIFACT_PATH, '<!doctype html><html><head><title>Feather artifact</title></head><body><h1>Rendered HTML artifact</h1><p>This is rendered markup, not source text.</p></body></html>')
 
   writeLine({
     type: 'user', uuid: 'e2e-msg-001', timestamp: '2025-06-15T14:00:00Z',
@@ -36,7 +38,7 @@ test.beforeAll(() => {
       role: 'assistant',
       content: [
         { type: 'thinking', thinking: 'Let me explain the markdown pipeline step by step.' },
-        { type: 'text', text: `Feather uses **marked** with GFM support.\n\n## How it works\n\n1. Raw text goes through \`marked.parse()\`\n2. Output is sanitized with \`DOMPurify\`\n3. Result is cached in an LRU map\n\n\`\`\`js\nconst html = marked.parse(text)\nconst safe = DOMPurify.sanitize(html)\n\`\`\`\n\nThis keeps things **fast** and **secure**.\n\nLocal artifact: [Feather fixture](${path.join(HOME, 'feather-next/test/e2e/feather.spec.js')}:12)` },
+        { type: 'text', text: `Feather uses **marked** with GFM support.\n\n## How it works\n\n1. Raw text goes through \`marked.parse()\`\n2. Output is sanitized with \`DOMPurify\`\n3. Result is cached in an LRU map\n\n\`\`\`js\nconst html = marked.parse(text)\nconst safe = DOMPurify.sanitize(html)\n\`\`\`\n\nThis keeps things **fast** and **secure**.\n\nLocal artifact: [Feather fixture](${path.join(HOME, 'feather-next/test/e2e/feather.spec.js')}:12)\n\nHTML artifact: [Rendered artifact](${HTML_ARTIFACT_PATH})` },
       ],
     },
   })
@@ -73,6 +75,7 @@ test.beforeAll(() => {
 
 test.afterAll(() => {
   try { fs.unlinkSync(testSessionPath) } catch {}
+  try { fs.unlinkSync(HTML_ARTIFACT_PATH) } catch {}
 })
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -254,6 +257,21 @@ test.describe('Message rendering', () => {
     await preview.waitForLoadState()
     expect(preview.url()).toBe(new URL(expectedHref, BASE).href)
     await expect(preview.locator('body')).toContainText('Synthetic session setup')
+  })
+
+  test('markdown links to HTML artifacts open as rendered sandboxed pages', async ({ page }) => {
+    const link = page.getByRole('link', { name: 'Rendered artifact' })
+    const expectedHref = `/api/files/html?path=${encodeURIComponent(HTML_ARTIFACT_PATH)}`
+    await expect(link).toHaveAttribute('href', expectedHref)
+
+    const [preview] = await Promise.all([
+      page.waitForEvent('popup'),
+      link.click(),
+    ])
+    await preview.waitForLoadState()
+    expect(preview.url()).toBe(new URL(expectedHref, BASE).href)
+    await expect(preview.getByRole('heading', { name: 'Rendered HTML artifact' })).toBeVisible()
+    await expect(preview.locator('body')).not.toContainText('<h1>')
   })
 
   test('thinking block renders as collapsible details', async ({ page }) => {

@@ -172,9 +172,12 @@ function resolveLocalPath(filePath: string): string {
   return filePath.replace(/^~/, `/home/${username}`)
 }
 
-function rawFileHref(filePath: string): string {
+function localFileHref(filePath: string): string {
   const base = location.pathname.replace(/\/+$/, '')
-  return `${base}/api/files/raw?path=${encodeURIComponent(resolveLocalPath(filePath))}`
+  const resolvedPath = resolveLocalPath(filePath)
+  const ext = resolvedPath.substring(resolvedPath.lastIndexOf('.')).toLowerCase()
+  const route = ext === '.html' || ext === '.htm' ? 'html' : 'raw'
+  return `${base}/api/files/${route}?path=${encodeURIComponent(resolvedPath)}`
 }
 
 function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
@@ -184,8 +187,8 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
     // the same authenticated preview endpoint as the Files tab.
     const localPath = localPathFromHref(a.getAttribute('href') || '')
     if (localPath) {
-      a.href = rawFileHref(localPath)
-      a.title = 'Open local file'
+      a.href = localFileHref(localPath)
+      a.title = /\.html?$/i.test(localPath) ? 'Open HTML preview' : 'Open local file'
     }
     a.setAttribute('target', '_blank')
     a.setAttribute('rel', 'noopener')
@@ -212,7 +215,7 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
       a.style.textDecoration = 'none'
       a.style.cursor = 'pointer'
       const ext = path.substring(path.lastIndexOf('.')).toLowerCase()
-      const fileHref = rawFileHref(path)
+      const fileHref = localFileHref(path)
       if (IMAGE_EXTS.has(ext)) {
         const imgSrc = fileHref
         a.href = imgSrc
