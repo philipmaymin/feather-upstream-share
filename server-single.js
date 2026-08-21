@@ -9,6 +9,7 @@ import pty from 'node-pty';
 import { parseMessage, parseCodexMessage, parseMessageForAgent } from './lib/parse.js';
 import * as sidecar from './lib/sidecar.js';
 import { createKeyedLock } from './lib/sendlock.js';
+import { codexPasteBufferArgs } from './lib/tmux-input.js';
 import { sessionIsActive, lastMessageMs } from './lib/sessions.js';
 import { resolveCodexWatchId } from './lib/codex-watch.js';
 import * as webpush from './lib/webpush.js';
@@ -581,15 +582,15 @@ function waitForClaudeReady(name, timeoutMs = 30000) {
   });
 }
 
-// Codex needs paste-buffer for every message. After the first turn, Enter
-// inserts a newline instead of submitting if you used send-keys -l, so we
-// route through bracketed paste with a 300ms delay before Enter.
+// Codex needs real terminal bracketed paste for every message. Without tmux's
+// -p flag a large message is delivered as ordinary keystrokes in chunks, so
+// the following Enter can land before the paste is complete and never submit.
 async function sendCodexText(name, text) {
   const tmp = `/tmp/feather-send-${Date.now()}.txt`;
   fs.writeFileSync(tmp, text);
   try {
     execFileSync('tmux', ['load-buffer', tmp], { stdio: 'ignore' });
-    execFileSync('tmux', ['paste-buffer', '-t', name], { stdio: 'ignore' });
+    execFileSync('tmux', codexPasteBufferArgs(name), { stdio: 'ignore' });
   } finally { try { fs.unlinkSync(tmp); } catch {} }
   await new Promise(r => setTimeout(r, 300));
   try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}

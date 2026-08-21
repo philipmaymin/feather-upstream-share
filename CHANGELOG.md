@@ -1,4 +1,5 @@
 ## 2026-08-21 - Rooms-first home, shared context, and sidecars
+- **Large pasted messages now send reliably to Codex.** Feather now uses the terminal's real bracketed-paste mode and preserves multiline input, so the submit key cannot get swallowed halfway through a long paste and leave the message waiting invisibly in Terminal.
 - **Local artifact links open correctly from chat.** Markdown links to files on disk now use the same preview route as the Files tab, including links that carry a source line number.
 - **HTML artifacts render when opened from chat.** Links to local `.html` and `.htm` files now open in Feather's sandboxed artifact preview instead of showing the document's source text.
 - **Rooms are now the home screen.** A Room is a real folder under `~/rooms/`, with durable `AGENTS.md`/`CLAUDE.md` instructions and `notes.md` memory shared by its Claude, Codex, and oh-my-pi chats.
