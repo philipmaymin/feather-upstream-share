@@ -36,7 +36,7 @@ test.beforeAll(() => {
       role: 'assistant',
       content: [
         { type: 'thinking', thinking: 'Let me explain the markdown pipeline step by step.' },
-        { type: 'text', text: 'Feather uses **marked** with GFM support.\n\n## How it works\n\n1. Raw text goes through `marked.parse()`\n2. Output is sanitized with `DOMPurify`\n3. Result is cached in an LRU map\n\n```js\nconst html = marked.parse(text)\nconst safe = DOMPurify.sanitize(html)\n```\n\nThis keeps things **fast** and **secure**.' },
+        { type: 'text', text: `Feather uses **marked** with GFM support.\n\n## How it works\n\n1. Raw text goes through \`marked.parse()\`\n2. Output is sanitized with \`DOMPurify\`\n3. Result is cached in an LRU map\n\n\`\`\`js\nconst html = marked.parse(text)\nconst safe = DOMPurify.sanitize(html)\n\`\`\`\n\nThis keeps things **fast** and **secure**.\n\nLocal artifact: [Feather fixture](${path.join(HOME, 'feather-next/test/e2e/feather.spec.js')}:12)` },
       ],
     },
   })
@@ -239,6 +239,21 @@ test.describe('Message rendering', () => {
     const code = await pre.first().innerText()
     expect(code).toContain('marked.parse')
     expect(code).toContain('DOMPurify.sanitize')
+  })
+
+  test('markdown links to local artifacts use the Files preview endpoint', async ({ page }) => {
+    const link = page.getByRole('link', { name: 'Feather fixture' })
+    const expectedPath = path.join(HOME, 'feather-next/test/e2e/feather.spec.js')
+    const expectedHref = `/api/files/raw?path=${encodeURIComponent(expectedPath)}`
+    await expect(link).toHaveAttribute('href', expectedHref)
+
+    const [preview] = await Promise.all([
+      page.waitForEvent('popup'),
+      link.click(),
+    ])
+    await preview.waitForLoadState()
+    expect(preview.url()).toBe(new URL(expectedHref, BASE).href)
+    await expect(preview.locator('body')).toContainText('Synthetic session setup')
   })
 
   test('thinking block renders as collapsible details', async ({ page }) => {

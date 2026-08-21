@@ -1,4 +1,5 @@
 ## 2026-08-21 - Rooms-first home, shared context, and sidecars
+- **Local artifact links open correctly from chat.** Markdown links to files on disk now use the same preview route as the Files tab, including links that carry a source line number.
 - **Rooms are now the home screen.** A Room is a real folder under `~/rooms/`, with durable `AGENTS.md`/`CLAUDE.md` instructions and `notes.md` memory shared by its Claude, Codex, and oh-my-pi chats.
 - **Create rooms and chats from Feather.** Room cards show their latest activity, expand to all chats, and can start a new Claude or Codex session in the room. Explicit assignment covers sessions whose working directory is not yet visible.
 - **The old Projects tree and Auto surface are retired.** Existing `~/auto-*` working directories are not touched. The normal Sessions/Links sidebar, Files viewer, search, notifications, usage, staged updater, and terminal controls remain available.

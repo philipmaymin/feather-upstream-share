@@ -157,8 +157,36 @@ function collapseCodeBlocks(el: HTMLElement) {
 const FILE_PATH_RE = /((?:\/(?:home|opt|tmp|var|etc|usr)\/[^\s,;:)"'`\]>]+)|(?:~\/[^\s,;:)"'`\]>]+))/g
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp'])
 
+function localPathFromHref(href: string): string | null {
+  let candidate = href.trim()
+  if (candidate.startsWith('file://')) candidate = candidate.slice('file://'.length)
+  try { candidate = decodeURIComponent(candidate) } catch {}
+  // Codex file links may carry a line or line:column suffix. The raw-file
+  // endpoint opens the whole file, so keep that UI hint out of the disk path.
+  candidate = candidate.replace(/:\d+(?::\d+)?$/, '')
+  return /^(?:\/(?:home|opt|tmp|var|etc|usr)\/|~\/)/.test(candidate) ? candidate : null
+}
+
+function resolveLocalPath(filePath: string): string {
+  const username = document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user'
+  return filePath.replace(/^~/, `/home/${username}`)
+}
+
+function rawFileHref(filePath: string): string {
+  const base = location.pathname.replace(/\/+$/, '')
+  return `${base}/api/files/raw?path=${encodeURIComponent(resolveLocalPath(filePath))}`
+}
+
 function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
   for (const a of el.querySelectorAll('a')) {
+    // Markdown already turns [label](/absolute/path) into an anchor, so the
+    // text-node pass below never sees its path. Route those anchors through
+    // the same authenticated preview endpoint as the Files tab.
+    const localPath = localPathFromHref(a.getAttribute('href') || '')
+    if (localPath) {
+      a.href = rawFileHref(localPath)
+      a.title = 'Open local file'
+    }
     a.setAttribute('target', '_blank')
     a.setAttribute('rel', 'noopener')
   }
@@ -184,10 +212,9 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
       a.style.textDecoration = 'none'
       a.style.cursor = 'pointer'
       const ext = path.substring(path.lastIndexOf('.')).toLowerCase()
-      const base = location.pathname.replace(/\/+$/, '')
-      const resolvedPath = path.replace(/^~/, '/home/' + (document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user'))
+      const fileHref = rawFileHref(path)
       if (IMAGE_EXTS.has(ext)) {
-        const imgSrc = `${base}/api/files/raw?path=${encodeURIComponent(resolvedPath)}`
+        const imgSrc = fileHref
         a.href = imgSrc
         a.onclick = (e) => { e.preventDefault(); onImageClick?.(imgSrc) }
         frag.appendChild(a)
@@ -203,7 +230,7 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
         img.onclick = () => onImageClick?.(imgSrc)
         frag.appendChild(img)
       } else {
-        a.href = `${base}/api/files/raw?path=${encodeURIComponent(resolvedPath)}`
+        a.href = fileHref
         a.target = '_blank'
         a.rel = 'noopener'
         frag.appendChild(a)
