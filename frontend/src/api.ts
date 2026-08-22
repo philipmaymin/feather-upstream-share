@@ -148,9 +148,12 @@ export async function fetchMessages(id: string, before = 0): Promise<{ messages:
   return await r.json()
 }
 
-export const sendInput = (id: string, text: string): Promise<{ ok: boolean, sentAt: string }> =>
-  fetch(`${BASE}/api/sessions/${id}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) })
-    .then(r => r.json())
+export async function sendInput(id: string, text: string): Promise<{ ok: boolean, sentAt: string }> {
+  const r = await fetch(`${BASE}/api/sessions/${id}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) })
+  const data = await r.json().catch(() => ({}))
+  if (!r.ok || data.ok !== true) throw Object.assign(new Error(data.error || `HTTP ${r.status}`), { status: r.status })
+  return data
+}
 
 export async function createSession(cwd?: string, agent?: 'claude' | 'codex' | 'omp'): Promise<string> {
   const id = crypto.randomUUID()
@@ -168,14 +171,33 @@ export const resumeSession = (id: string, cwd?: string) =>
 export const interruptSession = (id: string) =>
   fetch(`${BASE}/api/sessions/${id}/interrupt`, { method: 'POST' })
 
-export async function uploadFile(blob: Blob, name: string): Promise<string> {
+export async function uploadFileWithId(blob: Blob, name: string, uploadId: string, signal?: AbortSignal): Promise<string> {
   const r = await fetch(`${BASE}/api/upload`, {
-    method: 'POST',
-    headers: { 'Content-Type': blob.type || 'application/octet-stream', 'X-Filename': encodeURIComponent(name) },
+    method: 'POST', signal,
+    headers: {
+      'Content-Type': blob.type || 'application/octet-stream',
+      'X-Filename': encodeURIComponent(name),
+      'X-Upload-ID': uploadId,
+    },
     body: blob,
   })
-  const { path } = await r.json()
-  return path
+  const data = await r.json().catch(() => ({}))
+  if (!r.ok) throw Object.assign(new Error(data.error || `HTTP ${r.status}`), { status: r.status })
+  if (typeof data.path !== 'string' || !data.path.startsWith('/')) throw new Error('Upload response did not include a valid path')
+  return data.path
+}
+
+export async function transcribeAudio(blob: Blob, signal?: AbortSignal): Promise<string> {
+  const r = await fetch(`${BASE}/api/transcribe`, {
+    method: 'POST', signal,
+    headers: { 'Content-Type': blob.type || 'application/octet-stream' },
+    body: blob,
+  })
+  const data = await r.json().catch(() => ({}))
+  if (!r.ok) throw Object.assign(new Error(data.error || `HTTP ${r.status}`), { status: r.status })
+  if (typeof data.transcript !== 'string') throw new Error('Transcription response did not include text')
+  if (!data.transcript.trim()) throw new Error('No speech was detected')
+  return data.transcript.trim()
 }
 
 export const deleteSession = (id: string) =>

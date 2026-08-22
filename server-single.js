@@ -3,6 +3,7 @@ import compression from 'compression';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import { createHash, randomUUID } from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { WebSocketServer, WebSocket as WS } from 'ws';
 import pty from 'node-pty';
@@ -33,6 +34,8 @@ const STATIC_OVERRIDE = process.env.STATIC_OVERRIDE;
 const STATIC_DIR = path.resolve(import.meta.dirname, STATIC_OVERRIDE || 'static');
 const STAGING_DIR = path.resolve(import.meta.dirname, 'static-staging');
 const MAX_SSE_PER_SESSION = 10;
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 const CODEX_SESSIONS_ROOT = path.join(HOME || '/home/user', '.codex/sessions');
 // Codex now writes large context/permissions preambles before the first real
 // prompt. Keep enough headroom to find cwd, titles, and worker markers.
@@ -2278,13 +2281,72 @@ app.post('/api/upload', async (req, res) => {
     const dir = uploadsDir();
     const filename = decodeURIComponent(req.headers['x-filename'] || 'file');
     const safe = filename.replace(/[^a-zA-Z0-9._\- ]/g, '').slice(0, 100);
-    const dest = `${Date.now()}-${safe || 'upload'}`;
+    const requestedId = String(req.headers['x-upload-id'] || '');
+    if (requestedId && !/^[a-zA-Z0-9_-]{8,80}$/.test(requestedId)) {
+      return res.status(400).json({ error: 'invalid upload id' });
+    }
+    const uploadId = requestedId || randomUUID();
+    const dest = `${uploadId}-${safe || 'upload'}`;
     const fpath = path.join(dir, dest);
+    const declaredSize = Number(req.headers['content-length'] || 0);
+    if (declaredSize > MAX_UPLOAD_BYTES) return res.status(413).json({ error: 'upload exceeds 50 MB limit' });
     const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    fs.writeFileSync(fpath, Buffer.concat(chunks));
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > MAX_UPLOAD_BYTES) return res.status(413).json({ error: 'upload exceeds 50 MB limit' });
+      chunks.push(chunk);
+    }
+    const body = Buffer.concat(chunks);
+    const sameBody = () => {
+      try {
+        const existing = fs.readFileSync(fpath);
+        return existing.length === body.length &&
+          createHash('sha256').update(existing).digest('hex') === createHash('sha256').update(body).digest('hex');
+      } catch { return false; }
+    };
+    if (fs.existsSync(fpath)) {
+      if (!sameBody()) return res.status(409).json({ error: 'upload id already exists with different content' });
+      return res.json({ path: fpath, reused: true });
+    }
+    const tmp = path.join(dir, `.${uploadId}-${randomUUID()}.tmp`);
+    fs.writeFileSync(tmp, body, { flag: 'wx', mode: 0o600 });
+    try {
+      fs.linkSync(tmp, fpath);
+    } catch (e) {
+      if (e.code !== 'EEXIST' || !sameBody()) {
+        if (e.code === 'EEXIST') return res.status(409).json({ error: 'upload id already exists with different content' });
+        throw e;
+      }
+    } finally {
+      try { fs.unlinkSync(tmp); } catch {}
+    }
     res.json({ path: fpath });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
+app.post('/api/transcribe', async (req, res) => {
+  if (!DEEPGRAM_API_KEY) return res.status(500).json({ error: 'No Deepgram API key configured' });
+  try {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > MAX_AUDIO_BYTES) return res.status(413).json({ error: 'audio exceeds 25 MB limit' });
+      chunks.push(chunk);
+    }
+    const response = await fetch('https://api.deepgram.com/v1/listen?model=nova-3&punctuate=true&smart_format=true', {
+      method: 'POST',
+      headers: { Authorization: `Token ${DEEPGRAM_API_KEY}`, 'Content-Type': req.headers['content-type'] || 'audio/webm' },
+      body: Buffer.concat(chunks),
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!response.ok) return res.status(response.status).json({ error: await response.text() });
+    const data = await response.json();
+    res.json({ transcript: data.results?.channels?.[0]?.alternatives?.[0]?.transcript || '' });
+  } catch (e) {
+    res.status(e.name === 'TimeoutError' ? 504 : 500).json({ error: e.message });
+  }
 });
 
 app.get('/api/quick-links', (_req, res) => res.json(readUserJson('quick-links.json', [])));

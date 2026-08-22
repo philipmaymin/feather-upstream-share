@@ -96,6 +96,41 @@ describe('GET /api/health', () => {
   })
 })
 
+// ── Durable/idempotent uploads ─────────────────────────────────────────────
+
+describe('POST /api/upload', () => {
+  it('reuses an upload id for identical bytes and rejects conflicting bytes', async () => {
+    const uploadId = `testmedia-${Date.now()}`
+    const headers = { 'Content-Type': 'text/plain', 'X-Filename': encodeURIComponent('recovery.txt'), 'X-Upload-ID': uploadId }
+    let storedPath
+    try {
+      const first = await fetch(`${BASE}/api/upload`, { method: 'POST', headers, body: 'durable-media' })
+      assert.equal(first.status, 200)
+      const firstBody = await first.json()
+      storedPath = firstBody.path
+      assert.equal(fs.readFileSync(storedPath, 'utf8'), 'durable-media')
+
+      const retry = await fetch(`${BASE}/api/upload`, { method: 'POST', headers, body: 'durable-media' })
+      assert.equal(retry.status, 200)
+      const retryBody = await retry.json()
+      assert.equal(retryBody.path, storedPath)
+      assert.equal(retryBody.reused, true)
+
+      const conflict = await fetch(`${BASE}/api/upload`, { method: 'POST', headers, body: 'different-media' })
+      assert.equal(conflict.status, 409)
+      assert.match((await conflict.json()).error, /different content/)
+      assert.equal(fs.readFileSync(storedPath, 'utf8'), 'durable-media')
+    } finally {
+      if (storedPath) try { fs.unlinkSync(storedPath) } catch {}
+    }
+  })
+
+  it('rejects malformed idempotency keys', async () => {
+    const response = await fetch(`${BASE}/api/upload`, { method: 'POST', headers: { 'X-Upload-ID': '../bad' }, body: 'x' })
+    assert.equal(response.status, 400)
+  })
+})
+
 // ── Sessions ────────────────────────────────────────────────────────────────
 
 describe('GET /api/sessions', () => {

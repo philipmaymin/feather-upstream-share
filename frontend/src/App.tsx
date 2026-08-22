@@ -6,12 +6,16 @@ import { Terminal } from './components/Terminal'
 import { SidecarThread } from './components/Sidecar'
 import RoomsHome from './RoomsHome'
 import type { SessionMeta, Message, QuestionData, SidecarGroup } from './api'
-import { fetchSessions, fetchRooms, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFile, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
+import { fetchSessions, fetchRooms, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
 import type { SearchResult } from './api'
+import { retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
+import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords } from './lib/mediaOutbox.js'
 
 interface QuickLink { label: string; url: string }
 
-interface PendingFile { name: string; blob: Blob; dataUrl: string; isImage: boolean }
+type MediaStatus = 'draft' | 'uploading' | 'uploaded' | 'transcribing' | 'failed'
+interface PendingFile { id: string; name: string; blob: Blob; dataUrl: string; isImage: boolean; status: MediaStatus; attempts: number; error?: string; serverPath?: string; durable: boolean }
+interface VoiceMemo { id: string; name: string; blob: Blob; status: MediaStatus; attempts: number; error?: string; transcript?: string; intent: 'append' | 'send'; capturedText: string; sessionId: string; boxId: 'local'; durable: boolean }
 
 function resizeImage(blob: Blob, maxDim = 1600): Promise<Blob> {
   return new Promise((resolve) => {
@@ -158,6 +162,11 @@ export default function App() {
     }
   }
   const [files, setFiles] = createSignal<PendingFile[]>([])
+  const [voiceMemos, setVoiceMemos] = createSignal<VoiceMemo[]>([])
+  const [mediaNotice, setMediaNotice] = createSignal('')
+  const [transcribing, setTranscribing] = createSignal(false)
+  const uploadsInFlight = new Map<string, Promise<string>>()
+  const voiceMemosInFlight = new Map<string, Promise<void>>()
   const [uploading, setUploading] = createSignal(false)
   const [working, setWorking] = createSignal(false)
   const [dragging, setDragging] = createSignal(false)
@@ -259,7 +268,10 @@ export default function App() {
   const currentJsFile = document.querySelector<HTMLScriptElement>('script[src*="index-"]')?.src.match(/index-[^.]+\.js/)?.[0] || null
 
   let cleanupSSE: (() => void) | null = null
-  let recognition: any = null
+  let mediaRecorder: MediaRecorder | null = null
+  let mediaStream: MediaStream | null = null
+  let audioChunks: Blob[] = []
+  let voiceSendAfterStop = false
   let textareaRef: HTMLTextAreaElement | undefined
   let fileInputRef: HTMLInputElement | undefined
   let dragCounter = 0
@@ -305,17 +317,68 @@ export default function App() {
   }
 
   async function addFiles(fileList: FileList | File[]) {
+    if (uploading() || !currentId()) return
     const added: PendingFile[] = []
     for (const f of fileList) {
       const isImage = f.type.startsWith('image/')
       const blob = isImage ? await resizeImage(f) : f
-      const dataUrl = await new Promise<string>(r => { const rd = new FileReader(); rd.onload = () => r(rd.result as string); rd.readAsDataURL(blob) })
-      added.push({ name: f.name, blob, dataUrl, isImage })
+      const dataUrl = URL.createObjectURL(blob)
+      const id = crypto.randomUUID()
+      const record = { id, boxId: 'local', sessionId: currentId()!, kind: isImage ? 'image' : 'file', name: f.name, mimeType: blob.type, blob, status: 'draft', attempts: 0, createdAt: Date.now() }
+      let durable = true
+      try { await putMediaRecord(record) }
+      catch (e: any) {
+        durable = false
+        setMediaNotice(`Recovery storage unavailable: ${e?.message || e}. Keep this tab open or remove/download the file.`)
+      }
+      added.push({ id, name: f.name, blob, dataUrl, isImage, status: 'draft', attempts: 0, durable })
     }
     setFiles(prev => [...prev, ...added])
   }
 
-  function removeFile(idx: number) { setFiles(prev => prev.filter((_, i) => i !== idx)) }
+  async function removeFile(idx: number) {
+    if (uploading()) return
+    const file = files()[idx]
+    if (!file) return
+    URL.revokeObjectURL(file.dataUrl)
+    if (file.durable) await deleteMediaRecord(file.id).catch(() => {})
+    setFiles(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  function updateFile(id: string, patch: Partial<PendingFile>) {
+    setFiles(prev => prev.map(file => file.id === id ? { ...file, ...patch } : file))
+  }
+
+  function updateVoice(id: string, patch: Partial<VoiceMemo>) {
+    setVoiceMemos(prev => prev.map(memo => memo.id === id ? { ...memo, ...patch } : memo))
+  }
+
+  async function restoreMedia(sessionId: string) {
+    for (const file of files()) URL.revokeObjectURL(file.dataUrl)
+    setFiles([])
+    setVoiceMemos([])
+    try {
+      const records: any[] = await listMediaRecords('local', sessionId)
+      if (currentId() !== sessionId) return
+      const attachments = records.filter(r => r.kind === 'file' || r.kind === 'image').map(r => ({
+        id: r.id, name: r.name, blob: r.blob, dataUrl: URL.createObjectURL(r.blob), isImage: r.kind === 'image',
+        status: r.status === 'uploading' ? 'failed' : r.status, attempts: r.attempts || 0,
+        error: r.status === 'uploading' ? 'Interrupted before upload completed' : r.error,
+        serverPath: r.serverPath, durable: true,
+      })) as PendingFile[]
+      const memos = records.filter(r => r.kind === 'audio').map(r => ({
+        id: r.id, name: r.name, blob: r.blob, status: r.status === 'transcribing' ? 'failed' : r.status,
+        attempts: r.attempts || 0, error: r.status === 'transcribing' ? 'Interrupted before transcription completed' : r.error,
+        transcript: r.transcript, intent: r.intent || 'append', capturedText: r.capturedText || '', sessionId, boxId: 'local', durable: true,
+      })) as VoiceMemo[]
+      setFiles(attachments)
+      setVoiceMemos(memos)
+      if (records.length) setMediaNotice(`Recovered ${records.length} unsent media item${records.length === 1 ? '' : 's'}.`)
+      queueMicrotask(() => retryRecoverableMedia())
+    } catch (e: any) {
+      setMediaNotice(`Media recovery unavailable: ${e?.message || e}`)
+    }
+  }
 
   // Scroll position memory (in-memory, per session)
   const scrollPositions = new Map<string, number>()
@@ -365,6 +428,7 @@ export default function App() {
     setVh()
     window.visualViewport?.addEventListener('resize', setVh)
     window.addEventListener('resize', setVh)
+    window.addEventListener('online', retryRecoverableMedia)
 
     // The reverse proxy has already authenticated anyone who can load the app.
     // Warm Rooms alongside /api/me so the first render costs one round trip,
@@ -403,6 +467,9 @@ export default function App() {
     onCleanup(() => {
       clearInterval(versionInterval)
       clearInterval(sessionsInterval)
+      window.removeEventListener('online', retryRecoverableMedia)
+      window.visualViewport?.removeEventListener('resize', setVh)
+      window.removeEventListener('resize', setVh)
     })
   })
   onCleanup(() => { cleanupSSE?.(); document.removeEventListener('keydown', onGlobalKeyDown) })
@@ -437,6 +504,7 @@ export default function App() {
     setActivity(null)
     setQuestion(null)
     setText(loadDraft(id))
+    restoreMedia(id)
     setHistoryIdx(-1)
     // Clear unread status and update lastSeen timestamp
     const unread = new Set(unreadSessions())
@@ -707,80 +775,210 @@ export default function App() {
     updateSessions(await fetchSessions())
   }
 
-  function toggleVoice() {
-    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
-    if (!SR) return
-    if (listening()) { recognition?.stop(); setListening(false); return }
-    recognition = new SR()
-    recognition.continuous = true
-    recognition.interimResults = false
-    recognition.lang = 'en-US'
-    recognition.onresult = (e: any) => {
-      let t = ''
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) t += e.results[i][0].transcript
+  function stopVoice() {
+    setListening(false)
+    if (mediaStream) mediaStream.getTracks().forEach(track => track.stop())
+    mediaStream = null
+    mediaRecorder = null
+    audioChunks = []
+  }
+
+  async function persistMediaPatch(id: string, durable: boolean, patch: any) {
+    if (durable) await patchMediaRecord(id, patch).catch((e: any) => setMediaNotice(`Could not update recovery storage: ${e?.message || e}`))
+  }
+
+  function uploadPendingFile(file: PendingFile): Promise<string> {
+    return runMediaOperationOnce(uploadsInFlight, file.id, async () => {
+      if (file.serverPath) return file.serverPath
+      updateFile(file.id, { status: 'uploading', error: undefined })
+      await persistMediaPatch(file.id, file.durable, { status: 'uploading', error: null })
+      try {
+        const uploadPath = await retryMediaOperation(
+          () => uploadFileWithId(file.blob, file.name, file.id, AbortSignal.timeout(90_000)),
+          { onAttempt: async (attempt, error: any) => {
+            const patch = { status: attempt === 3 ? 'failed' : 'uploading', attempts: attempt, error: error?.message || String(error) }
+            updateFile(file.id, patch as Partial<PendingFile>)
+            await persistMediaPatch(file.id, file.durable, patch)
+          } },
+        )
+        updateFile(file.id, { status: 'uploaded', serverPath: uploadPath, error: undefined })
+        await persistMediaPatch(file.id, file.durable, { status: 'uploaded', serverPath: uploadPath, error: null })
+        return uploadPath
+      } catch (error: any) {
+        const message = error?.message || String(error)
+        updateFile(file.id, { status: 'failed', error: message })
+        await persistMediaPatch(file.id, file.durable, { status: 'failed', error: message })
+        throw error
       }
-      if (t) setText(prev => prev + (prev ? ' ' : '') + t)
+    })
+  }
+
+  async function sendSessionText(rawText: string, clearDraft = false, targetId = currentId()) {
+    const fullText = rawText.trim()
+    if (!fullText || !targetId) return
+    const targetIsCurrent = targetId === currentId()
+    const session = sessions().find(item => item.id === targetId) || (targetIsCurrent ? lastSession() : null)
+    if (session && !session.isActive) {
+      const response = await resumeSession(session.id, session.cwd ?? undefined)
+      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || `HTTP ${response.status}`)
+      updateSessions(await fetchSessions())
     }
-    recognition.onend = () => setListening(false)
-    recognition.onerror = () => setListening(false)
-    recognition.start()
+    const tempId = targetIsCurrent ? `optimistic-${Date.now()}` : undefined
+    if (tempId) {
+      setMessages(prev => [...prev, {
+        uuid: tempId, role: 'user', timestamp: new Date().toISOString(),
+        content: [{ type: 'text', text: fullText }], delivery: 'sent',
+      }])
+    }
+    try { await sendInput(targetId, fullText) }
+    catch (error) {
+      if (tempId) setMessages(prev => prev.filter(message => message.uuid !== tempId))
+      throw error
+    }
+    pushHistory(fullText)
+    if (clearDraft) saveDraft(targetId, '')
+    if (targetIsCurrent) {
+      setWorking(true)
+      startWorkingTimeout()
+    }
+  }
+
+  function processVoiceMemo(memo: VoiceMemo): Promise<void> {
+    return runMediaOperationOnce(voiceMemosInFlight, memo.id, async () => {
+      let transcript = memo.transcript
+      if (!transcript && memo.blob.size < 1000) return
+      try {
+        if (!transcript) {
+          updateVoice(memo.id, { status: 'transcribing', error: undefined })
+          await persistMediaPatch(memo.id, memo.durable, { status: 'transcribing', error: null })
+          transcript = await retryMediaOperation(
+            () => transcribeAudio(memo.blob, AbortSignal.timeout(120_000)),
+            { onAttempt: async (attempt, error: any) => {
+              const patch = { status: attempt === 3 ? 'failed' : 'transcribing', attempts: attempt, error: error?.message || String(error) }
+              updateVoice(memo.id, patch as Partial<VoiceMemo>)
+              await persistMediaPatch(memo.id, memo.durable, patch)
+            } },
+          )
+          updateVoice(memo.id, { transcript })
+          await persistMediaPatch(memo.id, memo.durable, { transcript })
+        }
+        if (memo.intent === 'send') {
+          await sendSessionText([memo.capturedText, transcript].filter(Boolean).join(' '), true, memo.sessionId)
+          if (memo.sessionId === currentId()) setText('')
+        } else {
+          const previous = memo.sessionId === currentId() ? text().trim() : loadDraft(memo.sessionId).trim()
+          const next = [previous, transcript].filter(Boolean).join(' ')
+          saveDraft(memo.sessionId, next)
+          if (memo.sessionId === currentId()) setText(next)
+        }
+        if (memo.durable) await deleteMediaRecord(memo.id)
+        setVoiceMemos(prev => prev.filter(item => item.id !== memo.id))
+        setMediaNotice('Voice memo recovered successfully.')
+      } catch (error: any) {
+        const message = error?.message || String(error)
+        updateVoice(memo.id, { status: 'failed', error: message, transcript })
+        await persistMediaPatch(memo.id, memo.durable, { status: 'failed', error: message, transcript })
+        setMediaNotice(`Voice memo retained: ${message}`)
+      }
+    })
+  }
+
+  async function retryRecoverableMedia() {
+    if (!navigator.onLine) return
+    for (const file of files().filter(item => item.status === 'failed')) uploadPendingFile(file).catch(() => {})
+    for (const memo of voiceMemos().filter(isRetryableVoiceMemo)) processVoiceMemo(memo)
+  }
+
+  function downloadBlob(blob: Blob, name: string) {
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = name
+    anchor.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  async function removeVoiceMemo(id: string) {
+    const memo = voiceMemos().find(item => item.id === id)
+    if (memo?.durable) await deleteMediaRecord(id).catch(() => {})
+    setVoiceMemos(prev => prev.filter(item => item.id !== id))
+  }
+
+  async function toggleVoice() {
+    if (listening()) {
+      voiceSendAfterStop = false
+      if (mediaRecorder?.state === 'recording') mediaRecorder.stop()
+      else stopVoice()
+      return
+    }
+    try { mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }) }
+    catch { return }
+    audioChunks = []
+    voiceSendAfterStop = false
+    const supportedMime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find(type => MediaRecorder.isTypeSupported(type))
+    try { mediaRecorder = supportedMime ? new MediaRecorder(mediaStream, { mimeType: supportedMime }) : new MediaRecorder(mediaStream) }
+    catch (e: any) { stopVoice(); setMediaNotice(`Recording is unsupported: ${e?.message || e}`); return }
+    const recorder = mediaRecorder
     setListening(true)
+    recorder.ondataavailable = event => { if (event.data.size > 0) audioChunks.push(event.data) }
+    recorder.onstop = async () => {
+      const blob = new Blob(audioChunks, { type: recorder.mimeType })
+      const sessionId = currentId()!
+      const id = crypto.randomUUID()
+      const name = `voice-memo-${Date.now()}.${blob.type.includes('mp4') ? 'm4a' : 'webm'}`
+      const record = { id, boxId: 'local', sessionId, kind: 'audio', name, mimeType: blob.type, blob, status: blob.size < 1000 ? 'failed' : 'transcribing', attempts: 0, error: blob.size < 1000 ? 'Recording was too short to transcribe' : null, intent: voiceSendAfterStop ? 'send' : 'append', capturedText: text().trim(), createdAt: Date.now() }
+      let durable = true
+      try { await putMediaRecord(record) }
+      catch (e: any) { durable = false; setMediaNotice(`Voice recovery storage unavailable: ${e?.message || e}. Download the memo before closing this tab.`) }
+      const memo: VoiceMemo = { ...record, status: record.status as MediaStatus, error: record.error || undefined, intent: record.intent as 'append' | 'send', boxId: 'local', durable }
+      setVoiceMemos(prev => [...prev, memo])
+      stopVoice()
+      if (blob.size < 1000) return
+      setTranscribing(true)
+      try { await processVoiceMemo(memo) }
+      finally { setTranscribing(false) }
+    }
+    recorder.onerror = (event: any) => {
+      setMediaNotice(`Recording failed: ${event?.error?.message || 'unknown recorder error'}`)
+      if (recorder.state === 'recording') recorder.stop()
+    }
+    recorder.start(1000)
+  }
+
+  async function sendComposedMessage(rawText: string, pending: PendingFile[] = files()) {
+    const val = rawText.trim()
+    if ((!val && !pending.length) || !currentId()) return
+    const targetId = currentId()!
+    setUploading(true)
+    setMediaNotice('')
+    try {
+      const parts: string[] = val ? [val] : []
+      for (const file of pending) {
+        const uploadPath = await uploadPendingFile(file)
+        parts.push(file.isImage ? `[Attached image: ${uploadPath}]` : `[Attached file: ${uploadPath}] (${file.name})`)
+      }
+      await sendSessionText(parts.join('\n'), true, targetId)
+      for (const file of pending) {
+        URL.revokeObjectURL(file.dataUrl)
+        if (file.durable) await deleteMediaRecord(file.id).catch(() => {})
+      }
+      if (targetId === currentId()) {
+        setText('')
+        setFiles([])
+        if (textareaRef) textareaRef.style.height = 'auto'
+      }
+    } catch (e: any) {
+      if (targetId === currentId()) setMediaNotice(`Media retained — ${e?.message || e}. Retry when ready.`)
+    } finally { setUploading(false) }
   }
 
   async function handleSend() {
-    const val = text().trim()
-    const pending = files()
-    if (!val && !pending.length) return
-
-    setText('')
-    setFiles([])
-    if (textareaRef) textareaRef.style.height = 'auto'
-
-    if (!currentId()) {
-      try {
-        const id = await createSession()
-        updateSessions(await fetchSessions())
-        await select(id)
-      } catch { return }
+    if (listening()) {
+      voiceSendAfterStop = true
+      if (mediaRecorder?.state === 'recording') mediaRecorder.stop()
+      return
     }
-    if (!currentId()) return
-
-    const tempId = `optimistic-${Date.now()}`
-    const optimisticText = val + (pending.length ? `\n[attaching ${pending.length} file${pending.length > 1 ? 's' : ''}...]` : '')
-    setMessages(prev => [...prev, {
-      uuid: tempId, role: 'user', timestamp: new Date().toISOString(),
-      content: [{ type: 'text', text: optimisticText }], delivery: 'sent',
-    }])
-    saveDraft(currentId()!, '')
-    setWorking(true)
-    startWorkingTimeout()
-
-    const s = cur() || lastSession()
-    if (s && !s.isActive) {
-      await resumeSession(s.id, s.cwd ?? undefined)
-      updateSessions(await fetchSessions())
-    }
-
-    setUploading(pending.length > 0)
-    const parts: string[] = val ? [val] : []
-    for (const f of pending) {
-      try {
-        const uploadPath = await uploadFile(f.blob, f.name)
-        parts.push(f.isImage ? `[Attached image: ${uploadPath}]` : `[Attached file: ${uploadPath}] (${f.name})`)
-      } catch { parts.push(`[Upload failed: ${f.name}]`) }
-    }
-    const fullText = parts.join('\n')
-    pushHistory(fullText)
-
-    if (fullText !== optimisticText) {
-      setMessages(prev => prev.map(m => m.uuid === tempId
-        ? { ...m, content: [{ type: 'text', text: fullText }] }
-        : m))
-    }
-
-    sendInput(currentId()!, fullText)
-    setUploading(false)
+    await sendComposedMessage(text(), files())
   }
 
   const cur = () => sessions().find(s => s.id === currentId())
@@ -1561,6 +1759,11 @@ export default function App() {
         {/* Input (chat tab only) */}
         <Show when={currentId() && tab() === 'chat'}>
           <input ref={fileInputRef} type="file" multiple hidden onChange={(e) => { if (e.target.files?.length) { addFiles(e.target.files); e.target.value = '' } }} />
+          <Show when={mediaNotice()}>
+            <div role="status" style={{ padding: '7px 12px', 'border-top': '1px solid #332b18', background: '#17140b', color: '#d8bd66', 'font-size': '12px', display: 'flex', 'justify-content': 'space-between', gap: '8px' }}>
+              <span>{mediaNotice()}</span><button onClick={() => setMediaNotice('')} style={{ background: 'none', border: 'none', color: '#d8bd66', cursor: 'pointer' }}>&times;</button>
+            </div>
+          </Show>
           {/* File previews */}
           <Show when={files().length > 0}>
             <div style={{ padding: '6px 12px 0', 'border-top': '1px solid #1e1e1e', background: '#0a0e14', display: 'flex', gap: '8px', 'flex-wrap': 'wrap' }}>
@@ -1570,7 +1773,34 @@ export default function App() {
                     ? <img src={f.dataUrl} style={{ height: '56px', 'max-width': '100px', 'border-radius': '6px', 'object-fit': 'cover', display: 'block' }} />
                     : <div style={{ padding: '4px 8px', 'font-size': '11px', color: '#999', 'max-width': '100px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{f.name}</div>
                   }
-                  <button onClick={() => removeFile(i())} style={{ position: 'absolute', top: '-6px', right: '-6px', width: '22px', height: '22px', 'border-radius': '50%', background: '#d45555', color: '#fff', border: 'none', 'font-size': '12px', cursor: 'pointer', display: 'flex', 'align-items': 'center', 'justify-content': 'center', 'line-height': '1' }}>&times;</button>
+                  <Show when={f.status !== 'draft'}>
+                    <div style={{ 'font-size': '10px', color: f.status === 'failed' ? '#ff7b72' : '#8b949e', 'max-width': '120px', padding: '3px 4px' }}>
+                      {f.status === 'uploading' ? `Uploading · ${Math.min(3, f.attempts + 1)}/3` : f.status === 'uploaded' ? 'Uploaded' : f.error || 'Upload failed'}
+                    </div>
+                  </Show>
+                  <Show when={f.status === 'failed'}>
+                    <div style={{ display: 'flex', gap: '4px', padding: '2px' }}>
+                      <button onClick={() => uploadPendingFile(f).catch(() => {})} disabled={uploading()} style={{ 'font-size': '10px' }}>Retry</button>
+                      <button onClick={() => downloadBlob(f.blob, f.name)} style={{ 'font-size': '10px' }}>Download</button>
+                    </div>
+                  </Show>
+                  <button onClick={() => removeFile(i())} disabled={uploading()} aria-label={`Remove ${f.name}`} style={{ position: 'absolute', top: '-6px', right: '-6px', width: '22px', height: '22px', 'border-radius': '50%', background: '#d45555', color: '#fff', border: 'none', 'font-size': '12px', cursor: uploading() ? 'wait' : 'pointer', display: 'flex', 'align-items': 'center', 'justify-content': 'center', 'line-height': '1' }}>&times;</button>
+                </div>
+              )}</For>
+            </div>
+          </Show>
+          <Show when={voiceMemos().length > 0}>
+            <div style={{ padding: '6px 12px', 'border-top': '1px solid #1e1e1e', background: '#0a0e14', display: 'flex', gap: '8px', 'flex-wrap': 'wrap' }}>
+              <For each={voiceMemos()}>{memo => (
+                <div style={{ background: '#1a1a2e', border: `1px solid ${memo.status === 'failed' ? '#6e3636' : '#333'}`, 'border-radius': '8px', padding: '7px 9px', 'font-size': '11px', color: '#bbb', 'max-width': '280px' }}>
+                  <div>🎤 {memo.status === 'transcribing' ? `Transcribing · ${Math.min(3, memo.attempts + 1)}/3` : memo.status === 'failed' ? (memo.error || 'Transcription failed') : 'Voice memo'}</div>
+                  <Show when={memo.status === 'failed'}>
+                    <div style={{ display: 'flex', gap: '5px', 'margin-top': '5px' }}>
+                      <Show when={isRetryableVoiceMemo(memo)}><button onClick={() => processVoiceMemo(memo)} disabled={transcribing()} style={{ 'font-size': '10px' }}>Retry</button></Show>
+                      <button onClick={() => downloadBlob(memo.blob, memo.name)} style={{ 'font-size': '10px' }}>Download</button>
+                      <button onClick={() => removeVoiceMemo(memo.id)} style={{ 'font-size': '10px' }}>Remove</button>
+                    </div>
+                  </Show>
                 </div>
               )}</For>
             </div>
@@ -1587,7 +1817,7 @@ export default function App() {
                   <span style={{ 'font-size': '11px', 'font-weight': '600', color: '#c4993a' }}>{starred()[currentId()!]?.length}</span>
                 </button>
               </Show>
-              <button onClick={toggleVoice} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', width: '32px', height: '32px', transition: 'color 0.15s' }} title="Voice input">
+              <button onClick={toggleVoice} disabled={transcribing()} style={{ background: listening() ? 'rgba(212,85,85,0.15)' : 'none', border: 'none', 'border-radius': '8px', cursor: transcribing() ? 'wait' : 'pointer', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', width: '32px', height: '32px', transition: 'color 0.15s' }} title={transcribing() ? 'Transcribing...' : listening() ? 'Stop & transcribe' : 'Record voice memo'} aria-label={transcribing() ? 'Transcribing...' : listening() ? 'Stop & transcribe' : 'Record voice memo'}>
                 <svg width="14" height="18" viewBox="0 0 14 18" fill="none" stroke={listening() ? '#d45555' : '#666'} stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="1" width="6" height="9" rx="3" fill={listening() ? 'rgba(212,85,85,0.2)' : 'none'} /><path d="M1 7.5a6 6 0 0 0 12 0" /><line x1="7" y1="13.5" x2="7" y2="16" /><line x1="4.5" y1="16" x2="9.5" y2="16" /></svg>
               </button>
             </div>
@@ -1623,7 +1853,7 @@ export default function App() {
             {/* Send button (hidden on mobile, keyboard has its own) */}
             <Show when={!isMobile}>
               <div style={{ 'flex-shrink': '0', height: '42px', display: 'flex', 'align-items': 'center' }}>
-                <button onClick={handleSend} disabled={uploading()} style={{ background: (text().trim() || files().length) ? '#4aba6a' : '#333', color: (text().trim() || files().length) ? '#000' : '#666', border: 'none', 'border-radius': '50%', padding: '0', width: '36px', height: '36px', cursor: (text().trim() || files().length) ? 'pointer' : 'default', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center' }}>{uploading() ? '...' : <svg width="14" height="16" viewBox="0 0 14 16" fill="currentColor"><polygon points="0,0 14,8 0,16" /></svg>}</button>
+                <button onClick={handleSend} disabled={uploading() || transcribing()} title={listening() ? 'Stop, transcribe & send' : 'Send'} style={{ background: (text().trim() || files().length || listening()) ? '#4aba6a' : '#333', color: (text().trim() || files().length || listening()) ? '#000' : '#666', border: 'none', 'border-radius': '50%', padding: '0', width: '36px', height: '36px', cursor: (text().trim() || files().length || listening()) ? 'pointer' : 'default', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center' }}>{uploading() || transcribing() ? '...' : <svg width="14" height="16" viewBox="0 0 14 16" fill="currentColor"><polygon points="0,0 14,8 0,16" /></svg>}</button>
               </div>
             </Show>
           </div>
