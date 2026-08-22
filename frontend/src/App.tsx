@@ -10,6 +10,7 @@ import { fetchSessions, fetchRooms, fetchMessages, subscribeMessages, sendInput,
 import type { SearchResult } from './api'
 import { MEDIA_ATTEMPTS, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords } from './lib/mediaOutbox.js'
+import { appUrl } from './lib/appPath.js'
 
 interface QuickLink { label: string; url: string }
 
@@ -158,7 +159,7 @@ export default function App() {
     setViewingFile({ path: filePath, kind, content: '' })
     if (kind === 'text') {
       try {
-        const r = await fetch(`/api/files/raw?path=${encodeURIComponent(filePath)}`)
+        const r = await fetch(appUrl(`/api/files/raw?path=${encodeURIComponent(filePath)}`))
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
         const sizeHeader = r.headers.get('content-length')
         setViewingFile({ path: filePath, kind, content: await r.text(), size: sizeHeader ? parseInt(sizeHeader, 10) : undefined })
@@ -167,7 +168,7 @@ export default function App() {
       }
     } else if (kind === 'pdf') {
       try {
-        const r = await fetch(`/api/files/raw?path=${encodeURIComponent(filePath)}`)
+        const r = await fetch(appUrl(`/api/files/raw?path=${encodeURIComponent(filePath)}`))
         if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
         const buf = await r.arrayBuffer()
         const blobUrl = URL.createObjectURL(new Blob([buf], { type: 'application/pdf' }))
@@ -246,9 +247,8 @@ export default function App() {
     const target = dir || browseDir() || sessionStats().cwd || '/home/user'
     setBrowseLoading(true)
     try {
-      const base = location.pathname.replace(/\/+$/, '')
       const hidden = showHidden() ? '&showHidden=1' : ''
-      const resp = await fetch(`${base}/api/files/list?dir=${encodeURIComponent(target)}${hidden}`)
+      const resp = await fetch(appUrl(`/api/files/list?dir=${encodeURIComponent(target)}${hidden}`))
       const data = await resp.json()
       if (resp.ok) {
         setBrowseDir(data.dir)
@@ -432,8 +432,7 @@ export default function App() {
     document.addEventListener('keydown', onGlobalKeyDown)
     updateSessions(await fetchSessions())
     fetchAgents().then(r => setCodexAvailable(r.agents.some(a => a.id === 'codex' && a.available))).catch(() => {})
-    const base = location.pathname.replace(/\/+$/, '')
-    fetch(`${base}/api/quick-links`).then(r => r.ok ? r.json() : []).then(setLinks).catch(() => {})
+    fetch(appUrl('/api/quick-links')).then(r => r.ok ? r.json() : []).then(setLinks).catch(() => {})
     fetchStarred().then(setStarred).catch(() => {})
     const hash = location.hash.slice(1)
     if (hash) select(hash)
@@ -464,7 +463,7 @@ export default function App() {
     // Check for updates every 30 seconds
     async function checkForUpdate() {
       try {
-        const r = await fetch(`${location.pathname.replace(/\/+$/, '')}/api/version`)
+        const r = await fetch(appUrl('/api/version'))
         if (!r.ok) return
         const { stagingJs, changes } = await r.json()
         if (stagingJs && currentJsFile && stagingJs !== currentJsFile) {
@@ -1136,7 +1135,7 @@ export default function App() {
   // Login screen component
   const LoginScreen = () => (
     <div style={{ display: 'flex', 'align-items': 'center', 'justify-content': 'center', height: 'calc(var(--vh, 1vh) * 100)', background: '#0a0e14', 'font-family': "-apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif", padding: '20px' }}>
-      <form onSubmit={handleLogin} action="/api/login" method="post" style={{ width: '100%', 'max-width': '320px', background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '16px', padding: '32px 24px', 'text-align': 'center' }}>
+      <form onSubmit={handleLogin} action={appUrl('/api/login')} method="post" style={{ width: '100%', 'max-width': '320px', background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '16px', padding: '32px 24px', 'text-align': 'center' }}>
         <div style={{ 'font-size': '40px', 'margin-bottom': '8px' }}>&#x1fab6;</div>
         <h1 style={{ 'font-size': '20px', 'font-weight': '700', color: '#e5e5e5', 'margin-bottom': '24px' }}>Feather</h1>
         <label for="username" style={{ display: 'none' }}>Username</label>
@@ -1503,7 +1502,7 @@ export default function App() {
                           <For each={f.actions}>{(a) => (
                             <span style={{ 'font-size': '10px', padding: '1px 5px', 'border-radius': '3px', background: 'rgba(255,255,255,0.05)', color: actionColors[a] || '#888' }}>{a}</span>
                           )}</For>
-                          <a href={`/api/files/raw?path=${encodeURIComponent(f.path)}&download=1`} download={f.path.split('/').pop()} title={`Download ${f.path.split('/').pop()}`} onClick={(ev) => ev.stopPropagation()} style={{ color: '#73b8ff', display: 'flex', 'align-items': 'center', padding: '0 2px', 'flex-shrink': '0', '-webkit-tap-highlight-color': 'transparent' }}>
+                          <a href={appUrl(`/api/files/raw?path=${encodeURIComponent(f.path)}&download=1`)} download={f.path.split('/').pop()} title={`Download ${f.path.split('/').pop()}`} onClick={(ev) => ev.stopPropagation()} style={{ color: '#73b8ff', display: 'flex', 'align-items': 'center', padding: '0 2px', 'flex-shrink': '0', '-webkit-tap-highlight-color': 'transparent' }}>
                             <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0l-3-3m3 3l3-3M3 13h10" /></svg>
                           </a>
                         </div>
@@ -1571,7 +1570,7 @@ export default function App() {
                           {entry.isDir ? (
                             <span style={{ width: '17px', 'flex-shrink': '0' }} />
                           ) : (
-                            <a href={`/api/files/raw?path=${encodeURIComponent(entry.path)}&download=1`} download={entry.name} title={`Download ${entry.name}`} onClick={(ev) => ev.stopPropagation()} style={{ color: '#73b8ff', display: 'flex', 'align-items': 'center', padding: '0 2px', 'flex-shrink': '0', '-webkit-tap-highlight-color': 'transparent' }}>
+                            <a href={appUrl(`/api/files/raw?path=${encodeURIComponent(entry.path)}&download=1`)} download={entry.name} title={`Download ${entry.name}`} onClick={(ev) => ev.stopPropagation()} style={{ color: '#73b8ff', display: 'flex', 'align-items': 'center', padding: '0 2px', 'flex-shrink': '0', '-webkit-tap-highlight-color': 'transparent' }}>
                               <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0l-3-3m3 3l3-3M3 13h10" /></svg>
                             </a>
                           )}
@@ -1607,7 +1606,7 @@ export default function App() {
             const slash = v.path.lastIndexOf('/')
             const name = slash >= 0 ? v.path.slice(slash + 1) : v.path
             const dir = slash >= 0 ? v.path.slice(0, slash) : ''
-            const rawUrl = `/api/files/raw?path=${encodeURIComponent(v.path)}`
+            const rawUrl = appUrl(`/api/files/raw?path=${encodeURIComponent(v.path)}`)
             const kindLabel = v.kind === 'pdf' ? 'PDF' : v.kind === 'image' ? 'IMAGE' : v.kind === 'binary' ? 'BINARY' : 'TEXT'
             const kindColor = v.kind === 'pdf' ? '#e57373' : v.kind === 'image' ? '#81c784' : v.kind === 'binary' ? '#ba68c8' : '#73b8ff'
             return (
@@ -1771,7 +1770,7 @@ export default function App() {
               <span style={{ 'font-size': '11px', 'font-weight': '600', color: '#4aba6a' }}>What's New</span>
               <button onClick={async () => {
                 try {
-                  const r = await fetch(`${location.pathname.replace(/\/+$/, '')}/api/update`, { method: 'POST' })
+                  const r = await fetch(appUrl('/api/update'), { method: 'POST' })
                   if (r.ok) location.reload()
                 } catch {}
               }} style={{ background: '#4aba6a', color: '#000', border: 'none', 'border-radius': '6px', padding: '4px 12px', 'font-size': '11px', 'font-weight': '600', cursor: 'pointer' }}>Perform Update</button>

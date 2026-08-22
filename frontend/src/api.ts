@@ -1,4 +1,6 @@
-const BASE = location.pathname.replace(/\/+$/, '')
+import { appBasePath } from './lib/appPath.js'
+
+const BASE = appBasePath()
 
 async function responseJson<T = any>(response: Response): Promise<T> {
   const data = await response.json().catch(() => ({}))

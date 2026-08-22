@@ -40,6 +40,7 @@ describe('localFilePath', () => {
     assert.equal(localFilePath('/api/files/raw?path=%2Ftmp%2Fx.png'), null)
     assert.equal(localFilePath('/assets/index.js'), null)
     assert.equal(localFilePath('/static/icon-192.png'), null)
+    assert.equal(localFilePath('/feather2/api/file?path=%2Ftmp%2Fx.png', '/feather2/'), null)
   })
 })
 
@@ -48,6 +49,13 @@ describe('localFileUrl', () => {
     assert.equal(
       localFileUrl('/home/user/rooms/family/chart.png'),
       '/api/files/raw?path=%2Fhome%2Fuser%2Frooms%2Ffamily%2Fchart.png',
+    )
+  })
+
+  it('preserves a mounted application prefix', () => {
+    assert.equal(
+      localFileUrl('/tmp/chart.png', '/feather2/'),
+      '/feather2/api/files/raw?path=%2Ftmp%2Fchart.png',
     )
   })
 

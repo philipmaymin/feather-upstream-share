@@ -20,6 +20,7 @@ import yaml from 'highlight.js/lib/languages/yaml'
 import markdown from 'highlight.js/lib/languages/markdown'
 import { toolImagePath, toolInputText, toolPresentation } from '../lib/toolPresentation.js'
 import { localFilePath } from '../lib/localMedia.js'
+import { appUrl } from '../lib/appPath.js'
 import { extractImages } from '../lib/attachments.js'
 
 hljs.registerLanguage('javascript', javascript)
@@ -175,11 +176,10 @@ function resolveLocalPath(filePath: string): string {
 }
 
 function localFileHref(filePath: string): string {
-  const base = location.pathname.replace(/\/+$/, '')
   const resolvedPath = resolveLocalPath(filePath)
   const ext = resolvedPath.substring(resolvedPath.lastIndexOf('.')).toLowerCase()
   const route = ext === '.html' || ext === '.htm' ? 'html' : 'raw'
-  return `${base}/api/files/${route}?path=${encodeURIComponent(resolvedPath)}`
+  return appUrl(`/api/files/${route}?path=${encodeURIComponent(resolvedPath)}`)
 }
 
 function localImageHref(src: string): string {
@@ -438,9 +438,8 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void) 
         {genericInput && <pre style={`${pre}color:#aaa`} ref={linkifyRef}>{genericInput}</pre>}
       </details>
       {imagePath && (() => {
-        const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''
         const resolvedPath = imagePath.replace(/^~/, '/home/' + (typeof document !== 'undefined' ? document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user' : 'user'))
-        const imgSrc = `${base}/api/files/raw?path=${encodeURIComponent(resolvedPath)}`
+        const imgSrc = appUrl(`/api/files/raw?path=${encodeURIComponent(resolvedPath)}`)
         return <img src={imgSrc} onClick={() => onImageClick?.(imgSrc)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '6px', display: 'block', cursor: 'zoom-in' }} />
       })()}
     </>
@@ -690,7 +689,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
           <img src={localImageHref(src)} onClick={() => setLightbox(localImageHref(src))} onError={(event) => replaceImageWithPathLink(event.currentTarget, src)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': hasAttachments ? '12px' : '6px', 'margin-bottom': '4px', cursor: 'zoom-in', display: 'block' }} />
         )}</For>
         <For each={files}>{(f) => (
-          <a href={f.path} target="_blank" rel="noopener" onClick={(e) => { if (f.name.toLowerCase().endsWith('.pdf')) { e.preventDefault(); const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''; setPdfViewer(`${base}/api/files/raw?path=${encodeURIComponent(f.path)}`) } }} style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
+          <a href={localFileHref(f.path)} target="_blank" rel="noopener" onClick={(e) => { if (f.name.toLowerCase().endsWith('.pdf')) { e.preventDefault(); setPdfViewer(localFileHref(f.path)) } }} style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
             <span style={{ 'font-size': '16px' }}>{f.name.endsWith('.pdf') ? '\uD83D\uDCC4' : '\uD83D\uDCCE'}</span>
             <span style={{ overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{f.name}</span>
           </a>
