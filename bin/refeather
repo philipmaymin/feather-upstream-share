@@ -4,6 +4,8 @@ set -Eeuo pipefail
 
 SELF="$(readlink -f "$0")"
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd)"
+CAPABILITY_SKILLS=(feather sidecar looper)
+CAPABILITY_CLIS=(room sidecar)
 
 die() { echo "refeather: $*" >&2; exit 1; }
 note() { echo "refeather: $*" >&2; }
@@ -87,7 +89,7 @@ PY
 
 source_preflight() {
   local source="$1" receipt="$2" check_port="$3"
-  local required_commands="${REFEATHER_REQUIRED_COMMANDS:-git tar npm python3 sha256sum flock curl df du}"
+  local required_commands="${REFEATHER_REQUIRED_COMMANDS:-git tar python3 df du}"
   local command
   for command in $required_commands; do need_command "$command"; done
   git -C "$source" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a Git worktree: $source"
@@ -150,12 +152,6 @@ cmd_stage() {
   source_preflight "$source" "$receipt" "$check_port"
   mkdir -p "$releases"
 
-  local source_kb available_kb required_kb
-  source_kb="$(du -sk "$source" | awk '{print $1}')"
-  available_kb="$(df -Pk "$releases" | awk 'NR==2 {print $4}')"
-  required_kb="${REFEATHER_REQUIRED_FREE_KB:-$((source_kb * 2 + ${REFEATHER_DISK_HEADROOM_KB:-262144}))}"
-  [ "$available_kb" -ge "$required_kb" ] || die "insufficient disk: ${available_kb}KB free, ${required_kb}KB required"
-
   local release="$releases/$SOURCE_COMMIT" manifest="$releases/$SOURCE_COMMIT/.refeather-release.json"
   if [ -d "$release" ]; then
     [ -f "$manifest" ] && [ "$(manifest_field "$manifest" sourceCommit)" = "$SOURCE_COMMIT" ] \
@@ -163,6 +159,12 @@ cmd_stage() {
     printf '%s\n' "$release"
     return
   fi
+
+  local source_kb available_kb required_kb
+  source_kb="$(du -sk "$source" | awk '{print $1}')"
+  available_kb="$(df -Pk "$releases" | awk 'NR==2 {print $4}')"
+  required_kb="${REFEATHER_REQUIRED_FREE_KB:-$((source_kb * 2 + ${REFEATHER_DISK_HEADROOM_KB:-262144}))}"
+  [ "$available_kb" -ge "$required_kb" ] || die "insufficient disk: ${available_kb}KB free, ${required_kb}KB required"
 
   local tmp="$releases/.stage-$SOURCE_COMMIT-$$"
   mkdir "$tmp"
@@ -195,18 +197,18 @@ backup_conflicts() {
 
 install_capabilities_impl() {
   local release="$1" target_root="$2" claude_dir="$3" codex_dir="$4" bin_dir="$5" backup_dir="$6"
-  local skill name source
-  for skill in feather sidecar looper; do
+  local skill name
+  for skill in "${CAPABILITY_SKILLS[@]}"; do
     [ -f "$release/skills/$skill/SKILL.md" ] || die "release lacks skills/$skill/SKILL.md"
   done
-  for name in room sidecar; do [ -x "$release/bin/$name" ] || die "release lacks executable bin/$name"; done
+  for name in "${CAPABILITY_CLIS[@]}"; do [ -x "$release/bin/$name" ] || die "release lacks executable bin/$name"; done
 
   local destinations=() targets=() dest target
-  for skill in feather sidecar looper; do
+  for skill in "${CAPABILITY_SKILLS[@]}"; do
     destinations+=("$claude_dir/$skill"); targets+=("$target_root/skills/$skill")
     destinations+=("$codex_dir/$skill"); targets+=("$target_root/skills/$skill")
   done
-  for name in room sidecar; do destinations+=("$bin_dir/$name"); targets+=("$target_root/bin/$name"); done
+  for name in "${CAPABILITY_CLIS[@]}"; do destinations+=("$bin_dir/$name"); targets+=("$target_root/bin/$name"); done
 
   local conflicts=()
   for ((index=0; index<${#destinations[@]}; index++)); do

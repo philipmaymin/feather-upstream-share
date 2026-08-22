@@ -16,8 +16,8 @@ interface QuickLink { label: string; url: string }
 
 type FileStatus = 'draft' | 'uploading' | 'uploaded' | 'failed'
 type VoiceStatus = 'transcribing' | 'failed'
-interface PendingFile { id: string; name: string; blob: Blob; dataUrl: string; isImage: boolean; status: FileStatus; attempts: number; error?: string; serverPath?: string; durable: boolean }
-interface VoiceMemo { id: string; name: string; blob: Blob; status: VoiceStatus; attempts: number; error?: string; transcript?: string; intent: 'append' | 'send'; capturedText: string; sessionId: string; boxId: 'local'; durable: boolean }
+interface PendingFile { id: string; name: string; blob: Blob; dataUrl: string; isImage: boolean; status: FileStatus; attempts: number; error?: string; serverPath?: string }
+interface VoiceMemo { id: string; name: string; blob: Blob; status: VoiceStatus; attempts: number; error?: string; transcript?: string; intent: 'append' | 'send'; capturedText: string; sessionId: string; boxId: 'local' }
 interface StoredMediaBase { id: string; boxId: string; sessionId: string; name: string; blob: Blob; attempts: number; error?: string }
 interface StoredFileMedia extends StoredMediaBase { kind: 'file' | 'image'; status: FileStatus; serverPath?: string }
 interface StoredVoiceMedia extends StoredMediaBase { kind: 'audio'; status: VoiceStatus; transcript?: string; intent?: 'append' | 'send'; capturedText?: string }
@@ -291,6 +291,7 @@ export default function App() {
   let textareaRef: HTMLTextAreaElement | undefined
   let fileInputRef: HTMLInputElement | undefined
   let dragCounter = 0
+  let mediaRestoreGeneration = 0
 
   // Update sessions and detect unread changes
   function updateSessions(newSessions: SessionMeta[]) {
@@ -341,13 +342,9 @@ export default function App() {
       const dataUrl = URL.createObjectURL(blob)
       const id = crypto.randomUUID()
       const record = { id, boxId: 'local', sessionId: currentId()!, kind: isImage ? 'image' : 'file', name: f.name, mimeType: blob.type, blob, status: 'draft', attempts: 0, createdAt: Date.now() }
-      let durable = true
       try { await putMediaRecord(record) }
-      catch (e: any) {
-        durable = false
-        setMediaNotice(`Recovery storage unavailable: ${e?.message || e}. Keep this tab open or remove/download the file.`)
-      }
-      added.push({ id, name: f.name, blob, dataUrl, isImage, status: 'draft', attempts: 0, durable })
+      catch (e: any) { setMediaNotice(`Recovery storage unavailable: ${e?.message || e}. Keep this tab open or remove/download the file.`) }
+      added.push({ id, name: f.name, blob, dataUrl, isImage, status: 'draft', attempts: 0 })
     }
     setFiles(prev => [...prev, ...added])
   }
@@ -357,7 +354,7 @@ export default function App() {
     const file = files()[idx]
     if (!file) return
     URL.revokeObjectURL(file.dataUrl)
-    if (file.durable) await deleteMediaRecord(file.id).catch(() => {})
+    await deleteMediaRecord(file.id).catch(() => {})
     setFiles(prev => prev.filter((_, i) => i !== idx))
   }
 
@@ -376,20 +373,21 @@ export default function App() {
   }
 
   async function restoreMedia(sessionId: string) {
+    const generation = ++mediaRestoreGeneration
     clearPendingMedia()
     try {
       const records = await listMediaRecords('local', sessionId) as StoredMedia[]
-      if (currentId() !== sessionId) return
+      if (generation !== mediaRestoreGeneration || currentId() !== sessionId) return
       const attachments = records.filter(r => r.kind === 'file' || r.kind === 'image').map(r => ({
         id: r.id, name: r.name, blob: r.blob, dataUrl: URL.createObjectURL(r.blob), isImage: r.kind === 'image',
         status: r.status === 'uploading' ? 'failed' : r.status, attempts: r.attempts || 0,
         error: r.status === 'uploading' ? 'Interrupted before upload completed' : r.error,
-        serverPath: r.serverPath, durable: true,
+        serverPath: r.serverPath,
       })) as PendingFile[]
       const memos = records.filter(r => r.kind === 'audio').map(r => ({
         id: r.id, name: r.name, blob: r.blob, status: r.status === 'transcribing' ? 'failed' : r.status,
         attempts: r.attempts || 0, error: r.status === 'transcribing' ? 'Interrupted before transcription completed' : r.error,
-        transcript: r.transcript, intent: r.intent || 'append', capturedText: r.capturedText || '', sessionId, boxId: 'local', durable: true,
+        transcript: r.transcript, intent: r.intent || 'append', capturedText: r.capturedText || '', sessionId, boxId: 'local',
       })) as VoiceMemo[]
       setFiles(attachments)
       setVoiceMemos(memos)
@@ -802,15 +800,15 @@ export default function App() {
     audioChunks = []
   }
 
-  async function persistMediaPatch(id: string, durable: boolean, patch: Record<string, unknown>) {
-    if (durable) await patchMediaRecord(id, patch).catch((e: any) => setMediaNotice(`Could not update recovery storage: ${e?.message || e}`))
+  async function persistMediaPatch(id: string, patch: Record<string, unknown>) {
+    await patchMediaRecord(id, patch).catch((e: any) => setMediaNotice(`Could not update recovery storage: ${e?.message || e}`))
   }
 
   function uploadPendingFile(file: PendingFile): Promise<string> {
     return runMediaOperationOnce(uploadsInFlight, file.id, async () => {
       if (file.serverPath) return file.serverPath
       updateFile(file.id, { status: 'uploading', error: undefined })
-      await persistMediaPatch(file.id, file.durable, { status: 'uploading', error: null })
+      await persistMediaPatch(file.id, { status: 'uploading', error: null })
       let lastAttempt = file.attempts
       try {
         const uploadPath = await retryMediaOperation(
@@ -820,17 +818,17 @@ export default function App() {
             if (willRetry) {
               const patch = { status: 'uploading' as const, attempts: attempt, error: error?.message || String(error) }
               updateFile(file.id, patch)
-              await persistMediaPatch(file.id, file.durable, patch)
+              await persistMediaPatch(file.id, patch)
             }
           } },
         )
         updateFile(file.id, { status: 'uploaded', serverPath: uploadPath, error: undefined })
-        await persistMediaPatch(file.id, file.durable, { status: 'uploaded', serverPath: uploadPath, error: null })
+        await persistMediaPatch(file.id, { status: 'uploaded', serverPath: uploadPath, error: null })
         return uploadPath
       } catch (error: any) {
         const patch = { status: 'failed' as const, attempts: lastAttempt, error: error?.message || String(error) }
         updateFile(file.id, patch)
-        await persistMediaPatch(file.id, file.durable, patch)
+        await persistMediaPatch(file.id, patch)
         throw error
       }
     })
@@ -874,7 +872,7 @@ export default function App() {
       try {
         if (!transcript) {
           updateVoice(memo.id, { status: 'transcribing', error: undefined })
-          await persistMediaPatch(memo.id, memo.durable, { status: 'transcribing', error: null })
+          await persistMediaPatch(memo.id, { status: 'transcribing', error: null })
           transcript = await retryMediaOperation(
             () => transcribeAudio(memo.blob, AbortSignal.timeout(120_000)),
             { onAttempt: async (attempt, error: any, willRetry: boolean) => {
@@ -882,12 +880,12 @@ export default function App() {
               if (willRetry) {
                 const patch = { status: 'transcribing' as const, attempts: attempt, error: error?.message || String(error) }
                 updateVoice(memo.id, patch)
-                await persistMediaPatch(memo.id, memo.durable, patch)
+                await persistMediaPatch(memo.id, patch)
               }
             } },
           )
           updateVoice(memo.id, { transcript })
-          await persistMediaPatch(memo.id, memo.durable, { transcript })
+          await persistMediaPatch(memo.id, { transcript })
         }
         if (memo.intent === 'send') {
           await sendSessionText([memo.capturedText, transcript].filter(Boolean).join(' '), memo.sessionId)
@@ -898,14 +896,14 @@ export default function App() {
           saveDraft(memo.sessionId, next)
           if (memo.sessionId === currentId()) setText(next)
         }
-        if (memo.durable) await deleteMediaRecord(memo.id)
+        await deleteMediaRecord(memo.id).catch((e: any) => setMediaNotice(`Could not clear recovery storage: ${e?.message || e}`))
         setVoiceMemos(prev => prev.filter(item => item.id !== memo.id))
         setMediaNotice('Voice memo recovered successfully.')
       } catch (error: any) {
         const message = error?.message || String(error)
         const patch = { status: 'failed' as const, attempts: lastAttempt, error: message, transcript }
         updateVoice(memo.id, patch)
-        await persistMediaPatch(memo.id, memo.durable, patch)
+        await persistMediaPatch(memo.id, patch)
         setMediaNotice(`Voice memo retained: ${message}`)
       }
     })
@@ -928,7 +926,7 @@ export default function App() {
 
   async function removeVoiceMemo(id: string) {
     const memo = voiceMemos().find(item => item.id === id)
-    if (memo?.durable) await deleteMediaRecord(id).catch(() => {})
+    if (memo) await deleteMediaRecord(id).catch(() => {})
     setVoiceMemos(prev => prev.filter(item => item.id !== id))
   }
 
@@ -955,10 +953,9 @@ export default function App() {
       const id = crypto.randomUUID()
       const name = `voice-memo-${Date.now()}.${blob.type.includes('mp4') ? 'm4a' : 'webm'}`
       const record = { id, boxId: 'local', sessionId, kind: 'audio', name, mimeType: blob.type, blob, status: blob.size < 1000 ? 'failed' : 'transcribing', attempts: 0, error: blob.size < 1000 ? 'Recording was too short to transcribe' : null, intent: voiceSendAfterStop ? 'send' : 'append', capturedText: text().trim(), createdAt: Date.now() }
-      let durable = true
       try { await putMediaRecord(record) }
-      catch (e: any) { durable = false; setMediaNotice(`Voice recovery storage unavailable: ${e?.message || e}. Download the memo before closing this tab.`) }
-      const memo: VoiceMemo = { ...record, status: record.status as VoiceStatus, error: record.error || undefined, intent: record.intent as 'append' | 'send', boxId: 'local', durable }
+      catch (e: any) { setMediaNotice(`Voice recovery storage unavailable: ${e?.message || e}. Download the memo before closing this tab.`) }
+      const memo: VoiceMemo = { ...record, status: record.status as VoiceStatus, error: record.error || undefined, intent: record.intent as 'append' | 'send', boxId: 'local' }
       setVoiceMemos(prev => [...prev, memo])
       stopVoice()
       if (blob.size < 1000) return
@@ -988,7 +985,7 @@ export default function App() {
       await sendSessionText(parts.join('\n'), targetId)
       for (const file of pending) {
         URL.revokeObjectURL(file.dataUrl)
-        if (file.durable) await deleteMediaRecord(file.id).catch(() => {})
+        await deleteMediaRecord(file.id).catch(() => {})
       }
       if (targetId === currentId()) {
         setText('')

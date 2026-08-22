@@ -82,10 +82,18 @@ if REFEATHER_REQUIRED_COMMANDS='git command-that-does-not-exist' "${stage[@]}" -
   echo "missing dependency unexpectedly passed" >&2; exit 1
 fi
 grep -q 'missing required command' "$TMP/dependency.err"
-if REFEATHER_REQUIRED_FREE_KB=999999999999 "${stage[@]}" --archive-receipt "$TMP/unpushed-receipt/receipt.json" 2>"$TMP/disk.err"; then
+# An already verified release is a no-op and needs no additional build space.
+[ "$(REFEATHER_REQUIRED_FREE_KB=999999999999 "${stage[@]}" --archive-receipt "$TMP/unpushed-receipt/receipt.json")" = "$release" ]
+
+printf 'disk-gate\n' >>"$source_repo/tracked.txt"
+git -C "$source_repo" add tracked.txt
+git -C "$source_repo" commit -qm disk-gate
+make_receipt "$(git -C "$source_repo" rev-parse HEAD)" "$TMP/disk-receipt"
+if REFEATHER_REQUIRED_FREE_KB=999999999999 "${stage[@]}" --archive-receipt "$TMP/disk-receipt/receipt.json" 2>"$TMP/disk.err"; then
   echo "low disk preflight unexpectedly passed" >&2; exit 1
 fi
 grep -q 'insufficient disk' "$TMP/disk.err"
+release="$(REFEATHER_DISK_HEADROOM_KB=0 "${stage[@]}" --archive-receipt "$TMP/disk-receipt/receipt.json")"
 
 # A canary bind check must fail before staging when another process owns the port.
 port_file="$TMP/canary-port"
@@ -102,7 +110,7 @@ PY
 port_pid=$!
 for _ in $(seq 1 100); do [ -s "$port_file" ] && break; sleep 0.01; done
 [ -s "$port_file" ] || { echo "canary listener did not start" >&2; exit 1; }
-if REFEATHER_DISK_HEADROOM_KB=0 "${stage[@]}" --archive-receipt "$TMP/unpushed-receipt/receipt.json" \
+if REFEATHER_DISK_HEADROOM_KB=0 "${stage[@]}" --archive-receipt "$TMP/disk-receipt/receipt.json" \
     --check-port "$(cat "$port_file")" 2>"$TMP/port.err"; then
   echo "occupied canary port unexpectedly passed" >&2; exit 1
 fi

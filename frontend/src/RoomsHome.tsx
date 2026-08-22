@@ -33,7 +33,6 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
   const [attachLoading, setAttachLoading] = createSignal(false)
   const [attachingRoom, setAttachingRoom] = createSignal<string | null>(null)
   const [attachCandidates, setAttachCandidates] = createSignal<SessionMeta[]>([])
-  const [recentAttachSessions, setRecentAttachSessions] = createSignal<SessionMeta[] | null>(null)
   const [attachError, setAttachError] = createSignal<string | null>(null)
   const [attachQuery, setAttachQuery] = createSignal('')
 
@@ -71,12 +70,8 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
   async function loadAttachCandidates(query = '') {
     setAttachError(null)
     try {
-      let sessions = !query ? recentAttachSessions() : null
-      if (!sessions) {
-        setAttachLoading(true)
-        sessions = query ? await searchSessions(query) : await fetchSessions(null, undefined, 300)
-        if (!query) setRecentAttachSessions(sessions)
-      }
+      setAttachLoading(true)
+      const sessions = query ? await searchSessions(query) : await fetchSessions(null, undefined, 300)
       const groupedIds = new Set((rooms() || []).flatMap(current => current.sessions.map(session => session.id)))
       setAttachCandidates(sessions.filter(session => !groupedIds.has(session.id)))
     } catch (e: any) { setAttachError(e.message) }
@@ -96,7 +91,6 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
     try {
       await assignSessionToRoom(room.name, session.id)
       setAttachCandidates(sessions => sessions.filter(candidate => candidate.id !== session.id))
-      setRecentAttachSessions(null)
       await refresh()
       props.onSessionsChanged?.()
     } catch (e: any) { setAttachError(e.message) }
@@ -108,7 +102,6 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
     setBusy(true)
     try {
       await assignSessionToRoom(room.name, session.id, true)
-      setRecentAttachSessions(null)
       await refresh()
       props.onSessionsChanged?.()
     } catch (e: any) { alert(e.message) }

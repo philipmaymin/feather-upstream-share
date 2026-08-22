@@ -1,13 +1,15 @@
 const DB_NAME = 'feather-media-outbox'
 const STORE = 'items'
 const KINDS = new Set(['file', 'image', 'audio'])
-const STATUSES = new Set(['draft', 'uploading', 'uploaded', 'transcribing', 'failed'])
+const FILE_STATUSES = new Set(['draft', 'uploading', 'uploaded', 'failed'])
+const AUDIO_STATUSES = new Set(['transcribing', 'failed'])
 
 function validateMediaRecord(record) {
   const valid = record && typeof record === 'object' &&
     typeof record.id === 'string' && typeof record.boxId === 'string' &&
     typeof record.sessionId === 'string' && typeof record.name === 'string' &&
-    KINDS.has(record.kind) && STATUSES.has(record.status) && record.blob instanceof Blob
+    KINDS.has(record.kind) && record.blob instanceof Blob &&
+    (record.kind === 'audio' ? AUDIO_STATUSES : FILE_STATUSES).has(record.status)
   if (!valid) throw new Error('Invalid media recovery record')
   return record
 }
@@ -33,6 +35,7 @@ function openMediaOutbox() {
     request.onsuccess = () => {
       const db = request.result
       db.onversionchange = () => { db.close(); databasePromise = null }
+      db.onclose = () => { databasePromise = null }
       resolve(db)
     }
     request.onerror = () => {
@@ -43,9 +46,18 @@ function openMediaOutbox() {
   return databasePromise
 }
 
-async function withStore(mode, run) {
+async function withStore(mode, run, retryClosed = true) {
   const db = await openMediaOutbox()
-  const tx = db.transaction(STORE, mode)
+  let tx
+  try {
+    tx = db.transaction(STORE, mode)
+  } catch (error) {
+    if (retryClosed && error?.name === 'InvalidStateError') {
+      databasePromise = null
+      return withStore(mode, run, false)
+    }
+    throw error
+  }
   const result = await run(tx.objectStore(STORE))
   await new Promise((resolve, reject) => {
     tx.oncomplete = resolve

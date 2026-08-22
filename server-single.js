@@ -283,7 +283,10 @@ function listCodexJsonlFiles() {
       else if (ent.isFile() && ent.name.startsWith('rollout-') && ent.name.endsWith('.jsonl')) {
         const uuid = extractCodexUuid(ent.name);
         if (!uuid) continue;
-        try { out.push({ uuid, fpath: full, mtime: fs.statSync(full).mtime }); } catch {}
+        try {
+          const stat = fs.statSync(full);
+          out.push({ uuid, fpath: full, mtime: stat.mtime, size: stat.size });
+        } catch {}
       }
     }
   }
@@ -798,12 +801,9 @@ function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
 
   // Codex sessions, only when not filtering by a specific Claude project
   if (!projectFilter) {
-    for (const { uuid, fpath, mtime } of listCodexJsonlFiles()) {
-      try {
-        const stat = fs.statSync(fpath);
-        if (stat.size < 50) continue;
-        candidates.push({ id: codexLocalIds.get(uuid) || uuid, fpath, mtime, projectId: null, agent: 'codex' });
-      } catch {}
+    for (const { uuid, fpath, mtime, size } of listCodexJsonlFiles()) {
+      if (size < 50) continue;
+      candidates.push({ id: codexLocalIds.get(uuid) || uuid, fpath, mtime, projectId: null, agent: 'codex' });
     }
   }
 
@@ -833,9 +833,12 @@ function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
       let buf;
       try {
         const fd = fs.openSync(c.fpath, 'r');
-        buf = Buffer.alloc(Math.min(CODEX_HEAD_BYTES, fs.fstatSync(fd).size));
-        fs.readSync(fd, buf, 0, buf.length, 0);
-        fs.closeSync(fd);
+        try {
+          buf = Buffer.alloc(Math.min(CODEX_HEAD_BYTES, fs.fstatSync(fd).size));
+          fs.readSync(fd, buf, 0, buf.length, 0);
+        } finally {
+          fs.closeSync(fd);
+        }
       } catch { buf = Buffer.alloc(0); }
       const cwd = extractCodexCwd(buf) || meta[c.id]?.cwd || null;
       const isWorker = buf.includes('AUTO_WORKER=TRUE')
@@ -1553,14 +1556,14 @@ function ensureRoomsDoctrine() {
 function lastRoomMessageSnippet(sessionId, agent) {
   const fpath = findJsonlPath(sessionId, agent);
   if (!fpath) return null;
+  let fd;
   try {
     const size = fs.statSync(fpath).size;
+    fd = fs.openSync(fpath, 'r');
     for (const tail of ROOM_TAILS) {
       const start = Math.max(0, size - tail);
-      const fd = fs.openSync(fpath, 'r');
       const buf = Buffer.alloc(size - start);
       fs.readSync(fd, buf, 0, buf.length, start);
-      fs.closeSync(fd);
       let lines = buf.toString('utf8').split('\n').filter(Boolean);
       if (start > 0) lines = lines.slice(1);
       for (let index = lines.length - 1; index >= 0; index--) {
@@ -1575,7 +1578,9 @@ function lastRoomMessageSnippet(sessionId, agent) {
       }
       if (start === 0) break;
     }
-  } catch {}
+  } catch {} finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
   return null;
 }
 
@@ -2407,8 +2412,8 @@ app.post('/api/upload', async (req, res) => {
       return res.json({ path: fpath, reused: true });
     }
     const tmp = path.join(dir, `.${uploadId}-${randomUUID()}.tmp`);
-    fs.writeFileSync(tmp, body, { flag: 'wx', mode: 0o600 });
     try {
+      fs.writeFileSync(tmp, body, { flag: 'wx', mode: 0o600 });
       fs.linkSync(tmp, fpath);
     } catch (e) {
       const racedBody = e.code === 'EEXIST' ? existingBody() : null;

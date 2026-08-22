@@ -98,6 +98,11 @@ async function copyHtml(uuid: string, container: HTMLElement): Promise<boolean> 
   return true
 }
 
+function filesystemPathFromHref(a: HTMLAnchorElement): string | null {
+  const candidate = localFilePath(a.getAttribute('href'))
+  return candidate?.replace(/:\d+(?::\d+)?$/, '') || null
+}
+
 async function copyPng(uuid: string, container: HTMLElement): Promise<boolean> {
   const el = getMsgEl(uuid, container)
   if (!el) return false
@@ -160,16 +165,6 @@ function collapseCodeBlocks(el: HTMLElement) {
 const FILE_PATH_RE = /((?:\/(?:home|opt|tmp|var|etc|usr)\/[^\s,;:)"'`\]>]+)|(?:~\/[^\s,;:)"'`\]>]+))/g
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp'])
 
-function localPathFromHref(href: string): string | null {
-  let candidate = href.trim()
-  if (candidate.startsWith('file://')) candidate = candidate.slice('file://'.length)
-  try { candidate = decodeURIComponent(candidate) } catch {}
-  // Codex file links may carry a line or line:column suffix. The raw-file
-  // endpoint opens the whole file, so keep that UI hint out of the disk path.
-  candidate = candidate.replace(/:\d+(?::\d+)?$/, '')
-  return /^(?:\/(?:home|opt|tmp|var|etc|usr)\/|~\/)/.test(candidate) ? candidate : null
-}
-
 function resolveLocalPath(filePath: string): string {
   const username = document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user'
   return filePath.replace(/^~/, `/home/${username}`)
@@ -192,7 +187,7 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
     // Markdown already turns [label](/absolute/path) into an anchor, so the
     // text-node pass below never sees its path. Route those anchors through
     // the same authenticated preview endpoint as the Files tab.
-    const localPath = localPathFromHref(a.getAttribute('href') || '')
+    const localPath = filesystemPathFromHref(a)
     if (localPath) {
       a.href = localFileHref(localPath)
       a.classList.add('feather-path')
