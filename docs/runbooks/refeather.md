@@ -76,8 +76,9 @@ evidence directory and causes a full preflight abort; nothing is overwritten.
 Promotion runs the same preflight by default before stopping the service.
 
 Set `FEATHER_URL` to the exact public or loopback mounted base used by the
-instance. CLI fallback probes only `FEATHER_PORT`, 4870, and 3300 and refuses
-zero or multiple Feather-shaped responses.
+instance. CLI fallback probes `FEATHER_PORT` (or legacy `PORT` when
+`FEATHER_PORT` is unset), 4870, and 3300 and refuses zero or multiple
+Feather-shaped responses.
 
 ## 3. Promote as the sole writer
 
@@ -93,10 +94,13 @@ sudo -E bin/refeather promote \
   --pre-promote-check '/path/to/canary-gate'
 ```
 
-Promotion takes the host lock, writes `active.json` and an fsynced JSONL phase
-journal, stops the named program, atomically replaces `current`, starts the
-same program, and requires `/api/health.version` to equal the staged manifest.
-Any ordinary failure restores the prior link and restarts the prior program.
+Promotion verifies the staged release content hash immediately before mutation,
+takes the host lock, writes `active.json` and an fsynced JSONL phase journal,
+stops the named program, atomically replaces `current`, starts the same program,
+and requires `/api/health.version` to equal the staged manifest. Supervisor
+operations have a finite timeout (`REFEATHER_SUPERVISOR_TIMEOUT`, 15 seconds by
+default). An ordinary failure is recovered only after the prior link, prior
+program restart, listener, and exact prior health version are all verified.
 Record the completed state JSON and journal with the migration receipt.
 
 ## Recovery and rollback
@@ -126,6 +130,10 @@ sudo -E bin/refeather rollback \
 Rollback uses the same lock, phase journal, atomic link, health-version gate,
 and failure restoration. It does not restore an older state snapshot; state
 schema compatibility must already have passed the separate downgrade gate.
+
+If restoration cannot be verified, the journal records `rollback-failed` and
+retains `active.json`. Repair the underlying Supervisor or listener issue and
+rerun `refeather recover`; do not remove the active transaction by hand.
 
 ## Failure gates and retained evidence
 

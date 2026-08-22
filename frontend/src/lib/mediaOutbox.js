@@ -1,8 +1,21 @@
-const DB_NAME = 'feather-media-outbox'
+import { appBasePath } from './appPath.js'
+
+const ROOT_DB_NAME = 'feather-media-outbox'
 const STORE = 'items'
 const KINDS = new Set(['file', 'image', 'audio'])
 const FILE_STATUSES = new Set(['draft', 'uploading', 'uploaded', 'failed'])
-const AUDIO_STATUSES = new Set(['transcribing', 'failed'])
+const AUDIO_STATUSES = new Set(['transcribing', 'failed', 'delivered'])
+const CLAIM_TTL_MS = 10 * 60 * 1000
+const claimOwner = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
+
+export function mediaOutboxDatabaseName(pathname = globalThis.location?.pathname || '/') {
+  const base = appBasePath(pathname)
+  return base ? `${ROOT_DB_NAME}:${encodeURIComponent(base)}` : ROOT_DB_NAME
+}
+
+export function isTerminalMediaRecord(record) {
+  return record?.kind === 'audio' && record?.status === 'delivered'
+}
 
 function validateMediaRecord(record) {
   const valid = record && typeof record === 'object' &&
@@ -27,7 +40,7 @@ function openMediaOutbox() {
   if (!globalThis.indexedDB) return Promise.reject(new Error('IndexedDB is unavailable'))
   if (databasePromise) return databasePromise
   databasePromise = new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1)
+    const request = indexedDB.open(mediaOutboxDatabaseName(), 1)
     request.onupgradeneeded = () => {
       const store = request.result.createObjectStore(STORE, { keyPath: 'id' })
       store.createIndex('scope', ['boxId', 'sessionId'])
@@ -91,4 +104,49 @@ export function listMediaRecords(boxId, sessionId) {
     const records = await requestResult(store.index('scope').getAll([boxId, sessionId]))
     return records.map(validateMediaRecord)
   })
+}
+
+function getMediaRecord(id) {
+  return withStore('readonly', store => requestResult(store.get(id)))
+}
+
+async function acquireFallbackClaim(id) {
+  return withStore('readwrite', async store => {
+    const current = await requestResult(store.get(id))
+    if (!current) return true
+    if (isTerminalMediaRecord(current)) return false
+    const now = Date.now()
+    if (current.claimOwner && current.claimOwner !== claimOwner && Number(current.claimUntil) > now) return false
+    await requestResult(store.put(validateMediaRecord({
+      ...current,
+      claimOwner,
+      claimUntil: now + CLAIM_TTL_MS,
+      updatedAt: now,
+    })))
+    return true
+  })
+}
+
+async function releaseFallbackClaim(id) {
+  return withStore('readwrite', async store => {
+    const current = await requestResult(store.get(id))
+    if (!current || current.claimOwner !== claimOwner) return
+    const { claimOwner: _owner, claimUntil: _until, ...next } = current
+    await requestResult(store.put(validateMediaRecord({ ...next, updatedAt: Date.now() })))
+  })
+}
+
+export async function withMediaRecordClaim(id, operation) {
+  const locks = globalThis.navigator?.locks
+  if (locks?.request) {
+    return locks.request(`${mediaOutboxDatabaseName()}:${id}`, { mode: 'exclusive', ifAvailable: true }, async lock => {
+      if (!lock) return undefined
+      const current = await getMediaRecord(id)
+      if (isTerminalMediaRecord(current)) return undefined
+      return operation()
+    })
+  }
+  if (!await acquireFallbackClaim(id)) return undefined
+  try { return await operation() }
+  finally { await releaseFallbackClaim(id).catch(() => {}) }
 }

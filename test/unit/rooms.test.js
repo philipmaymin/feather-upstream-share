@@ -148,6 +148,16 @@ describe('portable Room membership', () => {
       assert.equal(marriage.sessions[1].roomAssigned, true)
       assert.deepEqual(rooms.find((room) => room.name === 'other').sessions.map((session) => session.id), [movedId])
 
+      const wrongRoomDetach = await fetch(`http://127.0.0.1:${port}/api/rooms/marriage/assign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: movedId, remove: true }),
+      })
+      assert.equal(wrongRoomDetach.status, 409)
+      assert.match((await wrongRoomDetach.json()).error, /not assigned to #marriage/)
+      rooms = (await (await fetch(`http://127.0.0.1:${port}/api/rooms`)).json()).rooms
+      assert.deepEqual(rooms.find((room) => room.name === 'other').sessions.map((session) => session.id), [movedId])
+
       const detach = await fetch(`http://127.0.0.1:${port}/api/rooms/other/assign`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

@@ -6,7 +6,8 @@ import path from 'path'
 const HOME = process.env.HOME || '/home/user'
 const CLAUDE_PROJECTS = path.join(HOME, '.claude/projects')
 const sessionId = `e2e-media-recovery-${Date.now()}`
-let sessionPath
+const navigationSessionId = `e2e-media-navigation-${Date.now()}`
+let sessionPath, navigationSessionPath
 
 test.beforeAll(() => {
   const projectDir = fs.readdirSync(CLAUDE_PROJECTS)
@@ -14,18 +15,27 @@ test.beforeAll(() => {
     .find(candidate => fs.statSync(candidate).isDirectory())
   if (!projectDir) throw new Error('No Claude project directory found')
   sessionPath = path.join(projectDir, `${sessionId}.jsonl`)
+  navigationSessionPath = path.join(projectDir, `${navigationSessionId}.jsonl`)
   fs.writeFileSync(sessionPath, JSON.stringify({
     type: 'user', uuid: 'media-seed', timestamp: new Date().toISOString(), isSidechain: false, isMeta: false,
     message: { role: 'user', content: 'media recovery test' },
   }) + '\n')
+  fs.writeFileSync(navigationSessionPath, JSON.stringify({
+    type: 'user', uuid: 'media-navigation-seed', timestamp: new Date().toISOString(), isSidechain: false, isMeta: false,
+    message: { role: 'user', content: 'media navigation target' },
+  }) + '\n')
 })
 
-test.afterAll(() => { try { fs.unlinkSync(sessionPath) } catch {} })
+test.afterAll(() => {
+  try { fs.unlinkSync(sessionPath) } catch {}
+  try { fs.unlinkSync(navigationSessionPath) } catch {}
+})
 
 test('failed attachment survives reload, retries, and sends without a failure marker', async ({ page }) => {
   let allowUpload = false
   let uploadAttempts = 0
   let sentText = ''
+  let sentMessageId = ''
   await page.route('**/api/upload', async route => {
     uploadAttempts++
     if (!allowUpload) return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'temporary outage' }) })
@@ -33,6 +43,7 @@ test('failed attachment survives reload, retries, and sends without a failure ma
   })
   await page.route(`**/api/sessions/${sessionId}/send`, async route => {
     sentText = JSON.parse(route.request().postData() || '{}').text || ''
+    sentMessageId = route.request().headers()['x-feather-message-id'] || ''
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, sentAt: new Date().toISOString() }) })
   })
 
@@ -57,6 +68,7 @@ test('failed attachment survives reload, retries, and sends without a failure ma
 
   await page.locator('button[title="Send"]').last().click()
   await expect.poll(() => sentText).toContain('[Attached image: /tmp/recovered-photo.png]')
+  expect(sentMessageId).toMatch(/^[0-9a-f-]{20,}$/i)
   expect(sentText).not.toContain('[Upload failed:')
   await expect(page.locator('img[src^="blob:"]')).toHaveCount(0)
   await expect.poll(() => page.evaluate(() => new Promise((resolve, reject) => {
@@ -69,6 +81,129 @@ test('failed attachment survives reload, retries, and sends without a failure ma
       count.onsuccess = () => resolve(count.result)
     }
   }))).toBe(0)
+})
+
+test('an acknowledged send preserves composer edits typed while the request is in flight', async ({ page }) => {
+  let releaseSend
+  const sendGate = new Promise(resolve => { releaseSend = resolve })
+  let received = false
+  await page.route(`**/api/sessions/${sessionId}/send`, async route => {
+    received = true
+    await sendGate
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, sentAt: new Date().toISOString() }) })
+  })
+
+  await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
+  const composer = page.locator('textarea')
+  await composer.fill('submit this draft')
+  await page.locator('button[title="Send"]').last().click()
+  await expect.poll(() => received).toBe(true)
+  await composer.fill('newer unsent thought')
+  releaseSend()
+  await expect(composer).toHaveValue('newer unsent thought')
+  await expect.poll(() => page.evaluate(id => localStorage.getItem(`feather-draft-${id}`), sessionId)).toBe('newer unsent thought')
+})
+
+test('oversized attachments are rejected before any upload request', async ({ page }) => {
+  let uploads = 0
+  const oversizedPath = path.join('/tmp', `feather-too-large-${Date.now()}.bin`)
+  fs.writeFileSync(oversizedPath, '')
+  fs.truncateSync(oversizedPath, 50 * 1024 * 1024 + 1)
+  await page.route('**/api/upload', route => { uploads++; return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ path: '/tmp/should-not-upload' }) }) })
+  try {
+    await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
+    await page.locator('input[type=file]').setInputFiles(oversizedPath)
+    await expect(page.getByText(`${path.basename(oversizedPath)} is larger than the 50 MB upload limit.`)).toBeVisible()
+    expect(uploads).toBe(0)
+    await expect(page.getByText(path.basename(oversizedPath), { exact: true })).toHaveCount(0)
+  } finally {
+    fs.unlinkSync(oversizedPath)
+  }
+})
+
+test('a terminal voice tombstone is never transcribed or delivered again', async ({ page }) => {
+  let transcriptions = 0
+  let sends = 0
+  await page.route('**/api/transcribe', route => { transcriptions++; return route.fulfill({ status: 500, body: '{}' }) })
+  await page.route(`**/api/sessions/${sessionId}/send`, route => { sends++; return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, sentAt: new Date().toISOString() }) }) })
+
+  await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
+  await page.evaluate(({ sessionId }) => new Promise((resolve, reject) => {
+    const request = indexedDB.open('feather-media-outbox', 1)
+    request.onupgradeneeded = () => {
+      const store = request.result.createObjectStore('items', { keyPath: 'id' })
+      store.createIndex('scope', ['boxId', 'sessionId'])
+    }
+    request.onerror = () => reject(request.error)
+    request.onsuccess = () => {
+      const tx = request.result.transaction('items', 'readwrite')
+      tx.objectStore('items').put({
+        id: 'delivered-voice', boxId: 'local', sessionId, kind: 'audio', name: 'voice.webm',
+        blob: new Blob([], { type: 'audio/webm' }), status: 'delivered', attempts: 1,
+        intent: 'send', capturedText: 'already sent', transcript: 'already transcribed', deliveredAt: Date.now(),
+      })
+      tx.oncomplete = resolve
+      tx.onerror = () => reject(tx.error)
+    }
+  }), { sessionId })
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await page.waitForTimeout(250)
+  expect(transcriptions).toBe(0)
+  expect(sends).toBe(0)
+  await expect(page.getByText(/Recovered .*unsent media/)).toHaveCount(0)
+})
+
+test('voice and image work stay pinned to the session where they started', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: {
+      getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }),
+    } })
+    class FakeRecorder {
+      static isTypeSupported() { return true }
+      constructor(_stream, options) { this.mimeType = options?.mimeType || 'audio/webm'; this.state = 'inactive' }
+      start() { this.state = 'recording' }
+      stop() {
+        this.state = 'inactive'
+        this.ondataavailable?.({ data: new Blob([new Uint8Array(2048)], { type: this.mimeType }) })
+        this.onstop?.()
+      }
+    }
+    window.MediaRecorder = FakeRecorder
+    window.AudioContext = class {
+      createMediaStreamSource() { return { connect() {} } }
+      createAnalyser() { return { fftSize: 0, frequencyBinCount: 1, getByteFrequencyData() {} } }
+      close() {}
+    }
+  })
+  await page.route('**/api/transcribe', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ transcript: 'pinned voice' }) }))
+  let voiceSend
+  await page.route(`**/api/sessions/${sessionId}/send`, async route => {
+    voiceSend = {
+      messageId: route.request().headers()['x-feather-message-id'],
+      text: JSON.parse(route.request().postData() || '{}').text,
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, sentAt: new Date().toISOString() }) })
+  })
+
+  await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
+  await page.locator('textarea').fill('original draft')
+  await page.getByRole('button', { name: /Record voice memo/ }).first().click()
+  await page.locator('button').first().click()
+  await page.getByText('media navigation target', { exact: true }).click()
+  await page.locator('textarea').fill('other draft')
+  await page.locator('button[title="Stop, transcribe & send"]').last().click()
+  await expect(page.locator('textarea')).toHaveValue('other draft')
+  await expect.poll(() => voiceSend?.text).toBe('original draft pinned voice')
+  expect(voiceSend.messageId).toMatch(/^[0-9a-f-]{20,}$/i)
+  await expect.poll(() => page.evaluate(id => localStorage.getItem(`feather-draft-${id}`), sessionId)).toBe(null)
+
+  const oversizedSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="2000"><rect width="2000" height="2000" fill="red"/></svg>`
+  await page.locator('button').first().click()
+  await page.getByText('media recovery test', { exact: true }).click()
+  await page.locator('input[type=file]').setInputFiles({ name: 'slow.svg', mimeType: 'image/svg+xml', buffer: Buffer.from(oversizedSvg) })
+  await page.locator('button').first().click()
+  await page.getByText('media navigation target', { exact: true }).click()
+  await expect(page.locator('img[src^="blob:"]')).toHaveCount(0)
 })
 
 test('voice transcription uses the mounted prefix and inserts recovered text', async ({ page }) => {

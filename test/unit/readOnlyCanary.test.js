@@ -69,7 +69,14 @@ function fixture() {
   const bin = path.join(root, 'bin')
   fs.mkdirSync(bin)
   const tmuxLog = path.join(root, 'tmux.log')
-  fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${tmuxLog}"\nexit 1\n`, { mode: 0o755 })
+  fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh
+printf '%s\\n' "$*" >> "${tmuxLog}"
+case "$1" in
+  list-panes) printf 'claude\\n' ;;
+  capture-pane) printf '❯\\n' ;;
+esac
+exit 0
+`, { mode: 0o755 })
   return { home, state, sessionId, sessionFile, readableFile, tmuxLog, bin }
 }
 
@@ -108,6 +115,7 @@ async function startServer(fx, readOnly) {
     env: {
       ...process.env, HOME: fx.home, FEATHER_STATE_DIR: fx.state, PORT: String(port),
       PATH: `${fx.bin}:${process.env.PATH}`, FEATHER_READ_ONLY: readOnly ? '1' : '0',
+      FEATHER_DEEPGRAM_API_KEY: '',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -120,7 +128,7 @@ async function startServer(fx, readOnly) {
     if (child.exitCode !== null) throw new Error(`server exited ${child.exitCode}: ${output}`)
     try {
       const response = await fetch(`${base}/api/health`)
-      if (response.ok) return { base, port }
+      if (response.ok) return { base, port, child }
     } catch {}
     await new Promise(resolve => setTimeout(resolve, 50))
   }
@@ -141,6 +149,30 @@ function expectRejectedUpgrade(url) {
   })
 }
 
+function expectClosedUpgrade(url) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url)
+    let settled = false
+    const finish = () => { if (!settled) { settled = true; resolve() } }
+    ws.once('open', () => reject(new Error(`unexpected WebSocket upgrade: ${url}`)))
+    ws.once('unexpected-response', (_request, response) => { response.resume(); finish() })
+    ws.once('error', finish)
+    ws.once('close', finish)
+  })
+}
+
+function expectOpenedUpgrade(url) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url)
+    ws.once('open', () => { ws.close(); resolve() })
+    ws.once('unexpected-response', (_request, response) => {
+      response.resume()
+      reject(new Error(`upgrade rejected with ${response.statusCode}: ${url}`))
+    })
+    ws.once('error', reject)
+  })
+}
+
 describe('server-enforced read-only canary', () => {
   it('allows the browsing surface while rejecting every mutation and terminal upgrade without state or tmux changes', async () => {
     const fx = fixture()
@@ -153,6 +185,8 @@ describe('server-enforced read-only canary', () => {
     assert.equal(health.capabilities.mutations, false)
     assert.equal(health.capabilities.terminal, false)
     assert.equal(health.capabilities.backgroundControllers, false)
+    assert.equal(health.capabilities.maxUploadBytes, 50 * 1024 * 1024)
+    assert.equal(health.capabilities.maxAudioBytes, 25 * 1024 * 1024)
 
     const readable = [
       '/api/health', '/api/sessions',
@@ -202,6 +236,8 @@ describe('server-enforced read-only canary', () => {
     await expectRejectedUpgrade(`ws://127.0.0.1:${port}/api/terminal?session=${fx.sessionId}`)
     await expectRejectedUpgrade(`ws://127.0.0.1:${port}/api/stt`)
     await expectRejectedUpgrade(`ws://127.0.0.1:${port}/canary/api/shell`)
+    await expectRejectedUpgrade(`ws://127.0.0.1:${port}/api/shell/`)
+    await expectRejectedUpgrade(`ws://127.0.0.1:${port}/unclassified-upgrade`)
     await new Promise(resolve => setTimeout(resolve, 100))
     assert.deepEqual(inventory(fx.home), beforeHome)
     assert.deepEqual(inventory(fx.state), beforeState)
@@ -212,12 +248,89 @@ describe('server-enforced read-only canary', () => {
   it('retains mutation behavior when read-only mode is disabled', async () => {
     const fx = fixture()
     fs.mkdirSync(path.join(fx.state, 'uploads'))
-    const { base } = await startServer(fx, false)
+    const { base, port } = await startServer(fx, false)
     const response = await fetch(`${base}/api/quick-links`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify([{ label: 'Normal mode', url: 'https://example.test' }]),
     })
     assert.equal(response.status, 200)
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(fx.state, 'quick-links.json'), 'utf8')), [{ label: 'Normal mode', url: 'https://example.test' }])
+
+    await expectOpenedUpgrade(`ws://127.0.0.1:${port}/api/shell`)
+    for (const route of ['/api/shell/', '/api/shell-near-match', '/api/terminal/', '/api/terminal-near-match']) {
+      await expectClosedUpgrade(`ws://127.0.0.1:${port}${route}`)
+    }
+  })
+
+  it('returns stable durable send receipts while preserving unkeyed client behavior', async () => {
+    const fx = fixture()
+    fs.mkdirSync(path.join(fx.state, 'uploads'))
+    let running = await startServer(fx, false)
+    let endpoint = `${running.base}/api/sessions/${fx.sessionId}/send`
+    const jsonHeaders = { 'Content-Type': 'application/json', 'X-Feather-Message-ID': 'voice-recovery-0001' }
+
+    const first = await fetch(endpoint, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ text: 'deliver once' }) })
+    assert.equal(first.status, 200)
+    const firstReceipt = await first.json()
+    const retry = await fetch(endpoint, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ text: 'deliver once' }) })
+    assert.equal(retry.status, 200)
+    assert.deepEqual(await retry.json(), firstReceipt)
+
+    running.child.kill('SIGTERM')
+    await new Promise(resolve => running.child.once('exit', resolve))
+    children.delete(running.child)
+    running = await startServer(fx, false)
+    endpoint = `${running.base}/api/sessions/${fx.sessionId}/send`
+    const restartRetry = await fetch(endpoint, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ text: 'deliver once' }) })
+    assert.equal(restartRetry.status, 200)
+    assert.deepEqual(await restartRetry.json(), firstReceipt)
+
+    const conflict = await fetch(endpoint, { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ text: 'different text' }) })
+    assert.equal(conflict.status, 409)
+    assert.match((await conflict.json()).error, /different text/)
+    const invalid = await fetch(endpoint, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Feather-Message-ID': '../bad' },
+      body: JSON.stringify({ text: 'invalid key' }),
+    })
+    assert.equal(invalid.status, 400)
+
+    const unkeyedOne = await fetch(endpoint, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'legacy retry' }),
+    })
+    const unkeyedTwo = await fetch(endpoint, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'legacy retry' }),
+    })
+    assert.equal(unkeyedOne.status, 200)
+    assert.equal(unkeyedTwo.status, 200)
+
+    const calls = fs.readFileSync(fx.tmuxLog, 'utf8').trim().split('\n')
+    assert.equal(calls.filter(call => call === 'send-keys -t f-readonly -l deliver once').length, 1)
+    assert.equal(calls.filter(call => call === 'send-keys -t f-readonly -l legacy retry').length, 2)
+    const receiptsFile = path.join(fx.state, 'uploads/.message-receipts.json')
+    const stored = JSON.parse(fs.readFileSync(receiptsFile, 'utf8'))
+    assert.deepEqual(stored[fx.sessionId]['voice-recovery-0001'].response, firstReceipt)
+    assert.equal(stored[fx.sessionId]['voice-recovery-0001'].textHash.length, 64)
+    assert.equal(fs.statSync(receiptsFile).mode & 0o777, 0o600)
+  })
+
+  it('enforces the audio boundary and returns a stable 413 JSON shape', async () => {
+    const fx = fixture()
+    fs.mkdirSync(path.join(fx.state, 'uploads'))
+    const { base } = await startServer(fx, false)
+    const exactLimit = Buffer.alloc(25 * 1024 * 1024)
+    const boundary = await fetch(`${base}/api/transcribe`, {
+      method: 'POST', headers: { 'Content-Type': 'audio/webm' }, body: exactLimit,
+    })
+    const boundaryBody = await boundary.json()
+    assert.equal(boundary.status, 500, JSON.stringify(boundaryBody))
+    assert.deepEqual(boundaryBody, { error: 'No Deepgram API key configured' })
+
+    const oversized = await fetch(`${base}/api/transcribe`, {
+      method: 'POST',
+      headers: { 'Content-Length': String((25 * 1024 * 1024) + 1) },
+      body: Buffer.alloc((25 * 1024 * 1024) + 1),
+    })
+    assert.equal(oversized.status, 413)
+    assert.deepEqual(await oversized.json(), { error: 'audio exceeds 25 MB limit' })
   })
 })

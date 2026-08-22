@@ -1,4 +1,6 @@
 export const MEDIA_ATTEMPTS = 3
+export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+export const MAX_AUDIO_BYTES = 25 * 1024 * 1024
 
 export class MediaHttpError extends Error {
   constructor(status, message) {
@@ -50,6 +52,6 @@ export function runMediaOperationOnce(inFlight, id, operation) {
 export function isRetryableVoiceMemo(memo) {
   return memo?.status === 'failed' && (
     (typeof memo.transcript === 'string' && memo.transcript.trim().length > 0) ||
-    Number(memo?.blob?.size || 0) >= 1000
+    (Number(memo?.blob?.size || 0) >= 1000 && Number(memo?.blob?.size || 0) <= MAX_AUDIO_BYTES)
   )
 }

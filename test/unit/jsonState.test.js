@@ -60,6 +60,40 @@ describe('JSON state defaults and validation', () => {
 })
 
 describe('atomic replacement and recovery', () => {
+  it('retries an interrupted first write and never acknowledges state without a recovery copy', () => {
+    const { root, file } = fixture()
+    let interruptBackup = true
+    const store = objectStore(file, root, {
+      faultInjector(stage, { kind }) {
+        if (interruptBackup && stage === 'after-rename' && kind === 'backup') {
+          interruptBackup = false
+          throw new Error('injected first-write backup failure')
+        }
+      },
+    })
+
+    assert.throws(() => store.write({ installed: true }), /injected first-write backup failure/)
+    assert.equal(fs.existsSync(file), false)
+    assert.equal(fs.existsSync(`${file}.last-good`), false)
+
+    store.write({ installed: true })
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { installed: true })
+    assert.deepEqual(JSON.parse(fs.readFileSync(`${file}.last-good`, 'utf8')), { installed: true })
+
+    fs.writeFileSync(file, '{corrupt')
+    assert.deepEqual(store.recover(), { installed: true })
+  })
+
+  it('repairs a missing recovery copy before skipping an identical write', () => {
+    const { root, file } = fixture()
+    fs.writeFileSync(file, JSON.stringify({ installed: true }, null, 2))
+    const store = objectStore(file, root)
+
+    store.write({ installed: true })
+
+    assert.deepEqual(JSON.parse(fs.readFileSync(`${file}.last-good`, 'utf8')), { installed: true })
+  })
+
   it('fsyncs a same-directory temp, atomically replaces, preserves mode, and keeps the prior value', () => {
     const { root, file } = fixture()
     fs.writeFileSync(file, '{"old":true}\n', { mode: 0o640 })

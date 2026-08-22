@@ -48,6 +48,55 @@ print(result)
 PY
 }
 
+release_tree_hash() {
+  python3 - "$1" <<'PY'
+import hashlib, os, stat, sys
+
+root = os.path.abspath(sys.argv[1])
+digest = hashlib.sha256()
+for directory, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+    dirnames.sort()
+    filenames.sort()
+    names = dirnames + filenames
+    for name in names:
+        path = os.path.join(directory, name)
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        if relative == ".refeather-release.json":
+            continue
+        info = os.lstat(path)
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISLNK(info.st_mode):
+            kind, payload = "link", os.readlink(path).encode()
+        elif stat.S_ISDIR(info.st_mode):
+            kind, payload = "dir", b""
+        elif stat.S_ISREG(info.st_mode):
+            kind = "file"
+            file_digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    file_digest.update(block)
+            payload = file_digest.hexdigest().encode()
+        else:
+            raise SystemExit(f"unsupported release entry: {relative}")
+        digest.update(f"{kind}\0{mode:o}\0{relative}\0".encode())
+        digest.update(payload)
+        digest.update(b"\0")
+print(digest.hexdigest())
+PY
+}
+
+verify_release() {
+  local release="$1" manifest="$1/.refeather-release.json" expected actual
+  [ -f "$manifest" ] || { note "release has no manifest: $release"; return 1; }
+  expected="$(manifest_field "$manifest" treeHash 2>/dev/null || true)"
+  [ -n "$expected" ] || { note "release manifest has no content hash: $release"; return 1; }
+  actual="$(release_tree_hash "$release")" || return 1
+  [ "$actual" = "$expected" ] || {
+    note "release content hash mismatch: $release"
+    return 1
+  }
+}
+
 fsync_dir() {
   python3 - "$1" <<'PY'
 import os, sys
@@ -125,10 +174,10 @@ PY
 }
 
 write_release_manifest() {
-  python3 - "$1/.refeather-release.json" "$2" "$3" "$4" <<'PY'
+  python3 - "$1/.refeather-release.json" "$2" "$3" "$4" "$5" <<'PY'
 import json, os, sys, tempfile
-path, commit, version, source = sys.argv[1:]
-value = {"schema": 1, "sourceCommit": commit, "version": version, "source": source}
+path, commit, version, source, tree_hash = sys.argv[1:]
+value = {"schema": 2, "sourceCommit": commit, "version": version, "source": source, "treeHash": tree_hash}
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(value, handle, sort_keys=True)
     handle.write("\n")
@@ -156,6 +205,7 @@ cmd_stage() {
   if [ -d "$release" ]; then
     [ -f "$manifest" ] && [ "$(manifest_field "$manifest" sourceCommit)" = "$SOURCE_COMMIT" ] \
       || die "existing release is not a verified build of $SOURCE_COMMIT: $release"
+    verify_release "$release" || die "existing release content verification failed: $release"
     printf '%s\n' "$release"
     return
   fi
@@ -174,8 +224,13 @@ cmd_stage() {
   [ -f "$tmp/version.json" ] || { rm -rf "$tmp"; die "build did not produce version.json"; }
   local version
   version="$(manifest_field "$tmp/version.json" version)" || { rm -rf "$tmp"; die "invalid version.json"; }
-  write_release_manifest "$tmp" "$SOURCE_COMMIT" "$version" "$source"
+  : >"$tmp/.refeather-release.json"
   chmod -R a-w "$tmp"
+  local tree_hash
+  tree_hash="$(release_tree_hash "$tmp")" || { chmod -R u+w "$tmp"; rm -rf "$tmp"; die "could not hash staged release"; }
+  chmod u+w "$tmp/.refeather-release.json"
+  write_release_manifest "$tmp" "$SOURCE_COMMIT" "$version" "$source" "$tree_hash"
+  chmod a-w "$tmp/.refeather-release.json"
   mv "$tmp" "$release"
   fsync_dir "$releases"
   note "staged $release (version $version); current target and service unchanged"
@@ -308,13 +363,16 @@ finish_tx() {
 }
 
 supervisor_action() {
-  "$TX_SUPERVISORCTL" -s "$TX_SOCKET" "$1" "$TX_PROGRAM"
+  timeout --signal=TERM --kill-after="${REFEATHER_SUPERVISOR_KILL_AFTER:-2s}" \
+    "$TX_SUPERVISOR_TIMEOUT" "$TX_SUPERVISORCTL" -s "$TX_SOCKET" "$1" "$TX_PROGRAM"
 }
 
 health_version() {
   "$TX_CURL" -fsS --max-time "${REFEATHER_HEALTH_TIMEOUT:-3}" "$TX_HEALTH" | python3 -c '
 import json, sys
 value=json.load(sys.stdin)
+if value.get("status") != "ok":
+    raise SystemExit(1)
 print(value.get("version", ""))
 '
 }
@@ -340,16 +398,30 @@ switch_failed() {
   trap - ERR INT TERM
   set +e
   journal_event failure "phase=$TX_PHASE rc=$rc"
-  if [ "${TX_STOP_ATTEMPTED:-0}" = 1 ]; then supervisor_action stop >/dev/null 2>&1 || true; fi
-  if [ "${TX_POINTER_CHANGED:-0}" = 1 ]; then atomic_current_link "$TX_CURRENT" "$TX_PRIOR" || true; fi
   if [ "${TX_STOP_ATTEMPTED:-0}" = 1 ]; then
-    supervisor_action start >/dev/null 2>&1 || true
-    local old_expected; old_expected="$(prior_expected_version)"
-    [ -z "$old_expected" ] || wait_for_version "$old_expected" >/dev/null 2>&1 || true
+    if restore_prior_release; then
+      [ "${TX_FINISHED:-0}" = 1 ] || finish_tx rolled-back
+      note "$TX_COMMAND failed in phase $TX_PHASE; prior release restored and verified"
+    else
+      journal_event rollback-failed "phase=$TX_PHASE rc=$rc"
+      note "$TX_COMMAND failed in phase $TX_PHASE; prior release restoration could not be verified; run refeather recover"
+    fi
+  else
+    [ "${TX_FINISHED:-0}" = 1 ] || finish_tx rolled-back
+    note "$TX_COMMAND failed in phase $TX_PHASE before service mutation"
   fi
-  [ "${TX_FINISHED:-0}" = 1 ] || finish_tx rolled-back
-  note "$TX_COMMAND failed in phase $TX_PHASE; prior release restored"
   exit "$rc"
+}
+
+restore_prior_release() {
+  local old_expected
+  supervisor_action stop >/dev/null 2>&1 || true
+  atomic_current_link "$TX_CURRENT" "$TX_PRIOR" || return 1
+  [ "$(readlink -f "$TX_CURRENT" 2>/dev/null || true)" = "$TX_PRIOR" ] || return 1
+  supervisor_action start >/dev/null 2>&1 || return 1
+  old_expected="$(prior_expected_version)"
+  [ -n "$old_expected" ] || return 1
+  wait_for_version "$old_expected" >/dev/null 2>&1 || return 1
 }
 
 load_switch_options() {
@@ -359,6 +431,7 @@ load_switch_options() {
   TX_SOCKET="${REFEATHER_SUPERVISOR_SOCKET:-}"
   TX_HEALTH="${REFEATHER_HEALTH_URL:-}"
   TX_SUPERVISORCTL="${REFEATHER_SUPERVISORCTL:-supervisorctl}"
+  TX_SUPERVISOR_TIMEOUT="${REFEATHER_SUPERVISOR_TIMEOUT:-15s}"
   TX_CURL="${REFEATHER_CURL:-curl}"
   TX_JOURNAL_DIR="${REFEATHER_JOURNAL_DIR:-/var/lib/feather/refeather}"
   TX_LOCK_FILE="${REFEATHER_LOCK_FILE:-/var/lock/feather-refeather.lock}"
@@ -376,9 +449,10 @@ load_switch_options() {
   done
   [ -n "$TX_CANDIDATE" ] && [ -n "$TX_CURRENT" ] && [ -n "$TX_PROGRAM" ] && [ -n "$TX_SOCKET" ] && [ -n "$TX_HEALTH" ] \
     || die "$TX_COMMAND requires explicit --release, --current-link, --program, --supervisor-socket, and --health-url"
-  need_command "$TX_SUPERVISORCTL"; need_command "$TX_CURL"; need_command flock; need_command python3
+  need_command "$TX_SUPERVISORCTL"; need_command "$TX_CURL"; need_command flock; need_command python3; need_command timeout
   TX_CANDIDATE="$(realpath_existing "$TX_CANDIDATE")"
   [ -f "$TX_CANDIDATE/.refeather-release.json" ] || die "candidate has no release manifest"
+  verify_release "$TX_CANDIDATE" || die "candidate release content verification failed"
   TX_EXPECTED="$(manifest_field "$TX_CANDIDATE/.refeather-release.json" version)"
   [ -L "$TX_CURRENT" ] || die "current link must already be a symlink: $TX_CURRENT"
   TX_PRIOR="$(readlink -f "$TX_CURRENT")"
@@ -408,6 +482,8 @@ run_switch() {
       "${REFEATHER_CONFLICT_BACKUP_DIR:-$HOME/.feather/install-conflicts/$TX_ID}"
   fi
   if [ -n "$TX_PRECHECK" ]; then write_tx_state preflight; bash -lc "$TX_PRECHECK"; fi
+
+  verify_release "$TX_CANDIDATE"
 
   write_tx_state stopping
   TX_STOP_ATTEMPTED=1
@@ -447,8 +523,9 @@ for shell, key in mapping.items(): print(f"{shell}={shlex.quote(str(value.get(ke
 PY
 )"
   TX_JOURNAL_DIR="$journal_dir" TX_SUPERVISORCTL="${REFEATHER_SUPERVISORCTL:-supervisorctl}" TX_CURL="${REFEATHER_CURL:-curl}"
+  TX_SUPERVISOR_TIMEOUT="${REFEATHER_SUPERVISOR_TIMEOUT:-15s}"
   TX_FINISHED=0 TX_STOP_ATTEMPTED=1 TX_POINTER_CHANGED=1
-  need_command "$TX_SUPERVISORCTL"; need_command "$TX_CURL"
+  need_command "$TX_SUPERVISORCTL"; need_command "$TX_CURL"; need_command timeout
   case "$TX_PHASE" in
     prepared|preflight)
       finish_tx recovered-noop
@@ -459,13 +536,13 @@ PY
       note "finalized already-promoted transaction"
       ;;
     *)
-      supervisor_action stop >/dev/null 2>&1 || true
-      atomic_current_link "$TX_CURRENT" "$TX_PRIOR"
-      supervisor_action start
-      old_expected="$(prior_expected_version)"
-      [ -z "$old_expected" ] || wait_for_version "$old_expected"
-      finish_tx recovered-rollback
-      note "recovered interrupted $TX_COMMAND by restoring $TX_PRIOR"
+      if restore_prior_release; then
+        finish_tx recovered-rollback
+        note "recovered interrupted $TX_COMMAND by restoring $TX_PRIOR"
+      else
+        journal_event rollback-failed "recover phase=$TX_PHASE"
+        die "prior release restoration could not be verified; active transaction retained"
+      fi
       ;;
   esac
 }

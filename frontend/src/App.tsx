@@ -8,15 +8,15 @@ import RoomsHome from './RoomsHome'
 import type { SessionMeta, Message, QuestionData, SidecarGroup } from './api'
 import { fetchSessions, fetchRooms, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
 import type { SearchResult } from './api'
-import { MEDIA_ATTEMPTS, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
-import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords } from './lib/mediaOutbox.js'
+import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
+import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
 import { appUrl } from './lib/appPath.js'
 
 interface QuickLink { label: string; url: string }
 
 type FileStatus = 'draft' | 'uploading' | 'uploaded' | 'failed'
-type VoiceStatus = 'transcribing' | 'failed'
-interface PendingFile { id: string; name: string; blob: Blob; dataUrl: string; isImage: boolean; status: FileStatus; attempts: number; error?: string; serverPath?: string }
+type VoiceStatus = 'transcribing' | 'failed' | 'delivered'
+interface PendingFile { id: string; name: string; blob: Blob; dataUrl: string; isImage: boolean; status: FileStatus; attempts: number; error?: string; serverPath?: string; sessionId: string; boxId: 'local' }
 interface VoiceMemo { id: string; name: string; blob: Blob; status: VoiceStatus; attempts: number; error?: string; transcript?: string; intent: 'append' | 'send'; capturedText: string; sessionId: string; boxId: 'local' }
 interface StoredMediaBase { id: string; boxId: string; sessionId: string; name: string; blob: Blob; attempts: number; error?: string }
 interface StoredFileMedia extends StoredMediaBase { kind: 'file' | 'image'; status: FileStatus; serverPath?: string }
@@ -334,19 +334,27 @@ export default function App() {
   }
 
   async function addFiles(fileList: FileList | File[]) {
-    if (uploading() || !currentId()) return
+    if (uploading()) return
+    const sessionId = currentId()
+    const boxId = 'local' as const
+    if (!sessionId) return
     const added: PendingFile[] = []
     for (const f of fileList) {
+      if (f.size > MAX_UPLOAD_BYTES) {
+        setMediaNotice(`${f.name} is larger than the 50 MB upload limit.`)
+        continue
+      }
       const isImage = f.type.startsWith('image/')
       const blob = isImage ? await resizeImage(f) : f
       const dataUrl = URL.createObjectURL(blob)
       const id = crypto.randomUUID()
-      const record = { id, boxId: 'local', sessionId: currentId()!, kind: isImage ? 'image' : 'file', name: f.name, mimeType: blob.type, blob, status: 'draft', attempts: 0, createdAt: Date.now() }
+      const record = { id, boxId, sessionId, kind: isImage ? 'image' : 'file', name: f.name, mimeType: blob.type, blob, status: 'draft', attempts: 0, createdAt: Date.now() }
       try { await putMediaRecord(record) }
       catch (e: any) { setMediaNotice(`Recovery storage unavailable: ${e?.message || e}. Keep this tab open or remove/download the file.`) }
-      added.push({ id, name: f.name, blob, dataUrl, isImage, status: 'draft', attempts: 0 })
+      if (currentId() === sessionId) added.push({ id, name: f.name, blob, dataUrl, isImage, status: 'draft', attempts: 0, sessionId, boxId })
+      else URL.revokeObjectURL(dataUrl)
     }
-    setFiles(prev => [...prev, ...added])
+    if (currentId() === sessionId) setFiles(prev => [...prev, ...added])
   }
 
   async function removeFile(idx: number) {
@@ -378,20 +386,21 @@ export default function App() {
     try {
       const records = await listMediaRecords('local', sessionId) as StoredMedia[]
       if (generation !== mediaRestoreGeneration || currentId() !== sessionId) return
-      const attachments = records.filter(r => r.kind === 'file' || r.kind === 'image').map(r => ({
+      const recoverable = records.filter(record => !isTerminalMediaRecord(record))
+      const attachments = recoverable.filter(r => r.kind === 'file' || r.kind === 'image').map(r => ({
         id: r.id, name: r.name, blob: r.blob, dataUrl: URL.createObjectURL(r.blob), isImage: r.kind === 'image',
         status: r.status === 'uploading' ? 'failed' : r.status, attempts: r.attempts || 0,
         error: r.status === 'uploading' ? 'Interrupted before upload completed' : r.error,
-        serverPath: r.serverPath,
+        serverPath: r.serverPath, sessionId, boxId: 'local' as const,
       })) as PendingFile[]
-      const memos = records.filter(r => r.kind === 'audio').map(r => ({
+      const memos = recoverable.filter(r => r.kind === 'audio').map(r => ({
         id: r.id, name: r.name, blob: r.blob, status: r.status === 'transcribing' ? 'failed' : r.status,
         attempts: r.attempts || 0, error: r.status === 'transcribing' ? 'Interrupted before transcription completed' : r.error,
         transcript: r.transcript, intent: r.intent || 'append', capturedText: r.capturedText || '', sessionId, boxId: 'local',
       })) as VoiceMemo[]
       setFiles(attachments)
       setVoiceMemos(memos)
-      if (records.length) setMediaNotice(`Recovered ${records.length} unsent media item${records.length === 1 ? '' : 's'}.`)
+      if (recoverable.length) setMediaNotice(`Recovered ${recoverable.length} unsent media item${recoverable.length === 1 ? '' : 's'}.`)
       queueMicrotask(() => retryRecoverableMedia())
     } catch (e: any) {
       setMediaNotice(`Media recovery unavailable: ${e?.message || e}`)
@@ -834,7 +843,7 @@ export default function App() {
     })
   }
 
-  async function sendSessionText(rawText: string, targetId: string) {
+  async function sendSessionText(rawText: string, targetId: string, messageId?: string) {
     const fullText = rawText.trim()
     if (!fullText) return
     const targetIsCurrent = targetId === currentId()
@@ -851,13 +860,12 @@ export default function App() {
         content: [{ type: 'text', text: fullText }], delivery: 'sent',
       }])
     }
-    try { await sendInput(targetId, fullText) }
+    try { await sendInput(targetId, fullText, messageId) }
     catch (error) {
       if (tempId) setMessages(prev => prev.filter(message => message.uuid !== tempId))
       throw error
     }
     pushHistory(fullText)
-    saveDraft(targetId, '')
     if (targetIsCurrent) {
       setWorking(true)
       startWorkingTimeout()
@@ -865,7 +873,7 @@ export default function App() {
   }
 
   function processVoiceMemo(memo: VoiceMemo): Promise<void> {
-    return runMediaOperationOnce(voiceMemosInFlight, memo.id, async () => {
+    return runMediaOperationOnce(voiceMemosInFlight, memo.id, () => withMediaRecordClaim(memo.id, async () => {
       let transcript = memo.transcript
       let lastAttempt = memo.attempts
       if (!transcript && memo.blob.size < 1000) return
@@ -888,15 +896,19 @@ export default function App() {
           await persistMediaPatch(memo.id, { transcript })
         }
         if (memo.intent === 'send') {
-          await sendSessionText([memo.capturedText, transcript].filter(Boolean).join(' '), memo.sessionId)
-          if (memo.sessionId === currentId()) setText('')
+          await sendSessionText([memo.capturedText, transcript].filter(Boolean).join(' '), memo.sessionId, memo.id)
+          const draft = memo.sessionId === currentId() ? text() : loadDraft(memo.sessionId)
+          if (draft === memo.capturedText) {
+            saveDraft(memo.sessionId, '')
+            if (memo.sessionId === currentId()) setText('')
+          }
         } else {
           const previous = memo.sessionId === currentId() ? text().trim() : loadDraft(memo.sessionId).trim()
           const next = [previous, transcript].filter(Boolean).join(' ')
           saveDraft(memo.sessionId, next)
           if (memo.sessionId === currentId()) setText(next)
         }
-        await deleteMediaRecord(memo.id).catch((e: any) => setMediaNotice(`Could not clear recovery storage: ${e?.message || e}`))
+        await patchMediaRecord(memo.id, { status: 'delivered', error: null, deliveredAt: Date.now(), blob: new Blob([], { type: memo.blob.type }) })
         setVoiceMemos(prev => prev.filter(item => item.id !== memo.id))
         setMediaNotice('Voice memo recovered successfully.')
       } catch (error: any) {
@@ -906,7 +918,7 @@ export default function App() {
         await persistMediaPatch(memo.id, patch)
         setMediaNotice(`Voice memo retained: ${message}`)
       }
-    })
+    })) as Promise<void>
   }
 
   async function retryRecoverableMedia() {
@@ -937,6 +949,8 @@ export default function App() {
       else stopVoice()
       return
     }
+    const recordingTarget = { sessionId: currentId(), capturedText: text().trim() }
+    if (!recordingTarget.sessionId) return
     try { mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }) }
     catch { return }
     audioChunks = []
@@ -949,16 +963,17 @@ export default function App() {
     recorder.ondataavailable = event => { if (event.data.size > 0) audioChunks.push(event.data) }
     recorder.onstop = async () => {
       const blob = new Blob(audioChunks, { type: recorder.mimeType })
-      const sessionId = currentId()!
+      const sessionId = recordingTarget.sessionId!
       const id = crypto.randomUUID()
       const name = `voice-memo-${Date.now()}.${blob.type.includes('mp4') ? 'm4a' : 'webm'}`
-      const record = { id, boxId: 'local', sessionId, kind: 'audio', name, mimeType: blob.type, blob, status: blob.size < 1000 ? 'failed' : 'transcribing', attempts: 0, error: blob.size < 1000 ? 'Recording was too short to transcribe' : null, intent: voiceSendAfterStop ? 'send' : 'append', capturedText: text().trim(), createdAt: Date.now() }
+      const sizeError = blob.size > MAX_AUDIO_BYTES ? 'Voice memo is larger than the 25 MB audio limit' : blob.size < 1000 ? 'Recording was too short to transcribe' : null
+      const record = { id, boxId: 'local', sessionId, kind: 'audio', name, mimeType: blob.type, blob, status: sizeError ? 'failed' : 'transcribing', attempts: 0, error: sizeError, intent: voiceSendAfterStop ? 'send' : 'append', capturedText: recordingTarget.capturedText, createdAt: Date.now() }
       try { await putMediaRecord(record) }
       catch (e: any) { setMediaNotice(`Voice recovery storage unavailable: ${e?.message || e}. Download the memo before closing this tab.`) }
       const memo: VoiceMemo = { ...record, status: record.status as VoiceStatus, error: record.error || undefined, intent: record.intent as 'append' | 'send', boxId: 'local' }
-      setVoiceMemos(prev => [...prev, memo])
+      if (sessionId === currentId()) setVoiceMemos(prev => [...prev, memo])
       stopVoice()
-      if (blob.size < 1000) return
+      if (sizeError) return
       setTranscribing(true)
       try { await processVoiceMemo(memo) }
       finally { setTranscribing(false) }
@@ -982,14 +997,14 @@ export default function App() {
         const uploadPath = await uploadPendingFile(file)
         parts.push(file.isImage ? `[Attached image: ${uploadPath}]` : `[Attached file: ${uploadPath}] (${file.name})`)
       }
-      await sendSessionText(parts.join('\n'), targetId)
+      await sendSessionText(parts.join('\n'), targetId, pending[0]?.id)
       for (const file of pending) {
         URL.revokeObjectURL(file.dataUrl)
         await deleteMediaRecord(file.id).catch(() => {})
       }
       if (targetId === currentId()) {
-        setText('')
-        setFiles([])
+        if (text() === rawText) { setText(''); saveDraft(targetId, '') }
+        setFiles(prev => prev.filter(file => !pending.some(sent => sent.id === file.id)))
         if (textareaRef) textareaRef.style.height = 'auto'
       }
     } catch (e: any) {
@@ -1783,7 +1798,7 @@ export default function App() {
 
         {/* Input (chat tab only) */}
         <Show when={currentId() && tab() === 'chat'}>
-          <input ref={fileInputRef} type="file" multiple hidden onChange={(e) => { if (e.target.files?.length) { addFiles(e.target.files); e.target.value = '' } }} />
+          <input ref={fileInputRef} type="file" multiple hidden title="Maximum file size: 50 MB" onChange={(e) => { if (e.target.files?.length) { addFiles(e.target.files); e.target.value = '' } }} />
           <Show when={mediaNotice()}>
             <div role="status" style={{ padding: '7px 12px', 'border-top': '1px solid #332b18', background: '#17140b', color: '#d8bd66', 'font-size': '12px', display: 'flex', 'justify-content': 'space-between', gap: '8px' }}>
               <span>{mediaNotice()}</span><button onClick={() => setMediaNotice('')} style={{ background: 'none', border: 'none', color: '#d8bd66', cursor: 'pointer' }}>&times;</button>
@@ -1842,7 +1857,7 @@ export default function App() {
                   <span style={{ 'font-size': '11px', 'font-weight': '600', color: '#c4993a' }}>{starred()[currentId()!]?.length}</span>
                 </button>
               </Show>
-              <button onClick={toggleVoice} disabled={transcribing()} style={{ background: listening() ? 'rgba(212,85,85,0.15)' : 'none', border: 'none', 'border-radius': '8px', cursor: transcribing() ? 'wait' : 'pointer', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', width: '32px', height: '32px', transition: 'color 0.15s' }} title={transcribing() ? 'Transcribing...' : listening() ? 'Stop & transcribe' : 'Record voice memo'} aria-label={transcribing() ? 'Transcribing...' : listening() ? 'Stop & transcribe' : 'Record voice memo'}>
+              <button onClick={toggleVoice} disabled={transcribing()} style={{ background: listening() ? 'rgba(212,85,85,0.15)' : 'none', border: 'none', 'border-radius': '8px', cursor: transcribing() ? 'wait' : 'pointer', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', width: '32px', height: '32px', transition: 'color 0.15s' }} title={transcribing() ? 'Transcribing...' : listening() ? 'Stop & transcribe' : 'Record voice memo (max 25 MB)'} aria-label={transcribing() ? 'Transcribing...' : listening() ? 'Stop & transcribe' : 'Record voice memo (max 25 MB)'}>
                 <svg width="14" height="18" viewBox="0 0 14 18" fill="none" stroke={listening() ? '#d45555' : '#666'} stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="1" width="6" height="9" rx="3" fill={listening() ? 'rgba(212,85,85,0.2)' : 'none'} /><path d="M1 7.5a6 6 0 0 0 12 0" /><line x1="7" y1="13.5" x2="7" y2="16" /><line x1="4.5" y1="16" x2="9.5" y2="16" /></svg>
               </button>
             </div>

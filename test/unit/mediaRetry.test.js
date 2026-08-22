@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { retryMediaOperation, isTransientMediaError, MediaHttpError, runMediaOperationOnce, isRetryableVoiceMemo } from '../../frontend/src/lib/mediaRetry.js'
+import { MAX_AUDIO_BYTES, MAX_UPLOAD_BYTES, retryMediaOperation, isTransientMediaError, MediaHttpError, runMediaOperationOnce, isRetryableVoiceMemo } from '../../frontend/src/lib/mediaRetry.js'
 
 describe('retryMediaOperation', () => {
   it('makes exactly three total attempts for transient failures', async () => {
@@ -79,5 +79,12 @@ describe('isRetryableVoiceMemo', () => {
 
   it('allows retrying delivery when a transcript already exists', () => {
     assert.equal(isRetryableVoiceMemo({ status: 'failed', blob: { size: 10 }, transcript: 'already transcribed' }), true)
+  })
+
+  it('does not retry oversized audio but keeps the advertised byte limits exact', () => {
+    assert.equal(MAX_UPLOAD_BYTES, 50 * 1024 * 1024)
+    assert.equal(MAX_AUDIO_BYTES, 25 * 1024 * 1024)
+    assert.equal(isRetryableVoiceMemo({ status: 'failed', blob: { size: MAX_AUDIO_BYTES } }), true)
+    assert.equal(isRetryableVoiceMemo({ status: 'failed', blob: { size: MAX_AUDIO_BYTES + 1 } }), false)
   })
 })

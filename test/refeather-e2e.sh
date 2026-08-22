@@ -43,6 +43,20 @@ release="$(REFEATHER_DISK_HEADROOM_KB=0 "${stage[@]}")"
 [ ! -e "$current" ]
 [ ! -e "$service_log" ] # staging never guesses or restarts a service
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sourceCommit"])' "$release/.refeather-release.json")" = "$(git -C "$source_repo" rev-parse HEAD)" ]
+[ -n "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["treeHash"])' "$release/.refeather-release.json")" ]
+
+# Existing releases are reusable only while their deterministic content hash
+# still matches. Restore the fixture after proving tamper rejection.
+chmod u+w "$release/build.marker"
+printf 'tampered\n' >>"$release/build.marker"
+chmod a-w "$release/build.marker"
+if REFEATHER_DISK_HEADROOM_KB=0 "${stage[@]}" 2>"$TMP/tampered-reuse.err"; then
+  echo "tampered existing release unexpectedly reused" >&2; exit 1
+fi
+grep -q 'existing release content verification failed' "$TMP/tampered-reuse.err"
+chmod u+w "$release/build.marker"
+printf 'built\n' >"$release/build.marker"
+chmod a-w "$release/build.marker"
 
 make_receipt() {
   local commit="$1" dir="$2"
@@ -131,7 +145,32 @@ git -C "$source_repo" merge --abort
 
 old="$TMP/releases/old-release"
 mkdir -p "$old"
-printf '{"schema":1,"sourceCommit":"old","version":"old-v1","source":"fixture"}\n' >"$old/.refeather-release.json"
+printf 'old fixture\n' >"$old/content.txt"
+: >"$old/.refeather-release.json"
+chmod -R a-w "$old"
+python3 - "$old" <<'PY'
+import hashlib, json, os, stat, sys
+root = os.path.abspath(sys.argv[1]); digest = hashlib.sha256()
+for directory, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+    dirnames.sort(); filenames.sort()
+    for name in dirnames + filenames:
+        path = os.path.join(directory, name)
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        if relative == ".refeather-release.json": continue
+        info = os.lstat(path); mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISLNK(info.st_mode): kind, payload = "link", os.readlink(path).encode()
+        elif stat.S_ISDIR(info.st_mode): kind, payload = "dir", b""
+        elif stat.S_ISREG(info.st_mode):
+            kind = "file"; file_hash = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""): file_hash.update(block)
+            payload = file_hash.hexdigest().encode()
+        digest.update(f"{kind}\0{mode:o}\0{relative}\0".encode()); digest.update(payload); digest.update(b"\0")
+manifest = {"schema": 2, "sourceCommit": "old", "version": "old-v1", "source": "fixture", "treeHash": digest.hexdigest()}
+os.chmod(os.path.join(root, ".refeather-release.json"), 0o644)
+with open(os.path.join(root, ".refeather-release.json"), "w", encoding="utf-8") as handle: json.dump(manifest, handle)
+os.chmod(os.path.join(root, ".refeather-release.json"), 0o444)
+PY
 ln -s "$old" "$current"
 
 fake_supervisor="$TMP/fake-supervisorctl"
@@ -144,6 +183,8 @@ if [ "$action" = start ] && [ -n "${REFEATHER_TEST_FAIL_START_VERSION:-}" ]; the
   version=$(python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ["REFEATHER_TEST_CURRENT"], ".refeather-release.json")))["version"])')
   [ "$version" != "$REFEATHER_TEST_FAIL_START_VERSION" ] || exit 7
 fi
+if [ "$action" = start ] && [ "${REFEATHER_TEST_FAIL_ALL_START:-0}" = 1 ]; then exit 8; fi
+if [ "$action" = start ] && [ "${REFEATHER_TEST_HANG_START:-0}" = 1 ]; then sleep 30; fi
 SH
 chmod +x "$fake_supervisor"
 
@@ -162,9 +203,47 @@ chmod +x "$fake_curl"
 
 switch_env=(env REFEATHER_SUPERVISORCTL="$fake_supervisor" REFEATHER_CURL="$fake_curl"
   REFEATHER_TEST_CURRENT="$current" REFEATHER_TEST_SERVICE_LOG="$service_log"
-  REFEATHER_JOURNAL_DIR="$journal" REFEATHER_LOCK_FILE="$lock" REFEATHER_HEALTH_ATTEMPTS=2 REFEATHER_HEALTH_DELAY=0.01)
+  REFEATHER_JOURNAL_DIR="$journal" REFEATHER_LOCK_FILE="$lock" REFEATHER_HEALTH_ATTEMPTS=2 REFEATHER_HEALTH_DELAY=0.01
+  REFEATHER_SUPERVISOR_TIMEOUT=0.1s REFEATHER_SUPERVISOR_KILL_AFTER=0.1s)
 switch_args=(--current-link "$current" --program feather-zak --supervisor-socket unix:///tmp/zak-supervisor.sock
   --health-url http://127.0.0.1:8123/feather2/api/health --skip-capability-install)
+
+# A target changed after staging must be rejected before service mutation.
+chmod u+w "$release/build.marker"; printf 'tampered\n' >>"$release/build.marker"; chmod a-w "$release/build.marker"
+if "${switch_env[@]}" "$ROOT/bin/refeather" promote --release "$release" "${switch_args[@]}" 2>"$TMP/tampered-promote.err"; then
+  echo "tampered candidate unexpectedly promoted" >&2; exit 1
+fi
+grep -q 'candidate release content verification failed' "$TMP/tampered-promote.err"
+[ "$(readlink -f "$current")" = "$old" ]
+[ ! -e "$journal/active.json" ]
+chmod u+w "$release/build.marker"; printf 'built\n' >"$release/build.marker"; chmod a-w "$release/build.marker"
+
+# Recheck after the explicit preflight closes the verify-to-stop race window.
+tamper_precheck="chmod u+w '$release/build.marker'; printf 'tampered\\n' >>'$release/build.marker'; chmod a-w '$release/build.marker'"
+if "${switch_env[@]}" "$ROOT/bin/refeather" promote --release "$release" "${switch_args[@]}" \
+    --pre-promote-check "$tamper_precheck" 2>"$TMP/tampered-after-precheck.err"; then
+  echo "candidate changed by preflight unexpectedly promoted" >&2; exit 1
+fi
+grep -q 'release content hash mismatch' "$TMP/tampered-after-precheck.err"
+[ "$(readlink -f "$current")" = "$old" ]
+[ ! -e "$journal/active.json" ]
+chmod u+w "$release/build.marker"; printf 'built\n' >"$release/build.marker"; chmod a-w "$release/build.marker"
+
+# Interruption during preflight has not mutated the service and recovers as a
+# durable no-op without issuing Supervisor commands.
+preflight_wait="$TMP/preflight-blocked"
+setsid "${switch_env[@]}" "$ROOT/bin/refeather" promote --release "$release" "${switch_args[@]}" \
+  --pre-promote-check "touch '$preflight_wait'; sleep 30" >"$TMP/preflight-interrupted.out" 2>"$TMP/preflight-interrupted.err" & preflight_pid=$!
+for _ in $(seq 1 100); do [ -e "$preflight_wait" ] && break; sleep 0.02; done
+[ -e "$preflight_wait" ] || { echo "promotion never reached blocked preflight" >&2; exit 1; }
+kill -KILL -- "-$preflight_pid" 2>/dev/null || true
+wait "$preflight_pid" 2>/dev/null || true
+[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["phase"])' "$journal/active.json")" = preflight ]
+[ "$(readlink -f "$current")" = "$old" ]
+[ ! -e "$service_log" ]
+"${switch_env[@]}" "$ROOT/bin/refeather" recover
+[ ! -e "$journal/active.json" ]
+[ ! -e "$service_log" ]
 
 "${switch_env[@]}" "$ROOT/bin/refeather" promote --release "$release" "${switch_args[@]}"
 [ "$(readlink -f "$current")" = "$release" ]
@@ -185,6 +264,30 @@ if "${switch_env[@]}" REFEATHER_TEST_FAIL_START_VERSION=candidate-v1 "$ROOT/bin/
 fi
 [ "$(readlink -f "$current")" = "$old" ]
 grep -q 'prior release restored' "$TMP/failure.err"
+
+# If the candidate and the attempted prior restart both fail, rollback is not
+# reported as success and the durable transaction remains recoverable.
+if "${switch_env[@]}" REFEATHER_TEST_FAIL_ALL_START=1 "$ROOT/bin/refeather" promote --release "$release" "${switch_args[@]}" 2>"$TMP/rollback-failed.err"; then
+  echo "unverified restoration unexpectedly succeeded" >&2; exit 1
+fi
+[ -f "$journal/active.json" ]
+grep -q 'prior release restoration could not be verified' "$TMP/rollback-failed.err"
+rollback_journal="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["journal"])' "$journal/active.json")"
+grep -q '"phase": "rollback-failed"' "$rollback_journal"
+"${switch_env[@]}" "$ROOT/bin/refeather" recover
+[ "$(readlink -f "$current")" = "$old" ]
+[ ! -e "$journal/active.json" ]
+
+# A hung Supervisor command is bounded. If restoration also times out, active
+# state is retained and a later recover can finish idempotently.
+if "${switch_env[@]}" REFEATHER_TEST_HANG_START=1 "$ROOT/bin/refeather" promote --release "$release" "${switch_args[@]}" 2>"$TMP/supervisor-timeout.err"; then
+  echo "hung supervisor unexpectedly promoted" >&2; exit 1
+fi
+[ -f "$journal/active.json" ]
+grep -q 'prior release restoration could not be verified' "$TMP/supervisor-timeout.err"
+"${switch_env[@]}" "$ROOT/bin/refeather" recover
+[ "$(readlink -f "$current")" = "$old" ]
+[ ! -e "$journal/active.json" ]
 
 ( flock -x 8; sleep 2 ) 8>"$lock" & lock_pid=$!
 sleep 0.1

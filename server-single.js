@@ -3,7 +3,7 @@ import compression from 'compression';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { WebSocketServer, WebSocket as WS } from 'ws';
 import pty from 'node-pty';
@@ -66,6 +66,25 @@ if (!READ_ONLY_MODE) {
   try { fs.mkdirSync(OMP_SESSIONS, { recursive: true }); } catch {}
 }
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function isMessageReceiptState(value) {
+  if (!isJsonRecord(value)) return false;
+  return Object.values(value).every(session => isJsonRecord(session)
+    && Object.values(session).every(receipt => isJsonRecord(receipt)
+      && /^[0-9a-f]{64}$/.test(receipt.textHash)
+      && isJsonRecord(receipt.response)
+      && receipt.response.ok === true
+      && typeof receipt.response.sentAt === 'string'));
+}
+
+const MESSAGE_RECEIPTS_STATE = createJsonState({
+  file: path.join(INSTANCE_UPLOADS_DIR, '.message-receipts.json'),
+  root: INSTANCE_UPLOADS_DIR,
+  document: 'message delivery receipts',
+  defaultValue: {},
+  validate: isMessageReceiptState,
+  mode: 0o600,
+});
 
 // ── Per-user path helpers ───────────────────────────────────────────────────
 
@@ -202,13 +221,6 @@ function writeMeta(meta) {
   return META_STATE.write(meta);
 }
 
-// A message "counts" toward the page size only if it has visible user/assistant
-// text. Internal-only messages (tool_use, tool_result, thinking) ride along for
-// free so the UI can still group and collapse them without eating the window.
-function hasVisibleText(msg) {
-  return (msg.content || []).some(b => b.type === 'text' && (b.text || '').trim().length > 0);
-}
-
 function getMessages(sessionId, limit = 100, before = 0) {
   const agent = getAgentForSession(sessionId);
   const fpath = findJsonlPath(sessionId, agent);
@@ -222,20 +234,8 @@ function getMessages(sessionId, limit = 100, before = 0) {
     if (m) msgs.push(m);
   }
   const end = Math.max(0, msgs.length - before);
-  let start = end;
-  let visibleCount = 0;
-  for (let i = end - 1; i >= 0; i--) {
-    const v = hasVisibleText(msgs[i]);
-    if (v && visibleCount >= limit) break;
-    start = i;
-    if (v) visibleCount++;
-  }
+  const start = Math.max(0, end - limit);
   const hasMore = start > 0;
-  // Drop orphan internal messages at the head of the chunk — they'll come back
-  // attached to their preceding visible message on the next "Load earlier".
-  if (visibleCount > 0) {
-    while (start < end && !hasVisibleText(msgs[start])) start++;
-  }
   return { messages: msgs.slice(start, end), hasMore };
 }
 
@@ -642,6 +642,27 @@ const sendLock = createKeyedLock();
 
 async function sendInputToSession(id, text) {
   return sendLock(id, () => sendInputToSessionUnlocked(id, text));
+}
+
+async function sendInputToSessionIdempotent(id, text, messageId) {
+  return sendLock(id, async () => {
+    const textHash = createHash('sha256').update(String(text)).digest('hex');
+    const existing = MESSAGE_RECEIPTS_STATE.read()[id]?.[messageId];
+    if (existing) {
+      if (existing.textHash !== textHash) throw httpError(409, 'message id already used with different text');
+      return existing.response;
+    }
+    await sendInputToSessionUnlocked(id, text);
+    const response = { ok: true, sentAt: new Date().toISOString() };
+    MESSAGE_RECEIPTS_STATE.update(current => ({
+      ...current,
+      [id]: {
+        ...(isJsonRecord(current[id]) ? current[id] : {}),
+        [messageId]: { textHash, response },
+      },
+    }));
+    return response;
+  });
 }
 
 async function sendInputToSessionUnlocked(id, text) {
@@ -1452,7 +1473,12 @@ app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   return res.status(403).json(READ_ONLY_ERROR);
 });
-app.use(compression({ filter: (req) => !req.headers.accept?.includes('text/event-stream') }));
+app.use(compression({ filter: req => {
+  if (req.headers.accept?.includes('text/event-stream')) return false;
+  let pathname = req.path;
+  try { pathname = new URL(req.originalUrl || req.url, 'http://localhost').pathname; } catch {}
+  return !/(?:^|\/)api\/sessions\/[^/]+\/stream$/.test(pathname);
+} }));
 
 app.use(express.static(STATIC_DIR, {
   setHeaders: (res, filePath) => {
@@ -1481,6 +1507,8 @@ app.get('/api/health', (_req, res) => res.json({
     terminal: !READ_ONLY_MODE,
     shell: !READ_ONLY_MODE,
     backgroundControllers: !READ_ONLY_MODE,
+    maxUploadBytes: MAX_UPLOAD_BYTES,
+    maxAudioBytes: MAX_AUDIO_BYTES,
   },
 }));
 
@@ -1673,7 +1701,10 @@ app.post('/api/rooms/:name/assign', (req, res) => {
     if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
     const assignments = ROOM_ASSIGN_STATE.update(current => {
       const next = { ...current };
-      if (req.body?.remove) delete next[sessionId];
+      if (req.body?.remove) {
+        if (current[sessionId] !== name) throw httpError(409, `session is not assigned to #${name}`);
+        delete next[sessionId];
+      }
       else next[sessionId] = name;
       return next;
     });
@@ -1687,6 +1718,7 @@ app.post('/api/rooms/:name/assign', (req, res) => {
 META_STATE.read();
 for (const state of USER_JSON_STATES.values()) state.read();
 ROOM_ASSIGN_STATE.read();
+MESSAGE_RECEIPTS_STATE.read();
 
 // Verify that staging is a coherent build: index.html points to a JS bundle
 // that actually exists in staging/assets. Returns the matched JS filename, or null.
@@ -2072,14 +2104,20 @@ app.post('/api/sessions', (req, res) => {
 
 app.post('/api/sessions/:id/send', async (req, res) => {
   try {
-    await sendInputToSession(req.params.id, req.body.text);
+    const messageId = req.get('X-Feather-Message-ID');
+    if (messageId !== undefined && !/^[a-zA-Z0-9_-]{8,128}$/.test(messageId)) {
+      return res.status(400).json({ error: 'invalid message id' });
+    }
+    const response = messageId
+      ? await sendInputToSessionIdempotent(req.params.id, req.body.text, messageId)
+      : (await sendInputToSession(req.params.id, req.body.text), { ok: true, sentAt: new Date().toISOString() });
     sessionsSnapshotCache.invalidate();
     roomSnapshotCache.invalidate();
     // Reset pane stability so question detection doesn't fire on stale state
     paneStableCount.set(req.params.id, 0);
-    res.json({ ok: true, sentAt: new Date().toISOString() });
+    res.json(response);
   }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
 app.post('/api/sessions/:id/resume', async (req, res) => {
@@ -2429,9 +2467,11 @@ app.post('/api/upload', async (req, res) => {
 });
 
 app.post('/api/transcribe', async (req, res) => {
-  if (!DEEPGRAM_API_KEY) return res.status(500).json({ error: 'No Deepgram API key configured' });
   try {
+    const declaredSize = Number(req.headers['content-length'] || 0);
+    if (declaredSize > MAX_AUDIO_BYTES) throw httpError(413, 'audio exceeds 25 MB limit');
     const audio = await readBoundedBody(req, MAX_AUDIO_BYTES, 'audio exceeds 25 MB limit');
+    if (!DEEPGRAM_API_KEY) throw httpError(500, 'No Deepgram API key configured');
     const response = await fetch('https://api.deepgram.com/v1/listen?model=nova-3&punctuate=true&smart_format=true', {
       method: 'POST',
       headers: { Authorization: `Token ${DEEPGRAM_API_KEY}`, 'Content-Type': req.headers['content-type'] || 'audio/webm' },
@@ -2442,7 +2482,7 @@ app.post('/api/transcribe', async (req, res) => {
     const data = await response.json();
     res.json({ transcript: data.results?.channels?.[0]?.alternatives?.[0]?.transcript || '' });
   } catch (e) {
-    res.status(e.name === 'TimeoutError' ? 504 : 500).json({ error: e.message });
+    res.status(e.status || (e.name === 'TimeoutError' ? 504 : 500)).json({ error: e.message });
   }
 });
 
@@ -2743,8 +2783,14 @@ app.get('/api/files/list', (req, res) => {
 
 app.get('/api/files/raw', (req, res) => {
   try {
-    const filePath = expandTilde(req.query.path);
-    if (!filePath) return res.status(400).json({ error: 'path required' });
+    const requestedPath = req.query.path;
+    if (typeof requestedPath !== 'string' || !requestedPath || requestedPath.includes('\0')) {
+      return res.status(400).json({ error: 'valid path required' });
+    }
+    if (!path.isAbsolute(requestedPath) && !requestedPath.startsWith('~/') && requestedPath !== '~') {
+      return res.status(400).json({ error: 'absolute path required' });
+    }
+    const filePath = expandTilde(requestedPath);
     if (!isPathAllowed(filePath)) return res.status(403).json({ error: 'Access denied' });
     const resolved = path.resolve(filePath);
     if (!fs.existsSync(resolved)) return res.status(404).json({ error: 'Not found' });
@@ -2813,6 +2859,10 @@ app.get('/terminal', (_req, res) => res.redirect('/'));
 
 // ── SPA catch-all ───────────────────────────────────────────────────────────
 
+// Unknown API paths must remain machine-readable failures instead of being
+// mistaken for successful SPA navigation.
+app.all(['/api', '/api/{*path}'], (_req, res) => res.status(404).json({ error: 'not found' }));
+
 app.get('/{*path}', (_req, res) => {
   const index = path.join(STATIC_DIR, 'index.html');
   if (fs.existsSync(index)) res.sendFile(index);
@@ -2826,24 +2876,23 @@ const wss = new WebSocketServer({ noServer: true });
 const sttWss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
+  let pathname = '';
+  try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
   if (READ_ONLY_MODE) {
-    const pathname = (() => { try { return new URL(req.url, 'http://localhost').pathname; } catch { return ''; } })();
-    if (/(?:^|\/)api\/(terminal|shell|stt)$/.test(pathname)) {
-      const body = JSON.stringify(READ_ONLY_ERROR);
-      socket.end([
-        'HTTP/1.1 403 Forbidden',
-        'Content-Type: application/json',
-        'Cache-Control: no-store',
-        `Content-Length: ${Buffer.byteLength(body)}`,
-        'Connection: close',
-        '', body,
-      ].join('\r\n'));
-      return;
-    }
+    const body = JSON.stringify(READ_ONLY_ERROR);
+    socket.end([
+      'HTTP/1.1 403 Forbidden',
+      'Content-Type: application/json',
+      'Cache-Control: no-store',
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      'Connection: close',
+      '', body,
+    ].join('\r\n'));
+    return;
   }
-  if (req.url?.startsWith('/api/terminal') || req.url?.startsWith('/api/shell')) {
+  if (/(?:^|\/)api\/(terminal|shell)$/.test(pathname)) {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-  } else if (req.url?.startsWith('/api/stt')) {
+  } else if (/(?:^|\/)api\/stt$/.test(pathname)) {
     sttWss.handleUpgrade(req, socket, head, (ws) => sttWss.emit('connection', ws, req));
   } else {
     socket.destroy();

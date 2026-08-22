@@ -29,7 +29,11 @@ add_port() {
   for existing in "${ports[@]:-}"; do [ "$existing" = "$candidate" ] && return; done
   ports+=("$candidate")
 }
-add_port "${FEATHER_PORT:-}"
+if [ -n "${FEATHER_PORT:-}" ]; then
+  add_port "$FEATHER_PORT"
+else
+  add_port "${PORT:-}"
+fi
 add_port 4870
 add_port 3300
 

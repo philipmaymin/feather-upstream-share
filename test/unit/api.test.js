@@ -2,13 +2,22 @@ import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import path from 'path'
 import fs from 'fs'
+import os from 'os'
+import net from 'net'
+import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PORT = process.env.TEST_PORT || 4870
-const BASE = `http://localhost:${PORT}`
-const HOME = process.env.HOME || '/home/user'
-const CLAUDE_PROJECTS = path.join(HOME, '.claude/projects')
+const REPO_ROOT = path.resolve(__dirname, '..', '..')
+const EXPECTED_VERSION = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'version.json'), 'utf8')).version
+const EXTERNAL_SERVER = process.env.TEST_PORT !== undefined
+let BASE
+let fixtureRoot
+let fixtureHome
+let fixturePath
+let serverProcess
+let serverOutput = ''
+let toolFixture
 
 // ── Synthetic session for deterministic testing ─────────────────────────────
 
@@ -20,26 +29,93 @@ function writeLine(obj) {
   fs.appendFileSync(testSessionPath, JSON.stringify(obj) + '\n')
 }
 
-before(async () => {
-  // Verify server is reachable
-  for (let i = 0; i < 10; i++) {
+async function allocatePort() {
+  return await new Promise((resolve, reject) => {
+    const socket = net.createServer()
+    socket.unref()
+    socket.once('error', reject)
+    socket.listen(0, '127.0.0.1', () => {
+      const { port } = socket.address()
+      socket.close(error => error ? reject(error) : resolve(port))
+    })
+  })
+}
+
+async function waitForServer() {
+  let lastError
+  for (let i = 0; i < 80; i++) {
     try {
-      const r = await fetch(`${BASE}/api/health`)
-      if (r.ok) break
-    } catch {}
-    await new Promise(r => setTimeout(r, 500))
+      const response = await fetch(`${BASE}/api/health`, { signal: AbortSignal.timeout(500) })
+      const health = await response.json()
+      if (response.ok && health.status === 'ok' && health.version === EXPECTED_VERSION) return
+      lastError = new Error(`unexpected health response: HTTP ${response.status} ${JSON.stringify(health)}`)
+    } catch (error) {
+      lastError = error
+    }
+    if (serverProcess && (serverProcess.exitCode !== null || serverProcess.signalCode !== null)) {
+      throw new Error(`test server exited (${serverProcess.signalCode || `code ${serverProcess.exitCode}`})\n${serverOutput}`)
+    }
+    await new Promise(resolve => setTimeout(resolve, 100))
   }
-  const r = await fetch(`${BASE}/api/health`)
-  if (!r.ok) throw new Error(`Server not reachable at ${BASE}`)
+  throw new Error(`test server did not report exact version ${EXPECTED_VERSION}: ${lastError?.message}\n${serverOutput}`)
+}
 
-  // Create a synthetic session JSONL in the first project directory
-  const dirs = fs.readdirSync(CLAUDE_PROJECTS).filter(d =>
-    fs.statSync(path.join(CLAUDE_PROJECTS, d)).isDirectory()
-  )
-  if (dirs.length === 0) throw new Error('No project dirs found in ~/.claude/projects/')
+before(async () => {
+  let port
+  let stateDir
+  if (EXTERNAL_SERVER) {
+    port = Number(process.env.TEST_PORT)
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+      throw new Error('TEST_PORT must be an integer from 1 through 65535')
+    }
+    if (!process.env.TEST_HOME || !path.isAbsolute(process.env.TEST_HOME)) {
+      throw new Error('external-server mode requires an absolute TEST_HOME matching the isolated server HOME')
+    }
+    fixtureHome = process.env.TEST_HOME
+    BASE = `http://127.0.0.1:${port}`
+  } else {
+    fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-api-test-'))
+    fixtureHome = path.join(fixtureRoot, 'home')
+    stateDir = path.join(fixtureRoot, 'state')
+    port = await allocatePort()
+    BASE = `http://127.0.0.1:${port}`
+    fs.mkdirSync(fixtureHome, { recursive: true })
+    const fixtureBin = path.join(fixtureRoot, 'bin')
+    fs.mkdirSync(fixtureBin)
+    fs.writeFileSync(path.join(fixtureBin, 'tmux'), '#!/bin/sh\nexit 1\n', { mode: 0o700 })
+    fixturePath = `${fixtureBin}${path.delimiter}${process.env.PATH || ''}`
+  }
 
-  testSessionDir = path.join(CLAUDE_PROJECTS, dirs[0])
+  const testProjectDir = path.join(fixtureHome, '.claude/projects/-api-test-project')
+  fs.mkdirSync(testProjectDir, { recursive: true })
+
+  if (!EXTERNAL_SERVER) {
+    serverProcess = spawn(process.execPath, ['server-single.js'], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        HOME: fixtureHome,
+        FEATHER_STATE_DIR: stateDir,
+        FEATHER_DEEPGRAM_API_KEY: '',
+        PORT: String(port),
+        PATH: fixturePath,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const captureOutput = chunk => {
+      serverOutput = `${serverOutput}${chunk}`.slice(-16_384)
+    }
+    serverProcess.stdout.on('data', captureOutput)
+    serverProcess.stderr.on('data', captureOutput)
+  }
+
+  await waitForServer()
+
+  // Create a synthetic session JSONL in the isolated project directory.
+  testSessionDir = testProjectDir
   testSessionPath = path.join(testSessionDir, `${TEST_SESSION_ID}.jsonl`)
+  toolFixture = path.join(fixtureHome, 'tool-preview.svg')
+  fs.writeFileSync(toolFixture, '<svg xmlns="http://www.w3.org/2000/svg"></svg>')
 
   // Seed with known messages
   writeLine({
@@ -79,9 +155,22 @@ before(async () => {
   await new Promise(r => setTimeout(r, 500))
 })
 
-after(() => {
+after(async () => {
   // Clean up synthetic session
   try { fs.unlinkSync(testSessionPath) } catch {}
+  try { fs.unlinkSync(toolFixture) } catch {}
+  if (serverProcess && serverProcess.exitCode === null && serverProcess.signalCode === null) {
+    serverProcess.kill('SIGTERM')
+    await Promise.race([
+      new Promise(resolve => serverProcess.once('exit', resolve)),
+      new Promise(resolve => setTimeout(resolve, 2000)),
+    ])
+    if (serverProcess.exitCode === null && serverProcess.signalCode === null) {
+      serverProcess.kill('SIGKILL')
+      await new Promise(resolve => serverProcess.once('exit', resolve))
+    }
+  }
+  if (fixtureRoot) fs.rmSync(fixtureRoot, { recursive: true, force: true })
 })
 
 // ── Health ───────────────────────────────────────────────────────────────────
@@ -93,6 +182,8 @@ describe('GET /api/health', () => {
     const body = await r.json()
     assert.equal(body.status, 'ok')
     assert.ok(body.uptime > 0)
+    assert.equal(body.capabilities.maxUploadBytes, 50 * 1024 * 1024)
+    assert.equal(body.capabilities.maxAudioBytes, 25 * 1024 * 1024)
   })
 })
 
@@ -126,9 +217,46 @@ describe('POST /api/upload', () => {
   })
 
   it('rejects malformed idempotency keys', async () => {
-    const response = await fetch(`${BASE}/api/upload`, { method: 'POST', headers: { 'X-Upload-ID': '../bad' }, body: 'x' })
-    assert.equal(response.status, 400)
+    const r = await fetch(`${BASE}/api/upload`, { method: 'POST', headers: { 'X-Upload-ID': '../bad' }, body: 'x' })
+    assert.equal(r.status, 400)
   })
+
+  it('returns a stable JSON 413 for a declared oversized upload', async () => {
+    const r = await fetch(`${BASE}/api/upload`, {
+      method: 'POST',
+      headers: { 'Content-Length': String((50 * 1024 * 1024) + 1) },
+      body: Buffer.alloc((50 * 1024 * 1024) + 1),
+    })
+    assert.equal(r.status, 413)
+    assert.deepEqual(await r.json(), { error: 'upload exceeds 50 MB limit' })
+  })
+})
+
+// ── Retired surfaces ───────────────────────────────────────────────────────
+
+describe('retired Auto and CoS APIs', () => {
+  it('returns a JSON 404 for the exact API root', async () => {
+    const r = await fetch(`${BASE}/api`)
+    assert.equal(r.status, 404)
+    assert.ok(r.headers.get('content-type').includes('application/json'))
+    assert.deepEqual(await r.json(), { error: 'not found' })
+  })
+
+  for (const endpoint of ['/api/auto/instances', '/api/cos/workstreams']) {
+    it(`returns a JSON 404 for GET ${endpoint}`, async () => {
+      const r = await fetch(`${BASE}${endpoint}`)
+      assert.equal(r.status, 404)
+      assert.ok(r.headers.get('content-type').includes('application/json'))
+      assert.deepEqual(await r.json(), { error: 'not found' })
+    })
+
+    it(`returns a JSON 404 for POST ${endpoint}`, async () => {
+      const r = await fetch(`${BASE}${endpoint}`, { method: 'POST' })
+      assert.equal(r.status, 404)
+      assert.ok(r.headers.get('content-type').includes('application/json'))
+      assert.deepEqual(await r.json(), { error: 'not found' })
+    })
+  }
 })
 
 // ── Sessions ────────────────────────────────────────────────────────────────
@@ -444,5 +572,45 @@ describe('static files', () => {
     const html = await r.text()
     assert.ok(html.includes('<!DOCTYPE html>') || html.includes('<html'))
     assert.ok(html.includes('</html>'))
+  })
+})
+
+// ── /api/files/raw (serves local files for chat image embeds and links) ─────
+
+describe('GET /api/files/raw', () => {
+  it('serves a file by absolute path', async () => {
+    assert.ok(fs.existsSync(toolFixture), toolFixture)
+    const r = await fetch(`${BASE}/api/files/raw?path=${encodeURIComponent(toolFixture)}`)
+    const body = await r.text()
+    assert.equal(r.status, 200, body)
+    assert.ok(body.includes('<svg'))
+  })
+
+  it('normalizes ../ segments instead of passing them to sendFile', async () => {
+    const dodgy = path.join(path.dirname(toolFixture), 'nope', '..', path.basename(toolFixture))
+    const r = await fetch(`${BASE}/api/files/raw?path=${encodeURIComponent(dodgy)}`)
+    const body = await r.text()
+    assert.equal(r.status, 200, body)
+    assert.ok(body.includes('<svg'))
+  })
+
+  it('rejects relative paths', async () => {
+    const r = await fetch(`${BASE}/api/files/raw?path=etc/passwd`)
+    assert.equal(r.status, 400)
+  })
+
+  it('rejects paths containing null bytes', async () => {
+    const r = await fetch(`${BASE}/api/files/raw?path=${encodeURIComponent('/etc/passwd\0.png')}`)
+    assert.equal(r.status, 400)
+  })
+
+  it('rejects repeated path params (array injection)', async () => {
+    const r = await fetch(`${BASE}/api/files/raw?path=/etc/hostname&path=/etc/hostname`)
+    assert.equal(r.status, 400)
+  })
+
+  it('404s for missing files', async () => {
+    const r = await fetch(`${BASE}/api/files/raw?path=/tmp/no-such-file-ever.png`)
+    assert.equal(r.status, 404)
   })
 })
