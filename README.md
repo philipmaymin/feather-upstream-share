@@ -88,6 +88,53 @@ npm install    # installs deps + builds frontend automatically
 npm start      # → Feather on http://localhost:4870
 ```
 
+## Persistent state
+
+By default this single-server build keeps instance metadata under `~/.feather`
+and uploads under `~/feather-uploads`, preserving its established layout. Set
+`FEATHER_STATE_DIR` to an absolute path to consolidate both beneath one durable
+root and make release checkouts disposable:
+
+```bash
+FEATHER_STATE_DIR=/srv/feather/state npm start
+```
+
+The configured state root owns only these instance assets:
+
+| Asset | Contents |
+|------|----------|
+| `boxes.json` | Remote-box endpoints and credentials (secret, enforced `0600`) |
+| `sharing.json` | Peer grants and credentials (secret, enforced `0600`) |
+| `session-meta.json` | Per-session names, archive state, and sharing metadata |
+| `project-labels.json` | Project display labels |
+| `quick-links.json` | Saved navigation links |
+| `starred.json` | Starred sessions |
+| `muted.json` | Muted notification sessions |
+| `push-keys.json` | Push signing credentials |
+| `push-subscriptions.json` | Browser push subscriptions |
+| `uploads/` | Uploaded attachments |
+
+Everything else keeps its existing owner: release assets (`static/`,
+`version.json`, and the bridge extension) stay in the checkout; sidecars, Room
+assignments, access logs, and OMP state stay under `~/.feather`; Claude and Codex
+session stores stay under their harness homes; Rooms stay under `~/rooms`; and
+tmux/process/temp state remains runtime-managed. A new writable path must be
+classified into one of those groups before it is added.
+
+For a migration, stop all Feather writers, copy and validate the instance
+assets, then start one release with `FEATHER_STATE_DIR`. Deployment tooling may
+create checkout-local compatibility symlinks for older releases, but it must
+only create missing links: an existing file or a link to another target is a
+hard conflict and must never be replaced automatically. `boxes.json` and
+`sharing.json` targets must remain owner-only through that process.
+
+The current JSON files retain their existing unversioned shapes. A release that
+changes a state shape must introduce an explicit schema/version and document its
+downgrade behavior before writing it. Rollback after new writes must use the
+compatible current state or a tested downgrade adapter; restoring a pre-upgrade
+copy at that point would lose work. Do not run incompatible writers against the
+same root.
+
 ## Architecture
 
 ```

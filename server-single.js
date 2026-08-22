@@ -16,6 +16,7 @@ import { resolveCodexWatchId } from './lib/codex-watch.js';
 import * as webpush from './lib/webpush.js';
 import { createSnapshotCache } from './lib/snapshot-cache.js';
 import { paneHasReadyPrompt } from './lib/terminal-ready.js';
+import { ensureStateLayout, resolveStatePaths } from './lib/state-paths.js';
 
 // Load ~/.env if present
 try {
@@ -29,25 +30,35 @@ try {
 const DEEPGRAM_API_KEY = process.env.FEATHER_DEEPGRAM_API_KEY || '';
 
 const PORT = parseInt(process.env.PORT || '4870');
-const HOME = process.env.HOME;
+const HOME = process.env.HOME || '/home/user';
+const LEGACY_STATE_ROOT = path.join(HOME, '.feather');
+const STATE_PATHS = resolveStatePaths({
+  releaseDir: import.meta.dirname,
+  stateDir: process.env.FEATHER_STATE_DIR || LEGACY_STATE_ROOT,
+  homeDir: HOME,
+});
+const INSTANCE_UPLOADS_DIR = process.env.FEATHER_STATE_DIR
+  ? STATE_PATHS.instance.uploadsDir
+  : path.join(HOME, 'feather-uploads');
 const STATIC_OVERRIDE = process.env.STATIC_OVERRIDE;
 const STATIC_DIR = path.resolve(import.meta.dirname, STATIC_OVERRIDE || 'static');
-const STAGING_DIR = path.resolve(import.meta.dirname, 'static-staging');
+const STAGING_DIR = path.join(STATE_PATHS.release.root, 'static-staging');
 const MAX_SSE_PER_SESSION = 10;
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
-const CODEX_SESSIONS_ROOT = path.join(HOME || '/home/user', '.codex/sessions');
+const CODEX_SESSIONS_ROOT = STATE_PATHS.harness.codexSessionsDir;
 // Codex now writes large context/permissions preambles before the first real
 // prompt. Keep enough headroom to find cwd, titles, and worker markers.
 const CODEX_HEAD_BYTES = 256 * 1024;
-const OMP_SESSIONS = path.join(HOME || '/home/user', '.feather/omp-sessions');
+const OMP_SESSIONS = STATE_PATHS.harness.ompSessionsDir;
+if (process.env.FEATHER_STATE_DIR) ensureStateLayout(STATE_PATHS);
 try { fs.mkdirSync(OMP_SESSIONS, { recursive: true }); } catch {}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 // ── Per-user path helpers ───────────────────────────────────────────────────
 
 function projectsDir() {
-  return path.join(HOME, '.claude/projects');
+  return STATE_PATHS.harness.claudeProjectsDir;
 }
 
 function projectIdToCwd(projectId) {
@@ -73,13 +84,13 @@ function projectIdToCwd(projectId) {
 }
 
 function featherDir() {
-  const d = path.join(HOME, '.feather');
+  const d = STATE_PATHS.instance.root;
   if (!fs.existsSync(d)) try { fs.mkdirSync(d, { recursive: true }); } catch {}
   return d;
 }
 
 function uploadsDir() {
-  const d = path.join(HOME, 'feather-uploads');
+  const d = INSTANCE_UPLOADS_DIR;
   if (!fs.existsSync(d)) try { fs.mkdirSync(d, { recursive: true }); } catch {}
   return d;
 }
@@ -1423,8 +1434,8 @@ app.get('/api/agents', (_req, res) => {
 
 // ── Rooms: durable workspaces backed by ~/rooms/<name> ─────────────────
 
-const ROOMS_HOME_DIR = path.join(HOME, 'rooms');
-const ROOM_ASSIGN_FILE = path.join(HOME, '.feather', 'room-sessions.json');
+const ROOMS_HOME_DIR = STATE_PATHS.workspace.roomsDir;
+const ROOM_ASSIGN_FILE = STATE_PATHS.coordination.roomAssignmentsFile;
 const ROOM_TAILS = [512 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024];
 
 function httpError(status, message) {

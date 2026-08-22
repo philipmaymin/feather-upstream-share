@@ -8,14 +8,28 @@ import path from 'path'
 // at a throwaway dir before importing it — keeps the test off the real store.
 let sc
 let tmpHome
+let tmpState
+let previousStateDir
+let previousHome
 
 before(async () => {
   tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'sidecar-test-'))
+  tmpState = fs.mkdtempSync(path.join(os.tmpdir(), 'sidecar-instance-state-'))
+  previousStateDir = process.env.FEATHER_STATE_DIR
+  previousHome = process.env.HOME
   process.env.HOME = tmpHome
+  process.env.FEATHER_STATE_DIR = tmpState
   sc = await import('../../lib/sidecar.js')
 })
 
-after(() => { try { fs.rmSync(tmpHome, { recursive: true, force: true }) } catch {} })
+after(() => {
+  if (previousHome === undefined) delete process.env.HOME
+  else process.env.HOME = previousHome
+  if (previousStateDir === undefined) delete process.env.FEATHER_STATE_DIR
+  else process.env.FEATHER_STATE_DIR = previousStateDir
+  try { fs.rmSync(tmpHome, { recursive: true, force: true }) } catch {}
+  try { fs.rmSync(tmpState, { recursive: true, force: true }) } catch {}
+})
 
 describe('sidecar store (v1 + v2 multi-peer)', () => {
   it('creates a group; rejects duplicate / invalid / reserved roles', () => {
@@ -29,6 +43,8 @@ describe('sidecar store (v1 + v2 multi-peer)', () => {
     })
     assert.equal(g.members.length, 2)
     assert.equal(g.seq, 0)
+    assert.ok(fs.existsSync(path.join(tmpHome, '.feather/sidecars/groups.json')))
+    assert.deepEqual(fs.readdirSync(tmpState), [], 'FEATHER_STATE_DIR must not capture sidecar coordination state')
     assert.throws(() => sc.createGroup({ id: 'gx', members: [{ sessionId: 'x', role: 'peer' }, { sessionId: 'y', role: 'peer' }] }), /duplicate/)
     assert.throws(() => sc.createGroup({ id: 'gy', members: [{ sessionId: 'x', role: 'bad role' }] }), /invalid role/)
     assert.throws(() => sc.createGroup({ id: 'gz', members: [{ sessionId: 'x', role: 'all' }] }), /reserved/)
