@@ -13,6 +13,7 @@ import { codexPasteBufferArgs } from './lib/tmux-input.js';
 import { sessionIsActive, lastMessageMs } from './lib/sessions.js';
 import { resolveCodexWatchId } from './lib/codex-watch.js';
 import * as webpush from './lib/webpush.js';
+import { createSnapshotCache } from './lib/snapshot-cache.js';
 
 // Load ~/.env if present
 try {
@@ -376,7 +377,7 @@ function spawnTmuxCodex(name, codexArgs, dir) {
   // codex installs to ~/.npm-global/bin, which is only on the interactive-rc
   // PATH (not the login-shell PATH claude uses) — launch via --rcfile -i so the
   // binary resolves and gets its full environment, same as omp.
-  const codexCmd = `codex ${codexArgs} --dangerously-bypass-approvals-and-sandbox`;
+  const codexCmd = `codex -c check_for_update_on_startup=false ${codexArgs} --dangerously-bypass-approvals-and-sandbox`;
   const shellCmd = `tmux new-session -d -s ${name} -c "${dir}" "bash --rcfile ~/.bashrc -ic '${codexCmd}'" \\; set-option -t ${name} prefix M-a`;
   execFileSync('bash', ['-c', shellCmd], { stdio: 'ignore', encoding: 'utf8' });
 }
@@ -1435,51 +1436,58 @@ function lastRoomMessageSnippet(sessionId, agent) {
   return null;
 }
 
-app.get('/api/rooms', (_req, res) => {
-  try {
-    const names = listRoomDirs();
-    const assignments = readRoomAssignments();
-    const allSessions = discoverSessions(300);
-    const byRoom = new Map(names.map(name => [name, []]));
+function buildRoomsSnapshot() {
+  const names = listRoomDirs();
+  const assignments = readRoomAssignments();
+  const allSessions = discoverSessions(300);
+  const byRoom = new Map(names.map(name => [name, []]));
 
-    for (const session of allSessions) {
-      let room = assignments[session.id];
-      if (!room) {
-        room = names.find(name => {
-          const roomProjectId = path.join(ROOMS_HOME_DIR, name).replace(/[/.]/g, '-');
-          return session.projectId === roomProjectId;
-        });
-      }
-      if (room && byRoom.has(room)) byRoom.get(room).push(session);
+  for (const session of allSessions) {
+    let room = assignments[session.id];
+    if (!room) {
+      room = names.find(name => {
+        const roomProjectId = path.join(ROOMS_HOME_DIR, name).replace(/[/.]/g, '-');
+        return session.projectId === roomProjectId;
+      });
     }
+    if (room && byRoom.has(room)) byRoom.get(room).push(session);
+  }
 
-    const rooms = names.map(name => {
-      const sessions = byRoom.get(name);
-      const newest = sessions[0] || null;
-      let latest = newest ? lastRoomMessageSnippet(newest.id, newest.agent || 'claude') : null;
-      let updatedAt = newest?.updatedAt || null;
-      if (!latest) {
-        try {
-          const notesPath = path.join(ROOMS_HOME_DIR, name, 'notes.md');
-          const noteLines = fs.readFileSync(notesPath, 'utf8').split('\n')
-            .map(line => line.trim())
-            .filter(line => /^- \d{4}-\d{2}-\d{2}/.test(line));
-          if (noteLines.length) latest = { role: 'notes', text: noteLines[noteLines.length - 1].slice(0, 200) };
-          if (!updatedAt) updatedAt = fs.statSync(notesPath).mtime.toISOString();
-        } catch {}
-      }
-      return {
-        name,
-        cwd: path.join(ROOMS_HOME_DIR, name),
-        sessions,
-        active: sessions.some(session => session.isActive),
-        latest,
-        updatedAt,
-      };
-    });
-    rooms.sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
-    res.json({ rooms });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  const rooms = names.map(name => {
+    const sessions = byRoom.get(name);
+    const newest = sessions[0] || null;
+    let latest = newest ? lastRoomMessageSnippet(newest.id, newest.agent || 'claude') : null;
+    let updatedAt = newest?.updatedAt || null;
+    if (!latest) {
+      try {
+        const notesPath = path.join(ROOMS_HOME_DIR, name, 'notes.md');
+        const noteLines = fs.readFileSync(notesPath, 'utf8').split('\n')
+          .map(line => line.trim())
+          .filter(line => /^- \d{4}-\d{2}-\d{2}/.test(line));
+        if (noteLines.length) latest = { role: 'notes', text: noteLines[noteLines.length - 1].slice(0, 200) };
+        if (!updatedAt) updatedAt = fs.statSync(notesPath).mtime.toISOString();
+      } catch {}
+    }
+    return {
+      name,
+      cwd: path.join(ROOMS_HOME_DIR, name),
+      sessions,
+      active: sessions.some(session => session.isActive),
+      latest,
+      updatedAt,
+    };
+  });
+  rooms.sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
+  return rooms;
+}
+
+// Room discovery scans many transcripts across all supported agents. Keep the
+// view current without making every warm request wait for the synchronous scan.
+const roomSnapshotCache = createSnapshotCache(buildRoomsSnapshot, { ttlMs: 10_000 });
+
+app.get('/api/rooms', (_req, res) => {
+  try { res.json({ rooms: roomSnapshotCache.get() }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.post('/api/rooms', (req, res) => {
@@ -1504,6 +1512,7 @@ app.post('/api/rooms', (req, res) => {
     fs.symlinkSync('AGENTS.md', path.join(dir, 'CLAUDE.md'));
     fs.writeFileSync(path.join(dir, 'notes.md'),
       `# #${name} — notes\n\nWorking memory for this room. Sessions append decisions and open\nthreads as they happen (\`room note "..."\`). Newest at the bottom.\n`);
+    roomSnapshotCache.refresh();
     res.json({ name, cwd: dir });
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
@@ -1519,6 +1528,7 @@ app.post('/api/rooms/:name/assign', (req, res) => {
     else assignments[sessionId] = name;
     fs.mkdirSync(path.dirname(ROOM_ASSIGN_FILE), { recursive: true });
     fs.writeFileSync(ROOM_ASSIGN_FILE, JSON.stringify(assignments, null, 2));
+    roomSnapshotCache.refresh();
     res.json({ ok: true, assignments });
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
@@ -2660,7 +2670,11 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => { try { term.kill(); } catch {} });
 });
 
-server.listen(PORT, '0.0.0.0', () => console.log(`Feather (single-user) on http://0.0.0.0:${PORT}`));
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Feather (single-user) on http://0.0.0.0:${PORT}`);
+  // Warm the expensive Rooms snapshot before the first interactive request.
+  setTimeout(() => { try { roomSnapshotCache.get(); } catch {} }, 0);
+});
 
 // Graceful shutdown: close server so port is released before systemd restarts us
 function shutdown(sig) {

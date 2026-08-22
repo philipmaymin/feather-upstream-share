@@ -19,6 +19,7 @@ import sql from 'highlight.js/lib/languages/sql'
 import yaml from 'highlight.js/lib/languages/yaml'
 import markdown from 'highlight.js/lib/languages/markdown'
 import { toolImagePath, toolInputText, toolPresentation } from '../lib/toolPresentation.js'
+import { localFilePath } from '../lib/localMedia.js'
 
 hljs.registerLanguage('javascript', javascript)
 hljs.registerLanguage('js', javascript)
@@ -180,6 +181,11 @@ function localFileHref(filePath: string): string {
   return `${base}/api/files/${route}?path=${encodeURIComponent(resolvedPath)}`
 }
 
+function localImageHref(src: string): string {
+  const filePath = localFilePath(src)
+  return filePath ? localFileHref(filePath) : src
+}
+
 function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
   for (const a of el.querySelectorAll('a')) {
     // Markdown already turns [label](/absolute/path) into an anchor, so the
@@ -188,6 +194,8 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
     const localPath = localPathFromHref(a.getAttribute('href') || '')
     if (localPath) {
       a.href = localFileHref(localPath)
+      a.classList.add('feather-path')
+      a.dataset.path = localPath
       a.title = /\.html?$/i.test(localPath) ? 'Open HTML preview' : 'Open local file'
     }
     a.setAttribute('target', '_blank')
@@ -242,6 +250,36 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
     }
     if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)))
     node.parentNode?.replaceChild(frag, node)
+  }
+}
+
+// Markdown image syntax preserves an absolute filesystem path in <img src>.
+// Route it through the same authenticated preview as the Files tab, wire it
+// into the lightbox, and turn failures into a useful clickable path.
+function fixImages(el: HTMLElement, onImageClick?: (src: string) => void) {
+  for (const img of el.querySelectorAll('img')) {
+    const targetPath = localFilePath(img.getAttribute('src'))
+    if (!targetPath) continue
+    const url = localFileHref(targetPath)
+    img.loading = 'lazy'
+    img.classList.add('md-local-img')
+    if (!img.alt) img.alt = targetPath.split('/').pop() || 'image'
+    if (!img.closest('a')) {
+      img.style.cursor = 'zoom-in'
+      img.addEventListener('click', () => onImageClick?.(url))
+    }
+    img.addEventListener('error', () => {
+      const a = document.createElement('a')
+      a.textContent = targetPath
+      a.href = url
+      a.target = '_blank'
+      a.rel = 'noopener'
+      a.title = 'Open local file'
+      a.className = 'feather-path'
+      a.dataset.path = targetPath
+      img.replaceWith(a)
+    }, { once: true })
+    img.src = url
   }
 }
 
@@ -351,7 +389,7 @@ const linkifyRef = (el: HTMLElement) => queueMicrotask(() => fixLinks(el))
 
 function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void) {
   if (block.type === 'text' && block.text) {
-    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => queueMicrotask(() => { fixLinks(el, onImageClick); collapseCodeBlocks(el) })} />
+    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => queueMicrotask(() => { fixLinks(el, onImageClick); fixImages(el, onImageClick); collapseCodeBlocks(el) })} />
   }
   if (block.type === 'thinking' && block.thinking) {
     return (
@@ -470,6 +508,7 @@ const markdownCSS = `
 .markdown a { color: #73b8ff; text-decoration: none; }
 .markdown a:hover { text-decoration: underline; }
 .markdown img { max-width: 100%; border-radius: 6px; }
+.markdown img.md-local-img { display: block; max-height: 400px; margin: 8px 0; object-fit: contain; }
 .markdown hr { border: none; border-top: 1px solid #333; margin: 12px 0; }
 .markdown strong { font-weight: 600; }
 
@@ -659,7 +698,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
         'font-size': '14px', 'line-height': '1.5', 'word-break': 'break-word',
       }}>
         <For each={images}>{(src) => (
-          <img src={src} onClick={() => setLightbox(src)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': hasAttachments ? '12px' : '6px', 'margin-bottom': '4px', cursor: 'zoom-in', display: 'block' }} />
+          <img src={localImageHref(src)} onClick={() => setLightbox(localImageHref(src))} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': hasAttachments ? '12px' : '6px', 'margin-bottom': '4px', cursor: 'zoom-in', display: 'block' }} />
         )}</For>
         <For each={files}>{(f) => (
           <a href={f.path} target="_blank" rel="noopener" onClick={(e) => { if (f.name.toLowerCase().endsWith('.pdf')) { e.preventDefault(); const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''; setPdfViewer(`${base}/api/files/raw?path=${encodeURIComponent(f.path)}`) } }} style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
@@ -671,7 +710,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
           <For each={msg.content}>{(block) => {
             if (block.type === 'text' && block.text) {
               const display = hasAttachments ? cleanText : block.text
-              return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => queueMicrotask(() => { fixLinks(el, (src) => setLightbox(src)); collapseCodeBlocks(el) })} /> : null
+              return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => queueMicrotask(() => { fixLinks(el, (src) => setLightbox(src)); fixImages(el, (src) => setLightbox(src)); collapseCodeBlocks(el) })} /> : null
             }
             return renderBlock(block, (src) => setLightbox(src))
           }}</For>

@@ -289,18 +289,21 @@ test.describe('Message rendering', () => {
   })
 
   test('tool_use block shows tool name', async ({ page }) => {
+    await page.getByText('3 tool steps', { exact: false }).click()
     // Should see "Read" in monospace
     const toolUse = page.locator('text=Read').first()
     await expect(toolUse).toBeVisible()
   })
 
   test('tool_result shows output label', async ({ page }) => {
+    await page.getByText('3 tool steps', { exact: false }).click()
     // Tool results render with lowercase "output" label
     const result = page.locator('summary:has-text("output")')
     await expect(result.first()).toBeVisible()
   })
 
   test('error tool_result shows error label', async ({ page }) => {
+    await page.getByText('3 tool steps', { exact: false }).click()
     // Error tool results render with lowercase "error" label
     const error = page.locator('summary:has-text("error")')
     await expect(error.first()).toBeVisible()

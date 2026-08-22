@@ -1,3 +1,9 @@
+## 2026-08-22 - Faster Rooms and local Markdown images
+- **Rooms stay responsive as chat history grows.** Feather now serves a cached room snapshot immediately and refreshes stale session data in the background, while room creation and assignment still appear at once.
+- **Local images embedded in Markdown render in chat.** Paths such as `![chart](/home/user/rooms/example/chart.png)` now load through the same safe preview route as the Files tab, open in the image lightbox, and fall back to a clickable path if the image is missing.
+- **Codex sessions start with less friction.** Feather suppresses Codex's startup update check for new and resumed sessions.
+- Backend changes take effect on the next natural service restart; this update does not restart any running service.
+
 ## 2026-08-21 - Rooms-first home, shared context, and sidecars
 - **Large pasted messages now send reliably to Codex.** Feather now uses the terminal's real bracketed-paste mode and preserves multiline input, so the submit key cannot get swallowed halfway through a long paste and leave the message waiting invisibly in Terminal.
 - **Local artifact links open correctly from chat.** Markdown links to files on disk now use the same preview route as the Files tab, including links that carry a source line number.
