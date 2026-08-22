@@ -12,7 +12,7 @@ import * as sidecar from './lib/sidecar.js';
 import { createKeyedLock } from './lib/sendlock.js';
 import { codexPasteBufferArgs } from './lib/tmux-input.js';
 import { sessionIsActive, lastMessageMs, latestSessionActivityMs } from './lib/sessions.js';
-import { resolveCodexWatchId } from './lib/codex-watch.js';
+import { resolveCodexWatchId, codexAdoptionPending } from './lib/codex-watch.js';
 import * as webpush from './lib/webpush.js';
 import { createSnapshotCache } from './lib/snapshot-cache.js';
 import { paneHasReadyPrompt } from './lib/terminal-ready.js';
@@ -450,18 +450,20 @@ function spawnTmuxOmp(name, ompArgs, dir) {
 function adoptNewCodexUuid(featherId, beforeUuids, spawnCwd = null, attempts = 320) {
   let n = 0;
   const tick = () => {
+    if (!codexAdoptionPending(readMeta(), featherId)) return;
     n++;
     const after = listCodexJsonlFiles();
     let fresh = after.filter(f => !beforeUuids.has(f.uuid));
     if (spawnCwd && fresh.length > 0) {
       fresh = fresh.filter(file => {
+        let fd;
         try {
-          const fd = fs.openSync(file.fpath, 'r');
+          fd = fs.openSync(file.fpath, 'r');
           const buf = Buffer.alloc(Math.min(CODEX_HEAD_BYTES, fs.fstatSync(fd).size));
           fs.readSync(fd, buf, 0, buf.length, 0);
-          fs.closeSync(fd);
           return extractCodexCwd(buf) === spawnCwd;
         } catch { return false; }
+        finally { if (fd !== undefined) fs.closeSync(fd); }
       });
     }
     if (fresh.length > 0) {
@@ -2185,6 +2187,12 @@ app.post('/api/sessions/:id/delete', (req, res) => {
     const meta = readMeta();
     delete meta[id];
     writeMeta(meta);
+    MESSAGE_RECEIPTS_STATE.update(receipts => {
+      if (!(id in receipts)) return receipts;
+      const next = { ...receipts };
+      delete next[id];
+      return next;
+    });
     sseClients.delete(id);
     fileOffsets.delete(id);
     sessionsSnapshotCache.invalidate();

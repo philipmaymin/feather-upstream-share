@@ -311,6 +311,10 @@ describe('server-enforced read-only canary', () => {
     assert.deepEqual(stored[fx.sessionId]['voice-recovery-0001'].response, firstReceipt)
     assert.equal(stored[fx.sessionId]['voice-recovery-0001'].textHash.length, 64)
     assert.equal(fs.statSync(receiptsFile).mode & 0o777, 0o600)
+
+    const deleted = await fetch(`${running.base}/api/sessions/${fx.sessionId}/delete`, { method: 'POST' })
+    assert.equal(deleted.status, 200)
+    assert.equal(fx.sessionId in JSON.parse(fs.readFileSync(receiptsFile, 'utf8')), false)
   })
 
   it('enforces the audio boundary and returns a stable 413 JSON shape', async () => {
