@@ -285,7 +285,7 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
                       <div style={{ color: '#666', 'font-size': '12px', padding: '4px 0' }}>No updates yet. Agents post here with <code style={{ color: '#e0a050' }}>room update</code> when something worth knowing happens.</div>
                     </Show>
                     <For each={[...updatesList()].reverse()}>{(update) => (
-                      <div style={{ padding: '9px 0', 'border-bottom': '1px solid #14141c' }}>
+                      <div data-testid="room-update" style={{ padding: '9px 0', 'border-bottom': '1px solid #14141c' }}>
                         <div style={{ 'font-size': '10px', color: '#5a6472', 'font-family': 'monospace', 'margin-bottom': '3px' }}>{updateTimeLabel(update.ts)}</div>
                         <div style={{ 'font-size': '13px', color: '#d0d4da', 'line-height': '1.5', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{update.text}</div>
                       </div>

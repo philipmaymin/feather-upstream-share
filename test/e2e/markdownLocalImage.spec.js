@@ -56,11 +56,7 @@ test.afterAll(() => {
 })
 
 async function openTestSession(page) {
-  await page.goto('/', { waitUntil: 'domcontentloaded' })
-  const session = page.getByText('show the image', { exact: true }).first()
-  if (!await session.isVisible()) await page.locator('button:has-text("☰")').click()
-  await expect(session).toBeVisible({ timeout: 10_000 })
-  await session.click()
+  await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
   await expect(page.locator('[data-uuid="md-img-answer"]')).toBeVisible({ timeout: 10_000 })
 }
 

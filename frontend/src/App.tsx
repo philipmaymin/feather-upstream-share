@@ -38,16 +38,25 @@ function resizeImage(blob: Blob, maxDim = 1600): Promise<Blob> {
   return new Promise((resolve) => {
     const img = new Image()
     const url = URL.createObjectURL(blob)
-    img.onload = () => {
+    let settled = false
+    const finish = (value: Blob) => {
+      if (settled) return
+      settled = true
       URL.revokeObjectURL(url)
+      resolve(value)
+    }
+    img.onload = () => {
       const { width: w, height: h } = img
-      if (w <= maxDim && h <= maxDim) { resolve(blob); return }
+      if (w <= maxDim && h <= maxDim) { finish(blob); return }
       const scale = Math.min(maxDim / w, maxDim / h)
       const c = document.createElement('canvas')
       c.width = w * scale; c.height = h * scale
       c.getContext('2d')!.drawImage(img, 0, 0, c.width, c.height)
-      c.toBlob(b => resolve(b || blob), 'image/png')
+      c.toBlob(b => finish(b || blob), 'image/png')
     }
+    // A corrupt or mislabeled image should remain attachable instead of
+    // leaving addFiles() hung forever waiting for a load event that never fires.
+    img.onerror = () => finish(blob)
     img.src = url
   })
 }
@@ -1884,7 +1893,7 @@ export default function App() {
             {/* Textarea */}
             <div style={{ flex: '1', position: 'relative', 'min-width': '0', display: 'flex', 'flex-direction': 'column', 'justify-content': 'flex-end' }}>
               <textarea ref={textareaRef} value={text()}
-                onInput={(e) => { setText(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px' }}
+                onInput={(e) => { const value = e.target.value; setText(value); if (currentId()) saveDraft(currentId()!, value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px' }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
                   if (e.key === 'ArrowUp' && textareaRef?.selectionStart === 0) {

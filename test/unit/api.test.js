@@ -573,6 +573,15 @@ describe('static files', () => {
     assert.ok(html.includes('<!DOCTYPE html>') || html.includes('<html'))
     assert.ok(html.includes('</html>'))
   })
+
+  it('serves the SPA shell for nested client routes from a hidden worktree', async () => {
+    const staticDir = path.join(__dirname, '..', '..', 'static')
+    if (!fs.existsSync(path.join(staticDir, 'index.html'))) return
+    const r = await fetch(`${BASE}/feather2/`)
+    assert.equal(r.status, 200)
+    assert.ok(r.headers.get('content-type').includes('text/html'))
+    assert.match(await r.text(), /<html/i)
+  })
 })
 
 // ── /api/files/raw (serves local files for chat image embeds and links) ─────

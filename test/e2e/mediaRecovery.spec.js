@@ -9,6 +9,14 @@ const sessionId = `e2e-media-recovery-${Date.now()}`
 const navigationSessionId = `e2e-media-navigation-${Date.now()}`
 let sessionPath, navigationSessionPath
 
+test.beforeEach(async ({ page }) => {
+  // These synthetic transcripts have no tmux process. Stub only the resume
+  // handshake so the tests exercise media/send behavior rather than spawning a harness.
+  await page.route('**/api/sessions/*/resume', route => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }),
+  }))
+})
+
 test.beforeAll(() => {
   const projectDir = fs.readdirSync(CLAUDE_PROJECTS)
     .map(name => path.join(CLAUDE_PROJECTS, name))
@@ -49,7 +57,8 @@ test('failed attachment survives reload, retries, and sends without a failure ma
 
   await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
   await page.locator('textarea').fill('keep this caption')
-  await page.locator('input[type=file]').setInputFiles({ name: 'photo.png', mimeType: 'image/png', buffer: Buffer.from('not-a-real-png-but-a-durable-blob') })
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+  await page.locator('input[type=file]').setInputFiles({ name: 'photo.png', mimeType: 'image/png', buffer: png })
   await expect(page.locator('img[src^="blob:"]')).toBeVisible()
 
   await page.locator('button[title="Send"]').last().click()
@@ -189,7 +198,7 @@ test('voice and image work stay pinned to the session where they started', async
   await page.locator('textarea').fill('original draft')
   await page.getByRole('button', { name: /Record voice memo/ }).first().click()
   await page.locator('button').first().click()
-  await page.getByText('media navigation target', { exact: true }).click()
+  await page.getByText('media navigation target', { exact: true }).first().click()
   await page.locator('textarea').fill('other draft')
   await page.locator('button[title="Stop, transcribe & send"]').last().click()
   await expect(page.locator('textarea')).toHaveValue('other draft')
@@ -200,10 +209,10 @@ test('voice and image work stay pinned to the session where they started', async
 
   const oversizedSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="2000"><rect width="2000" height="2000" fill="red"/></svg>`
   await page.locator('button').first().click()
-  await page.getByText('media recovery test', { exact: true }).click()
+  await page.getByText('media recovery test', { exact: true }).first().click()
   await page.locator('input[type=file]').setInputFiles({ name: 'slow.svg', mimeType: 'image/svg+xml', buffer: Buffer.from(oversizedSvg) })
   await page.locator('button').first().click()
-  await page.getByText('media navigation target', { exact: true }).click()
+  await page.getByText('media navigation target', { exact: true }).first().click()
   await expect(page.locator('img[src^="blob:"]')).toHaveCount(0)
 })
 

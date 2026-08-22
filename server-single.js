@@ -3113,7 +3113,9 @@ app.all(['/api', '/api/{*path}'], (_req, res) => res.status(404).json({ error: '
 
 app.get('/{*path}', (_req, res) => {
   const index = path.join(STATIC_DIR, 'index.html');
-  if (fs.existsSync(index)) res.sendFile(index);
+  // Use a root-relative send so checkouts under a hidden worktree directory
+  // (for example .claude/worktrees) do not trip send's dotfile rejection.
+  if (fs.existsSync(index)) res.sendFile('index.html', { root: STATIC_DIR });
   else res.status(404).send('Frontend not built. Run: cd frontend && npm run build');
 });
 

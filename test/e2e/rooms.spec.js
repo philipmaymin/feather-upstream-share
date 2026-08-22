@@ -59,3 +59,32 @@ test('attaches and detaches an existing chat without duplicate Room rows', async
   await page.getByTestId(`attach-${candidate.id}`).click()
   await expect(page.getByText(candidate.title, { exact: true })).toHaveCount(1)
 })
+
+test('shows room updates newest-first and remembers that they were read', async ({ page }) => {
+  const room = {
+    name: 'briefings', cwd: '/srv/zak/home/rooms/briefings', active: false,
+    latest: null, updatedAt: '2026-08-22T12:00:00Z', sessions: [],
+    pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null },
+    updates: { count: 2, latestAt: '2026-08-22T12:00:00Z', latest: 'Second outcome.' },
+  }
+  await page.route('**/api/rooms', route => route.fulfill({ json: { rooms: [room] } }))
+  await page.route('**/api/rooms/briefings/updates', route => route.fulfill({ json: { updates: [
+    { id: 'first', ts: '2026-08-22T11:00:00Z', text: 'First outcome.' },
+    { id: 'second', ts: '2026-08-22T12:00:00Z', text: 'Second outcome.' },
+  ] } }))
+
+  await page.goto(BASE)
+  const button = page.getByTestId('updates-briefings')
+  await expect(button).toContainText('2 new')
+  await button.click()
+  const panel = page.getByTestId('updates-panel-briefings')
+  await expect(panel).toBeVisible()
+  await expect(panel.locator('div').filter({ hasText: 'Second outcome.' }).last()).toBeVisible()
+  const entries = panel.getByTestId('room-update')
+  await expect(entries.first()).toContainText('Second outcome.')
+  await expect(button).not.toContainText('new')
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('feather:roomUpdatesSeen') || '{}').briefings)).toBe(2)
+
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await expect(page.getByTestId('updates-briefings')).not.toContainText('new')
+})
