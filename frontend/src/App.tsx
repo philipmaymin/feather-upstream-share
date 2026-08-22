@@ -181,6 +181,23 @@ export default function App() {
   const [files, setFiles] = createSignal<PendingFile[]>([])
   const [voiceMemos, setVoiceMemos] = createSignal<VoiceMemo[]>([])
   const [mediaNotice, setMediaNotice] = createSignal('')
+  let mediaNoticeTimer: ReturnType<typeof setTimeout> | undefined
+  function dismissMediaNotice() {
+    if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer)
+    mediaNoticeTimer = undefined
+    setMediaNotice('')
+  }
+  function showMediaNotice(message: string, autoDismissMs = 0) {
+    if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer)
+    mediaNoticeTimer = undefined
+    setMediaNotice(message)
+    if (autoDismissMs > 0) {
+      mediaNoticeTimer = setTimeout(() => {
+        setMediaNotice(current => current === message ? '' : current)
+        mediaNoticeTimer = undefined
+      }, autoDismissMs)
+    }
+  }
   const [transcribing, setTranscribing] = createSignal(false)
   const uploadsInFlight = new Map<string, Promise<string>>()
   const voiceMemosInFlight = new Map<string, Promise<void>>()
@@ -498,7 +515,7 @@ export default function App() {
       window.removeEventListener('resize', setVh)
     })
   })
-  onCleanup(() => { clearPendingMedia(); cleanupSSE?.(); document.removeEventListener('keydown', onGlobalKeyDown) })
+  onCleanup(() => { if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer); clearPendingMedia(); cleanupSSE?.(); document.removeEventListener('keydown', onGlobalKeyDown) })
 
   // Autoresize textarea on programmatic text changes (draft restore on session
   // select, voice dictation, history navigation). The onInput handler covers
@@ -521,6 +538,7 @@ export default function App() {
       // Save scroll position of current session
       if (messageScrollRef) scrollPositions.set(prev, messageScrollRef.scrollTop)
     }
+    dismissMediaNotice()
     setCurrentId(id)
     location.hash = id
     setSidebar(false)
@@ -729,6 +747,7 @@ export default function App() {
     if (!confirm('Delete this session?')) return
     setMenuOpen(false)
     await deleteSession(id)
+    dismissMediaNotice()
     setCurrentId(null)
     location.hash = ''
     cleanupSSE?.()
@@ -737,6 +756,7 @@ export default function App() {
   }
 
   function goHome() {
+    dismissMediaNotice()
     const id = currentId()
     if (id) saveDraft(id, text())
     cleanupSSE?.()
@@ -910,13 +930,13 @@ export default function App() {
         }
         await patchMediaRecord(memo.id, { status: 'delivered', error: null, deliveredAt: Date.now(), blob: new Blob([], { type: memo.blob.type }) })
         setVoiceMemos(prev => prev.filter(item => item.id !== memo.id))
-        setMediaNotice('Voice memo recovered successfully.')
+        if (memo.sessionId === currentId()) showMediaNotice('Voice memo recovered successfully.', 4000)
       } catch (error: any) {
         const message = error?.message || String(error)
         const patch = { status: 'failed' as const, attempts: lastAttempt, error: message, transcript }
         updateVoice(memo.id, patch)
         await persistMediaPatch(memo.id, patch)
-        setMediaNotice(`Voice memo retained: ${message}`)
+        if (memo.sessionId === currentId()) showMediaNotice(`Voice memo retained: ${message}`)
       }
     })) as Promise<void>
   }
@@ -1801,7 +1821,7 @@ export default function App() {
           <input ref={fileInputRef} type="file" multiple hidden title="Maximum file size: 50 MB" onChange={(e) => { if (e.target.files?.length) { addFiles(e.target.files); e.target.value = '' } }} />
           <Show when={mediaNotice()}>
             <div role="status" style={{ padding: '7px 12px', 'border-top': '1px solid #332b18', background: '#17140b', color: '#d8bd66', 'font-size': '12px', display: 'flex', 'justify-content': 'space-between', gap: '8px' }}>
-              <span>{mediaNotice()}</span><button onClick={() => setMediaNotice('')} style={{ background: 'none', border: 'none', color: '#d8bd66', cursor: 'pointer' }}>&times;</button>
+              <span>{mediaNotice()}</span><button onClick={dismissMediaNotice} style={{ background: 'none', border: 'none', color: '#d8bd66', cursor: 'pointer' }}>&times;</button>
             </div>
           </Show>
           {/* File previews */}

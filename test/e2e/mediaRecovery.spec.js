@@ -195,6 +195,7 @@ test('voice and image work stay pinned to the session where they started', async
   await expect(page.locator('textarea')).toHaveValue('other draft')
   await expect.poll(() => voiceSend?.text).toBe('original draft pinned voice')
   expect(voiceSend.messageId).toMatch(/^[0-9a-f-]{20,}$/i)
+  await expect(page.getByText('Voice memo recovered successfully.')).toHaveCount(0)
   await expect.poll(() => page.evaluate(id => localStorage.getItem(`feather-draft-${id}`), sessionId)).toBe(null)
 
   const oversizedSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="2000"><rect width="2000" height="2000" fill="red"/></svg>`
@@ -207,6 +208,7 @@ test('voice and image work stay pinned to the session where they started', async
 })
 
 test('voice transcription uses the mounted prefix and inserts recovered text', async ({ page }) => {
+  await page.clock.install()
   await page.addInitScript(() => {
     Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: {
       getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }),
@@ -257,5 +259,8 @@ test('voice transcription uses the mounted prefix and inserts recovered text', a
   await mic.click()
   await page.getByRole('button', { name: /Stop & transcribe/ }).first().click()
   await expect(page.locator('textarea')).toHaveValue('prefix voice works')
+  await expect(page.getByText('Voice memo recovered successfully.')).toBeVisible()
+  await page.clock.fastForward(5000)
+  await expect(page.getByText('Voice memo recovered successfully.')).toHaveCount(0)
   expect(transcriptPath).toBe('/feather2/api/transcribe')
 })
