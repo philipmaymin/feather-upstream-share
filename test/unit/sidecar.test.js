@@ -107,4 +107,25 @@ describe('sidecar store (v1 + v2 multi-peer)', () => {
     const p2 = sc.priming({ selfRole: 'a', roster: ['a', 'b'] })
     assert.doesNotMatch(p2, /--to all/)
   })
+
+  it('preserves unknown registry and group fields during a mutation', () => {
+    const groupsFile = path.join(tmpHome, '.feather/sidecars/groups.json')
+    const groups = JSON.parse(fs.readFileSync(groupsFile, 'utf8'))
+    groups.futureDocumentField = { keep: true }
+    groups.g1.futureGroupField = 7
+    fs.writeFileSync(groupsFile, JSON.stringify(groups))
+
+    sc.addMember('g1', { sessionId: 'ffffffff-6', role: 'future-test', spawned: true })
+
+    const updated = sc.readGroups()
+    assert.deepEqual(updated.futureDocumentField, { keep: true })
+    assert.equal(updated.g1.futureGroupField, 7)
+  })
+
+  it('fails closed when the existing group registry is malformed', () => {
+    const groupsFile = path.join(tmpHome, '.feather/sidecars/groups.json')
+    fs.writeFileSync(groupsFile, '{broken')
+    assert.throws(() => sc.readGroups(), /malformed Sidecar groups/)
+    assert.equal(fs.readFileSync(groupsFile, 'utf8'), '{broken')
+  })
 })

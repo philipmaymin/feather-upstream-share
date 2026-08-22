@@ -17,6 +17,7 @@ import * as webpush from './lib/webpush.js';
 import { createSnapshotCache } from './lib/snapshot-cache.js';
 import { paneHasReadyPrompt } from './lib/terminal-ready.js';
 import { ensureStateLayout, resolveStatePaths } from './lib/state-paths.js';
+import { createJsonState } from './lib/json-state.js';
 
 // Load ~/.env if present
 try {
@@ -174,16 +175,21 @@ function findSessionCwd(sessionId) {
 // ── Session metadata ────────────────────────────────────────────────────────
 
 function metaFilePath() {
-  return path.join(featherDir(), 'session-meta.json');
+  return STATE_PATHS.instance.metaFile;
 }
 
+const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const META_STATE = createJsonState({
+  file: metaFilePath(), root: featherDir(), document: 'session metadata',
+  defaultValue: {}, validate: isRecord,
+});
+
 function readMeta() {
-  try { return JSON.parse(fs.readFileSync(metaFilePath(), 'utf8')); }
-  catch { return {}; }
+  return META_STATE.read();
 }
 
 function writeMeta(meta) {
-  fs.writeFileSync(metaFilePath(), JSON.stringify(meta, null, 2));
+  return META_STATE.write(meta);
 }
 
 // A message "counts" toward the page size only if it has visible user/assistant
@@ -225,13 +231,25 @@ function getMessages(sessionId, limit = 100, before = 0) {
 
 // ── Per-user JSON helpers ──────────────────────────────────────────────────
 
+const USER_JSON_STATES = new Map([
+  ['project-labels.json', createJsonState({ file: STATE_PATHS.instance.projectLabelsFile, root: featherDir(), document: 'project labels', defaultValue: {}, validate: isRecord })],
+  ['quick-links.json', createJsonState({ file: STATE_PATHS.instance.quickLinksFile, root: featherDir(), document: 'quick links', defaultValue: [], validate: Array.isArray })],
+  ['starred.json', createJsonState({ file: STATE_PATHS.instance.starredFile, root: featherDir(), document: 'starred messages', defaultValue: {}, validate: isRecord })],
+  ['muted.json', createJsonState({ file: STATE_PATHS.instance.mutedFile, root: featherDir(), document: 'muted sessions', defaultValue: [], validate: Array.isArray })],
+  ['push-keys.json', createJsonState({ file: STATE_PATHS.instance.pushKeysFile, root: featherDir(), document: 'push signing keys', defaultValue: {}, validate: isRecord, mode: 0o600 })],
+  ['push-subscriptions.json', createJsonState({ file: STATE_PATHS.instance.pushSubscriptionsFile, root: featherDir(), document: 'push subscriptions', defaultValue: [], validate: Array.isArray })],
+]);
+
 function readUserJson(filename, fallback) {
-  try { return JSON.parse(fs.readFileSync(path.join(featherDir(), filename), 'utf8')); }
-  catch { return fallback; }
+  const state = USER_JSON_STATES.get(filename);
+  if (!state) throw new Error(`unclassified JSON state: ${filename}`);
+  return state.read();
 }
 
 function writeUserJson(filename, data) {
-  fs.writeFileSync(path.join(featherDir(), filename), JSON.stringify(data, null, 2));
+  const state = USER_JSON_STATES.get(filename);
+  if (!state) throw new Error(`unclassified JSON state: ${filename}`);
+  return state.write(data);
 }
 
 // ── Codex helpers ──────────────────────────────────────────────────────────
@@ -1436,6 +1454,10 @@ app.get('/api/agents', (_req, res) => {
 
 const ROOMS_HOME_DIR = STATE_PATHS.workspace.roomsDir;
 const ROOM_ASSIGN_FILE = STATE_PATHS.coordination.roomAssignmentsFile;
+const ROOM_ASSIGN_STATE = createJsonState({
+  file: ROOM_ASSIGN_FILE, root: path.dirname(ROOM_ASSIGN_FILE), document: 'Room assignments',
+  defaultValue: {}, validate: isRecord,
+});
 const ROOM_TAILS = [512 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024];
 
 function httpError(status, message) {
@@ -1445,8 +1467,7 @@ function httpError(status, message) {
 }
 
 function readRoomAssignments() {
-  try { return JSON.parse(fs.readFileSync(ROOM_ASSIGN_FILE, 'utf8')); }
-  catch { return {}; }
+  return ROOM_ASSIGN_STATE.read();
 }
 
 function listRoomDirs() {
@@ -1594,15 +1615,22 @@ app.post('/api/rooms/:name/assign', (req, res) => {
     const sessionId = String(req.body?.sessionId || '').trim();
     if (!sessionId) throw httpError(400, 'sessionId required');
     if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
-    const assignments = readRoomAssignments();
-    if (req.body?.remove) delete assignments[sessionId];
-    else assignments[sessionId] = name;
-    fs.mkdirSync(path.dirname(ROOM_ASSIGN_FILE), { recursive: true });
-    fs.writeFileSync(ROOM_ASSIGN_FILE, JSON.stringify(assignments, null, 2));
+    const assignments = ROOM_ASSIGN_STATE.update(current => {
+      const next = { ...current };
+      if (req.body?.remove) delete next[sessionId];
+      else next[sessionId] = name;
+      return next;
+    });
     roomSnapshotCache.refresh();
     res.json({ ok: true, assignments });
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
+
+// Validate every durable JSON document before accepting traffic. Missing
+// documents use their documented defaults; malformed state fails startup.
+META_STATE.read();
+for (const state of USER_JSON_STATES.values()) state.read();
+ROOM_ASSIGN_STATE.read();
 
 // Verify that staging is a coherent build: index.html points to a JS bundle
 // that actually exists in staging/assets. Returns the matched JS filename, or null.

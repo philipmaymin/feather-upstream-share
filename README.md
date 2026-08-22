@@ -135,6 +135,11 @@ compatible current state or a tested downgrade adapter; restoring a pre-upgrade
 copy at that point would lose work. Do not run incompatible writers against the
 same root.
 
+Durable JSON writes use a same-directory fsynced temporary file and atomic
+rename, retain a `.last-good` recovery copy, and fail closed on malformed
+existing state. Defaults and rollback compatibility are recorded in
+[`docs/state-compatibility.md`](docs/state-compatibility.md).
+
 ## Architecture
 
 ```
