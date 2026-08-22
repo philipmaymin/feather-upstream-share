@@ -1,6 +1,8 @@
 import { createSignal, onMount, onCleanup, Show, For } from 'solid-js'
-import { fetchRooms, cachedRoomsSnapshot, fetchSessions, searchSessions, createRoom, createSession, assignSessionToRoom, setRoomPulse, fetchRoomUpdates } from './api'
+import { fetchRooms, cachedRoomsSnapshot, fetchSessions, searchSessions, createRoom, renameRoom, createSession, assignSessionToRoom, setRoomPulse, fetchRoomUpdates } from './api'
 import type { RoomInfo, SessionMeta, RoomUpdate } from './api'
+
+type AgentId = 'claude' | 'codex' | 'omp'
 
 // Full-screen rooms home (iMessage model, phone-first): one row per room
 // folder under ~/rooms/, latest message snippet, status dot. Tap a session
@@ -43,6 +45,7 @@ function pulseLabel(room: RoomInfo) {
 }
 
 const SEEN_KEY = 'feather:roomUpdatesSeen'
+const ROOM_HARNESSES_KEY = 'feather:roomHarnesses'
 function loadSeen(): Record<string, number> {
   try {
     const value = JSON.parse(localStorage.getItem(SEEN_KEY) || '{}')
@@ -52,6 +55,17 @@ function loadSeen(): Record<string, number> {
 function saveSeen(map: Record<string, number>) {
   try { localStorage.setItem(SEEN_KEY, JSON.stringify(map)) } catch {}
 }
+function loadRoomHarnesses(): Record<string, AgentId> {
+  try {
+    const value = JSON.parse(localStorage.getItem(ROOM_HARNESSES_KEY) || '{}')
+    if (!value || typeof value !== 'object') return {}
+    return Object.fromEntries(Object.entries(value).filter(([, agent]) => agent === 'omp' || agent === 'claude' || agent === 'codex')) as Record<string, AgentId>
+  } catch { return {} }
+}
+function saveRoomHarnesses(map: Record<string, AgentId>) {
+  try { localStorage.setItem(ROOM_HARNESSES_KEY, JSON.stringify(map)) } catch {}
+}
+const agentLabel = (agent: AgentId) => agent === 'omp' ? 'OMP' : agent === 'codex' ? 'Codex' : 'Claude Code'
 function updateTimeLabel(iso: string | null) {
   if (!iso) return ''
   const date = new Date(iso)
@@ -74,6 +88,7 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
   const [attachError, setAttachError] = createSignal<string | null>(null)
   const [attachQuery, setAttachQuery] = createSignal('')
   const [seen, setSeen] = createSignal<Record<string, number>>(loadSeen())
+  const [roomHarnesses, setRoomHarnesses] = createSignal<Record<string, AgentId>>(loadRoomHarnesses())
   const [updatesRoom, setUpdatesRoom] = createSignal<string | null>(null)
   const [updatesList, setUpdatesList] = createSignal<RoomUpdate[]>([])
   const [updatesLoading, setUpdatesLoading] = createSignal(false)
@@ -98,15 +113,59 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
     finally { setBusy(false) }
   }
 
-  async function newChat(room: RoomInfo, agent?: 'claude' | 'codex' | 'omp') {
+  const roomHarness = (name: string): AgentId => roomHarnesses()[name] || 'omp'
+
+  function setRoomHarness(name: string, agent: AgentId) {
+    const next = { ...roomHarnesses(), [name]: agent }
+    setRoomHarnesses(next)
+    saveRoomHarnesses(next)
+  }
+
+  async function newChat(room: RoomInfo, agent?: AgentId) {
     setBusy(true)
     try {
-      const id = await createSession(room.cwd, agent)
+      const id = await createSession(room.cwd, agent || roomHarness(room.name))
       // Belt and braces: cwd-derived grouping covers claude immediately, but
       // codex/omp transcripts appear later — pin the membership explicitly.
       await assignSessionToRoom(room.name, id).catch(() => {})
       props.onSessionsChanged?.()
       props.onOpen(id)
+    } catch (e: any) { alert(e.message) }
+    finally { setBusy(false) }
+  }
+
+  async function doRenameRoom(room: RoomInfo) {
+    const name = prompt('Rename room (lowercase, digits, dashes):', room.name)?.trim()
+    if (!name || name === room.name) return
+    setBusy(true)
+    try {
+      await renameRoom(room.name, name)
+      const harnesses = { ...roomHarnesses() }
+      if (harnesses[room.name]) {
+        harnesses[name] = harnesses[room.name]
+        delete harnesses[room.name]
+        setRoomHarnesses(harnesses)
+        saveRoomHarnesses(harnesses)
+      }
+      await refresh()
+      setExpanded(name)
+      props.onSessionsChanged?.()
+    } catch (e: any) { alert(e.message) }
+    finally { setBusy(false) }
+  }
+
+  async function moveSession(room: RoomInfo, session: SessionMeta, event: MouseEvent) {
+    event.stopPropagation()
+    const choices = (rooms() || []).map(candidate => candidate.name).filter(name => name !== room.name)
+    if (!choices.length) { alert('Create another room first.'); return }
+    const destination = prompt(`Move chat to room:\n${choices.join(', ')}`)?.trim()
+    if (!destination) return
+    if (!choices.includes(destination)) { alert(`No room named #${destination}`); return }
+    setBusy(true)
+    try {
+      await assignSessionToRoom(destination, session.id)
+      await refresh()
+      props.onSessionsChanged?.()
     } catch (e: any) { alert(e.message) }
     finally { setBusy(false) }
   }
@@ -212,6 +271,11 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
       <span style={{ width: '7px', height: '7px', 'border-radius': '50%', background: s.isActive ? '#4aba6a' : '#333', 'flex-shrink': '0' }} />
       <span style={{ 'font-size': '9px', padding: '1px 5px', 'border-radius': '3px', background: agentBg(s.agent), color: agentColor(s.agent), 'flex-shrink': '0', 'font-weight': '600' }}>{s.agent || 'claude'}</span>
       <span style={{ flex: '1', 'font-size': '13px', color: '#ccc', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{s.title}</span>
+      <Show when={(rooms()?.length || 0) > 1}>
+        <button aria-label={`Move ${s.title} to another room`} disabled={busy()}
+          onClick={(event) => moveSession(room, s, event)}
+          style={{ background: 'none', border: 'none', color: '#777', 'font-size': '11px', padding: '3px 5px', cursor: 'pointer', 'flex-shrink': '0' }}>Move</button>
+      </Show>
       <Show when={s.roomAssigned}>
         <button data-testid={`detach-${s.id}`} aria-label={`Detach ${s.title} from #${room.name}`} disabled={busy()}
           onClick={(event) => detachSession(room, s, event)}
@@ -294,11 +358,27 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
                 </Show>
                 <Show when={expanded() === room.name}>
                   <For each={room.sessions}>{(s) => sessionRow(room, s)}</For>
-                  <div style={{ display: 'flex', 'flex-wrap': 'wrap', gap: '8px', padding: '10px 16px 12px 28px', 'border-top': '1px solid #16161f' }}>
+                  <div style={{ display: 'flex', 'flex-wrap': 'wrap', gap: '8px', padding: '10px 16px 12px 28px', 'border-top': '1px solid #16161f', position: 'relative' }}>
                     <button onClick={() => newChat(room)} disabled={busy()}
-                      style={{ background: '#152a1c', border: '1px solid #2a4a34', color: '#4aba6a', 'font-size': '12px', 'font-weight': '600', padding: '5px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>+ New chat here</button>
-                    <button onClick={() => newChat(room, 'codex')} disabled={busy()}
-                      style={{ background: 'none', border: '1px solid #333', color: '#c084fc', 'font-size': '12px', padding: '5px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>codex</button>
+                      style={{ background: roomHarness(room.name) === 'omp' ? '#3a2a1e' : '#15202a', border: `1px solid ${roomHarness(room.name) === 'omp' ? '#68481f' : '#344657'}`, color: roomHarness(room.name) === 'omp' ? '#e0a050' : agentColor(roomHarness(room.name)), 'font-size': '12px', 'font-weight': '700', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>+ New {agentLabel(roomHarness(room.name))} chat</button>
+                    <details style={{ position: 'relative' }}>
+                      <summary style={{ 'list-style': 'none', background: 'none', border: '1px solid #2b3038', color: '#777', 'font-size': '11px', padding: '6px 9px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Room options</summary>
+                      <div style={{ position: 'absolute', top: '34px', left: '0', width: '180px', padding: '8px', background: '#11151c', border: '1px solid #333', 'border-radius': '9px', 'box-shadow': '0 8px 24px rgba(0,0,0,.45)', 'z-index': '20', display: 'flex', 'flex-direction': 'column', gap: '7px' }}>
+                        <label style={{ color: '#777', 'font-size': '10px', display: 'flex', 'flex-direction': 'column', gap: '4px' }}>Default harness
+                          <select aria-label={`Default harness for #${room.name}`} value={roomHarness(room.name)} onChange={(event) => setRoomHarness(room.name, event.currentTarget.value as AgentId)}
+                            style={{ background: '#0c1016', border: '1px solid #333', color: '#ddd', padding: '6px', 'border-radius': '6px' }}>
+                            <option value="omp">OMP</option><option value="claude">Claude Code</option><option value="codex">Codex</option>
+                          </select>
+                        </label>
+                        <div style={{ color: '#666', 'font-size': '10px' }}>Start one fallback chat</div>
+                        <button onClick={() => newChat(room, 'claude')} disabled={busy()}
+                          style={{ background: 'none', border: '1px solid #29313b', color: '#73b8ff', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Claude Code</button>
+                        <button onClick={() => newChat(room, 'codex')} disabled={busy()}
+                          style={{ background: 'none', border: '1px solid #332a3d', color: '#c084fc', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Codex</button>
+                        <button onClick={() => doRenameRoom(room)} disabled={busy()}
+                          style={{ background: 'none', border: 'none', 'border-top': '1px solid #292d34', color: '#999', 'font-size': '11px', padding: '7px 2px 2px', cursor: 'pointer', 'text-align': 'left' }}>Rename room…</button>
+                      </div>
+                    </details>
                     <button data-testid={`attach-existing-${room.name}`} onClick={() => showAttach(room)} disabled={busy()}
                       style={{ 'margin-left': 'auto', background: 'none', border: '1px solid #333', color: '#9aa4b2', 'font-size': '12px', padding: '5px 10px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                       {attachingRoom() === room.name ? 'Close' : 'Attach existing'}

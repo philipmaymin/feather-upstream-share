@@ -26,6 +26,7 @@ export interface AgentInfo {
   id: 'claude' | 'codex' | 'omp'
   label: string
   available: boolean
+  default?: boolean
 }
 
 export const fetchAgents = (): Promise<{ agents: AgentInfo[] }> =>
@@ -115,6 +116,15 @@ export async function createRoom(name: string): Promise<{ name: string; cwd: str
   return responseJson(response)
 }
 
+export async function renameRoom(room: string, name: string): Promise<{ ok: true; name: string; cwd: string }> {
+  const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/rename`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+  return responseJson(response)
+}
+
 export const assignSessionToRoom = async (room: string, sessionId: string, remove = false) => {
   const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/assign`, {
     method: 'POST',
@@ -150,7 +160,7 @@ export interface Message {
   role: 'user' | 'assistant'
   timestamp: string
   content: ContentBlock[]
-  delivery?: 'sent' | 'delivered'
+  delivery?: 'queued' | 'sent' | 'delivered'
   stopReason?: string
   cwd?: string
   model?: string

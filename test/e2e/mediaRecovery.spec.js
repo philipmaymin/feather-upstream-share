@@ -113,6 +113,40 @@ test('an acknowledged send preserves composer edits typed while the request is i
   await expect.poll(() => page.evaluate(id => localStorage.getItem(`feather-draft-${id}`), sessionId)).toBe('newer unsent thought')
 })
 
+test('a send survives leaving during delivery and retries against its original chat after reload', async ({ page }) => {
+  let sendAttempts = 0
+  const messageIds = []
+  let sent
+  await page.route(`**/api/sessions/${sessionId}/send`, async route => {
+    sendAttempts++
+    messageIds.push(route.request().headers()['x-feather-message-id'])
+    if (sendAttempts === 1) {
+      await new Promise(resolve => setTimeout(resolve, 800))
+      return route.abort('failed')
+    }
+    sent = {
+      text: JSON.parse(route.request().postData() || '{}').text,
+      messageId: route.request().headers()['x-feather-message-id'],
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, sentAt: new Date().toISOString() }) })
+  })
+
+  await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
+  await page.locator('textarea').fill('install OMP and keep this request')
+  await page.locator('button[title="Send"]').last().click()
+  await expect(page.getByText('queued', { exact: true })).toBeVisible()
+  await expect(page.locator('textarea')).toHaveValue('')
+  await expect.poll(() => sendAttempts).toBe(1)
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('feather-message-outbox-v1') || '[]').length)).toBe(1)
+
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await expect.poll(() => sent?.text).toBe('install OMP and keep this request')
+  expect(sent.messageId).toMatch(/^[0-9a-f-]{20,}$/i)
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('feather-message-outbox-v1'))).toBe(null)
+  expect(sendAttempts).toBeGreaterThanOrEqual(2)
+  expect(new Set(messageIds).size).toBe(1)
+})
+
 test('oversized attachments are rejected before any upload request', async ({ page }) => {
   let uploads = 0
   const oversizedPath = path.join('/tmp', `feather-too-large-${Date.now()}.bin`)

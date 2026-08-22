@@ -781,8 +781,9 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
         <span onClick={(e) => { const el = e.currentTarget; el.textContent = el.textContent === formatTime(msg.timestamp) ? formatFullDate(msg.timestamp) : formatTime(msg.timestamp) }}
           style={{ 'font-size': '10px', color: '#444', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>{formatTime(msg.timestamp)}</span>
         {msg.role === 'user' && msg.delivery && (
-          <span style={{ 'font-size': '11px', color: msg.delivery === 'delivered' ? '#4aba6a' : '#555' }}>
-            {msg.delivery === 'delivered' ? '\u2713\u2713' : '\u2713'}
+          <span title={msg.delivery === 'queued' ? 'Queued safely on this device' : msg.delivery === 'delivered' ? 'Delivered to the chat transcript' : 'Accepted by Feather'}
+            style={{ 'font-size': msg.delivery === 'queued' ? '10px' : '11px', color: msg.delivery === 'delivered' ? '#4aba6a' : msg.delivery === 'queued' ? '#d8bd66' : '#777' }}>
+            {msg.delivery === 'queued' ? 'queued' : msg.delivery === 'delivered' ? '\u2713\u2713' : '\u2713'}
           </span>
         )}
         {!msg.uuid.startsWith('optimistic-') && (

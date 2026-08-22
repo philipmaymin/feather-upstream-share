@@ -10,6 +10,7 @@ import { fetchSessions, fetchRooms, fetchMessages, subscribeMessages, sendInput,
 import type { SearchResult } from './api'
 import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
+import { listPendingMessages, putPendingMessage, patchPendingMessage, deletePendingMessage } from './lib/messageOutbox.js'
 import { appUrl } from './lib/appPath.js'
 
 interface QuickLink { label: string; url: string }
@@ -22,6 +23,7 @@ interface StoredMediaBase { id: string; boxId: string; sessionId: string; name: 
 interface StoredFileMedia extends StoredMediaBase { kind: 'file' | 'image'; status: FileStatus; serverPath?: string }
 interface StoredVoiceMedia extends StoredMediaBase { kind: 'audio'; status: VoiceStatus; transcript?: string; intent?: 'append' | 'send'; capturedText?: string }
 type StoredMedia = StoredFileMedia | StoredVoiceMedia
+interface PendingMessage { id: string; sessionId: string; text: string; createdAt: number; attempts: number; error?: string }
 
 function fileStatusLabel(file: PendingFile) {
   if (file.status === 'uploading') return `Uploading · ${Math.min(MEDIA_ATTEMPTS, file.attempts + 1)}/${MEDIA_ATTEMPTS}`
@@ -210,6 +212,8 @@ export default function App() {
   const [transcribing, setTranscribing] = createSignal(false)
   const uploadsInFlight = new Map<string, Promise<string>>()
   const voiceMemosInFlight = new Map<string, Promise<void>>()
+  const pendingSendsInFlight = new Map<string, Promise<void>>()
+  let pendingRetryTimer: ReturnType<typeof setTimeout> | undefined
   const [uploading, setUploading] = createSignal(false)
   const [working, setWorking] = createSignal(false)
   const [dragging, setDragging] = createSignal(false)
@@ -241,7 +245,7 @@ export default function App() {
       && group.members.some(member => !member.spawned && member.sessionId.slice(0, 8) === sessionId.slice(0, 8)))
   async function spawnSidecarFor(sessionId: string) {
     const task = prompt('Task / opening message for the sidecar (optional):') ?? ''
-    const agent = (prompt('Agent for the peer (claude / codex / omp):', 'claude') || 'claude').trim()
+    const agent = (prompt('Agent for the peer (omp / claude / codex):', 'omp') || 'omp').trim()
     const session = sessions().find(candidate => candidate.id === sessionId) || lastSession()
     try {
       const result = await createSidecar(sessionId, { task, agent, cwd: session?.cwd || undefined })
@@ -464,7 +468,11 @@ export default function App() {
   async function initApp() {
     document.addEventListener('keydown', onGlobalKeyDown)
     updateSessions(await fetchSessions())
-    fetchAgents().then(r => setCodexAvailable(r.agents.some(a => a.id === 'codex' && a.available))).catch(() => {})
+    refreshPendingMessages()
+    queueMicrotask(() => retryPendingMessages())
+    fetchAgents().then(r => {
+      setCodexAvailable(r.agents.some(a => a.id === 'codex' && a.available))
+    }).catch(() => {})
     fetch(appUrl('/api/quick-links')).then(r => r.ok ? r.json() : []).then(setLinks).catch(() => {})
     fetchStarred().then(setStarred).catch(() => {})
     const hash = location.hash.slice(1)
@@ -480,7 +488,7 @@ export default function App() {
     setVh()
     window.visualViewport?.addEventListener('resize', setVh)
     window.addEventListener('resize', setVh)
-    window.addEventListener('online', retryRecoverableMedia)
+    window.addEventListener('online', retryRecoverableWork)
 
     // The reverse proxy has already authenticated anyone who can load the app.
     // Warm Rooms alongside /api/me so the first render costs one round trip,
@@ -519,12 +527,12 @@ export default function App() {
     onCleanup(() => {
       clearInterval(versionInterval)
       clearInterval(sessionsInterval)
-      window.removeEventListener('online', retryRecoverableMedia)
+      window.removeEventListener('online', retryRecoverableWork)
       window.visualViewport?.removeEventListener('resize', setVh)
       window.removeEventListener('resize', setVh)
     })
   })
-  onCleanup(() => { if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer); clearPendingMedia(); cleanupSSE?.(); document.removeEventListener('keydown', onGlobalKeyDown) })
+  onCleanup(() => { if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer); if (pendingRetryTimer) clearTimeout(pendingRetryTimer); clearPendingMedia(); cleanupSSE?.(); document.removeEventListener('keydown', onGlobalKeyDown) })
 
   // Autoresize textarea on programmatic text changes (draft restore on session
   // select, voice dictation, history navigation). The onInput handler covers
@@ -601,6 +609,7 @@ export default function App() {
         }
       }
     } catch {}
+    appendPendingMessages(id)
     setLoading(false)
     // Restore scroll position if we have one saved
     const savedScroll = scrollPositions.get(id)
@@ -648,6 +657,7 @@ export default function App() {
       }
       // Keep lastSeen fresh so the current session doesn't go unread on next poll
       lastSeenUpdatedAt.set(id, new Date().toISOString())
+      let deliveredPendingId: string | undefined
       setMessages(prev => {
         if (prev.some(m => m.uuid === msg.uuid)) return prev
         if (msg.role === 'user') {
@@ -659,13 +669,19 @@ export default function App() {
           )
           if (idx >= 0) {
             const updated = [...prev]
+            deliveredPendingId = prev[idx].uuid.slice('optimistic-'.length)
             updated[idx] = { ...msg, delivery: 'delivered' }
             return updated
           }
         }
         return [...prev, msg]
       })
+      if (deliveredPendingId) {
+        deletePendingMessage(deliveredPendingId)
+        refreshPendingMessages()
+      }
     }, setSSEStatus, setActivity, setQuestion)
+    queueMicrotask(() => retryPendingMessages(id))
   }
 
   function doSearch(query: string) {
@@ -717,7 +733,7 @@ export default function App() {
     messageScrollRef.scrollTo({ top: messageScrollRef.scrollTop + offset })
   }
 
-  async function handleNew(newTab = false, agent: 'claude' | 'codex' = 'claude') {
+  async function handleNew(newTab = false, agent: 'claude' | 'codex' | 'omp' = 'omp') {
     setCreating(true)
     // Open the window synchronously to avoid popup blockers (iOS Safari
     // blocks window.open after an await breaks the user-gesture chain)
@@ -842,6 +858,92 @@ export default function App() {
     await patchMediaRecord(id, patch).catch((e: any) => setMediaNotice(`Could not update recovery storage: ${e?.message || e}`))
   }
 
+  function refreshPendingMessages() {
+    try { return listPendingMessages() as PendingMessage[] }
+    catch (error: any) {
+      showMediaNotice(`Message recovery storage unavailable: ${error?.message || error}`)
+      return []
+    }
+  }
+
+  function appendPendingMessages(sessionId: string) {
+    const allQueued = refreshPendingMessages()
+    const queued = allQueued.filter(message => message.sessionId === sessionId)
+    if (!queued.length || currentId() !== sessionId) return
+    setMessages(previous => {
+      const known = new Set(previous.map(message => message.uuid))
+      return [...previous, ...queued.filter(message => !known.has(`optimistic-${message.id}`)).map(message => ({
+        uuid: `optimistic-${message.id}`,
+        role: 'user' as const,
+        timestamp: new Date(message.createdAt).toISOString(),
+        content: [{ type: 'text', text: message.text }],
+        delivery: 'queued' as const,
+      }))]
+    })
+  }
+
+  function schedulePendingRetry() {
+    if (pendingRetryTimer) clearTimeout(pendingRetryTimer)
+    const queued = refreshPendingMessages()
+    if (!queued.length || !navigator.onLine) return
+    const attempts = Math.max(...queued.map(message => message.attempts), 0)
+    const delay = Math.min(60_000, 2_000 * (2 ** Math.min(attempts, 5)))
+    pendingRetryTimer = setTimeout(() => retryPendingMessages(), delay)
+  }
+
+  function deliverPendingMessage(record: PendingMessage): Promise<void> {
+    const existing = pendingSendsInFlight.get(record.id)
+    if (existing) return existing
+    const delivery = (async () => {
+      const attempt = record.attempts + 1
+      patchPendingMessage(record.id, { attempts: attempt, error: undefined, lastAttemptAt: Date.now() })
+      refreshPendingMessages()
+      try {
+        const session = sessions().find(item => item.id === record.sessionId) || (record.sessionId === currentId() ? lastSession() : null)
+        if (session && !session.isActive) {
+          const response = await resumeSession(session.id, session.cwd ?? undefined)
+          if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || `HTTP ${response.status}`)
+          updateSessions(await fetchSessions())
+        }
+        await sendInput(record.sessionId, record.text, record.id)
+        deletePendingMessage(record.id)
+        refreshPendingMessages()
+        pushHistory(record.text)
+        if (record.sessionId === currentId()) {
+          setMessages(previous => {
+            const optimisticId = `optimistic-${record.id}`
+            const durableCopyExists = previous.some(message => message.uuid !== optimisticId && !message.uuid.startsWith('optimistic-') &&
+              message.role === 'user' && message.content?.some(block => block.type === 'text' && block.text === record.text))
+            return durableCopyExists
+              ? previous.filter(message => message.uuid !== optimisticId)
+              : previous.map(message => message.uuid === optimisticId ? { ...message, delivery: 'sent' as const } : message)
+          })
+          setWorking(true)
+          startWorkingTimeout()
+        }
+      } catch (error: any) {
+        patchPendingMessage(record.id, { attempts: attempt, error: error?.message || String(error), lastAttemptAt: Date.now() })
+        refreshPendingMessages()
+        if (record.sessionId === currentId()) showMediaNotice(`Message kept safely and will retry — ${error?.message || error}`)
+        schedulePendingRetry()
+        throw error
+      }
+    })().finally(() => pendingSendsInFlight.delete(record.id))
+    pendingSendsInFlight.set(record.id, delivery)
+    return delivery
+  }
+
+  async function retryPendingMessages(sessionId?: string) {
+    if (!navigator.onLine) return
+    const queued = refreshPendingMessages().filter(message => !sessionId || message.sessionId === sessionId)
+    for (const message of queued) await deliverPendingMessage(message).catch(() => {})
+  }
+
+  function retryRecoverableWork() {
+    retryRecoverableMedia()
+    retryPendingMessages()
+  }
+
   function uploadPendingFile(file: PendingFile): Promise<string> {
     return runMediaOperationOnce(uploadsInFlight, file.id, async () => {
       if (file.serverPath) return file.serverPath
@@ -872,33 +974,22 @@ export default function App() {
     })
   }
 
-  async function sendSessionText(rawText: string, targetId: string, messageId?: string) {
+  async function sendSessionText(rawText: string, targetId: string, messageId: string = crypto.randomUUID(), onQueued?: () => void) {
     const fullText = rawText.trim()
     if (!fullText) return
-    const targetIsCurrent = targetId === currentId()
-    const session = sessions().find(item => item.id === targetId) || (targetIsCurrent ? lastSession() : null)
-    if (session && !session.isActive) {
-      const response = await resumeSession(session.id, session.cwd ?? undefined)
-      if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || `HTTP ${response.status}`)
-      updateSessions(await fetchSessions())
-    }
-    const tempId = targetIsCurrent ? `optimistic-${Date.now()}` : undefined
-    if (tempId) {
-      setMessages(prev => [...prev, {
-        uuid: tempId, role: 'user', timestamp: new Date().toISOString(),
-        content: [{ type: 'text', text: fullText }], delivery: 'sent',
-      }])
-    }
-    try { await sendInput(targetId, fullText, messageId) }
-    catch (error) {
-      if (tempId) setMessages(prev => prev.filter(message => message.uuid !== tempId))
-      throw error
-    }
-    pushHistory(fullText)
-    if (targetIsCurrent) {
-      setWorking(true)
-      startWorkingTimeout()
-    }
+    const existing = (listPendingMessages() as PendingMessage[]).find(message => message.id === messageId)
+    const record = putPendingMessage({
+      id: messageId,
+      sessionId: targetId,
+      text: fullText,
+      createdAt: existing?.createdAt ?? Date.now(),
+      attempts: existing?.attempts ?? 0,
+      error: existing?.error,
+    }) as PendingMessage
+    refreshPendingMessages()
+    appendPendingMessages(targetId)
+    onQueued?.()
+    await deliverPendingMessage(record)
   }
 
   function processVoiceMemo(memo: VoiceMemo): Promise<void> {
@@ -1018,6 +1109,7 @@ export default function App() {
     const val = rawText.trim()
     if ((!val && !pending.length) || !currentId()) return
     const targetId = currentId()!
+    let safelyQueued = false
     setUploading(true)
     setMediaNotice('')
     try {
@@ -1026,18 +1118,30 @@ export default function App() {
         const uploadPath = await uploadPendingFile(file)
         parts.push(file.isImage ? `[Attached image: ${uploadPath}]` : `[Attached file: ${uploadPath}] (${file.name})`)
       }
-      await sendSessionText(parts.join('\n'), targetId, pending[0]?.id)
+      await sendSessionText(parts.join('\n'), targetId, pending[0]?.id || crypto.randomUUID(), () => {
+        // Clicking Send transfers ownership from the composer to the durable
+        // outbox. Clear only after that synchronous write succeeds.
+        safelyQueued = true
+        if (targetId === currentId() && text() === rawText) {
+          setText('')
+          saveDraft(targetId, '')
+          if (textareaRef) textareaRef.style.height = 'auto'
+        }
+      })
       for (const file of pending) {
         URL.revokeObjectURL(file.dataUrl)
         await deleteMediaRecord(file.id).catch(() => {})
       }
       if (targetId === currentId()) {
-        if (text() === rawText) { setText(''); saveDraft(targetId, '') }
         setFiles(prev => prev.filter(file => !pending.some(sent => sent.id === file.id)))
         if (textareaRef) textareaRef.style.height = 'auto'
       }
     } catch (e: any) {
-      if (targetId === currentId()) setMediaNotice(`Media retained — ${e?.message || e}. Retry when ready.`)
+      if (targetId === currentId()) setMediaNotice(safelyQueued
+        ? pending.length
+          ? `Media and message retained — ${e?.message || e}. Feather will retry.`
+          : `Message retained — ${e?.message || e}. Feather will retry.`
+        : `Could not queue message — ${e?.message || e}. Your draft is still here.`)
     } finally { setUploading(false) }
   }
 
@@ -1249,18 +1353,22 @@ export default function App() {
           {/* Sessions tab */}
           <Show when={sidebarTab() === 'sessions'}>
             {/* New session + search buttons */}
-            <div style={{ padding: '8px 16px', display: 'flex', gap: '8px' }}>
-              <button onClick={() => handleNew()} disabled={creating()} style={{ flex: '1', padding: '10px', background: creating() ? '#1a1a2e' : '#4aba6a', color: creating() ? '#666' : '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
-                {creating() ? 'Starting...' : '+ New Claude'}
+            <div style={{ padding: '8px 16px', display: 'flex', gap: '8px', position: 'relative' }}>
+              <button onClick={() => handleNew()} disabled={creating()} style={{ flex: '1', padding: '10px', background: creating() ? '#1a1a2e' : '#e0a050', color: creating() ? '#666' : '#111', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '700', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                {creating() ? 'Starting...' : '+ New OMP'}
               </button>
-              <button onClick={() => handleNew(true)} disabled={creating()} title="Open in new tab" style={{ padding: '10px 12px', background: creating() ? '#1a1a2e' : '#3a9a5a', color: creating() ? '#666' : '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+              <button onClick={() => handleNew(true)} disabled={creating()} title="Open new OMP chat in a new tab" style={{ padding: '10px 12px', background: creating() ? '#1a1a2e' : '#b97d32', color: creating() ? '#666' : '#111', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                 &#8599;
               </button>
-              <Show when={codexAvailable()}>
-                <button onClick={() => handleNew(false, 'codex')} disabled={creating()} title="New Codex session" style={{ padding: '10px 12px', background: creating() ? '#1a1a2e' : '#c084fc', color: creating() ? '#666' : '#000', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
-                  + Codex
-                </button>
-              </Show>
+              <details style={{ position: 'relative' }}>
+                <summary title="Fallback agents" style={{ 'list-style': 'none', padding: '10px 11px', background: '#141820', color: '#777', border: '1px solid #2a2f38', 'border-radius': '8px', 'font-size': '13px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Other</summary>
+                <div style={{ position: 'absolute', top: '44px', right: '0', width: '150px', padding: '6px', background: '#11151c', border: '1px solid #333', 'border-radius': '9px', 'box-shadow': '0 8px 24px rgba(0,0,0,.45)', 'z-index': '80', display: 'flex', 'flex-direction': 'column', gap: '5px' }}>
+                  <button onClick={() => handleNew(false, 'claude')} disabled={creating()} style={{ padding: '7px 9px', background: 'none', border: '1px solid #29313b', color: '#73b8ff', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Claude Code</button>
+                  <Show when={codexAvailable()}>
+                    <button onClick={() => handleNew(false, 'codex')} disabled={creating()} style={{ padding: '7px 9px', background: 'none', border: '1px solid #332a3d', color: '#c084fc', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Codex</button>
+                  </Show>
+                </div>
+              </details>
               <button onClick={() => { setSearchOpen(!searchOpen()); if (!searchOpen()) { setSearchQuery(''); setSearchResults([]) } }} title="Search chats" style={{ padding: '10px 12px', background: searchOpen() ? '#4aba6a' : '#1a1a2e', color: searchOpen() ? '#000' : '#888', border: '1px solid #333', 'border-radius': '8px', 'font-size': '14px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                 &#x1F50D;
               </button>

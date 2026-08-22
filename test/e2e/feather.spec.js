@@ -115,7 +115,7 @@ test.describe('App shell', () => {
     await page.waitForLoadState('networkidle')
     await openSidebar(page)
     await expect(page.getByText('Feather', { exact: true })).toBeVisible()
-    await expect(page.locator('button:has-text("+ New Claude")')).toBeVisible()
+    await expect(page.locator('button:has-text("+ New OMP")')).toBeVisible()
   })
 
   test('sidebar closes with Escape key', async ({ page }) => {
@@ -275,16 +275,15 @@ test.describe('Message rendering', () => {
   })
 
   test('thinking block renders as collapsible details', async ({ page }) => {
-    const details = page.locator('details')
-    await expect(details.first()).toBeVisible()
-    const summary = page.locator('details summary')
-    await expect(summary.first()).toHaveText('Thinking...')
+    const details = page.locator('details').filter({ has: page.locator('summary', { hasText: 'Thinking...' }) }).first()
+    await expect(details).toBeVisible()
+    const summary = details.locator('summary')
+    await expect(summary).toHaveText('Thinking...')
 
     // Click to expand
-    await summary.first().click()
+    await summary.click()
     await page.waitForTimeout(200)
-    const content = page.locator('details div')
-    const text = await content.first().innerText()
+    const text = await details.locator('div').innerText()
     expect(text).toContain('markdown pipeline')
   })
 
@@ -476,7 +475,7 @@ test.describe('Mobile viewport', () => {
     await page.goto(BASE)
     await page.waitForLoadState('networkidle')
     await openSidebar(page)
-    await expect(page.locator('button:has-text("+ New Claude")')).toBeVisible()
+    await expect(page.locator('button:has-text("+ New OMP")')).toBeVisible()
   })
 
   test('messages are readable on mobile', async ({ page }) => {

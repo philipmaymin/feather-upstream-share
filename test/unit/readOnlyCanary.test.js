@@ -202,6 +202,9 @@ describe('server-enforced read-only canary', () => {
       const response = await fetch(`${base}${endpoint}`)
       assert.equal(response.status, 200, `GET ${endpoint}`)
     }
+    const agents = (await (await fetch(`${base}/api/agents`)).json()).agents
+    assert.equal(agents.find(agent => agent.id === 'omp')?.default, true)
+    assert.equal(agents.find(agent => agent.id === 'claude')?.default, false)
     const mutations = [
       ['GET', '/api/future-side-effect'],
       ['GET', '/api/push/key'],
@@ -216,6 +219,7 @@ describe('server-enforced read-only canary', () => {
       ['POST', '/api/sidecar', { driverSessionId: fx.sessionId }],
       ['POST', '/api/quick-links', []], ['POST', '/api/starred', {}],
       ['POST', '/api/rooms', { name: 'forbidden-room' }],
+      ['POST', '/api/rooms/test-room/rename', { name: 'renamed-room' }],
       ['POST', '/api/rooms/test-room/assign', { sessionId: fx.sessionId }],
       ['POST', '/api/rooms/test-room/pulse', { enabled: false }],
       ['POST', '/api/rooms/test-room/updates', { text: 'forbidden' }],

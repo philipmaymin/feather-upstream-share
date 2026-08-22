@@ -37,6 +37,10 @@ if (!process.env.OPENAI_API_KEY && process.env.FEATHER_OPENAI_API_KEY) {
 
 const DEEPGRAM_API_KEY = process.env.FEATHER_DEEPGRAM_API_KEY || '';
 const envEnabled = value => /^(1|true|yes|on)$/i.test(String(value || '').trim());
+const SUPPORTED_AGENTS = new Set(['claude', 'codex', 'omp']);
+const DEFAULT_AGENT = SUPPORTED_AGENTS.has(process.env.FEATHER_DEFAULT_AGENT)
+  ? process.env.FEATHER_DEFAULT_AGENT
+  : 'omp';
 const READ_ONLY_MODE = envEnabled(process.env.FEATHER_READ_ONLY);
 const ROOM_PULSES_ENABLED = !READ_ONLY_MODE && !/^(0|false|no|off)$/i.test(String(process.env.FEATHER_ROOM_PULSES || '').trim());
 const configuredPulseInterval = Number(process.env.FEATHER_ROOM_PULSE_INTERVAL_MS);
@@ -494,7 +498,7 @@ function adoptNewCodexUuid(featherId, beforeUuids, spawnCwd = null, attempts = 3
 }
 
 function spawnOrResume(id, cwd, resume = false, agent = null) {
-  const resolvedAgent = agent || (resume ? getAgentForSession(id) : 'claude');
+  const resolvedAgent = agent || (resume ? getAgentForSession(id) : DEFAULT_AGENT);
   const name = tmuxName(id);
 
   if (resolvedAgent === 'codex') {
@@ -881,7 +885,7 @@ function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
           fs.closeSync(fd);
         }
       } catch { buf = Buffer.alloc(0); }
-      const cwd = extractCodexCwd(buf) || meta[c.id]?.cwd || null;
+      const cwd = meta[c.id]?.cwdOverride || extractCodexCwd(buf) || meta[c.id]?.cwd || null;
       const isWorker = buf.includes('AUTO_WORKER=TRUE')
         || /^\/home\/[^/]+\/(?:auto|autoweb)-/.test(cwd || '')
         || /^\/home\/[^/]+\/\.feather\/room-runs\//.test(cwd || '');
@@ -890,7 +894,7 @@ function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
     if (c.agent === 'omp') {
       let buf;
       try { buf = fs.readFileSync(c.fpath).slice(0, 65536); } catch { buf = Buffer.alloc(0); }
-      const cwd = meta[c.id]?.cwd || null;
+      const cwd = meta[c.id]?.cwdOverride || meta[c.id]?.cwd || null;
       const isWorker = /^\/home\/[^/]+\/(?:auto|autoweb)-/.test(cwd || '')
         || /^\/home\/[^/]+\/\.feather\/room-runs\//.test(cwd || '');
       return { ...c, info: { firstUserText: extractOmpTitle(buf), cwd, isTitleGen: false, isWorker } };
@@ -910,7 +914,7 @@ function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
   const labels = readUserJson('project-labels.json', {});
 
   const sessions = top.map(({ id, fpath, mtime, projectId: candidateProjectId, agent, info }) => {
-    const cwd = info.cwd || meta[id]?.cwd || (candidateProjectId ? projectIdToCwd(candidateProjectId) : null) || null;
+    const cwd = meta[id]?.cwdOverride || info.cwd || meta[id]?.cwd || (candidateProjectId ? projectIdToCwd(candidateProjectId) : null) || null;
     const projectId = candidateProjectId || (cwd ? encodeProjectPath(cwd) : null);
     const activityMs = lastActivityMs(fpath, agent, mtime.getTime());
     const session = {
@@ -1545,11 +1549,11 @@ function agentVersion(bin) {
 }
 
 app.get('/api/agents', (_req, res) => {
-  const agents = [{ id: 'claude', label: 'Claude Code', available: true }];
+  const agents = [{ id: 'claude', label: 'Claude Code', available: true, default: DEFAULT_AGENT === 'claude' }];
   const codexVer = agentVersion('codex');
-  agents.push(codexVer ? { id: 'codex', label: `Codex ${codexVer}`, available: true } : { id: 'codex', label: 'Codex', available: false });
+  agents.push(codexVer ? { id: 'codex', label: `Codex ${codexVer}`, available: true, default: DEFAULT_AGENT === 'codex' } : { id: 'codex', label: 'Codex', available: false, default: DEFAULT_AGENT === 'codex' });
   const ompVer = agentVersion('omp');
-  agents.push(ompVer ? { id: 'omp', label: `oh-my-pi ${ompVer}`, available: true } : { id: 'omp', label: 'oh-my-pi', available: false });
+  agents.push(ompVer ? { id: 'omp', label: `oh-my-pi ${ompVer}`, available: true, default: DEFAULT_AGENT === 'omp' } : { id: 'omp', label: 'oh-my-pi', available: false, default: DEFAULT_AGENT === 'omp' });
   res.json({ agents });
 });
 
@@ -1797,6 +1801,67 @@ app.post('/api/rooms', (req, res) => {
       `# #${name} — notes\n\nWorking memory for this room. Sessions append decisions and open\nthreads as they happen (\`room note "..."\`). Newest at the bottom.\n`);
     roomSnapshotCache.refresh();
     res.json({ name, cwd: dir });
+  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
+});
+
+app.post('/api/rooms/:name/rename', (req, res) => {
+  try {
+    const oldName = req.params.name;
+    const newName = String(req.body?.name || '').trim();
+    if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(newName)) {
+      throw httpError(400, 'bad room name (lowercase, digits, dashes)');
+    }
+    if (!listRoomDirs().includes(oldName)) throw httpError(404, 'no such room');
+    if (oldName === newName) return res.json({ ok: true, name: newName, cwd: path.join(ROOMS_HOME_DIR, newName) });
+    if (fs.existsSync(path.join(ROOMS_HOME_DIR, newName))) throw httpError(409, 'room exists');
+
+    const oldDir = path.join(ROOMS_HOME_DIR, oldName);
+    const newDir = path.join(ROOMS_HOME_DIR, newName);
+    if (!fs.lstatSync(oldDir).isDirectory()) throw httpError(409, 'symlinked rooms cannot be renamed in Feather');
+    const room = buildRoomsSnapshot().find(candidate => candidate.name === oldName);
+    fs.renameSync(oldDir, newDir);
+
+    ROOM_ASSIGN_STATE.update(current => {
+      const next = { ...current };
+      for (const [sessionId, assignedRoom] of Object.entries(next)) {
+        if (assignedRoom === oldName) next[sessionId] = newName;
+      }
+      for (const session of room?.sessions || []) next[session.id] = newName;
+      return next;
+    });
+    ROOM_PULSES_STATE.update(current => {
+      if (!(oldName in current)) return current;
+      const next = { ...current, [newName]: current[oldName] };
+      delete next[oldName];
+      return next;
+    });
+
+    const meta = readMeta();
+    let metaChanged = false;
+    for (const session of room?.sessions || []) {
+      if (session.cwd !== oldDir) continue;
+      meta[session.id] = { ...(meta[session.id] || {}), cwd: newDir, cwdOverride: newDir };
+      metaChanged = true;
+    }
+    if (metaChanged) writeMeta(meta);
+
+    for (const [file, before, after] of [
+      ['AGENTS.md', `# Room: #${oldName}`, `# Room: #${newName}`],
+      ['notes.md', `# #${oldName} — notes`, `# #${newName} — notes`],
+    ]) {
+      const target = path.join(newDir, file);
+      try {
+        const contents = fs.readFileSync(target, 'utf8');
+        if (contents.includes(before)) fs.writeFileSync(target, contents.replace(before, after));
+      } catch {}
+    }
+
+    // A rename changes cwd metadata as well as room membership. Rebuild the
+    // session index first so the room response returned after this mutation is
+    // internally consistent instead of briefly serving the old cwd.
+    sessionsSnapshotCache.refresh();
+    roomSnapshotCache.refresh();
+    res.json({ ok: true, name: newName, cwd: newDir });
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
@@ -2527,7 +2592,7 @@ app.post('/api/sidecar', (req, res) => {
   const {
     driverSessionId,
     driverRole = 'driver',
-    agent = 'claude',
+    agent = DEFAULT_AGENT,
     task = '',
   } = body;
   if (!driverSessionId) return res.status(400).json({ error: 'driverSessionId required' });
@@ -2605,7 +2670,7 @@ app.post('/api/sidecar/:id/peers', (req, res) => {
   try {
     const group = sidecar.getGroup(req.params.id);
     if (!group || group.status !== 'active') return res.status(404).json({ error: 'no active room' });
-    const { role = 'peer', agent = group.agent || 'claude', task = '' } = req.body || {};
+    const { role = 'peer', agent = group.agent || DEFAULT_AGENT, task = '' } = req.body || {};
     const peerId = crypto.randomUUID();
     sidecar.addMember(group.id, { sessionId: peerId, role, spawned: true });
     const driver = group.members.find(member => !member.spawned);

@@ -45,7 +45,7 @@ export function SidecarThread(props: {
   async function addPeer() {
     const id = props.id(); if (!id) return
     const role = (prompt('Role for the new peer (e.g. critic-perf):') || '').trim(); if (!role) return
-    const agent = (prompt('Agent (claude / codex):', 'claude') || 'claude').trim()
+    const agent = (prompt('Agent (omp / claude / codex):', 'omp') || 'omp').trim()
     const task = prompt('Task / rubric for this peer (optional):') ?? ''
     try { await addSidecarPeer(id, role, { agent, task }); await reload() }
     catch (e: any) { alert('Add peer failed: ' + (e?.message || e)) }

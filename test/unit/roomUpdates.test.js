@@ -123,5 +123,17 @@ describe('room updates API', () => {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: 'x' }),
     })).status, 404)
     assert.equal((await fetch(`${base}/api/rooms/nope/updates`)).status, 404)
+
+    const renamed = await fetch(`${base}/api/rooms/demo/rename`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'renamed-demo' }),
+    })
+    assert.equal(renamed.status, 200, stderr)
+    assert.equal(fs.existsSync(path.join(root, 'rooms/demo')), false)
+    assert.equal(fs.existsSync(path.join(root, 'rooms/renamed-demo/updates.jsonl')), true)
+    assert.match(fs.readFileSync(path.join(root, 'rooms/renamed-demo/AGENTS.md'), 'utf8'), /# Room: #renamed-demo/)
+    const afterRename = await (await fetch(`${base}/api/rooms`)).json()
+    assert.ok(afterRename.rooms.some(room => room.name === 'renamed-demo'))
+    assert.ok(!afterRename.rooms.some(room => room.name === 'demo'))
+    assert.equal((await fetch(`${base}/api/rooms/renamed-demo/updates`)).status, 200)
   })
 })
