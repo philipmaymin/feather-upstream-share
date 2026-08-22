@@ -25,6 +25,7 @@ describe('Room keep-working scheduler', () => {
     const stateDir = path.join(root, 'state')
     const binDir = path.join(root, 'bin')
     const tmuxLog = path.join(root, 'tmux.log')
+    const tmuxReg = path.join(root, 'tmux.reg')
     const activeId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
     const rooms = ['active', 'idle', 'broken']
     fs.mkdirSync(path.join(home, '.feather'), { recursive: true })
@@ -41,7 +42,16 @@ describe('Room keep-working scheduler', () => {
     fs.writeFileSync(path.join(activeProject, `${activeId}.jsonl`), sessionLine(activeId, path.join(home, 'rooms/active'), 'still working'))
     const due = (sessionId = null) => ({ enabled: true, status: 'waiting', lastRunAt: null, nextRunAtMs: 1, sessionId, error: null })
     fs.writeFileSync(path.join(home, '.feather/room-pulses.json'), JSON.stringify({ active: due(), idle: due(), broken: due() }))
-    fs.writeFileSync(path.join(binDir, 'tmux'), `#!/bin/sh\nif [ "$1" = list-sessions ]; then printf 'f-aaaaaaaa|%s\\n' "$(date +%s)"; exit 0; fi\nif [ "$1" = has-session ] && [ "$3" = f-aaaaaaaa ]; then exit 0; fi\nif [ "$1" = new-session ]; then case "$*" in *rooms/broken*) exit 1;; esac; printf '%s\\n' "$*" >>"$TMUX_TEST_LOG"; exit 0; fi\nexit 1\n`)
+    fs.writeFileSync(tmuxReg, 'f-aaaaaaaa\n')
+    fs.writeFileSync(path.join(binDir, 'tmux'), [
+      '#!/bin/sh',
+      'case "$1" in',
+      '  list-sessions) now=$(date +%s); while IFS= read -r name; do printf "%s|%s\\n" "$name" "$now"; done < "$TMUX_REG"; exit 0 ;;',
+      '  has-session) grep -qxF "$3" "$TMUX_REG"; exit $? ;;',
+      '  new-session) case "$*" in *rooms/broken*) exit 1;; esac; args="$*"; name=""; while [ $# -gt 0 ]; do [ "$1" = "-s" ] && name="$2"; shift; done; [ -n "$name" ] && printf "%s\\n" "$name" >> "$TMUX_REG"; printf "%s\\n" "$args" >> "$TMUX_TEST_LOG"; exit 0 ;;',
+      'esac',
+      'exit 0',
+    ].join('\n'))
     fs.chmodSync(path.join(binDir, 'tmux'), 0o755)
 
     const port = 29_000 + (process.pid % 1000)
@@ -50,7 +60,7 @@ describe('Room keep-working scheduler', () => {
       env: {
         ...process.env, HOME: home, FEATHER_STATE_DIR: stateDir, PORT: String(port),
         FEATHER_ROOM_PULSE_CHECK_MS: '50', FEATHER_ROOM_PULSE_INTERVAL_MS: '60000',
-        PATH: `${binDir}:${process.env.PATH}`, TMUX_TEST_LOG: tmuxLog,
+        PATH: `${binDir}:${process.env.PATH}`, TMUX_TEST_LOG: tmuxLog, TMUX_REG: tmuxReg,
       },
       stdio: ['ignore', 'ignore', 'pipe'],
     })
