@@ -1,5 +1,5 @@
 import { createSignal, onMount, onCleanup, Show, For } from 'solid-js'
-import { fetchRooms, cachedRoomsSnapshot, createRoom, createSession, assignSessionToRoom } from './api'
+import { fetchRooms, cachedRoomsSnapshot, fetchSessions, searchSessions, createRoom, createSession, assignSessionToRoom } from './api'
 import type { RoomInfo, SessionMeta } from './api'
 
 // Full-screen rooms home (iMessage model, phone-first): one row per room
@@ -30,6 +30,12 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
   const [error, setError] = createSignal<string | null>(null)
   const [expanded, setExpanded] = createSignal<string | null>(null)
   const [busy, setBusy] = createSignal(false)
+  const [attachLoading, setAttachLoading] = createSignal(false)
+  const [attachingRoom, setAttachingRoom] = createSignal<string | null>(null)
+  const [attachCandidates, setAttachCandidates] = createSignal<SessionMeta[]>([])
+  const [recentAttachSessions, setRecentAttachSessions] = createSignal<SessionMeta[] | null>(null)
+  const [attachError, setAttachError] = createSignal<string | null>(null)
+  const [attachQuery, setAttachQuery] = createSignal('')
 
   async function refresh(useWarmSnapshot = false) {
     try { setRooms(await fetchRooms(useWarmSnapshot ? 1000 : 0)); setError(null) }
@@ -62,6 +68,53 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
     finally { setBusy(false) }
   }
 
+  async function loadAttachCandidates(query = '') {
+    setAttachError(null)
+    try {
+      let sessions = !query ? recentAttachSessions() : null
+      if (!sessions) {
+        setAttachLoading(true)
+        sessions = query ? await searchSessions(query) : await fetchSessions(null, undefined, 300)
+        if (!query) setRecentAttachSessions(sessions)
+      }
+      const groupedIds = new Set((rooms() || []).flatMap(current => current.sessions.map(session => session.id)))
+      setAttachCandidates(sessions.filter(session => !groupedIds.has(session.id)))
+    } catch (e: any) { setAttachError(e.message) }
+    finally { setAttachLoading(false) }
+  }
+
+  async function showAttach(room: RoomInfo) {
+    if (attachingRoom() === room.name) { setAttachingRoom(null); setAttachError(null); return }
+    setAttachingRoom(room.name)
+    setAttachQuery('')
+    setAttachCandidates([])
+    await loadAttachCandidates()
+  }
+
+  async function attachSession(room: RoomInfo, session: SessionMeta) {
+    setBusy(true)
+    try {
+      await assignSessionToRoom(room.name, session.id)
+      setAttachCandidates(sessions => sessions.filter(candidate => candidate.id !== session.id))
+      setRecentAttachSessions(null)
+      await refresh()
+      props.onSessionsChanged?.()
+    } catch (e: any) { setAttachError(e.message) }
+    finally { setBusy(false) }
+  }
+
+  async function detachSession(room: RoomInfo, session: SessionMeta, event: MouseEvent) {
+    event.stopPropagation()
+    setBusy(true)
+    try {
+      await assignSessionToRoom(room.name, session.id, true)
+      setRecentAttachSessions(null)
+      await refresh()
+      props.onSessionsChanged?.()
+    } catch (e: any) { alert(e.message) }
+    finally { setBusy(false) }
+  }
+
   // Tap the card → open the newest chat (iMessage model). The chevron (or a
   // room with no chats) expands the card to show all chats + new-chat buttons.
   function openRoom(room: RoomInfo) {
@@ -79,6 +132,11 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
       <span style={{ width: '7px', height: '7px', 'border-radius': '50%', background: s.isActive ? '#4aba6a' : '#333', 'flex-shrink': '0' }} />
       <span style={{ 'font-size': '9px', padding: '1px 5px', 'border-radius': '3px', background: agentBg(s.agent), color: agentColor(s.agent), 'flex-shrink': '0', 'font-weight': '600' }}>{s.agent || 'claude'}</span>
       <span style={{ flex: '1', 'font-size': '13px', color: '#ccc', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{s.title}</span>
+      <Show when={s.roomAssigned}>
+        <button data-testid={`detach-${s.id}`} aria-label={`Detach ${s.title} from #${room.name}`} disabled={busy()}
+          onClick={(event) => detachSession(room, s, event)}
+          style={{ background: 'none', border: 'none', color: '#777', 'font-size': '11px', padding: '3px 5px', cursor: 'pointer', 'flex-shrink': '0' }}>Detach</button>
+      </Show>
       <span style={{ 'font-size': '11px', color: '#555', 'font-family': 'monospace', 'flex-shrink': '0' }}>{timeAgo(s.updatedAt)}</span>
     </div>
   )
@@ -121,12 +179,43 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
                 </div>
                 <Show when={expanded() === room.name}>
                   <For each={room.sessions}>{(s) => sessionRow(room, s)}</For>
-                  <div style={{ display: 'flex', gap: '8px', padding: '10px 16px 12px 28px', 'border-top': '1px solid #16161f' }}>
+                  <div style={{ display: 'flex', 'flex-wrap': 'wrap', gap: '8px', padding: '10px 16px 12px 28px', 'border-top': '1px solid #16161f' }}>
                     <button onClick={() => newChat(room)} disabled={busy()}
                       style={{ background: '#152a1c', border: '1px solid #2a4a34', color: '#4aba6a', 'font-size': '12px', 'font-weight': '600', padding: '5px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>+ New chat here</button>
                     <button onClick={() => newChat(room, 'codex')} disabled={busy()}
                       style={{ background: 'none', border: '1px solid #333', color: '#c084fc', 'font-size': '12px', padding: '5px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>codex</button>
+                    <button data-testid={`attach-existing-${room.name}`} onClick={() => showAttach(room)} disabled={busy()}
+                      style={{ 'margin-left': 'auto', background: 'none', border: '1px solid #333', color: '#9aa4b2', 'font-size': '12px', padding: '5px 10px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                      {attachingRoom() === room.name ? 'Close' : 'Attach existing'}
+                    </button>
                   </div>
+                  <Show when={attachingRoom() === room.name}>
+                    <div data-testid={`attach-picker-${room.name}`} style={{ 'border-top': '1px solid #16161f', padding: '6px 16px 10px 28px' }}>
+                      <form onSubmit={(event) => { event.preventDefault(); loadAttachCandidates(attachQuery().trim()) }}
+                        style={{ display: 'flex', gap: '6px', padding: '5px 0 3px' }}>
+                        <input data-testid={`attach-search-${room.name}`} value={attachQuery()} onInput={(event) => setAttachQuery(event.currentTarget.value)}
+                          aria-label={`Search chats to attach to #${room.name}`} placeholder="Search all chats"
+                          style={{ flex: '1', 'min-width': '0', background: '#090d12', border: '1px solid #292f38', color: '#ddd', 'font-size': '12px', padding: '6px 8px', 'border-radius': '7px', outline: 'none' }} />
+                        <button type="submit" disabled={attachLoading()}
+                          style={{ background: 'none', border: '1px solid #333', color: '#9aa4b2', 'font-size': '11px', padding: '5px 9px', 'border-radius': '7px', cursor: 'pointer' }}>Search</button>
+                      </form>
+                      <Show when={attachError()}>
+                        <div style={{ color: '#d45555', 'font-size': '12px', padding: '6px 0' }}>{attachError()}</div>
+                      </Show>
+                      <Show when={attachCandidates().length > 0} fallback={
+                        <div style={{ color: '#666', 'font-size': '12px', padding: '7px 0' }}>{attachLoading() ? 'Loading chats…' : attachQuery().trim() ? 'No matching ungrouped chats.' : 'No ungrouped recent chats.'}</div>
+                      }>
+                        <For each={attachCandidates()}>{(session) => (
+                          <button data-testid={`attach-${session.id}`} disabled={busy()} onClick={() => attachSession(room, session)}
+                            style={{ display: 'flex', width: '100%', 'align-items': 'center', gap: '8px', background: 'none', border: 'none', color: '#bbb', padding: '7px 0', cursor: 'pointer', 'text-align': 'left' }}>
+                            <span style={{ 'font-size': '9px', padding: '1px 5px', 'border-radius': '3px', background: agentBg(session.agent), color: agentColor(session.agent), 'font-weight': '600' }}>{session.agent || 'claude'}</span>
+                            <span style={{ flex: '1', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', 'font-size': '12px' }}>{session.title}</span>
+                            <span style={{ color: '#4aba6a', 'font-size': '11px' }}>Attach</span>
+                          </button>
+                        )}</For>
+                      </Show>
+                    </div>
+                  </Show>
                 </Show>
               </div>
             )}</For>

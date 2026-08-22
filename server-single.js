@@ -18,6 +18,7 @@ import { createSnapshotCache } from './lib/snapshot-cache.js';
 import { paneHasReadyPrompt } from './lib/terminal-ready.js';
 import { ensureStateLayout, resolveStatePaths } from './lib/state-paths.js';
 import { createJsonState, isJsonRecord } from './lib/json-state.js';
+import { encodeProjectPath, groupRoomSessions } from './lib/rooms.js';
 
 // Load ~/.env if present
 try {
@@ -762,7 +763,7 @@ function summarizeReply(text) {
 
 const SESSION_SOURCE_MTIME = Symbol('sessionSourceMtime');
 
-function discoverSessions(limit = 50, projectFilter) {
+function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
   const projDir = projectsDir();
   const candidates = [];
   const meta = readMeta();
@@ -852,14 +853,17 @@ function discoverSessions(limit = 50, projectFilter) {
   });
 
   const filtered = withInfo.filter(c => !c.info.isTitleGen && !c.info.isWorker);
-  const top = filtered.slice(0, limit).sort((a, b) => b.mtime - a.mtime);
+  const required = new Set(requiredIds);
+  const top = filtered
+    .filter((candidate, index) => index < limit || required.has(candidate.id))
+    .sort((a, b) => b.mtime - a.mtime);
   const active = getActiveTmuxSessions();
   const now = Date.now();
   const labels = readUserJson('project-labels.json', {});
 
   const sessions = top.map(({ id, fpath, mtime, projectId: candidateProjectId, agent, info }) => {
     const cwd = info.cwd || meta[id]?.cwd || (candidateProjectId ? projectIdToCwd(candidateProjectId) : null) || null;
-    const projectId = candidateProjectId || (cwd ? cwd.replace(/[/.]/g, '-') : null);
+    const projectId = candidateProjectId || (cwd ? encodeProjectPath(cwd) : null);
     const activityMs = lastActivityMs(fpath, agent, mtime.getTime());
     const session = {
       id, title: meta[id]?.title || info.firstUserText || id.slice(0, 8),
@@ -1574,19 +1578,19 @@ function lastRoomMessageSnippet(sessionId, agent) {
 function buildRoomsSnapshot() {
   const names = listRoomDirs();
   const assignments = readRoomAssignments();
-  const allSessions = sessionsSnapshotCache.get();
-  const byRoom = new Map(names.map(name => [name, []]));
-
-  for (const session of allSessions) {
-    let room = assignments[session.id];
-    if (!room) {
-      room = names.find(name => {
-        const roomProjectId = path.join(ROOMS_HOME_DIR, name).replace(/[/.]/g, '-');
-        return session.projectId === roomProjectId;
-      });
-    }
-    if (room && byRoom.has(room)) byRoom.get(room).push(session);
-  }
+  const recentSessions = sessionsSnapshotCache.get();
+  const recentIds = new Set(recentSessions.map(session => session.id));
+  const missingAssignedIds = Object.keys(assignments).filter(id => !recentIds.has(id));
+  const assignedHistory = missingAssignedIds.length
+    ? discoverSessions(0, null, missingAssignedIds)
+    : [];
+  const allSessions = [...recentSessions, ...assignedHistory];
+  const byRoom = groupRoomSessions({
+    roomNames: names,
+    roomsRoot: ROOMS_HOME_DIR,
+    sessions: allSessions,
+    assignments,
+  });
 
   const rooms = names.map(name => {
     const sessions = byRoom.get(name);

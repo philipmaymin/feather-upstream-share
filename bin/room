@@ -15,6 +15,8 @@
 #   room council "<task>" [-n N]       N sealed attempts (claude+codex) + judge
 #   room second-opinion "<question>"   ask the other harness
 #   room spawn "<task>"                resumable Feather session in the room cwd
+#   room attach <session-id>            attach an existing Feather chat
+#   room detach <session-id>            remove its explicit Room assignment
 #   room handoff                       distill latest room session into notes.md
 #
 # Room resolution: -r <name> flag, $ROOM env, or cwd under ~/rooms/<name>.
@@ -284,6 +286,21 @@ cmd_spawn() {
   echo "spawned session $id in #$ROOM_NAME (visible in Feather, resumable)"
 }
 
+cmd_assignment() { # $1 = attach|detach, $2 = session id
+  local action="$1" session_id="${2:-}"
+  [ -n "$session_id" ] || die "usage: room $action <session-id>"
+  resolve_room
+  local remove=false verb=attached preposition=to
+  if [ "$action" = detach ]; then remove=true; verb=detached; preposition=from; fi
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"sessionId": sys.argv[1], "remove": sys.argv[2] == "true"}))' \
+    "$session_id" "$remove")
+  curl -sf -X POST "$FEATHER_URL/api/rooms/$ROOM_NAME/assign" \
+    -H 'Content-Type: application/json' -d "$payload" >/dev/null \
+    || die "feather refused to $action session $session_id"
+  echo "$verb session $session_id $preposition #$ROOM_NAME"
+}
+
 cmd_handoff() {
   resolve_room
   new_run_dir handoff
@@ -335,6 +352,7 @@ case "$cmd" in
   council) cmd_council "$@" ;;
   second-opinion|so) cmd_second_opinion "$@" ;;
   spawn) cmd_spawn "$@" ;;
+  attach|detach) cmd_assignment "$cmd" "$@" ;;
   handoff) cmd_handoff "$@" ;;
   *) die "unknown command: $cmd" ;;
 esac

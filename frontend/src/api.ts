@@ -17,6 +17,7 @@ export interface SessionMeta {
   agent?: 'claude' | 'codex' | 'omp'
   outcome?: 'finished' | 'errored' | null
   summary?: string | null
+  roomAssigned?: boolean
 }
 
 export interface AgentInfo {
@@ -85,16 +86,14 @@ export async function createRoom(name: string): Promise<{ name: string; cwd: str
   return responseJson(response)
 }
 
-export const assignSessionToRoom = (room: string, sessionId: string, remove = false) =>
-  fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/assign`, {
+export const assignSessionToRoom = async (room: string, sessionId: string, remove = false) => {
+  const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/assign`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ sessionId, remove }),
-  }).then(async response => {
-    const body = await response.json().catch(() => ({}))
-    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`)
-    return body
   })
+  return responseJson<{ ok: true, assignments: Record<string, string> }>(response)
+}
 
 export interface ContentBlock {
   type: string
@@ -123,9 +122,11 @@ export interface Message {
   internal?: boolean
 }
 
-export async function fetchSessions(project?: string | null): Promise<SessionMeta[]> {
+export async function fetchSessions(project?: string | null, query?: string, limit?: number): Promise<SessionMeta[]> {
   const params = new URLSearchParams()
   if (project) params.set('project', project)
+  if (query) params.set('q', query)
+  if (limit) params.set('limit', String(limit))
   const qs = params.toString()
   const r = await fetch(`${BASE}/api/sessions${qs ? '?' + qs : ''}`)
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
