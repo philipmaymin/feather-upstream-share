@@ -29,6 +29,10 @@ try {
 } catch {}
 
 const DEEPGRAM_API_KEY = process.env.FEATHER_DEEPGRAM_API_KEY || '';
+const envEnabled = value => /^(1|true|yes|on)$/i.test(String(value || '').trim());
+const READ_ONLY_MODE = envEnabled(process.env.FEATHER_READ_ONLY);
+const READ_ONLY_ERROR = Object.freeze({ error: 'read-only canary', code: 'FEATHER_READ_ONLY' });
+const SESSION_READ_ROUTE = /^\/api\/sessions\/[^/]+\/(messages|stream|export)$/;
 
 const PORT = parseInt(process.env.PORT || '4870');
 const HOME = process.env.HOME || '/home/user';
@@ -52,8 +56,10 @@ const CODEX_SESSIONS_ROOT = STATE_PATHS.harness.codexSessionsDir;
 // prompt. Keep enough headroom to find cwd, titles, and worker markers.
 const CODEX_HEAD_BYTES = 256 * 1024;
 const OMP_SESSIONS = STATE_PATHS.harness.ompSessionsDir;
-if (process.env.FEATHER_STATE_DIR) ensureStateLayout(STATE_PATHS);
-try { fs.mkdirSync(OMP_SESSIONS, { recursive: true }); } catch {}
+if (!READ_ONLY_MODE && process.env.FEATHER_STATE_DIR) ensureStateLayout(STATE_PATHS);
+if (!READ_ONLY_MODE) {
+  try { fs.mkdirSync(OMP_SESSIONS, { recursive: true }); } catch {}
+}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 // ── Per-user path helpers ───────────────────────────────────────────────────
@@ -86,13 +92,13 @@ function projectIdToCwd(projectId) {
 
 function featherDir() {
   const d = STATE_PATHS.instance.root;
-  if (!fs.existsSync(d)) try { fs.mkdirSync(d, { recursive: true }); } catch {}
+  if (!READ_ONLY_MODE && !fs.existsSync(d)) try { fs.mkdirSync(d, { recursive: true }); } catch {}
   return d;
 }
 
 function uploadsDir() {
   const d = INSTANCE_UPLOADS_DIR;
-  if (!fs.existsSync(d)) try { fs.mkdirSync(d, { recursive: true }); } catch {}
+  if (!READ_ONLY_MODE && !fs.existsSync(d)) try { fs.mkdirSync(d, { recursive: true }); } catch {}
   return d;
 }
 
@@ -974,7 +980,7 @@ async function generateTitle(sessionId, firstMessage) {
   titleQueue.delete(sessionId);
 }
 
-setInterval(() => {
+if (!READ_ONLY_MODE) setInterval(() => {
   const projDir = projectsDir();
   if (!fs.existsSync(projDir)) return;
   const meta = readMeta();
@@ -1228,7 +1234,7 @@ function broadcastQuestion(sessionId, question) {
   }
 }
 
-setInterval(() => {
+if (!READ_ONLY_MODE) setInterval(() => {
   try {
     for (const [sid, clients] of sseClients.entries()) {
       if (clients.size === 0) continue;
@@ -1407,6 +1413,35 @@ initCodexWatchers();
 
 const app = express();
 app.use(express.json());
+
+// An allowlist keeps future GET handlers with side effects closed until they
+// are explicitly classified, while static and non-API reads remain available.
+const READ_ONLY_API_ROUTES = [
+  /^\/api\/health$/,
+  /^\/api\/(agents|rooms|version|projects|search|sessions|running|usage|digest|me)$/,
+  SESSION_READ_ROUTE,
+  /^\/api\/sidecar$/,
+  /^\/api\/sidecar\/[^/]+$/,
+  /^\/api\/sidecar\/[^/]+\/stream$/,
+  /^\/api\/quick-links$/,
+  /^\/api\/mute$/,
+  /^\/api\/push\/subscribe$/,
+  /^\/api\/starred$/,
+  /^\/api\/starred\/album$/,
+  /^\/api\/files\/(list|raw|html)$/,
+];
+
+function readOnlyRequestAllowed(req) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+  if (!req.path.startsWith('/api')) return true;
+  return READ_ONLY_API_ROUTES.some(pattern => pattern.test(req.path));
+}
+
+app.use((req, res, next) => {
+  if (!READ_ONLY_MODE || readOnlyRequestAllowed(req)) return next();
+  res.setHeader('Cache-Control', 'no-store');
+  return res.status(403).json(READ_ONLY_ERROR);
+});
 app.use(compression({ filter: (req) => !req.headers.accept?.includes('text/event-stream') }));
 
 app.use(express.static(STATIC_DIR, {
@@ -1428,7 +1463,16 @@ app.use('/home/user/feather-uploads', express.static('/home/user/feather-uploads
 
 // ── API routes ─────────────────────────────────────────────────────────────
 
-app.get('/api/health', (_req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+app.get('/api/health', (_req, res) => res.json({
+  status: 'ok', uptime: process.uptime(),
+  capabilities: {
+    readOnly: READ_ONLY_MODE,
+    mutations: !READ_ONLY_MODE,
+    terminal: !READ_ONLY_MODE,
+    shell: !READ_ONLY_MODE,
+    backgroundControllers: !READ_ONLY_MODE,
+  },
+}));
 
 // Detect an optional agent's version via the interactive-rc shell so binaries
 // under ~/.npm-global/bin (codex, omp) resolve the same way they do when spawned
@@ -2129,6 +2173,7 @@ function sidecarBroadcast(groupId, msg) {
 }
 
 function sidecarGcIfDriverGone(group) {
+  if (READ_ONLY_MODE) return false;
   const driver = group.members.find(member => !member.spawned);
   if (!driver || tmuxIsActive(driver.sessionId)) return false;
   for (const member of group.members) {
@@ -2481,7 +2526,7 @@ async function pushCheck() {
   } catch {}
 }
 
-if (process.env.FEATHER_PUSH_POLL !== '0') setInterval(pushCheck, 60000).unref();
+if (!READ_ONLY_MODE && process.env.FEATHER_PUSH_POLL !== '0') setInterval(pushCheck, 60000).unref();
 
 app.get('/api/starred', (_req, res) => res.json(readUserJson('starred.json', {})));
 
@@ -2637,7 +2682,7 @@ function reapIdleSessions() {
   }
 }
 
-setInterval(reapIdleSessions, 5 * 60 * 1000);
+if (!READ_ONLY_MODE) setInterval(reapIdleSessions, 5 * 60 * 1000);
 
 // ── File browser API ──────────────────────────────────────────────────────
 
@@ -2768,6 +2813,21 @@ const wss = new WebSocketServer({ noServer: true });
 const sttWss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
+  if (READ_ONLY_MODE) {
+    const pathname = (() => { try { return new URL(req.url, 'http://localhost').pathname; } catch { return ''; } })();
+    if (/(?:^|\/)api\/(terminal|shell|stt)$/.test(pathname)) {
+      const body = JSON.stringify(READ_ONLY_ERROR);
+      socket.end([
+        'HTTP/1.1 403 Forbidden',
+        'Content-Type: application/json',
+        'Cache-Control: no-store',
+        `Content-Length: ${Buffer.byteLength(body)}`,
+        'Connection: close',
+        '', body,
+      ].join('\r\n'));
+      return;
+    }
+  }
   if (req.url?.startsWith('/api/terminal') || req.url?.startsWith('/api/shell')) {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
   } else if (req.url?.startsWith('/api/stt')) {
