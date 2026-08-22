@@ -83,12 +83,19 @@ describe('room assignment CLI', () => {
       ])
       await run(cli, ['pause'], { cwd: roomDir, env })
       await run(cli, ['wake'], { cwd: roomDir, env })
-      assert.match(fs.readFileSync(path.join(roomsDir, 'friction/notes.md'), 'utf8'), /Complaint from #health: The upload button loses my file/)
-      assert.match(fs.readFileSync(path.join(roomsDir, 'friction/notes.md'), 'utf8'), /Complaint from #health: The table gets crushed on mobile/)
-      assert.deepEqual(requests, [
+      for (let attempt = 0; attempt < 200 && requests.filter(request => request.url === '/api/rooms/friction/pulse').length < 2; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      const notes = fs.readFileSync(path.join(roomsDir, 'friction/notes.md'), 'utf8')
+      assert.match(notes, /Complaint from #health: The upload button loses my file/)
+      assert.match(notes, /Complaint from #health: The table gets crushed on mobile/)
+      assert.deepEqual(requests.filter(request => request.url === '/api/rooms/health/pulse'), [
         { url: '/api/rooms/health/pulse', body: { enabled: false } },
         { url: '/api/rooms/health/pulse', body: { enabled: true } },
       ])
+      const frictionWakes = requests.filter(request => request.url === '/api/rooms/friction/pulse')
+      assert.equal(frictionWakes.length, 2)
+      assert.ok(frictionWakes.every(request => request.body.enabled === true))
     } finally {
       await new Promise((resolve) => server.close(resolve))
     }

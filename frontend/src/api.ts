@@ -44,6 +44,7 @@ export interface RoomInfo {
   active: boolean
   latest: { role: string; text: string } | null
   updatedAt: string | null
+  updates: { count: number; latestAt: string | null; latest: string | null }
   pulse: {
     enabled: boolean
     status: 'waiting' | 'working' | 'paused' | 'error'
@@ -62,6 +63,7 @@ let roomsFetchedAt = 0
 function normalizeRoom(room: RoomInfo): RoomInfo {
   return {
     ...room,
+    updates: room.updates || { count: 0, latestAt: null, latest: null },
     pulse: room.pulse || {
       enabled: true, status: 'waiting', lastRunAt: null,
       nextRunAt: null, sessionId: null, error: null,
@@ -95,6 +97,13 @@ export async function fetchRooms(maxAgeMs = 0): Promise<RoomInfo[]> {
   })()
   try { return await roomsRequest }
   finally { roomsRequest = null }
+}
+
+export interface RoomUpdate { id: string | null; ts: string | null; text: string }
+
+export async function fetchRoomUpdates(room: string): Promise<RoomUpdate[]> {
+  const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/updates`)
+  return (await responseJson<{ updates: RoomUpdate[] }>(response)).updates
 }
 
 export async function createRoom(name: string): Promise<{ name: string; cwd: string }> {

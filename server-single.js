@@ -1470,6 +1470,7 @@ app.use(express.json());
 const READ_ONLY_API_ROUTES = [
   /^\/api\/health$/,
   /^\/api\/(agents|rooms|version|projects|search|sessions|running|usage|digest|me)$/,
+  /^\/api\/rooms\/[^/]+\/updates$/,
   SESSION_READ_ROUTE,
   /^\/api\/sidecar$/,
   /^\/api\/sidecar\/[^/]+$/,
@@ -1671,6 +1672,50 @@ function lastRoomMessageSnippet(sessionId, agent) {
   return null;
 }
 
+// Human-facing room briefings are separate from terse agent working memory in
+// notes.md. The JSONL feed is append-only so its count is a stable unread marker.
+const ROOM_UPDATE_MAX_CHARS = 4000;
+function roomUpdatesFile(name) { return path.join(ROOMS_HOME_DIR, name, 'updates.jsonl'); }
+
+function readRoomUpdates(name) {
+  let raw;
+  try { raw = fs.readFileSync(roomUpdatesFile(name), 'utf8'); } catch { return []; }
+  const updates = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry && typeof entry.text === 'string') {
+        updates.push({
+          id: typeof entry.id === 'string' ? entry.id : null,
+          ts: typeof entry.ts === 'string' ? entry.ts : null,
+          text: entry.text,
+        });
+      }
+    } catch {}
+  }
+  return updates;
+}
+
+function roomUpdatesSummary(name) {
+  const updates = readRoomUpdates(name);
+  const newest = updates[updates.length - 1] || null;
+  return {
+    count: updates.length,
+    latestAt: newest?.ts || null,
+    latest: newest ? newest.text.replace(/\s+/g, ' ').trim().slice(0, 180) : null,
+  };
+}
+
+function appendRoomUpdate(name, text) {
+  const clean = String(text == null ? '' : text).trim();
+  if (!clean) throw httpError(400, 'update text is required');
+  if (clean.length > ROOM_UPDATE_MAX_CHARS) throw httpError(413, `update exceeds ${ROOM_UPDATE_MAX_CHARS} characters`);
+  const entry = { id: randomUUID(), ts: new Date().toISOString(), text: clean };
+  fs.appendFileSync(roomUpdatesFile(name), JSON.stringify(entry) + '\n');
+  return entry;
+}
+
 function buildRoomsSnapshot() {
   const names = listRoomDirs();
   const assignments = readRoomAssignments();
@@ -1712,6 +1757,7 @@ function buildRoomsSnapshot() {
       pulse: roomPulse(name, Date.now(), pulseState),
       latest,
       updatedAt,
+      updates: roomUpdatesSummary(name),
     };
   });
   rooms.sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
@@ -1795,7 +1841,26 @@ app.post('/api/rooms/:name/pulse', (req, res) => {
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
-const ROOM_PULSE_PROMPT = `Keep working on this room. Read AGENTS.md, notes.md, and the recent chats in this room. Then do the next useful thing fully autonomously. Do not ask the user to choose routine steps. Use tools and agents if useful. Append what you did and any open thread to notes.md. If you hit a recurring annoyance, run: room complain "describe it plainly". If this room genuinely has no useful next action, run: room pause. Then stop.`;
+app.get('/api/rooms/:name/updates', (req, res) => {
+  try {
+    const { name } = req.params;
+    if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
+    res.json({ updates: readRoomUpdates(name) });
+  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
+});
+
+app.post('/api/rooms/:name/updates', (req, res) => {
+  try {
+    const { name } = req.params;
+    if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
+    const entry = appendRoomUpdate(name, req.body?.text);
+    roomSnapshotCache.update(rooms => rooms.map(room =>
+      room.name === name ? { ...room, updates: roomUpdatesSummary(name) } : room));
+    res.json({ ok: true, update: entry });
+  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
+});
+
+const ROOM_PULSE_PROMPT = `Keep working on this room. Read AGENTS.md, notes.md, and the recent chats in this room. Then do the next useful thing fully autonomously. Do not ask the user to choose routine steps. Use tools and agents if useful. Append what you did and any open thread to notes.md. If you did something a person walking in cold would care about, also post a human-facing briefing: room update "<what happened and why it matters>". Write that update for a busy, sharp executive who has not seen this room in a day — plain language, lead with the outcome and why they should care, a few sentences over terseness; notes.md stays your terse working memory. If you hit a recurring annoyance, run: room complain "describe it plainly". If this room genuinely has no useful next action, run: room pause. Then stop.`;
 
 function launchRoomPulse(name) {
   try {

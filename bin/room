@@ -11,6 +11,8 @@
 #   room new <name>                    scaffold a room folder
 #   room list                          list rooms
 #   room note "<text>"                 append a timestamped note to notes.md
+#   room update "<text>"               post a human-facing briefing
+#   room updates                       list this room's updates feed
 #   room complain "<text>"             add an annoyance to #friction
 #   room pause                          stop automatic checks for this room
 #   room wake                           resume automatic checks for this room
@@ -149,6 +151,37 @@ cmd_note() {
   echo "noted in #$ROOM_NAME"
 }
 
+cmd_update() {
+  resolve_room
+  [ -n "${1:-}" ] || die 'usage: room update "<what happened and why it matters>"'
+  local line
+  line=$(python3 -c 'import json,sys,uuid,datetime; print(json.dumps({"id":uuid.uuid4().hex,"ts":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),"text":sys.argv[1]}))' "$1") \
+    || die "could not encode update"
+  [ -d "$ROOM_PATH" ] || die "no such room: $ROOM_NAME"
+  printf '%s\n' "$line" >>"$ROOM_PATH/updates.jsonl" || die "could not write update to #$ROOM_NAME"
+  echo "posted update to #$ROOM_NAME"
+}
+
+cmd_updates() {
+  resolve_room
+  local file="$ROOM_PATH/updates.jsonl"
+  [ -s "$file" ] || { echo "no updates yet in #$ROOM_NAME"; return; }
+  python3 - "$file" <<'PY'
+import json, sys
+for raw in open(sys.argv[1], encoding="utf-8"):
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        entry = json.loads(raw)
+    except Exception:
+        continue
+    print(f"── {entry.get('ts','')} ──")
+    print(entry.get("text", ""))
+    print()
+PY
+}
+
 cmd_complain() {
   resolve_room
   [ -n "${1:-}" ] || die 'usage: room complain "<what is annoying>"'
@@ -160,6 +193,8 @@ cmd_complain() {
     "$0" new friction >/dev/null || die "could not create #friction"
   fi
   printf -- '- %s Complaint from #%s: %s\n' "$(date -u +%Y-%m-%d\ %H:%M)" "$source" "$1" >>"$friction/notes.md"
+  # Wake #friction without making complaint recording depend on its API call.
+  ( "$0" -r friction wake >/dev/null 2>&1 9>&- & )
   echo "flagged in #friction"
 }
 
@@ -354,6 +389,8 @@ case "$cmd" in
   new) cmd_new "$@" ;;
   list) cmd_list "$@" ;;
   note) cmd_note "$@" ;;
+  update) cmd_update "$@" ;;
+  updates) cmd_updates "$@" ;;
   complain|friction) cmd_complain "$@" ;;
   pause) cmd_pulse false ;;
   wake) cmd_pulse true ;;
