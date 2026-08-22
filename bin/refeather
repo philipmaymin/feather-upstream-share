@@ -311,9 +311,12 @@ atomic_current_link() {
   tmp="${current}.tmp.$$"
   mkdir -p "$(dirname "$current")"
   [ ! -e "$current" ] || [ -L "$current" ] || die "current target is not a symlink: $current"
-  ln -s "$target" "$tmp"
-  mv -Tf "$tmp" "$current"
-  fsync_dir "$(dirname "$current")"
+  ln -s "$target" "$tmp" || return 1
+  if ! mv -Tf "$tmp" "$current"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  fsync_dir "$(dirname "$current")" || return 1
 }
 
 write_tx_state() {

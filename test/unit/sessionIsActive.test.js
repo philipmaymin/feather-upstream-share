@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { sessionIsActive, ACTIVE_MS, messageTimestampMs, lastMessageMs } from '../../lib/sessions.js'
+import { sessionIsActive, ACTIVE_MS, messageTimestampMs, lastMessageMs, latestSessionActivityMs } from '../../lib/sessions.js'
 
 // Regression: finished sessions kept showing the green "active" dot because
 // isActive was true whenever a feather-* tmux session existed, which lingers up
@@ -30,6 +30,18 @@ describe('sessionIsActive', () => {
     const active = new Set([prefix])
     assert.equal(sessionIsActive(active, id, now - ACTIVE_MS, now), false)
     assert.equal(sessionIsActive(active, id, now - (ACTIVE_MS - 1), now), true)
+  })
+})
+
+describe('latestSessionActivityMs', () => {
+  it('protects a newly resumed session whose transcript is old', () => {
+    const oldMessage = Date.parse('2026-08-22T12:00:00Z')
+    const resumed = Date.parse('2026-08-22T17:00:00Z')
+    assert.equal(latestSessionActivityMs(oldMessage, resumed), resumed)
+  })
+
+  it('keeps a newer real message authoritative', () => {
+    assert.equal(latestSessionActivityMs(200, 100), 200)
   })
 })
 

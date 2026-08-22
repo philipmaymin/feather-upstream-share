@@ -11,7 +11,7 @@ import { parseMessage, parseCodexMessage, parseMessageForAgent } from './lib/par
 import * as sidecar from './lib/sidecar.js';
 import { createKeyedLock } from './lib/sendlock.js';
 import { codexPasteBufferArgs } from './lib/tmux-input.js';
-import { sessionIsActive, lastMessageMs } from './lib/sessions.js';
+import { sessionIsActive, lastMessageMs, latestSessionActivityMs } from './lib/sessions.js';
 import { resolveCodexWatchId } from './lib/codex-watch.js';
 import * as webpush from './lib/webpush.js';
 import { createSnapshotCache } from './lib/snapshot-cache.js';
@@ -28,6 +28,12 @@ try {
     if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
   }
 } catch {}
+
+// Let an instance-scoped key authenticate Feather-launched Codex sessions
+// without overriding an explicitly configured standard OpenAI key.
+if (!process.env.OPENAI_API_KEY && process.env.FEATHER_OPENAI_API_KEY) {
+  process.env.OPENAI_API_KEY = process.env.FEATHER_OPENAI_API_KEY;
+}
 
 const DEEPGRAM_API_KEY = process.env.FEATHER_DEEPGRAM_API_KEY || '';
 const envEnabled = value => /^(1|true|yes|on)$/i.test(String(value || '').trim());
@@ -397,13 +403,14 @@ function tmuxName(id) {
 function getActiveTmuxSessions() {
   const prefix = 'f-';
   try {
-    const out = execFileSync('tmux', ['list-sessions', '-F', '#{session_name}'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-    const active = new Set();
+    const out = execFileSync('tmux', ['list-sessions', '-F', '#{session_name}|#{session_created}'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    const active = new Map();
     for (const line of out.split('\n')) {
-      if (line.startsWith(prefix)) active.add(line.slice(prefix.length));
+      const [name, created] = line.split('|');
+      if (name?.startsWith(prefix)) active.set(name.slice(prefix.length), Number(created) * 1000 || 0);
     }
     return active;
-  } catch { return new Set(); }
+  } catch { return new Map(); }
 }
 
 function tmuxIsActive(id) {
@@ -2688,7 +2695,10 @@ function reapIdleSessions() {
     for (const { uuid, fpath, mtime } of listCodexJsonlFiles()) {
       const id = resolveCodexWatchId(uuid, meta);
       if (!active.has(id.slice(0, 8))) continue;
-      const activity = lastActivityMs(fpath, 'codex', mtime.getTime());
+      const activity = latestSessionActivityMs(
+        lastActivityMs(fpath, 'codex', mtime.getTime()),
+        active.get(id.slice(0, 8)) || 0,
+      );
       if (now - activity > IDLE_MS) {
         const name = tmuxName(id);
         try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
@@ -2705,7 +2715,10 @@ function reapIdleSessions() {
       const files = fs.readdirSync(dirPath).filter(file => file.endsWith('.jsonl')).sort().reverse();
       if (!files.length) continue;
       const fpath = path.join(dirPath, files[0]);
-      const activity = lastActivityMs(fpath, 'omp', fs.statSync(fpath).mtimeMs);
+      const activity = latestSessionActivityMs(
+        lastActivityMs(fpath, 'omp', fs.statSync(fpath).mtimeMs),
+        active.get(id.slice(0, 8)) || 0,
+      );
       if (now - activity > IDLE_MS) {
         const name = tmuxName(id);
         try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
@@ -2724,7 +2737,10 @@ function reapIdleSessions() {
         const id = file.replace('.jsonl', '');
         if (!active.has(id.slice(0, 8))) continue;
         const fpath = path.join(dirPath, file);
-        const activity = lastActivityMs(fpath, 'claude', fs.statSync(fpath).mtimeMs);
+        const activity = latestSessionActivityMs(
+          lastActivityMs(fpath, 'claude', fs.statSync(fpath).mtimeMs),
+          active.get(id.slice(0, 8)) || 0,
+        );
         if (now - activity > IDLE_MS) {
           const name = tmuxName(id);
           try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
