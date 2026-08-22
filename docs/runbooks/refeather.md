@@ -70,7 +70,7 @@ bin/refeather install-capabilities \
 ```
 
 This installs Feather, Sidecar, and Looper into both `~/.claude/skills` and
-`~/.codex/skills`, and `room` plus `sidecar` into `~/.local/bin`. Existing
+`~/.codex/skills`, and `room`, `sidecar`, plus `refeather` into `~/.local/bin`. Existing
 correct links are left alone. A file or foreign link is copied into a conflict
 evidence directory and causes a full preflight abort; nothing is overwritten.
 Promotion runs the same preflight by default before stopping the service.

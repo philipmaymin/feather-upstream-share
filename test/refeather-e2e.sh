@@ -22,7 +22,7 @@ for skill in feather sidecar looper; do
   mkdir -p "$source_repo/skills/$skill"
   printf -- '---\nname: %s\n---\n' "$skill" >"$source_repo/skills/$skill/SKILL.md"
 done
-for cli in room sidecar; do printf '#!/bin/sh\n' >"$source_repo/bin/$cli"; chmod +x "$source_repo/bin/$cli"; done
+for cli in room sidecar refeather; do printf '#!/bin/sh\n' >"$source_repo/bin/$cli"; chmod +x "$source_repo/bin/$cli"; done
 cat >"$source_repo/build-test.sh" <<'SH'
 #!/usr/bin/env bash
 set -e

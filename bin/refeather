@@ -5,7 +5,7 @@ set -Eeuo pipefail
 SELF="$(readlink -f "$0")"
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd)"
 CAPABILITY_SKILLS=(feather sidecar looper)
-CAPABILITY_CLIS=(room sidecar)
+CAPABILITY_CLIS=(room sidecar refeather)
 
 die() { echo "refeather: $*" >&2; exit 1; }
 note() { echo "refeather: $*" >&2; }
@@ -283,7 +283,7 @@ install_capabilities_impl() {
     dest="${destinations[$index]}"; target="${targets[$index]}"
     [ -L "$dest" ] || ln -s "$target" "$dest"
   done
-  note "installed Feather, Sidecar, and Looper for Claude and Codex; installed room and sidecar CLIs"
+  note "installed Feather, Sidecar, and Looper for Claude and Codex; installed room, sidecar, and refeather CLIs"
 }
 
 cmd_install_capabilities() {

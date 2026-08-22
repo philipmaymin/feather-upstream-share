@@ -16,7 +16,7 @@ for skill in feather sidecar looper; do
   mkdir -p "$release/skills/$skill"
   printf -- '---\nname: %s\n---\n' "$skill" >"$release/skills/$skill/SKILL.md"
 done
-for cli in room sidecar; do printf '#!/bin/sh\n' >"$release/bin/$cli"; chmod +x "$release/bin/$cli"; done
+for cli in room sidecar refeather; do printf '#!/bin/sh\n' >"$release/bin/$cli"; chmod +x "$release/bin/$cli"; done
 ln -s "$release" "$current"
 
 install=("$ROOT/bin/refeather" install-capabilities --release "$release" --target-root "$current"
@@ -29,7 +29,7 @@ for harness in "$claude" "$codex"; do
     [ "$(readlink "$harness/$skill")" = "$current/skills/$skill" ]
   done
 done
-for cli in room sidecar; do [ "$(readlink "$bindir/$cli")" = "$current/bin/$cli" ]; done
+for cli in room sidecar refeather; do [ "$(readlink "$bindir/$cli")" = "$current/bin/$cli" ]; done
 
 rm "$claude/feather"
 printf 'user-owned skill\n' >"$claude/feather"

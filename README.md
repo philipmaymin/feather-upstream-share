@@ -76,8 +76,9 @@ left untouched.
 ## Agent capabilities
 
 Install Feather, Sidecar, and Looper for both Claude and Codex, plus the `room`
-and `sidecar` CLIs, through the guarded installer. Point the links at the stable
-`current` release so promotion updates server and agent capabilities together:
+`sidecar`, and `refeather` CLIs, through the guarded installer. Point the links
+at the stable `current` release so promotion updates server and agent
+capabilities together:
 
 ```bash
 bin/refeather install-capabilities \
