@@ -14,6 +14,7 @@ import { sessionIsActive, lastMessageMs } from './lib/sessions.js';
 import { resolveCodexWatchId } from './lib/codex-watch.js';
 import * as webpush from './lib/webpush.js';
 import { createSnapshotCache } from './lib/snapshot-cache.js';
+import { paneHasReadyPrompt } from './lib/terminal-ready.js';
 
 // Load ~/.env if present
 try {
@@ -529,30 +530,22 @@ async function sendText(name, text) {
   }
 }
 
-function isClaudeRunning(name) {
+function isAgentRunning(name) {
   try {
     const cmd = execFileSync('tmux', ['list-panes', '-t', name, '-F', '#{pane_current_command}'], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-    return cmd === 'claude' || cmd === 'node';
+    return cmd === 'claude' || cmd === 'codex' || cmd === 'omp' || cmd === 'node';
   } catch { return false; }
 }
 
-function isClaudeAtPrompt(name) {
+function isAgentAtPrompt(name, agent = 'claude') {
   try {
     const content = execFileSync('tmux', ['capture-pane', '-t', name, '-p'],
       { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
-    const lines = content.trimEnd().split('\n');
-    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 8); i--) {
-      const line = lines[i];
-      // Claude Code prompt: line starts with ❯ or > (input prompt)
-      if (/^\s*[>❯]\s*$/.test(line)) return true;
-      // Welcome screen with `Try "..."` placeholder — CC is ready, paste replaces the placeholder
-      if (/^\s*[>❯]\s+Try\s+"/.test(line)) return true;
-    }
-    return false;
+    return paneHasReadyPrompt(content, agent);
   } catch { return false; }
 }
 
-function waitForClaudeReady(name, timeoutMs = 30000) {
+function waitForAgentReady(name, agent = 'claude', timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     let processDetected = false;
@@ -564,10 +557,10 @@ function waitForClaudeReady(name, timeoutMs = 30000) {
       } catch {
         return reject(new Error('session_gone'));
       }
-      if (!processDetected && isClaudeRunning(name)) {
+      if (!processDetected && isAgentRunning(name)) {
         processDetected = true;
       }
-      if (processDetected && isClaudeAtPrompt(name)) {
+      if (processDetected && isAgentAtPrompt(name, agent)) {
         if (!firstPromptSeenAt) firstPromptSeenAt = Date.now();
         if (Date.now() - firstPromptSeenAt >= STABILITY_MS) return resolve();
       } else {
@@ -617,9 +610,7 @@ async function sendInputToSessionUnlocked(id, text) {
 
   if (!sessionExists) {
     spawnOrResume(id, null, true, agent);
-    // Codex doesn't have a "claude ready" prompt detector — give it a fixed
-    // settle window before sending input.
-    if (agent === 'codex') await new Promise(r => setTimeout(r, 6000));
+    if (agent === 'codex') await waitForAgentReady(name, agent);
   }
 
   if (agent === 'codex') {
@@ -630,11 +621,11 @@ async function sendInputToSessionUnlocked(id, text) {
   // Complete all readiness retries before delivery. Retrying this whole block
   // after a partially successful send can create a second distinct turn.
   try {
-    await waitForClaudeReady(name);
+    await waitForAgentReady(name, agent);
   } catch {
     spawnOrResume(id, null, true, agent);
     try {
-      await waitForClaudeReady(name);
+      await waitForAgentReady(name, agent);
     } catch {
       throw new Error('Failed to resume session after retry');
     }
@@ -846,6 +837,14 @@ function discoverSessions(limit = 50, projectFilter) {
   sessions.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   return sessions;
 }
+
+// Session discovery is shared by the sidebar and Rooms home, and scans every
+// supported agent transcript. Serve the common unfiltered index from a warm
+// snapshot so app startup can mount Rooms before deferred refresh work runs.
+const sessionsSnapshotCache = createSnapshotCache(
+  () => discoverSessions(300, null),
+  { ttlMs: 10_000 },
+);
 
 // Agents can append status/bookkeeping for days after their last real message.
 // Grow the tail until a user/assistant timestamp is found so activity dots,
@@ -1439,7 +1438,7 @@ function lastRoomMessageSnippet(sessionId, agent) {
 function buildRoomsSnapshot() {
   const names = listRoomDirs();
   const assignments = readRoomAssignments();
-  const allSessions = discoverSessions(300);
+  const allSessions = sessionsSnapshotCache.get();
   const byRoom = new Map(names.map(name => [name, []]));
 
   for (const session of allSessions) {
@@ -1677,7 +1676,14 @@ app.get('/api/search', (req, res) => {
 });
 
 app.get('/api/sessions', (req, res) => {
-  try { res.json({ sessions: discoverSessions(parseInt(req.query.limit) || 50, req.query.project || null) }); }
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const project = req.query.project || null;
+    const sessions = project
+      ? discoverSessions(limit, project)
+      : sessionsSnapshotCache.get().slice(0, limit);
+    res.json({ sessions });
+  }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1896,13 +1902,20 @@ app.get('/api/sessions/:id/stream', (req, res) => {
 });
 
 app.post('/api/sessions', (req, res) => {
-  try { spawnOrResume(req.body.id, req.body.cwd, false, req.body.agent); res.json({ id: req.body.id, status: 'starting' }); }
+  try {
+    spawnOrResume(req.body.id, req.body.cwd, false, req.body.agent);
+    sessionsSnapshotCache.invalidate();
+    roomSnapshotCache.invalidate();
+    res.json({ id: req.body.id, status: 'starting' });
+  }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/sessions/:id/send', async (req, res) => {
   try {
     await sendInputToSession(req.params.id, req.body.text);
+    sessionsSnapshotCache.invalidate();
+    roomSnapshotCache.invalidate();
     // Reset pane stability so question detection doesn't fire on stale state
     paneStableCount.set(req.params.id, 0);
     res.json({ ok: true, sentAt: new Date().toISOString() });
@@ -1912,14 +1925,22 @@ app.post('/api/sessions/:id/send', async (req, res) => {
 
 app.post('/api/sessions/:id/resume', async (req, res) => {
   try {
-    spawnOrResume(req.params.id, req.body?.cwd, true);
-    try { await waitForClaudeReady(tmuxName(req.params.id)); } catch {}
+    const agent = getAgentForSession(req.params.id);
+    spawnOrResume(req.params.id, req.body?.cwd, true, agent);
+    try { await waitForAgentReady(tmuxName(req.params.id), agent); } catch {}
+    sessionsSnapshotCache.invalidate();
+    roomSnapshotCache.invalidate();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/sessions/:id/interrupt', (req, res) => {
-  try { execFileSync('tmux', ['send-keys', '-t', tmuxName(req.params.id), 'C-c'], { stdio: 'ignore' }); res.json({ ok: true }); }
+  try {
+    execFileSync('tmux', ['send-keys', '-t', tmuxName(req.params.id), 'C-c'], { stdio: 'ignore' });
+    sessionsSnapshotCache.invalidate();
+    roomSnapshotCache.invalidate();
+    res.json({ ok: true });
+  }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1962,6 +1983,8 @@ app.post('/api/sessions/:id/delete', (req, res) => {
     writeMeta(meta);
     sseClients.delete(id);
     fileOffsets.delete(id);
+    sessionsSnapshotCache.invalidate();
+    roomSnapshotCache.invalidate();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1971,6 +1994,8 @@ app.post('/api/sessions/:id/rename', (req, res) => {
     const meta = readMeta();
     meta[req.params.id] = { ...(meta[req.params.id] || {}), title: req.body.title };
     writeMeta(meta);
+    sessionsSnapshotCache.invalidate();
+    roomSnapshotCache.invalidate();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1981,6 +2006,8 @@ app.post('/api/sessions/:id/fork', (req, res) => {
     const cwd = req.body?.cwd || HOME;
     const forkName = `f-f${Date.now().toString(36)}`;
     spawnTmuxClaude(forkName, `--resume ${id} --fork-session`, cwd);
+    sessionsSnapshotCache.invalidate();
+    roomSnapshotCache.invalidate();
     res.json({ ok: true, tmux: forkName });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -2672,8 +2699,12 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Feather (single-user) on http://0.0.0.0:${PORT}`);
-  // Warm the expensive Rooms snapshot before the first interactive request.
-  setTimeout(() => { try { roomSnapshotCache.get(); } catch {} }, 0);
+  // Warm shared discovery first; Rooms then reuses it instead of scanning all
+  // transcripts a second time before the first interactive request.
+  setTimeout(() => {
+    try { sessionsSnapshotCache.get(); } catch {}
+    try { roomSnapshotCache.get(); } catch {}
+  }, 0);
 });
 
 // Graceful shutdown: close server so port is released before systemd restarts us
