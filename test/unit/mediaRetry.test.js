@@ -37,9 +37,9 @@ describe('retryMediaOperation', () => {
     const seen = []
     await assert.rejects(retryMediaOperation(
       async () => { throw new MediaHttpError(429, 'slow down') },
-      { sleep: async () => {}, onAttempt: (attempt, error) => seen.push([attempt, error?.status]) },
+      { sleep: async () => {}, onAttempt: (attempt, error, willRetry) => seen.push([attempt, error?.status, willRetry]) },
     ))
-    assert.deepEqual(seen, [[1, 429], [2, 429], [3, 429]])
+    assert.deepEqual(seen, [[1, 429, true], [2, 429, true], [3, 429, false]])
   })
 })
 

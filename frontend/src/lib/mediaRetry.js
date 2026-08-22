@@ -28,8 +28,9 @@ export async function retryMediaOperation(operation, {
       return await operation(attempt)
     } catch (error) {
       lastError = error
-      await onAttempt(attempt, error)
-      if (attempt >= attempts || !isTransientMediaError(error)) throw error
+      const willRetry = attempt < attempts && isTransientMediaError(error)
+      await onAttempt(attempt, error, willRetry)
+      if (!willRetry) throw error
       await sleep(350 * (2 ** (attempt - 1)) + Math.floor(Math.random() * 150))
     }
   }

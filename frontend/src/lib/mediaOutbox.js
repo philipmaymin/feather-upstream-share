@@ -1,5 +1,16 @@
 const DB_NAME = 'feather-media-outbox'
 const STORE = 'items'
+const KINDS = new Set(['file', 'image', 'audio'])
+const STATUSES = new Set(['draft', 'uploading', 'uploaded', 'transcribing', 'failed'])
+
+function validateMediaRecord(record) {
+  const valid = record && typeof record === 'object' &&
+    typeof record.id === 'string' && typeof record.boxId === 'string' &&
+    typeof record.sessionId === 'string' && typeof record.name === 'string' &&
+    KINDS.has(record.kind) && STATUSES.has(record.status) && record.blob instanceof Blob
+  if (!valid) throw new Error('Invalid media recovery record')
+  return record
+}
 
 function requestResult(request) {
   return new Promise((resolve, reject) => {
@@ -8,44 +19,52 @@ function requestResult(request) {
   })
 }
 
-export function openMediaOutbox() {
+let databasePromise = null
+
+function openMediaOutbox() {
   if (!globalThis.indexedDB) return Promise.reject(new Error('IndexedDB is unavailable'))
-  return new Promise((resolve, reject) => {
+  if (databasePromise) return databasePromise
+  databasePromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, 1)
     request.onupgradeneeded = () => {
       const store = request.result.createObjectStore(STORE, { keyPath: 'id' })
       store.createIndex('scope', ['boxId', 'sessionId'])
     }
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error || new Error('Could not open media recovery storage'))
+    request.onsuccess = () => {
+      const db = request.result
+      db.onversionchange = () => { db.close(); databasePromise = null }
+      resolve(db)
+    }
+    request.onerror = () => {
+      databasePromise = null
+      reject(request.error || new Error('Could not open media recovery storage'))
+    }
   })
+  return databasePromise
 }
 
 async function withStore(mode, run) {
   const db = await openMediaOutbox()
-  try {
-    const tx = db.transaction(STORE, mode)
-    const result = await run(tx.objectStore(STORE))
-    await new Promise((resolve, reject) => {
-      tx.oncomplete = resolve
-      tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'))
-      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'))
-    })
-    return result
-  } finally {
-    db.close()
-  }
+  const tx = db.transaction(STORE, mode)
+  const result = await run(tx.objectStore(STORE))
+  await new Promise((resolve, reject) => {
+    tx.oncomplete = resolve
+    tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'))
+    tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'))
+  })
+  return result
 }
 
 export function putMediaRecord(record) {
-  return withStore('readwrite', store => requestResult(store.put({ ...record, updatedAt: Date.now() })))
+  const next = validateMediaRecord({ ...record, updatedAt: Date.now() })
+  return withStore('readwrite', store => requestResult(store.put(next)))
 }
 
 export async function patchMediaRecord(id, patch) {
   return withStore('readwrite', async store => {
     const current = await requestResult(store.get(id))
     if (!current) return null
-    const next = { ...current, ...patch, id, updatedAt: Date.now() }
+    const next = validateMediaRecord({ ...current, ...patch, id, updatedAt: Date.now() })
     await requestResult(store.put(next))
     return next
   })
@@ -56,5 +75,8 @@ export function deleteMediaRecord(id) {
 }
 
 export function listMediaRecords(boxId, sessionId) {
-  return withStore('readonly', store => requestResult(store.index('scope').getAll([boxId, sessionId])))
+  return withStore('readonly', async store => {
+    const records = await requestResult(store.index('scope').getAll([boxId, sessionId]))
+    return records.map(validateMediaRecord)
+  })
 }

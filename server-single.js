@@ -3,7 +3,7 @@ import compression from 'compression';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { WebSocketServer, WebSocket as WS } from 'ws';
 import pty from 'node-pty';
@@ -17,7 +17,7 @@ import * as webpush from './lib/webpush.js';
 import { createSnapshotCache } from './lib/snapshot-cache.js';
 import { paneHasReadyPrompt } from './lib/terminal-ready.js';
 import { ensureStateLayout, resolveStatePaths } from './lib/state-paths.js';
-import { createJsonState } from './lib/json-state.js';
+import { createJsonState, isJsonRecord } from './lib/json-state.js';
 
 // Load ~/.env if present
 try {
@@ -184,10 +184,9 @@ function metaFilePath() {
   return STATE_PATHS.instance.metaFile;
 }
 
-const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const META_STATE = createJsonState({
   file: metaFilePath(), root: featherDir(), document: 'session metadata',
-  defaultValue: {}, validate: isRecord,
+  defaultValue: {}, validate: isJsonRecord,
 });
 
 function readMeta() {
@@ -238,11 +237,11 @@ function getMessages(sessionId, limit = 100, before = 0) {
 // ── Per-user JSON helpers ──────────────────────────────────────────────────
 
 const USER_JSON_STATES = new Map([
-  ['project-labels.json', createJsonState({ file: STATE_PATHS.instance.projectLabelsFile, root: featherDir(), document: 'project labels', defaultValue: {}, validate: isRecord })],
+  ['project-labels.json', createJsonState({ file: STATE_PATHS.instance.projectLabelsFile, root: featherDir(), document: 'project labels', defaultValue: {}, validate: isJsonRecord })],
   ['quick-links.json', createJsonState({ file: STATE_PATHS.instance.quickLinksFile, root: featherDir(), document: 'quick links', defaultValue: [], validate: Array.isArray })],
-  ['starred.json', createJsonState({ file: STATE_PATHS.instance.starredFile, root: featherDir(), document: 'starred messages', defaultValue: {}, validate: isRecord })],
+  ['starred.json', createJsonState({ file: STATE_PATHS.instance.starredFile, root: featherDir(), document: 'starred messages', defaultValue: {}, validate: isJsonRecord })],
   ['muted.json', createJsonState({ file: STATE_PATHS.instance.mutedFile, root: featherDir(), document: 'muted sessions', defaultValue: [], validate: Array.isArray })],
-  ['push-keys.json', createJsonState({ file: STATE_PATHS.instance.pushKeysFile, root: featherDir(), document: 'push signing keys', defaultValue: {}, validate: isRecord, mode: 0o600 })],
+  ['push-keys.json', createJsonState({ file: STATE_PATHS.instance.pushKeysFile, root: featherDir(), document: 'push signing keys', defaultValue: {}, validate: isJsonRecord, mode: 0o600 })],
   ['push-subscriptions.json', createJsonState({ file: STATE_PATHS.instance.pushSubscriptionsFile, root: featherDir(), document: 'push subscriptions', defaultValue: [], validate: Array.isArray })],
 ]);
 
@@ -1500,7 +1499,7 @@ const ROOMS_HOME_DIR = STATE_PATHS.workspace.roomsDir;
 const ROOM_ASSIGN_FILE = STATE_PATHS.coordination.roomAssignmentsFile;
 const ROOM_ASSIGN_STATE = createJsonState({
   file: ROOM_ASSIGN_FILE, root: path.dirname(ROOM_ASSIGN_FILE), document: 'Room assignments',
-  defaultValue: {}, validate: isRecord,
+  defaultValue: {}, validate: isJsonRecord,
 });
 const ROOM_TAILS = [512 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024];
 
@@ -2360,6 +2359,17 @@ app.post('/api/sidecar/:id/delete', (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+async function readBoundedBody(req, maxBytes, limitMessage) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) throw httpError(413, limitMessage);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
 app.post('/api/upload', async (req, res) => {
   try {
     const dir = uploadsDir();
@@ -2374,23 +2384,18 @@ app.post('/api/upload', async (req, res) => {
     const fpath = path.join(dir, dest);
     const declaredSize = Number(req.headers['content-length'] || 0);
     if (declaredSize > MAX_UPLOAD_BYTES) return res.status(413).json({ error: 'upload exceeds 50 MB limit' });
-    const chunks = [];
-    let size = 0;
-    for await (const chunk of req) {
-      size += chunk.length;
-      if (size > MAX_UPLOAD_BYTES) return res.status(413).json({ error: 'upload exceeds 50 MB limit' });
-      chunks.push(chunk);
-    }
-    const body = Buffer.concat(chunks);
-    const sameBody = () => {
+    const body = await readBoundedBody(req, MAX_UPLOAD_BYTES, 'upload exceeds 50 MB limit');
+    const existingBody = () => {
       try {
-        const existing = fs.readFileSync(fpath);
-        return existing.length === body.length &&
-          createHash('sha256').update(existing).digest('hex') === createHash('sha256').update(body).digest('hex');
-      } catch { return false; }
+        return fs.readFileSync(fpath);
+      } catch (error) {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      }
     };
-    if (fs.existsSync(fpath)) {
-      if (!sameBody()) return res.status(409).json({ error: 'upload id already exists with different content' });
+    const existing = existingBody();
+    if (existing) {
+      if (!existing.equals(body)) return res.status(409).json({ error: 'upload id already exists with different content' });
       return res.json({ path: fpath, reused: true });
     }
     const tmp = path.join(dir, `.${uploadId}-${randomUUID()}.tmp`);
@@ -2398,7 +2403,8 @@ app.post('/api/upload', async (req, res) => {
     try {
       fs.linkSync(tmp, fpath);
     } catch (e) {
-      if (e.code !== 'EEXIST' || !sameBody()) {
+      const racedBody = e.code === 'EEXIST' ? existingBody() : null;
+      if (e.code !== 'EEXIST' || !racedBody?.equals(body)) {
         if (e.code === 'EEXIST') return res.status(409).json({ error: 'upload id already exists with different content' });
         throw e;
       }
@@ -2412,17 +2418,11 @@ app.post('/api/upload', async (req, res) => {
 app.post('/api/transcribe', async (req, res) => {
   if (!DEEPGRAM_API_KEY) return res.status(500).json({ error: 'No Deepgram API key configured' });
   try {
-    const chunks = [];
-    let size = 0;
-    for await (const chunk of req) {
-      size += chunk.length;
-      if (size > MAX_AUDIO_BYTES) return res.status(413).json({ error: 'audio exceeds 25 MB limit' });
-      chunks.push(chunk);
-    }
+    const audio = await readBoundedBody(req, MAX_AUDIO_BYTES, 'audio exceeds 25 MB limit');
     const response = await fetch('https://api.deepgram.com/v1/listen?model=nova-3&punctuate=true&smart_format=true', {
       method: 'POST',
       headers: { Authorization: `Token ${DEEPGRAM_API_KEY}`, 'Content-Type': req.headers['content-type'] || 'audio/webm' },
-      body: Buffer.concat(chunks),
+      body: audio,
       signal: AbortSignal.timeout(120_000),
     });
     if (!response.ok) return res.status(response.status).json({ error: await response.text() });

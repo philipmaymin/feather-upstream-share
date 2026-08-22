@@ -6,7 +6,7 @@ const imgPattern = /\[Attached image: (\/[^\]]+)\]/g
 
 const filePattern = /\[Attached file: (\/[^\]]+)\]\s*\(([^)]+)\)/g
 
-export function codeRanges(text) {
+function codeRanges(text) {
   const ranges = []
   for (const re of [/```[\s\S]*?(?:```|$)/g, /`[^`\n]*`/g]) {
     for (const m of text.matchAll(re)) {

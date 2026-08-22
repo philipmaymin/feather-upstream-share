@@ -257,6 +257,18 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
 // Markdown image syntax preserves an absolute filesystem path in <img src>.
 // Route it through the same authenticated preview as the Files tab, wire it
 // into the lightbox, and turn failures into a useful clickable path.
+function replaceImageWithPathLink(img: HTMLImageElement, targetPath: string) {
+  const a = document.createElement('a')
+  a.textContent = targetPath
+  a.href = localFileHref(targetPath)
+  a.target = '_blank'
+  a.rel = 'noopener'
+  a.title = 'Open local file'
+  a.className = 'feather-path'
+  a.dataset.path = targetPath
+  img.replaceWith(a)
+}
+
 function fixImages(el: HTMLElement, onImageClick?: (src: string) => void) {
   for (const img of el.querySelectorAll('img')) {
     const targetPath = localFilePath(img.getAttribute('src'))
@@ -269,17 +281,7 @@ function fixImages(el: HTMLElement, onImageClick?: (src: string) => void) {
       img.style.cursor = 'zoom-in'
       img.addEventListener('click', () => onImageClick?.(url))
     }
-    img.addEventListener('error', () => {
-      const a = document.createElement('a')
-      a.textContent = targetPath
-      a.href = url
-      a.target = '_blank'
-      a.rel = 'noopener'
-      a.title = 'Open local file'
-      a.className = 'feather-path'
-      a.dataset.path = targetPath
-      img.replaceWith(a)
-    }, { once: true })
+    img.addEventListener('error', () => replaceImageWithPathLink(img, targetPath), { once: true })
     img.src = url
   }
 }
@@ -685,7 +687,7 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
         'font-size': '14px', 'line-height': '1.5', 'word-break': 'break-word',
       }}>
         <For each={images}>{(src) => (
-          <img src={localImageHref(src)} onClick={() => setLightbox(localImageHref(src))} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': hasAttachments ? '12px' : '6px', 'margin-bottom': '4px', cursor: 'zoom-in', display: 'block' }} />
+          <img src={localImageHref(src)} onClick={() => setLightbox(localImageHref(src))} onError={(event) => replaceImageWithPathLink(event.currentTarget, src)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': hasAttachments ? '12px' : '6px', 'margin-bottom': '4px', cursor: 'zoom-in', display: 'block' }} />
         )}</For>
         <For each={files}>{(f) => (
           <a href={f.path} target="_blank" rel="noopener" onClick={(e) => { if (f.name.toLowerCase().endsWith('.pdf')) { e.preventDefault(); const base = typeof location !== 'undefined' ? location.pathname.replace(/\/+$/, '') : ''; setPdfViewer(`${base}/api/files/raw?path=${encodeURIComponent(f.path)}`) } }} style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
