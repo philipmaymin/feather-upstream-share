@@ -1,5 +1,5 @@
 import { createSignal, onMount, onCleanup, Show, For } from 'solid-js'
-import { fetchRooms, cachedRoomsSnapshot, fetchSessions, searchSessions, createRoom, createSession, assignSessionToRoom } from './api'
+import { fetchRooms, cachedRoomsSnapshot, fetchSessions, searchSessions, createRoom, createSession, assignSessionToRoom, setRoomPulse } from './api'
 import type { RoomInfo, SessionMeta } from './api'
 
 // Full-screen rooms home (iMessage model, phone-first): one row per room
@@ -17,10 +17,29 @@ function timeAgo(iso: string | null) {
   return `${Math.floor(h / 24)}d`
 }
 
+function timeUntil(iso: string | null) {
+  if (!iso) return 'later'
+  const m = Math.max(0, Math.ceil((new Date(iso).getTime() - Date.now()) / 60000))
+  if (m < 1) return 'now'
+  if (m < 60) return `in ${m}m`
+  return `in ${Math.ceil(m / 60)}h`
+}
+
 function snippetLabel(latest: { role: string, text: string } | null) {
   if (!latest) return 'No messages yet'
   const prefix = latest.role === 'user' ? 'you: ' : latest.role === 'notes' ? 'notes: ' : ''
   return prefix + latest.text
+}
+
+function pulseLabel(room: RoomInfo) {
+  if (!room.pulse.enabled) return 'Paused'
+  const age = timeAgo(room.pulse.lastRunAt)
+  let worked = ''
+  if (age === 'now') worked = 'Worked now'
+  else if (age) worked = `Worked ${age} ago`
+  if (room.pulse.status === 'working') return `${worked || 'Started'} · working now`
+  if (room.pulse.status === 'error') return `Last check failed · tries again ${timeUntil(room.pulse.nextRunAt)}`
+  return `${worked ? `${worked} · ` : ''}checks again ${timeUntil(room.pulse.nextRunAt)}`
 }
 
 export default function RoomsHome(props: { onOpen: (id: string) => void, onSessionsChanged?: () => void }) {
@@ -108,6 +127,16 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
     finally { setBusy(false) }
   }
 
+  async function togglePulse(room: RoomInfo, event: MouseEvent) {
+    event.stopPropagation()
+    setBusy(true)
+    try {
+      const pulse = await setRoomPulse(room.name, !room.pulse.enabled)
+      setRooms((current) => current?.map((item) => item.name === room.name ? { ...item, pulse } : item) || null)
+    } catch (e: any) { alert(e.message) }
+    finally { setBusy(false) }
+  }
+
   // Tap the card → open the newest chat (iMessage model). The chevron (or a
   // room with no chats) expands the card to show all chats + new-chat buttons.
   function openRoom(room: RoomInfo) {
@@ -168,6 +197,14 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
                   </div>
                   <div style={{ 'margin-top': '6px', 'padding-left': '20px', 'font-size': '13px', color: room.latest ? '#999' : '#555', overflow: 'hidden', display: '-webkit-box', '-webkit-line-clamp': '2', '-webkit-box-orient': 'vertical', 'line-height': '1.4' }}>
                     {snippetLabel(room.latest)}
+                  </div>
+                  <div style={{ 'margin-top': '9px', 'padding-left': '20px', display: 'flex', 'align-items': 'center', gap: '8px' }}>
+                    <button data-testid={`pulse-${room.name}`} onClick={(event) => togglePulse(room, event)} disabled={busy()}
+                      aria-pressed={room.pulse.enabled}
+                      style={{ background: room.pulse.enabled ? '#152a1c' : 'transparent', border: `1px solid ${room.pulse.enabled ? '#2a4a34' : '#333'}`, color: room.pulse.enabled ? '#69c77f' : '#777', 'font-size': '11px', 'font-weight': '600', padding: '3px 8px', 'border-radius': '999px', cursor: 'pointer' }}>
+                      {room.pulse.enabled ? 'Keep working' : 'Paused'}
+                    </button>
+                    <span style={{ color: room.pulse.status === 'error' ? '#d48166' : '#666', 'font-size': '11px' }}>{pulseLabel(room)}</span>
                   </div>
                 </div>
                 <Show when={expanded() === room.name}>

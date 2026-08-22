@@ -67,15 +67,25 @@ chats without maintaining a separate Projects tree.
 
 Each room contains an `AGENTS.md`, a matching `CLAUDE.md` symlink, and a
 `notes.md` working memory. From a room chat, `room note "..."` appends a durable
-decision or open thread. The optional `room` CLI also supports lookups, sealed
-councils, second opinions, spawned sessions, and handoffs.
+decision or open thread.
+
+By default, Feather checks each inactive Room every 15 minutes and launches one
+non-interactive OMP session to do the next useful thing. The Room card shows when
+it last worked and when it will check again. Pause or resume that behavior from
+the card, or from inside the Room with `room pause` and `room wake`.
+
+Agents can run `room complain "..."` to append recurring annoyances to
+`#friction`. `#meta` is the separate place for reusable lessons across Rooms.
+
+The optional `room` CLI also supports lookups, sealed councils, second opinions,
+spawned sessions, and handoffs.
 
 Feather's former Auto surface is retired. Existing `~/auto-*` directories are
 left untouched.
 
 ## Agent capabilities
 
-Install Feather, Sidecar, and Looper for both Claude and Codex, plus the `room`
+Install Feather, Sidecar, and Looper for both Claude and Codex, plus the `room`,
 `sidecar`, and `refeather` CLIs, through the guarded installer. Point the links
 at the stable `current` release so promotion updates server and agent
 capabilities together:

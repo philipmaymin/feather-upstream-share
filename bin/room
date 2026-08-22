@@ -11,6 +11,9 @@
 #   room new <name>                    scaffold a room folder
 #   room list                          list rooms
 #   room note "<text>"                 append a timestamped note to notes.md
+#   room complain "<text>"             add an annoyance to #friction
+#   room pause                          stop automatic checks for this room
+#   room wake                           resume automatic checks for this room
 #   room lookup "<question>"           quick Haiku answer (transcripts, memory)
 #   room council "<task>" [-n N]       N sealed attempts (claude+codex) + judge
 #   room second-opinion "<question>"   ask the other harness
@@ -144,6 +147,31 @@ cmd_note() {
   [ -n "${1:-}" ] || die 'usage: room note "<text>"'
   printf -- '- %s %s\n' "$(date -u +%Y-%m-%d\ %H:%M)" "$1" >>"$ROOM_PATH/notes.md"
   echo "noted in #$ROOM_NAME"
+}
+
+cmd_complain() {
+  resolve_room
+  [ -n "${1:-}" ] || die 'usage: room complain "<what is annoying>"'
+  local source="$ROOM_NAME" friction="$ROOMS_DIR/friction"
+  mkdir -p "$ROOMS_DIR"
+  exec 9>"$ROOMS_DIR/.friction.lock"
+  flock 9 || die "could not lock #friction"
+  if [ ! -f "$friction/AGENTS.md" ]; then
+    "$0" new friction >/dev/null || die "could not create #friction"
+  fi
+  printf -- '- %s Complaint from #%s: %s\n' "$(date -u +%Y-%m-%d\ %H:%M)" "$source" "$1" >>"$friction/notes.md"
+  echo "flagged in #friction"
+}
+
+cmd_pulse() {
+  local enabled="$1"
+  resolve_room
+  ensure_feather_url
+  curl -sf -X POST "$FEATHER_URL/api/rooms/$ROOM_NAME/pulse" \
+    -H 'Content-Type: application/json' -d "{\"enabled\":$enabled}" >/dev/null \
+    || die "feather refused to change automatic checks for #$ROOM_NAME"
+  if [ "$enabled" = true ]; then echo "#${ROOM_NAME} will keep working"
+  else echo "#${ROOM_NAME} automatic checks paused"; fi
 }
 
 cmd_lookup() {
@@ -326,6 +354,9 @@ case "$cmd" in
   new) cmd_new "$@" ;;
   list) cmd_list "$@" ;;
   note) cmd_note "$@" ;;
+  complain|friction) cmd_complain "$@" ;;
+  pause) cmd_pulse false ;;
+  wake) cmd_pulse true ;;
   lookup) cmd_lookup "$@" ;;
   council) cmd_council "$@" ;;
   second-opinion|so) cmd_second_opinion "$@" ;;

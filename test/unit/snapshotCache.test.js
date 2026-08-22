@@ -40,6 +40,15 @@ describe('createSnapshotCache', () => {
     assert.deepEqual(cache.get(), { version: 2 })
   })
 
+  it('patches a warm snapshot without rerunning the loader', () => {
+    let loads = 0
+    const cache = createSnapshotCache(() => ({ version: ++loads, enabled: true }), { ttlMs: 10_000 })
+    assert.deepEqual(cache.get(), { version: 1, enabled: true })
+    cache.update((snapshot) => ({ ...snapshot, enabled: false }))
+    assert.deepEqual(cache.get(), { version: 1, enabled: false })
+    assert.equal(loads, 1)
+  })
+
   it('keeps the last good snapshot when a background refresh fails', () => {
     let now = 1_000
     let fail = false

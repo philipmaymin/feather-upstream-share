@@ -18,6 +18,7 @@ test('attaches and detaches an existing chat without duplicate Room rows', async
     await route.fulfill({ json: { rooms: [{
       name: 'marriage', cwd: '/srv/zak/home/rooms/marriage', active: false,
       latest: null, updatedAt: seeded.updatedAt,
+      pulse: { enabled: true, status: 'waiting', lastRunAt: null, nextRunAt: '2026-08-22T12:15:00Z', sessionId: null },
       sessions: attached ? [seeded, { ...candidate, roomAssigned: true }] : [seeded],
     }] } })
   })
@@ -32,9 +33,15 @@ test('attaches and detaches an existing chat without duplicate Room rows', async
     if (body.sessionId === candidate.id) attached = !body.remove
     await route.fulfill({ json: { ok: true, assignments: attached ? { [candidate.id]: 'marriage' } : {} } })
   })
+  await page.route('**/api/rooms/marriage/pulse', async (route) => {
+    await route.fulfill({ json: { ok: true, pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null } } })
+  })
 
   await page.goto(BASE)
   await expect(page.getByText('#marriage')).toBeVisible()
+  await expect(page.getByTestId('pulse-marriage')).toHaveText('Keep working')
+  await page.getByTestId('pulse-marriage').click()
+  await expect(page.getByTestId('pulse-marriage')).toHaveText('Paused')
   await page.locator('button:has-text("›")').click()
   await page.getByTestId('attach-existing-marriage').click()
   await expect(page.getByTestId('attach-picker-marriage')).toBeVisible()

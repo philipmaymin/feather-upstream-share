@@ -54,4 +54,43 @@ describe('room assignment CLI', () => {
       await new Promise((resolve) => server.close(resolve))
     }
   })
+
+  it('records complaints in #friction and lets a room pause or wake itself', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-room-feedback-'))
+    roots.push(root)
+    const roomsDir = path.join(root, 'rooms')
+    const roomDir = path.join(roomsDir, 'health')
+    fs.mkdirSync(roomDir, { recursive: true })
+    fs.writeFileSync(path.join(roomDir, 'AGENTS.md'), '# Room: #health\n')
+    fs.writeFileSync(path.join(roomDir, 'notes.md'), '# notes\n')
+    const requests = []
+    const server = http.createServer((request, response) => {
+      const chunks = []
+      request.on('data', (chunk) => chunks.push(chunk))
+      request.on('end', () => {
+        requests.push({ url: request.url, body: JSON.parse(Buffer.concat(chunks).toString()) })
+        response.writeHead(200, { 'Content-Type': 'application/json' })
+        response.end('{"ok":true}')
+      })
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const env = { ...process.env, HOME: root, ROOMS_DIR: roomsDir, FEATHER_URL: `http://127.0.0.1:${server.address().port}` }
+    const cli = path.resolve(import.meta.dirname, '../../bin/room')
+    try {
+      await Promise.all([
+        run(cli, ['complain', 'The upload button loses my file'], { cwd: roomDir, env }),
+        run(cli, ['complain', 'The table gets crushed on mobile'], { cwd: roomDir, env }),
+      ])
+      await run(cli, ['pause'], { cwd: roomDir, env })
+      await run(cli, ['wake'], { cwd: roomDir, env })
+      assert.match(fs.readFileSync(path.join(roomsDir, 'friction/notes.md'), 'utf8'), /Complaint from #health: The upload button loses my file/)
+      assert.match(fs.readFileSync(path.join(roomsDir, 'friction/notes.md'), 'utf8'), /Complaint from #health: The table gets crushed on mobile/)
+      assert.deepEqual(requests, [
+        { url: '/api/rooms/health/pulse', body: { enabled: false } },
+        { url: '/api/rooms/health/pulse', body: { enabled: true } },
+      ])
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+    }
+  })
 })

@@ -143,6 +143,8 @@ describe('portable Room membership', () => {
       }
       assert.ok(rooms, stderr || 'server did not become ready')
       const marriage = rooms.find((room) => room.name === 'marriage')
+      assert.equal(marriage.pulse.enabled, true)
+      assert.equal(marriage.pulse.status, 'waiting')
       assert.deepEqual(marriage.sessions.map((session) => session.id), [cwdId, oldId])
       assert.equal(marriage.sessions[1].title, 'Historical marriage conversation')
       assert.equal(marriage.sessions[1].roomAssigned, true)
@@ -168,6 +170,14 @@ describe('portable Room membership', () => {
       assert.deepEqual(rooms.find((room) => room.name === 'marriage').sessions.map((session) => session.id), [movedId, cwdId, oldId])
       assert.equal(new Set(rooms.flatMap((room) => room.sessions.map((session) => session.id))).size,
         rooms.flatMap((room) => room.sessions).length)
+
+      const pause = await fetch(`http://127.0.0.1:${port}/api/rooms/marriage/pulse`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }),
+      })
+      assert.equal(pause.status, 200)
+      assert.equal((await pause.json()).pulse.enabled, false)
+      rooms = (await (await fetch(`http://127.0.0.1:${port}/api/rooms`)).json()).rooms
+      assert.equal(rooms.find((room) => room.name === 'marriage').pulse.status, 'paused')
     } finally {
       child.kill('SIGTERM')
       if (child.exitCode === null) await new Promise((resolve) => child.once('exit', resolve))

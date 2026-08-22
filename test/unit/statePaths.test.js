@@ -54,6 +54,7 @@ describe('state path classification', () => {
     assert.equal(paths.release.staticDir, '/opt/feather/releases/a/static')
     assert.equal(paths.coordination.sidecarsDir, '/home/zak/.feather/sidecars')
     assert.equal(paths.coordination.roomAssignmentsFile, '/home/zak/.feather/room-sessions.json')
+    assert.equal(paths.coordination.roomPulsesFile, '/home/zak/.feather/room-pulses.json')
     assert.equal(paths.harness.claudeProjectsDir, '/home/zak/.claude/projects')
     assert.equal(paths.harness.ompSessionsDir, '/home/zak/.feather/omp-sessions')
     assert.equal(paths.harness.codexSessionsDir, '/home/zak/.codex/sessions')

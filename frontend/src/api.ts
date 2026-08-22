@@ -44,6 +44,14 @@ export interface RoomInfo {
   active: boolean
   latest: { role: string; text: string } | null
   updatedAt: string | null
+  pulse: {
+    enabled: boolean
+    status: 'waiting' | 'working' | 'paused' | 'error'
+    lastRunAt: string | null
+    nextRunAt: string | null
+    sessionId: string | null
+    error?: string | null
+  }
 }
 
 const ROOMS_SNAPSHOT_KEY = 'feather-rooms-snapshot-v1'
@@ -51,12 +59,22 @@ let roomsSnapshot: RoomInfo[] | null = null
 let roomsRequest: Promise<RoomInfo[]> | null = null
 let roomsFetchedAt = 0
 
+function normalizeRoom(room: RoomInfo): RoomInfo {
+  return {
+    ...room,
+    pulse: room.pulse || {
+      enabled: true, status: 'waiting', lastRunAt: null,
+      nextRunAt: null, sessionId: null, error: null,
+    },
+  }
+}
+
 export function cachedRoomsSnapshot(): RoomInfo[] | null {
   if (roomsSnapshot) return roomsSnapshot
   if (typeof sessionStorage === 'undefined') return null
   try {
     const stored = JSON.parse(sessionStorage.getItem(ROOMS_SNAPSHOT_KEY) || 'null')
-    if (Array.isArray(stored)) roomsSnapshot = stored
+    if (Array.isArray(stored)) roomsSnapshot = stored.map(normalizeRoom)
   } catch {}
   return roomsSnapshot
 }
@@ -69,7 +87,7 @@ export async function fetchRooms(maxAgeMs = 0): Promise<RoomInfo[]> {
   roomsRequest = (async () => {
     const response = await fetch(`${BASE}/api/rooms`)
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    const rooms = (await response.json()).rooms as RoomInfo[]
+    const rooms = ((await response.json()).rooms as RoomInfo[]).map(normalizeRoom)
     roomsSnapshot = rooms
     roomsFetchedAt = Date.now()
     try { sessionStorage.setItem(ROOMS_SNAPSHOT_KEY, JSON.stringify(rooms)) } catch {}
@@ -95,6 +113,15 @@ export const assignSessionToRoom = async (room: string, sessionId: string, remov
     body: JSON.stringify({ sessionId, remove }),
   })
   return responseJson<{ ok: true, assignments: Record<string, string> }>(response)
+}
+
+export async function setRoomPulse(room: string, enabled: boolean): Promise<RoomInfo['pulse']> {
+  const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/pulse`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+  return (await responseJson<{ ok: true, pulse: RoomInfo['pulse'] }>(response)).pulse
 }
 
 export interface ContentBlock {
