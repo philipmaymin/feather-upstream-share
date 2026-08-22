@@ -20,6 +20,7 @@ import yaml from 'highlight.js/lib/languages/yaml'
 import markdown from 'highlight.js/lib/languages/markdown'
 import { toolImagePath, toolInputText, toolPresentation } from '../lib/toolPresentation.js'
 import { localFilePath } from '../lib/localMedia.js'
+import { extractImages } from '../lib/attachments.js'
 
 hljs.registerLanguage('javascript', javascript)
 hljs.registerLanguage('js', javascript)
@@ -542,20 +543,6 @@ div:hover > div > .star-btn, div:hover > div > .action-menu-btn { opacity: 0.6 !
 .hljs-params { color: #c9d1d9; }
 .hljs-property { color: #79c0ff; }
 `
-
-// ── Image extraction ─────────────────────────────────────────────────────────
-
-const imgPattern = /\[Attached image: (\/[^\]]+)\]/g
-
-const filePattern = /\[Attached file: (\/[^\]]+)\]\s*\(([^)]+)\)/g
-
-function extractImages(text: string): { cleanText: string; images: string[]; files: { path: string; name: string }[] } {
-  const images: string[] = []
-  const files: { path: string; name: string }[] = []
-  let cleaned = text.replace(imgPattern, (_, p) => { images.push(p); return '' })
-  cleaned = cleaned.replace(filePattern, (_, p, name) => { files.push({ path: p, name }); return '' }).trim()
-  return { cleanText: cleaned, images, files }
-}
 
 // ── Component ───────────────────────────────────────────────────────────────
 

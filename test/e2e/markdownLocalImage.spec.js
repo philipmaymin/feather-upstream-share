@@ -32,6 +32,8 @@ test.beforeAll(() => {
     `Full image: [open the SVG](${imagePath})`,
     '',
     `[Attached image: ${imagePath}]`,
+    '',
+    'Quoted marker, not an attachment: `[Attached image: /abs/path]` stays inline code.',
   ].join('\n')
   const lines = [
     {
@@ -82,6 +84,14 @@ test('missing local image degrades to a clickable file path', async ({ page }) =
   const fallback = page.locator('.markdown a.feather-path', { hasText: '/no/such/dir/missing-image.png' })
   await expect(fallback).toBeVisible()
   await expect(fallback).toHaveAttribute('href', /^\/api\/files\/raw\?path=/)
+})
+
+test('attachment markers quoted in code spans do not become previews', async ({ page }) => {
+  await openTestSession(page)
+
+  const code = page.locator('.markdown code', { hasText: '[Attached image: /abs/path]' })
+  await expect(code).toBeVisible()
+  await expect(page.locator('img[src*="%2Fabs%2Fpath"]')).toHaveCount(0)
 })
 
 test('local Markdown link still uses the Files preview', async ({ page }) => {
