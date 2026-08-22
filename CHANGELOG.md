@@ -1,5 +1,7 @@
 ## 2026-08-22 - Faster Rooms and local Markdown images
 - **Rooms stay responsive as chat history grows.** Feather now serves cached room and session snapshots immediately and refreshes stale transcript data in the background, while room and chat mutations still invalidate the cache at once.
+- **The Rooms list now feels instant in the browser too.** Feather paints the last good room snapshot immediately while refreshing it quietly, overlaps the first Rooms request with authentication, and keeps fingerprinted frontend bundles cached instead of revalidating them on every reload.
+- **New chats stay visible with the warm cache.** Transcripts created outside Feather are patched into the cached session index directly, without waiting for a full history rescan.
 - **Local images embedded in Markdown render in chat.** Paths such as `![chart](/home/user/rooms/example/chart.png)` now load through the same safe preview route as the Files tab, open in the image lightbox, and fall back to a clickable path if the image is missing.
 - **Codex sessions start with less friction.** Feather suppresses Codex's startup update check for new and resumed sessions.
 - **Old Codex chats resume promptly again.** Resume readiness now recognizes Codex's own terminal prompt instead of waiting up to 30 seconds for a Claude-only prompt that can never appear.

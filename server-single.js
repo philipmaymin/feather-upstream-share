@@ -723,6 +723,8 @@ function summarizeReply(text) {
 
 // ── Session discovery ──────────────────────────────────────────────────────
 
+const SESSION_SOURCE_MTIME = Symbol('sessionSourceMtime');
+
 function discoverSessions(limit = 50, projectFilter) {
   const projDir = projectsDir();
   const candidates = [];
@@ -822,7 +824,7 @@ function discoverSessions(limit = 50, projectFilter) {
     const cwd = info.cwd || meta[id]?.cwd || (candidateProjectId ? projectIdToCwd(candidateProjectId) : null) || null;
     const projectId = candidateProjectId || (cwd ? cwd.replace(/[/.]/g, '-') : null);
     const activityMs = lastActivityMs(fpath, agent, mtime.getTime());
-    return {
+    const session = {
       id, title: meta[id]?.title || info.firstUserText || id.slice(0, 8),
       updatedAt: new Date(activityMs).toISOString(),
       isActive: sessionIsActive(active, id, activityMs, now),
@@ -833,6 +835,11 @@ function discoverSessions(limit = 50, projectFilter) {
       outcome: info.outcome || null,
       summary: info.summary || null,
     };
+    // Keep the transcript's filesystem recency for reproducing the historical
+    // `limit` behavior from a larger shared snapshot. Symbols never leak into
+    // the JSON response.
+    session[SESSION_SOURCE_MTIME] = mtime.getTime();
+    return session;
   });
   sessions.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   return sessions;
@@ -845,6 +852,49 @@ const sessionsSnapshotCache = createSnapshotCache(
   () => discoverSessions(300, null),
   { ttlMs: 10_000 },
 );
+let roomSnapshotCache = null;
+
+// A Claude transcript can also be created outside Feather (or by a test
+// fixture). Patch that one item into the warm index instead of rescanning every
+// historical transcript on the request path or briefly hiding the new chat.
+function cacheNewClaudeSession(filePath, id, projectId, attempt = 0) {
+  setTimeout(() => {
+    let stat;
+    try { stat = fs.statSync(filePath); } catch { return; }
+    if (stat.size < 50) {
+      if (attempt < 5) cacheNewClaudeSession(filePath, id, projectId, attempt + 1);
+      return;
+    }
+
+    const info = extractSessionInfo(filePath);
+    if (info.isTitleGen || info.isWorker
+      || /-home-user-(?:auto|autoweb)-/.test(projectId)
+      || /^\/home\/[^/]+\/\.feather\/room-runs\//.test(info.cwd || '')) return;
+
+    const meta = readMeta();
+    const labels = readUserJson('project-labels.json', {});
+    const cwd = info.cwd || meta[id]?.cwd || projectIdToCwd(projectId) || null;
+    const activityMs = lastActivityMs(filePath, 'claude', stat.mtimeMs);
+    const item = {
+      id,
+      title: meta[id]?.title || info.firstUserText || id.slice(0, 8),
+      updatedAt: new Date(activityMs).toISOString(),
+      isActive: sessionIsActive(getActiveTmuxSessions(), id, activityMs, Date.now()),
+      projectId,
+      projectLabel: labels[projectId] || null,
+      cwd,
+      agent: 'claude',
+      outcome: info.outcome || null,
+      summary: info.summary || null,
+    };
+    item[SESSION_SOURCE_MTIME] = stat.mtimeMs;
+    sessionsSnapshotCache.update(sessions => [
+      item,
+      ...sessions.filter(session => session.id !== id),
+    ].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, 300));
+    if (roomSnapshotCache) roomSnapshotCache.refresh();
+  }, 100);
+}
 
 // Agents can append status/bookkeeping for days after their last real message.
 // Grow the tail until a user/assistant timestamp is found so activity dots,
@@ -1235,8 +1285,12 @@ function watchDir(dp) {
     fs.watch(dp, (event, filename) => {
       if (filename?.endsWith('.jsonl')) {
         const sid = filename.replace('.jsonl', '');
-        if (!fileOffsets.has(sid)) fileOffsets.set(sid, 0);
-        processFileChange(path.join(dp, filename));
+        const filePath = path.join(dp, filename);
+        if (!fileOffsets.has(sid)) {
+          fileOffsets.set(sid, 0);
+          cacheNewClaudeSession(filePath, sid, path.basename(dp));
+        }
+        processFileChange(filePath);
       }
     });
   } catch {}
@@ -1328,6 +1382,10 @@ app.use(express.static(STATIC_DIR, {
     if (filePath.endsWith('index.html') || filePath.endsWith('.html')) {
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
+    } else if (filePath.startsWith(path.join(STATIC_DIR, 'assets') + path.sep)) {
+      // Vite fingerprints everything under assets/, so it is safe to keep
+      // bundles locally until a new index points at a new filename.
+      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     }
   }
 }));
@@ -1482,7 +1540,7 @@ function buildRoomsSnapshot() {
 
 // Room discovery scans many transcripts across all supported agents. Keep the
 // view current without making every warm request wait for the synchronous scan.
-const roomSnapshotCache = createSnapshotCache(buildRoomsSnapshot, { ttlMs: 10_000 });
+roomSnapshotCache = createSnapshotCache(buildRoomsSnapshot, { ttlMs: 10_000 });
 
 app.get('/api/rooms', (_req, res) => {
   try { res.json({ rooms: roomSnapshotCache.get() }); }
@@ -1681,7 +1739,10 @@ app.get('/api/sessions', (req, res) => {
     const project = req.query.project || null;
     const sessions = project
       ? discoverSessions(limit, project)
-      : sessionsSnapshotCache.get().slice(0, limit);
+      : [...sessionsSnapshotCache.get()]
+          .sort((a, b) => (b[SESSION_SOURCE_MTIME] || 0) - (a[SESSION_SOURCE_MTIME] || 0))
+          .slice(0, limit)
+          .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
     res.json({ sessions });
   }
   catch (e) { res.status(500).json({ error: e.message }); }

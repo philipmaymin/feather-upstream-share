@@ -6,7 +6,7 @@ import { Terminal } from './components/Terminal'
 import { SidecarThread } from './components/Sidecar'
 import RoomsHome from './RoomsHome'
 import type { SessionMeta, Message, QuestionData, SidecarGroup } from './api'
-import { fetchSessions, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFile, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
+import { fetchSessions, fetchRooms, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFile, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
 import type { SearchResult } from './api'
 
 interface QuickLink { label: string; url: string }
@@ -366,6 +366,10 @@ export default function App() {
     window.visualViewport?.addEventListener('resize', setVh)
     window.addEventListener('resize', setVh)
 
+    // The reverse proxy has already authenticated anyone who can load the app.
+    // Warm Rooms alongside /api/me so the first render costs one round trip,
+    // not two; fetchRooms coalesces this with RoomsHome's own refresh.
+    fetchRooms().catch(() => {})
     const user = await checkAuth()
     setAuthChecked(true)
     if (user) {

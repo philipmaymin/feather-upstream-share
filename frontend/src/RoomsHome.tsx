@@ -1,5 +1,5 @@
 import { createSignal, onMount, onCleanup, Show, For } from 'solid-js'
-import { fetchRooms, createRoom, createSession, assignSessionToRoom } from './api'
+import { fetchRooms, cachedRoomsSnapshot, createRoom, createSession, assignSessionToRoom } from './api'
 import type { RoomInfo, SessionMeta } from './api'
 
 // Full-screen rooms home (iMessage model, phone-first): one row per room
@@ -24,18 +24,20 @@ function snippetLabel(latest: { role: string, text: string } | null) {
 }
 
 export default function RoomsHome(props: { onOpen: (id: string) => void, onSessionsChanged?: () => void }) {
-  const [rooms, setRooms] = createSignal<RoomInfo[] | null>(null)
+  // Keep the last successful snapshot visible while a fresh one loads. This
+  // makes returning home immediate instead of flashing an empty loading view.
+  const [rooms, setRooms] = createSignal<RoomInfo[] | null>(cachedRoomsSnapshot())
   const [error, setError] = createSignal<string | null>(null)
   const [expanded, setExpanded] = createSignal<string | null>(null)
   const [busy, setBusy] = createSignal(false)
 
-  async function refresh() {
-    try { setRooms(await fetchRooms()); setError(null) }
+  async function refresh(useWarmSnapshot = false) {
+    try { setRooms(await fetchRooms(useWarmSnapshot ? 1000 : 0)); setError(null) }
     catch (e: any) { setError(e.message) }
   }
 
   let timer: ReturnType<typeof setInterval>
-  onMount(() => { refresh(); timer = setInterval(refresh, 10000) })
+  onMount(() => { refresh(true); timer = setInterval(refresh, 10000) })
   onCleanup(() => clearInterval(timer))
 
   async function newRoom() {

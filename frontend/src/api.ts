@@ -37,10 +37,37 @@ export interface RoomInfo {
   updatedAt: string | null
 }
 
-export async function fetchRooms(): Promise<RoomInfo[]> {
-  const response = await fetch(`${BASE}/api/rooms`)
-  if (!response.ok) throw new Error(`HTTP ${response.status}`)
-  return (await response.json()).rooms
+const ROOMS_SNAPSHOT_KEY = 'feather-rooms-snapshot-v1'
+let roomsSnapshot: RoomInfo[] | null = null
+let roomsRequest: Promise<RoomInfo[]> | null = null
+let roomsFetchedAt = 0
+
+export function cachedRoomsSnapshot(): RoomInfo[] | null {
+  if (roomsSnapshot) return roomsSnapshot
+  if (typeof sessionStorage === 'undefined') return null
+  try {
+    const stored = JSON.parse(sessionStorage.getItem(ROOMS_SNAPSHOT_KEY) || 'null')
+    if (Array.isArray(stored)) roomsSnapshot = stored
+  } catch {}
+  return roomsSnapshot
+}
+
+export async function fetchRooms(maxAgeMs = 0): Promise<RoomInfo[]> {
+  // The app shell and RoomsHome both warm this endpoint during startup. Share
+  // that request so the home view does not add a second network round trip.
+  if (roomsSnapshot && Date.now() - roomsFetchedAt < maxAgeMs) return roomsSnapshot
+  if (roomsRequest) return roomsRequest
+  roomsRequest = (async () => {
+    const response = await fetch(`${BASE}/api/rooms`)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const rooms = (await response.json()).rooms as RoomInfo[]
+    roomsSnapshot = rooms
+    roomsFetchedAt = Date.now()
+    try { sessionStorage.setItem(ROOMS_SNAPSHOT_KEY, JSON.stringify(rooms)) } catch {}
+    return rooms
+  })()
+  try { return await roomsRequest }
+  finally { roomsRequest = null }
 }
 
 export async function createRoom(name: string): Promise<{ name: string; cwd: string }> {

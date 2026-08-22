@@ -60,4 +60,17 @@ describe('createSnapshotCache', () => {
     assert.doesNotThrow(() => scheduled.shift()())
     assert.deepEqual(cache.get(), { ok: true })
   })
+
+  it('can patch a warm snapshot without running the expensive loader again', () => {
+    let loads = 0
+    const cache = createSnapshotCache(() => {
+      loads++
+      return ['first']
+    }, { ttlMs: 1000 })
+
+    assert.deepEqual(cache.get(), ['first'])
+    assert.deepEqual(cache.update(items => ['new', ...items]), ['new', 'first'])
+    assert.deepEqual(cache.get(), ['new', 'first'])
+    assert.equal(loads, 1)
+  })
 })
