@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# Guarded Feather release staging, promotion, recovery, and capability install.
+set -Eeuo pipefail
+
+SELF="$(readlink -f "$0")"
+REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd)"
+
+die() { echo "refeather: $*" >&2; exit 1; }
+note() { echo "refeather: $*" >&2; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  refeather stage [--source DIR] [--releases-dir DIR] [--archive-receipt FILE]
+                  [--build-command CMD] [--check-port PORT]
+  refeather promote --release DIR --current-link LINK --program NAME
+                    --supervisor-socket URL --health-url URL [--skip-capability-install]
+  refeather rollback --release DIR --current-link LINK --program NAME
+                     --supervisor-socket URL --health-url URL [--skip-capability-install]
+  refeather recover [--journal-dir DIR] [--lock-file FILE]
+  refeather install-capabilities --release DIR [--target-root DIR]
+                    [--claude-skills-dir DIR] [--codex-skills-dir DIR] [--bin-dir DIR]
+
+Environment equivalents use the REFEATHER_ prefix. Promotion never guesses a
+Supervisor program/socket or health URL. FEATHER_URL is unrelated runtime
+client configuration; pass the exact mounted health URL to --health-url.
+EOF
+}
+
+need_command() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+realpath_existing() {
+  [ -e "$1" ] || [ -L "$1" ] || die "path does not exist: $1"
+  readlink -f "$1"
+}
+
+manifest_field() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+result = value
+for part in sys.argv[2].split('.'):
+    result = result[part]
+print(result)
+PY
+}
+
+fsync_dir() {
+  python3 - "$1" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try: os.fsync(fd)
+finally: os.close(fd)
+PY
+}
+
+validate_archive_receipt() {
+  local receipt="$1" commit="$2"
+  [ -f "$receipt" ] || die "archive receipt not found: $receipt"
+  python3 - "$receipt" "$commit" <<'PY'
+import hashlib, json, os, sys
+receipt_path, commit = os.path.abspath(sys.argv[1]), sys.argv[2]
+with open(receipt_path, encoding="utf-8") as handle:
+    receipt = json.load(handle)
+if receipt.get("schema") != 1 or receipt.get("sourceCommit") != commit:
+    raise SystemExit("archive receipt schema/sourceCommit does not match HEAD")
+artifacts = receipt.get("artifacts")
+required = ("refs", "binaryDiff", "untracked", "mutableState")
+if not isinstance(artifacts, dict) or any(name not in artifacts for name in required):
+    raise SystemExit("archive receipt must cover refs, binaryDiff, untracked, and mutableState")
+base = os.path.dirname(receipt_path)
+for name in required:
+    entry = artifacts[name]
+    if not isinstance(entry, dict) or not entry.get("path") or not entry.get("sha256"):
+        raise SystemExit(f"archive receipt artifact {name} is incomplete")
+    path = entry["path"] if os.path.isabs(entry["path"]) else os.path.join(base, entry["path"])
+    if not os.path.isfile(path):
+        raise SystemExit(f"archive receipt artifact missing: {name}")
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""): digest.update(block)
+    if digest.hexdigest() != entry["sha256"]:
+        raise SystemExit(f"archive receipt hash mismatch: {name}")
+PY
+}
+
+source_preflight() {
+  local source="$1" receipt="$2" check_port="$3"
+  local required_commands="${REFEATHER_REQUIRED_COMMANDS:-git tar npm python3 sha256sum flock curl df du}"
+  local command
+  for command in $required_commands; do need_command "$command"; done
+  git -C "$source" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a Git worktree: $source"
+  [ -z "$(git -C "$source" ls-files -u)" ] || die "source has unresolved merge conflicts"
+
+  SOURCE_COMMIT="$(git -C "$source" rev-parse HEAD)"
+  local status upstream ahead=0 unsafe=()
+  status="$(git -C "$source" status --porcelain --untracked-files=all)"
+  [ -z "$status" ] || unsafe+=("dirty or untracked files")
+  upstream="$(git -C "$source" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)"
+  if [ -z "$upstream" ]; then unsafe+=("no upstream tracking branch")
+  else
+    ahead="$(git -C "$source" rev-list --count "$upstream..HEAD")"
+    [ "$ahead" -eq 0 ] || unsafe+=("$ahead unpushed commit(s)")
+  fi
+  if [ "${#unsafe[@]}" -gt 0 ]; then
+    [ -n "$receipt" ] || die "unsafe source (${unsafe[*]}); supply a complete --archive-receipt"
+    validate_archive_receipt "$receipt" "$SOURCE_COMMIT"
+  elif [ -n "$receipt" ]; then
+    validate_archive_receipt "$receipt" "$SOURCE_COMMIT"
+  fi
+
+  if [ -n "$check_port" ]; then
+    python3 - "$check_port" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+sock = socket.socket()
+try: sock.bind(("127.0.0.1", port))
+except OSError: raise SystemExit(f"requested canary port is already in use: {port}")
+finally: sock.close()
+PY
+  fi
+}
+
+write_release_manifest() {
+  python3 - "$1/.refeather-release.json" "$2" "$3" "$4" <<'PY'
+import json, os, sys, tempfile
+path, commit, version, source = sys.argv[1:]
+value = {"schema": 1, "sourceCommit": commit, "version": version, "source": source}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, sort_keys=True)
+    handle.write("\n")
+    handle.flush(); os.fsync(handle.fileno())
+PY
+}
+
+cmd_stage() {
+  local source="${REFEATHER_SOURCE:-$REPO_ROOT}"
+  local releases="${REFEATHER_RELEASES_DIR:-$HOME/.local/share/feather/releases}"
+  local receipt="${REFEATHER_ARCHIVE_RECEIPT:-}" build_command="${REFEATHER_BUILD_COMMAND:-REFEATHER_RELEASE_BUILD=1 npm ci && REFEATHER_RELEASE_BUILD=1 npm run build}"
+  local check_port="${REFEATHER_CHECK_PORT:-}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source) source="$2"; shift 2 ;; --releases-dir) releases="$2"; shift 2 ;;
+      --archive-receipt) receipt="$2"; shift 2 ;; --build-command) build_command="$2"; shift 2 ;;
+      --check-port) check_port="$2"; shift 2 ;; *) die "unknown stage option: $1" ;;
+    esac
+  done
+  source="$(realpath_existing "$source")"
+  source_preflight "$source" "$receipt" "$check_port"
+  mkdir -p "$releases"
+
+  local source_kb available_kb required_kb
+  source_kb="$(du -sk "$source" | awk '{print $1}')"
+  available_kb="$(df -Pk "$releases" | awk 'NR==2 {print $4}')"
+  required_kb="${REFEATHER_REQUIRED_FREE_KB:-$((source_kb * 2 + ${REFEATHER_DISK_HEADROOM_KB:-262144}))}"
+  [ "$available_kb" -ge "$required_kb" ] || die "insufficient disk: ${available_kb}KB free, ${required_kb}KB required"
+
+  local release="$releases/$SOURCE_COMMIT" manifest="$releases/$SOURCE_COMMIT/.refeather-release.json"
+  if [ -d "$release" ]; then
+    [ -f "$manifest" ] && [ "$(manifest_field "$manifest" sourceCommit)" = "$SOURCE_COMMIT" ] \
+      || die "existing release is not a verified build of $SOURCE_COMMIT: $release"
+    printf '%s\n' "$release"
+    return
+  fi
+
+  local tmp="$releases/.stage-$SOURCE_COMMIT-$$"
+  mkdir "$tmp"
+  if ! git -C "$source" archive "$SOURCE_COMMIT" | tar -x -C "$tmp"; then rm -rf "$tmp"; die "could not archive source"; fi
+  note "building immutable release $SOURCE_COMMIT"
+  if ! (cd "$tmp" && bash -lc "$build_command"); then rm -rf "$tmp"; die "release build failed"; fi
+  [ -f "$tmp/version.json" ] || { rm -rf "$tmp"; die "build did not produce version.json"; }
+  local version
+  version="$(manifest_field "$tmp/version.json" version)" || { rm -rf "$tmp"; die "invalid version.json"; }
+  write_release_manifest "$tmp" "$SOURCE_COMMIT" "$version" "$source"
+  chmod -R a-w "$tmp"
+  mv "$tmp" "$release"
+  fsync_dir "$releases"
+  note "staged $release (version $version); current target and service unchanged"
+  printf '%s\n' "$release"
+}
+
+backup_conflicts() {
+  local backup_root="$1"; shift
+  mkdir -p "$backup_root"
+  : >"$backup_root/manifest.tsv"
+  local source index=0
+  for source in "$@"; do
+    index=$((index + 1))
+    cp -a --no-dereference "$source" "$backup_root/item-$index"
+    printf '%s\t%s\n' "$source" "$backup_root/item-$index" >>"$backup_root/manifest.tsv"
+  done
+  note "conflicts preserved at $backup_root; existing destinations were not changed"
+}
+
+install_capabilities_impl() {
+  local release="$1" target_root="$2" claude_dir="$3" codex_dir="$4" bin_dir="$5" backup_dir="$6"
+  local skill name source
+  for skill in feather sidecar looper; do
+    [ -f "$release/skills/$skill/SKILL.md" ] || die "release lacks skills/$skill/SKILL.md"
+  done
+  for name in room sidecar; do [ -x "$release/bin/$name" ] || die "release lacks executable bin/$name"; done
+
+  local destinations=() targets=() dest target
+  for skill in feather sidecar looper; do
+    destinations+=("$claude_dir/$skill"); targets+=("$target_root/skills/$skill")
+    destinations+=("$codex_dir/$skill"); targets+=("$target_root/skills/$skill")
+  done
+  for name in room sidecar; do destinations+=("$bin_dir/$name"); targets+=("$target_root/bin/$name"); done
+
+  local conflicts=()
+  for ((index=0; index<${#destinations[@]}; index++)); do
+    dest="${destinations[$index]}"; target="${targets[$index]}"
+    if [ -L "$dest" ]; then
+      [ "$(readlink "$dest")" = "$target" ] || conflicts+=("$dest")
+    elif [ -e "$dest" ]; then conflicts+=("$dest")
+    fi
+  done
+  if [ "${#conflicts[@]}" -gt 0 ]; then
+    backup_conflicts "$backup_dir" "${conflicts[@]}"
+    die "capability destination conflicts detected; inspect backup evidence and remove or relocate conflicts explicitly"
+  fi
+
+  mkdir -p "$claude_dir" "$codex_dir" "$bin_dir"
+  for ((index=0; index<${#destinations[@]}; index++)); do
+    dest="${destinations[$index]}"; target="${targets[$index]}"
+    [ -L "$dest" ] || ln -s "$target" "$dest"
+  done
+  note "installed Feather, Sidecar, and Looper for Claude and Codex; installed room and sidecar CLIs"
+}
+
+cmd_install_capabilities() {
+  local release="${REFEATHER_RELEASE:-}" target_root="${REFEATHER_TARGET_ROOT:-}"
+  local claude_dir="${REFEATHER_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
+  local codex_dir="${REFEATHER_CODEX_SKILLS_DIR:-$HOME/.codex/skills}"
+  local bin_dir="${REFEATHER_BIN_DIR:-$HOME/.local/bin}"
+  local backup_dir="${REFEATHER_CONFLICT_BACKUP_DIR:-$HOME/.feather/install-conflicts/$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --release) release="$2"; shift 2 ;; --target-root) target_root="$2"; shift 2 ;;
+      --claude-skills-dir) claude_dir="$2"; shift 2 ;; --codex-skills-dir) codex_dir="$2"; shift 2 ;;
+      --bin-dir) bin_dir="$2"; shift 2 ;; --backup-dir) backup_dir="$2"; shift 2 ;;
+      *) die "unknown install-capabilities option: $1" ;;
+    esac
+  done
+  [ -n "$release" ] || die "install-capabilities requires --release"
+  release="$(realpath_existing "$release")"
+  [ -n "$target_root" ] || target_root="$release"
+  install_capabilities_impl "$release" "$target_root" "$claude_dir" "$codex_dir" "$bin_dir" "$backup_dir"
+}
+
+atomic_current_link() {
+  local current="$1" target="$2" tmp
+  tmp="${current}.tmp.$$"
+  mkdir -p "$(dirname "$current")"
+  [ ! -e "$current" ] || [ -L "$current" ] || die "current target is not a symlink: $current"
+  ln -s "$target" "$tmp"
+  mv -Tf "$tmp" "$current"
+  fsync_dir "$(dirname "$current")"
+}
+
+write_tx_state() {
+  local phase="$1"
+  TX_PHASE="$phase"
+  python3 - "$ACTIVE_STATE" "$TX_ID" "$TX_COMMAND" "$phase" "$TX_PRIOR" "$TX_CANDIDATE" "$TX_EXPECTED" \
+    "$TX_PROGRAM" "$TX_SOCKET" "$TX_HEALTH" "$TX_CURRENT" "$TX_JOURNAL" <<'PY'
+import json, os, sys, tempfile, time
+path = sys.argv[1]
+keys = ("transaction", "command", "phase", "prior", "candidate", "expectedVersion", "program", "supervisorSocket", "healthUrl", "currentLink", "journal")
+value = dict(zip(keys, sys.argv[2:]))
+value["updatedAt"] = int(time.time())
+os.makedirs(os.path.dirname(path), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".active-", dir=os.path.dirname(path), text=True)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, sort_keys=True); handle.write("\n"); handle.flush(); os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    dfd = os.open(os.path.dirname(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try: os.fsync(dfd)
+    finally: os.close(dfd)
+finally:
+    try: os.unlink(tmp)
+    except FileNotFoundError: pass
+PY
+  journal_event "$phase"
+}
+
+journal_event() {
+  local phase="$1" message="${2:-}"
+  python3 - "$TX_JOURNAL" "$TX_ID" "$TX_COMMAND" "$phase" "$message" <<'PY'
+import json, os, sys, time
+path, transaction, command, phase, message = sys.argv[1:]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({"ts": int(time.time()), "transaction": transaction, "command": command, "phase": phase, "message": message}, sort_keys=True) + "\n")
+    handle.flush(); os.fsync(handle.fileno())
+PY
+}
+
+finish_tx() {
+  local outcome="$1" final="$TX_JOURNAL_DIR/$TX_ID.state.json"
+  journal_event "$outcome"
+  mv "$ACTIVE_STATE" "$final"
+  fsync_dir "$TX_JOURNAL_DIR"
+  TX_FINISHED=1
+}
+
+supervisor_action() {
+  "$TX_SUPERVISORCTL" -s "$TX_SOCKET" "$1" "$TX_PROGRAM"
+}
+
+health_version() {
+  "$TX_CURL" -fsS --max-time "${REFEATHER_HEALTH_TIMEOUT:-3}" "$TX_HEALTH" | python3 -c '
+import json, sys
+value=json.load(sys.stdin)
+print(value.get("version", ""))
+'
+}
+
+wait_for_version() {
+  local expected="$1" attempts="${REFEATHER_HEALTH_ATTEMPTS:-20}" actual="" index
+  for ((index=1; index<=attempts; index++)); do
+    actual="$(health_version 2>/dev/null || true)"
+    [ "$actual" = "$expected" ] && return 0
+    sleep "${REFEATHER_HEALTH_DELAY:-0.25}"
+  done
+  note "health version mismatch at $TX_HEALTH: expected $expected, last response $actual"
+  return 1
+}
+
+prior_expected_version() {
+  local manifest="$TX_PRIOR/.refeather-release.json"
+  [ -f "$manifest" ] && manifest_field "$manifest" version || true
+}
+
+switch_failed() {
+  local rc="${1:-$?}"
+  trap - ERR INT TERM
+  set +e
+  journal_event failure "phase=$TX_PHASE rc=$rc"
+  if [ "${TX_STOP_ATTEMPTED:-0}" = 1 ]; then supervisor_action stop >/dev/null 2>&1 || true; fi
+  if [ "${TX_POINTER_CHANGED:-0}" = 1 ]; then atomic_current_link "$TX_CURRENT" "$TX_PRIOR" || true; fi
+  if [ "${TX_STOP_ATTEMPTED:-0}" = 1 ]; then
+    supervisor_action start >/dev/null 2>&1 || true
+    local old_expected; old_expected="$(prior_expected_version)"
+    [ -z "$old_expected" ] || wait_for_version "$old_expected" >/dev/null 2>&1 || true
+  fi
+  [ "${TX_FINISHED:-0}" = 1 ] || finish_tx rolled-back
+  note "$TX_COMMAND failed in phase $TX_PHASE; prior release restored"
+  exit "$rc"
+}
+
+load_switch_options() {
+  TX_CANDIDATE="${REFEATHER_RELEASE:-}"
+  TX_CURRENT="${REFEATHER_CURRENT_LINK:-}"
+  TX_PROGRAM="${REFEATHER_SUPERVISOR_PROGRAM:-}"
+  TX_SOCKET="${REFEATHER_SUPERVISOR_SOCKET:-}"
+  TX_HEALTH="${REFEATHER_HEALTH_URL:-}"
+  TX_SUPERVISORCTL="${REFEATHER_SUPERVISORCTL:-supervisorctl}"
+  TX_CURL="${REFEATHER_CURL:-curl}"
+  TX_JOURNAL_DIR="${REFEATHER_JOURNAL_DIR:-/var/lib/feather/refeather}"
+  TX_LOCK_FILE="${REFEATHER_LOCK_FILE:-/var/lock/feather-refeather.lock}"
+  TX_PRECHECK="${REFEATHER_PRE_PROMOTE_CHECK:-}"
+  TX_SKIP_CAPABILITIES=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --release) TX_CANDIDATE="$2"; shift 2 ;; --current-link) TX_CURRENT="$2"; shift 2 ;;
+      --program) TX_PROGRAM="$2"; shift 2 ;; --supervisor-socket) TX_SOCKET="$2"; shift 2 ;;
+      --health-url) TX_HEALTH="$2"; shift 2 ;; --supervisorctl) TX_SUPERVISORCTL="$2"; shift 2 ;;
+      --journal-dir) TX_JOURNAL_DIR="$2"; shift 2 ;; --lock-file) TX_LOCK_FILE="$2"; shift 2 ;;
+      --pre-promote-check) TX_PRECHECK="$2"; shift 2 ;; --skip-capability-install) TX_SKIP_CAPABILITIES=1; shift ;;
+      *) die "unknown $TX_COMMAND option: $1" ;;
+    esac
+  done
+  [ -n "$TX_CANDIDATE" ] && [ -n "$TX_CURRENT" ] && [ -n "$TX_PROGRAM" ] && [ -n "$TX_SOCKET" ] && [ -n "$TX_HEALTH" ] \
+    || die "$TX_COMMAND requires explicit --release, --current-link, --program, --supervisor-socket, and --health-url"
+  need_command "$TX_SUPERVISORCTL"; need_command "$TX_CURL"; need_command flock; need_command python3
+  TX_CANDIDATE="$(realpath_existing "$TX_CANDIDATE")"
+  [ -f "$TX_CANDIDATE/.refeather-release.json" ] || die "candidate has no release manifest"
+  TX_EXPECTED="$(manifest_field "$TX_CANDIDATE/.refeather-release.json" version)"
+  [ -L "$TX_CURRENT" ] || die "current link must already be a symlink: $TX_CURRENT"
+  TX_PRIOR="$(readlink -f "$TX_CURRENT")"
+  [ -d "$TX_PRIOR" ] || die "current link target is missing: $TX_PRIOR"
+}
+
+run_switch() {
+  TX_COMMAND="$1"; shift
+  load_switch_options "$@"
+  mkdir -p "$TX_JOURNAL_DIR" "$(dirname "$TX_LOCK_FILE")"
+  exec 9>"$TX_LOCK_FILE"
+  flock -n 9 || die "another promotion or rollback owns lock $TX_LOCK_FILE"
+  ACTIVE_STATE="$TX_JOURNAL_DIR/active.json"
+  [ ! -e "$ACTIVE_STATE" ] || die "unfinished transaction exists; run refeather recover"
+  TX_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  TX_JOURNAL="$TX_JOURNAL_DIR/$TX_ID.jsonl"
+  TX_PHASE=initializing TX_STOP_ATTEMPTED=0 TX_POINTER_CHANGED=0 TX_FINISHED=0
+  write_tx_state prepared
+  trap switch_failed ERR
+  trap 'switch_failed 130' INT TERM
+
+  if [ "$TX_SKIP_CAPABILITIES" -eq 0 ]; then
+    install_capabilities_impl "$TX_CANDIDATE" "$TX_CURRENT" \
+      "${REFEATHER_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}" \
+      "${REFEATHER_CODEX_SKILLS_DIR:-$HOME/.codex/skills}" \
+      "${REFEATHER_BIN_DIR:-$HOME/.local/bin}" \
+      "${REFEATHER_CONFLICT_BACKUP_DIR:-$HOME/.feather/install-conflicts/$TX_ID}"
+  fi
+  if [ -n "$TX_PRECHECK" ]; then write_tx_state preflight; bash -lc "$TX_PRECHECK"; fi
+
+  write_tx_state stopping
+  TX_STOP_ATTEMPTED=1
+  supervisor_action stop
+  write_tx_state stopped
+  atomic_current_link "$TX_CURRENT" "$TX_CANDIDATE"
+  TX_POINTER_CHANGED=1
+  write_tx_state pointer-switched
+  write_tx_state starting
+  supervisor_action start
+  write_tx_state health-check
+  wait_for_version "$TX_EXPECTED"
+  write_tx_state promoted
+  finish_tx complete
+  trap - ERR INT TERM
+  note "$TX_COMMAND complete: $TX_CURRENT -> $TX_CANDIDATE (version $TX_EXPECTED)"
+}
+
+cmd_recover() {
+  local journal_dir="${REFEATHER_JOURNAL_DIR:-/var/lib/feather/refeather}"
+  local lock_file="${REFEATHER_LOCK_FILE:-/var/lock/feather-refeather.lock}"
+  while [ $# -gt 0 ]; do case "$1" in
+    --journal-dir) journal_dir="$2"; shift 2 ;; --lock-file) lock_file="$2"; shift 2 ;;
+    *) die "unknown recover option: $1" ;; esac; done
+  mkdir -p "$journal_dir" "$(dirname "$lock_file")"
+  exec 9>"$lock_file"; flock -n 9 || die "another promotion or rollback owns lock $lock_file"
+  ACTIVE_STATE="$journal_dir/active.json"
+  [ -f "$ACTIVE_STATE" ] || die "no unfinished transaction"
+  eval "$(python3 - "$ACTIVE_STATE" <<'PY'
+import json, shlex, sys
+with open(sys.argv[1], encoding="utf-8") as handle: value=json.load(handle)
+mapping={
+ "TX_ID":"transaction", "TX_COMMAND":"command", "TX_PHASE":"phase", "TX_PRIOR":"prior",
+ "TX_CANDIDATE":"candidate", "TX_EXPECTED":"expectedVersion", "TX_PROGRAM":"program",
+ "TX_SOCKET":"supervisorSocket", "TX_HEALTH":"healthUrl", "TX_CURRENT":"currentLink", "TX_JOURNAL":"journal"}
+for shell, key in mapping.items(): print(f"{shell}={shlex.quote(str(value.get(key, '')))}")
+PY
+)"
+  TX_JOURNAL_DIR="$journal_dir" TX_SUPERVISORCTL="${REFEATHER_SUPERVISORCTL:-supervisorctl}" TX_CURL="${REFEATHER_CURL:-curl}"
+  TX_FINISHED=0 TX_STOP_ATTEMPTED=1 TX_POINTER_CHANGED=1
+  need_command "$TX_SUPERVISORCTL"; need_command "$TX_CURL"
+  case "$TX_PHASE" in
+    prepared|preflight)
+      finish_tx recovered-noop
+      note "recovered transaction before service mutation"
+      ;;
+    promoted)
+      finish_tx complete
+      note "finalized already-promoted transaction"
+      ;;
+    *)
+      supervisor_action stop >/dev/null 2>&1 || true
+      atomic_current_link "$TX_CURRENT" "$TX_PRIOR"
+      supervisor_action start
+      old_expected="$(prior_expected_version)"
+      [ -z "$old_expected" ] || wait_for_version "$old_expected"
+      finish_tx recovered-rollback
+      note "recovered interrupted $TX_COMMAND by restoring $TX_PRIOR"
+      ;;
+  esac
+}
+
+command="${1:-}"; [ -n "$command" ] || { usage; exit 1; }; shift
+case "$command" in
+  stage) cmd_stage "$@" ;; promote) run_switch promote "$@" ;; rollback) run_switch rollback "$@" ;;
+  recover) cmd_recover "$@" ;; install-capabilities) cmd_install_capabilities "$@" ;;
+  -h|--help|help) usage ;; *) die "unknown command: $command" ;;
+esac

@@ -1,49 +1,32 @@
 #!/usr/bin/env bash
 # sidecar — talk to your Feather sidecar peers from inside an agent session.
-# Self-identifies via this deployment's tmux session name (f-<id8>); Feather resolves
+# Self-identifies via the tmux session name (feather-<id8>); Feather resolves
 # which group this session belongs to.
 #
 #   sidecar post --to <role|a,b|all> <text...>   send to a peer, several, or all
 #   sidecar read [--since <seq>] [--from <role>]  print the thread (optionally filtered)
 #   sidecar wait --from <role|all> --count <N> [--timeout <S>]   block until N replies land
 #   sidecar whoami                                show this session's group(s)
+#   sidecar url                                   show the selected Feather base URL
 #
 # When this session is in several groups, pass --group <id> (or set SIDECAR_GROUP).
 # Install: ln -s <feather>/bin/sidecar ~/.local/bin/sidecar   (must be on PATH)
-# Override the backend with FEATHER_URL (else it probes $PORT, the account's
-# deployed Feather port, then the conventional local ports).
+# FEATHER_URL is authoritative. Without it, discovery succeeds only when one
+# Feather-shaped service answers on FEATHER_PORT, 4870, or 3300.
 set -euo pipefail
 
 die() { echo "sidecar: $*" >&2; exit 1; }
 command -v jq   >/dev/null || die "jq is required"
 command -v curl >/dev/null || die "curl is required"
 
-resolve_base() {
-  if [ -n "${FEATHER_URL:-}" ]; then printf '%s' "$FEATHER_URL"; return; fi
-  local account_port p
-  case "${USER:-$(id -un)}" in
-    user)   account_port=4871 ;;
-    tobin)  account_port=4872 ;;
-    maya)   account_port=4873 ;;
-    stella) account_port=4874 ;;
-    allan)  account_port=4875 ;;
-    *)      account_port=4870 ;;
-  esac
-  for p in "${PORT:-}" "$account_port" 4870 3300; do
-    [ -n "$p" ] || continue
-    if curl -fsS -o /dev/null "http://127.0.0.1:$p/api/health" 2>/dev/null; then
-      printf '%s' "http://127.0.0.1:$p"; return
-    fi
-  done
-  printf '%s' "http://127.0.0.1:${PORT:-$account_port}"
-}
-BASE="$(resolve_base)"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$(readlink -f "$0")")" && pwd)"
+BASE="$($SCRIPT_DIR/feather-instance)" || die "could not resolve Feather; set FEATHER_URL"
 
 self_prefix() {
   local s
   s=$(tmux display-message -p '#S' 2>/dev/null) || die "not inside a tmux session"
   case "$s" in
-    f-*) printf '%s' "${s#f-}" ;;
+    feather-*) printf '%s' "${s#feather-}" ;;
     *) die "not a feather session (tmux session: $s)" ;;
   esac
 }
@@ -71,6 +54,9 @@ self_role() { # $1 prefix, $2 gid
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
+  url)
+    printf '%s\n' "$BASE"
+    ;;
   post)
     to=""; group=""; text=""
     while [ $# -gt 0 ]; do

@@ -24,32 +24,18 @@ set -u
 
 ROOMS_DIR="${ROOMS_DIR:-$HOME/rooms}"
 RUNS_DIR="${ROOM_RUNS_DIR:-$HOME/.feather/room-runs}"
+FEATHER_URL="${FEATHER_URL:-}"
 TIMEOUT="${ROOM_TIMEOUT:-600}"
 LOOKUP_TIMEOUT="${ROOM_LOOKUP_TIMEOUT:-180}"
 
 die() { echo "room: $*" >&2; exit 1; }
 
-resolve_feather_url() {
-  if [ -n "${FEATHER_URL:-}" ]; then printf '%s' "$FEATHER_URL"; return; fi
-  local account_port port
-  case "${USER:-$(id -un)}" in
-    user)   account_port=4871 ;;
-    tobin)  account_port=4872 ;;
-    maya)   account_port=4873 ;;
-    stella) account_port=4874 ;;
-    allan)  account_port=4875 ;;
-    *)      account_port=4870 ;;
-  esac
-  for port in "${PORT:-}" "$account_port" 4870 3300; do
-    [ -n "$port" ] || continue
-    if curl -fsS -o /dev/null "http://127.0.0.1:$port/api/health" 2>/dev/null; then
-      printf 'http://127.0.0.1:%s' "$port"
-      return
-    fi
-  done
-  printf 'http://127.0.0.1:%s' "${PORT:-$account_port}"
+ensure_feather_url() {
+  [ -n "$FEATHER_URL" ] && return
+  local script_dir
+  script_dir="$(CDPATH= cd -- "$(dirname -- "$(readlink -f "$0")")" && pwd)"
+  FEATHER_URL="$($script_dir/feather-instance)" || die "could not resolve Feather; set FEATHER_URL"
 }
-FEATHER_URL="$(resolve_feather_url)"
 
 # ── Room resolution ─────────────────────────────────────────────────────────
 resolve_room() {
@@ -129,20 +115,9 @@ attempt_status() {  # $1 = outfile → echoes ok|failed
 
 cmd_new() {
   local name="${1:-}"; [ -n "$name" ] || die "usage: room new <name>"
-  [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die "bad room name (lowercase, digits, dashes)"
   local dir="$ROOMS_DIR/$name"
   [ -e "$dir" ] && die "already exists: $dir"
-  mkdir -p "$dir" "$ROOMS_DIR"
-  if [ ! -f "$ROOMS_DIR/_doctrine.md" ]; then
-    cat >"$ROOMS_DIR/_doctrine.md" <<'EOF'
-# Shared room doctrine
-
-- Read the room's `AGENTS.md` and `notes.md` before acting.
-- Treat `notes.md` as durable memory: record decisions, state, and open threads as work proceeds.
-- Verify important claims mechanically and keep evidence close to the decision.
-- Delegate only when it materially helps. A `WORKER:` is a focused hand and must not recursively delegate.
-EOF
-  fi
+  mkdir -p "$dir"
   cat >"$dir/AGENTS.md" <<EOF
 # Room: #$name
 
@@ -182,7 +157,7 @@ Question: $1
 Where to look (use grep/tail, do not read whole files):
 - Room notes: $ROOM_PATH/notes.md
 - Long-term memory facts: grep -i ~/memory/memory.jsonl
-- Past Claude session transcripts: ~/.claude/projects/*/*.jsonl
+- Past Claude session transcripts: ~/.claude/projects/-home-user*/*.jsonl
   (grep -il for keywords first, then grep the matching file for context;
   these are JSONL — extract the relevant text, do not dump raw JSON)
 
@@ -272,6 +247,7 @@ core content, improved by grafting any clearly better ideas from the others,
 cmd_spawn() {
   [ -n "${1:-}" ] || die 'usage: room spawn "<task>"'
   resolve_room
+  ensure_feather_url
   local id; id=$(cat /proc/sys/kernel/random/uuid)
   local resp
   resp=$(curl -sf -X POST "$FEATHER_URL/api/sessions" -H 'Content-Type: application/json' \
@@ -290,6 +266,7 @@ cmd_assignment() { # $1 = attach|detach, $2 = session id
   local action="$1" session_id="${2:-}"
   [ -n "$session_id" ] || die "usage: room $action <session-id>"
   resolve_room
+  ensure_feather_url
   local remove=false verb=attached preposition=to
   if [ "$action" = detach ]; then remove=true; verb=detached; preposition=from; fi
   local payload
@@ -303,6 +280,7 @@ cmd_assignment() { # $1 = attach|detach, $2 = session id
 
 cmd_handoff() {
   resolve_room
+  ensure_feather_url
   new_run_dir handoff
   # Feather normalizes Claude, Codex, and OMP sessions behind one API.
   local latest

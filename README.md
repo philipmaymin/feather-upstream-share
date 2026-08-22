@@ -73,6 +73,22 @@ councils, second opinions, spawned sessions, and handoffs.
 Feather's former Auto surface is retired. Existing `~/auto-*` directories are
 left untouched.
 
+## Agent capabilities
+
+Install Feather, Sidecar, and Looper for both Claude and Codex, plus the `room`
+and `sidecar` CLIs, through the guarded installer. Point the links at the stable
+`current` release so promotion updates server and agent capabilities together:
+
+```bash
+bin/refeather install-capabilities \
+  --release /opt/feather/releases/<commit> \
+  --target-root /opt/feather/current
+```
+
+The installer is idempotent and never overwrites a file or foreign symlink;
+conflicts are copied to a timestamped evidence directory and installation
+stops with cleanup guidance.
+
 ## Quick start
 
 ```bash
@@ -187,14 +203,19 @@ existing state. Defaults and rollback compatibility are recorded in
 - **Byte-offset SSE IDs.** Enables resumable streams and gap-free message delivery.
 - **Mobile-first.** `--vh` viewport fix, safe-area insets, `-webkit-overflow-scrolling: touch`, PWA meta tags.
 
-## Deploying changes
+## Releasing changes
 
 ```bash
 cd ~/feather
-npm run deploy    # stamps version.json, builds frontend, restarts server
+npm run deploy    # stages an immutable release; does not restart anything
 ```
 
-Both backend (`/api/health`) and frontend (tab bar) show the same version timestamp.
+Promotion is a separate guarded operation with explicit current-link, service,
+and mounted health inputs. It owns a host lock, journals every phase, verifies
+the expected build version, and restores the prior release on failure. See
+[`docs/runbooks/refeather.md`](docs/runbooks/refeather.md).
+
+Both backend (`/api/health`) and frontend (tab bar) show the promoted version.
 
 ## Deployment
 
@@ -204,6 +225,10 @@ Both backend (`/api/health`) and frontend (tab bar) show the same version timest
 # Create a service file pointing to server-single.js
 sudo systemctl enable --now feather-next
 ```
+
+For Supervisor, customize [`infra/feather.supervisor.conf`](infra/feather.supervisor.conf).
+Production should execute one stable `current` link and keep mutable metadata
+in `FEATHER_STATE_DIR`, never in a personalized source checkout.
 
 ### Reverse proxy (Caddy)
 

@@ -19,7 +19,7 @@ export default defineConfig({
     // DEPLOY PROTOCOL: builds go here (static-test), NOT static/ or static-staging/.
     // After building: run Playwright tests, then cp to static-staging/.
     // NEVER cp directly to static/ -- users get updates via the "Update Available" button.
-    outDir: '../static-test',
+    outDir: process.env.REFEATHER_RELEASE_BUILD === '1' ? '../static' : '../static-test',
     emptyOutDir: true,
     chunkSizeWarningLimit: 1000,
   },

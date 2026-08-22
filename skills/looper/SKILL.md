@@ -20,6 +20,10 @@ rebuilt self-evaluation with extra steps.
 
 ## Setup (uses the sidecar broker — see /sidecar)
 
+Install Looper together with Feather and Sidecar for both harnesses using
+`bin/refeather install-capabilities`, and set the exact `FEATHER_URL` for the
+promoted instance.
+
 Spawn the evaluator in the project dir, primed with a rubric. `driverRole=generator`,
 `peerRole=evaluator`, and **`cwd` = the project**:
 
@@ -34,7 +38,7 @@ Judge the REAL artifact, never the generator'\''s description:
 6. Write [APPROVED] only when it genuinely clears a high bar on every criterion. Otherwise list what to fix and wait for "ready for review".
 Do your first review NOW.'
 
-curl -s -X POST "${FEATHER_URL:-http://127.0.0.1:${PORT:-4870}}/api/sidecar" -H 'Content-Type: application/json' \
+curl -s -X POST "$FEATHER_URL/api/sidecar" -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg d "$DRIVER" --arg t "$RUBRIC" \
         '{driverSessionId:$d, driverRole:"generator", peerRole:"evaluator", agent:"claude", cwd:"<PROJECT_DIR>", task:$t}')"
 ```
@@ -55,8 +59,8 @@ Ping-pong (submit, then end your turn) keeps it idle-by-construction — no mid-
 ## Teardown
 
 ```bash
-curl -s "${FEATHER_URL:-http://127.0.0.1:${PORT:-4870}}/api/sidecar" | jq -r '.groups[] | select(any(.members[]; .role=="evaluator")) | .id'   # find it
-curl -s -X POST "${FEATHER_URL:-http://127.0.0.1:${PORT:-4870}}/api/sidecar/<id>/delete"   # kills the evaluator session
+curl -s "$FEATHER_URL/api/sidecar" | jq -r '.groups[] | select(any(.members[]; .role=="evaluator")) | .id'   # find it
+curl -s -X POST "$FEATHER_URL/api/sidecar/<id>/delete"   # kills the evaluator session
 ```
 
 ## Notes

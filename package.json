@@ -6,6 +6,8 @@
     "start": "node server-single.js",
     "build": "echo {\\\"version\\\":\\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"} > version.json && cd frontend && npm install && npm run build",
     "build:frontend": "npm run build",
+    "deploy": "bin/refeather stage",
+    "refeather": "bin/refeather",
     "prepare": "npm run build:frontend",
     "test": "node --test test/unit/*.test.js",
     "test:api": "node --test test/unit/api.test.js",

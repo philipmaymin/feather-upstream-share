@@ -46,6 +46,10 @@ const STATE_PATHS = resolveStatePaths({
 const INSTANCE_UPLOADS_DIR = process.env.FEATHER_STATE_DIR
   ? STATE_PATHS.instance.uploadsDir
   : path.join(HOME, 'feather-uploads');
+const VERSION = (() => {
+  try { return JSON.parse(fs.readFileSync(STATE_PATHS.release.versionFile, 'utf8')).version; }
+  catch { return 'unknown'; }
+})();
 const STATIC_OVERRIDE = process.env.STATIC_OVERRIDE;
 const STATIC_DIR = path.resolve(import.meta.dirname, STATIC_OVERRIDE || 'static');
 const STAGING_DIR = path.join(STATE_PATHS.release.root, 'static-staging');
@@ -1467,7 +1471,7 @@ app.use('/home/user/feather-uploads', express.static('/home/user/feather-uploads
 // ── API routes ─────────────────────────────────────────────────────────────
 
 app.get('/api/health', (_req, res) => res.json({
-  status: 'ok', uptime: process.uptime(),
+  status: 'ok', version: VERSION, uptime: process.uptime(),
   capabilities: {
     readOnly: READ_ONLY_MODE,
     mutations: !READ_ONLY_MODE,

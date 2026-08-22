@@ -16,20 +16,21 @@ It is **not** a generator-evaluator/GAN looper — that's a separate harness bui
 
 ## Install
 
-From the feather repo root, symlink the skill and the CLI, then restart Claude Code:
+Install the complete promoted capability bundle for Claude and Codex:
 
 ```bash
-ln -sf "$(pwd)/skills/sidecar" ~/.claude/skills/sidecar
-ln -sf "$(pwd)/bin/sidecar"    ~/.local/bin/sidecar   # ~/.local/bin must be on PATH
+bin/refeather install-capabilities --release /opt/feather/releases/<commit> --target-root /opt/feather/current
 ```
 
-The `sidecar` CLI auto-detects the backend port (it probes `$PORT`, then the
-current account's deployed Feather port, followed by conventional local ports,
-using whichever answers `/api/health`). Override only if needed:
+Configure the exact instance URL when more than one Feather may be reachable:
 
 ```bash
-export FEATHER_URL="http://127.0.0.1:3300"   # this install runs on 3300
+export FEATHER_URL="https://host.example/feather2"
 ```
+
+Without `FEATHER_URL`, `sidecar` probes `FEATHER_PORT`, 4870, and 3300, validates
+the health shape, and succeeds only when exactly one instance answers. Use
+`sidecar url` to show the selected base URL.
 
 ## How it works
 
@@ -49,7 +50,7 @@ peer (use `"agent":"codex"` for a less-correlated second brain). The driver id i
 just this session's tmux prefix:
 
 ```bash
-DRIVER=$(tmux display-message -p '#S'); DRIVER=${DRIVER#f-}
+DRIVER=$(tmux display-message -p '#S'); DRIVER=${DRIVER#feather-}
 curl -s -X POST "$FEATHER_URL/api/sidecar" -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg d "$DRIVER" --arg task "$1" \
         '{driverSessionId:$d, agent:"claude", task:$task}')"
@@ -93,7 +94,7 @@ A group can hold **N peers**, addressed by role name — the substrate for a gen
 
 ```bash
 # spawn a panel: one driver + three differentiated critics
-DRIVER=$(tmux display-message -p '#S'); DRIVER=${DRIVER#f-}
+DRIVER=$(tmux display-message -p '#S'); DRIVER=${DRIVER#feather-}
 curl -s -X POST "$FEATHER_URL/api/sidecar" -H 'Content-Type: application/json' -d "$(jq -nc --arg d "$DRIVER" '{
   driverSessionId:$d, driverRole:"generator", agent:"claude",
   peers:[ {role:"critic-security",task:"Review only for security."},
@@ -134,7 +135,7 @@ with buttons to open each member session. Spawn/kill from there too.
 ## Notes
 
 - The `sidecar` CLI self-identifies via its tmux session name, so it only works
-  from inside an `f-*` session. Outside one it errors clearly.
+  from inside a `feather-*` session. Outside one it errors clearly.
 - `--to <role>` is the *other* member's role (`peer` by default; the driver is
   `driver`). Add more roles later by extending the members list — addressing is
   by name, so N peers is the same shape as one.

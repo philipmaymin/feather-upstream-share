@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Resolve the Feather instance used by local CLIs. FEATHER_URL is authoritative;
+# probing is only a fallback and must find exactly one Feather-shaped service.
+set -euo pipefail
+
+die() { echo "feather-instance: $*" >&2; exit 1; }
+
+normalize_url() {
+  local url="$1"
+  while [ "${url%/}" != "$url" ]; do url="${url%/}"; done
+  [ -n "$url" ] || die "FEATHER_URL is empty"
+  printf '%s' "$url"
+}
+
+if [ -n "${FEATHER_URL:-}" ]; then
+  normalize_url "$FEATHER_URL"
+  exit 0
+fi
+
+CURL_BIN="${FEATHER_CURL:-curl}"
+command -v "$CURL_BIN" >/dev/null 2>&1 || die "curl is required (or set FEATHER_CURL)"
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+
+ports=()
+add_port() {
+  local candidate="${1:-}" existing
+  [ -n "$candidate" ] || return 0
+  case "$candidate" in *[!0-9]*) die "invalid Feather port: $candidate" ;; esac
+  for existing in "${ports[@]:-}"; do [ "$existing" = "$candidate" ] && return; done
+  ports+=("$candidate")
+}
+add_port "${FEATHER_PORT:-}"
+add_port 4870
+add_port 3300
+
+matches=()
+for port in "${ports[@]}"; do
+  url="http://127.0.0.1:$port"
+  body=$($CURL_BIN -fsS --max-time 1 "$url/api/health" 2>/dev/null || true)
+  if printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+ok = value.get("status") == "ok" and isinstance(value.get("version"), str) and isinstance(value.get("capabilities"), dict)
+raise SystemExit(0 if ok else 1)
+'; then
+    matches+=("$url")
+  fi
+done
+
+case "${#matches[@]}" in
+  1) printf '%s' "${matches[0]}" ;;
+  0) die "no Feather instance found; set FEATHER_URL explicitly" ;;
+  *) die "multiple Feather instances found (${matches[*]}); set FEATHER_URL explicitly" ;;
+esac
