@@ -100,4 +100,62 @@ describe('room assignment CLI', () => {
       await new Promise((resolve) => server.close(resolve))
     }
   })
+
+  it('deduplicates native-tool complaints by tool-call id', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-room-complaint-id-'))
+    roots.push(root)
+    const roomsDir = path.join(root, 'rooms')
+    const roomDir = path.join(roomsDir, 'health')
+    fs.mkdirSync(roomDir, { recursive: true })
+    fs.writeFileSync(path.join(roomDir, 'AGENTS.md'), '# Room: #health\n')
+    fs.writeFileSync(path.join(roomDir, 'notes.md'), '# notes\n')
+    const env = {
+      ...process.env, HOME: root, ROOMS_DIR: roomsDir,
+      // Detached wake is best-effort; point it at a closed local port so this
+      // unit test never touches the live Feather server.
+      FEATHER_URL: 'http://127.0.0.1:1',
+    }
+    const cli = path.resolve(import.meta.dirname, '../../bin/room')
+
+    const first = await run(cli, ['complain', '--id', 'tool-call-123', 'Repeated browser failure'], { cwd: roomDir, env })
+    const retry = await run(cli, ['complain', '--id', 'tool-call-123', 'Repeated browser failure'], { cwd: roomDir, env })
+    assert.match(first.stdout, /flagged in #friction/)
+    assert.match(retry.stdout, /already flagged in #friction/)
+    let notes = fs.readFileSync(path.join(roomsDir, 'friction/notes.md'), 'utf8')
+    assert.equal(notes.split('[id:tool-call-123]').length - 1, 1)
+
+    const frictionDir = path.join(roomsDir, 'friction')
+    const self = await run(cli, ['complain', '--id', 'self-tool-123', 'Triage loop failure'], { cwd: frictionDir, env })
+    const selfRetry = await run(cli, ['complain', '--id', 'self-tool-123', 'Triage loop failure'], { cwd: frictionDir, env })
+    assert.match(self.stdout, /wake skipped/)
+    assert.match(selfRetry.stdout, /already flagged.*wake skipped/)
+    notes = fs.readFileSync(path.join(frictionDir, 'notes.md'), 'utf8')
+    assert.equal(notes.split('[id:self-tool-123]').length - 1, 1)
+
+    const outsideDir = path.join(root, 'plain-project')
+    fs.mkdirSync(outsideDir)
+    await run(cli, ['complain', '--id', 'outside-tool-123', '--source', 'plain-project', 'Outside Room failure'], { cwd: outsideDir, env })
+    notes = fs.readFileSync(path.join(frictionDir, 'notes.md'), 'utf8')
+    assert.match(notes, /Complaint from #plain-project: Outside Room failure/)
+
+    const notesPath = path.join(frictionDir, 'notes.md')
+    fs.chmodSync(notesPath, 0o444)
+    try {
+      await assert.rejects(
+        run(cli, ['complain', '--id', 'unwritable-tool-123', 'Must not acknowledge'], { cwd: roomDir, env }),
+        /could not record complaint/,
+      )
+    } finally {
+      fs.chmodSync(notesPath, 0o644)
+    }
+
+    await assert.rejects(
+      run(cli, ['complain', '--id', 'bad id', 'Nope'], { cwd: roomDir, env }),
+      /invalid complaint id/,
+    )
+    await assert.rejects(
+      run(cli, ['complain', '--source', 'bad source', 'Nope'], { cwd: outsideDir, env }),
+      /invalid complaint source/,
+    )
+  })
 })

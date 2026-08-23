@@ -10,17 +10,20 @@ current="$TMP/current"
 claude="$TMP/home/.claude/skills"
 codex="$TMP/home/.codex/skills"
 bindir="$TMP/home/.local/bin"
+omptools="$TMP/home/.omp/agent/tools"
 backup="$TMP/conflict-backup"
-mkdir -p "$release/skills" "$release/bin"
+mkdir -p "$release/skills" "$release/bin" "$release/omp-tools"
 for skill in feather sidecar looper; do
   mkdir -p "$release/skills/$skill"
   printf -- '---\nname: %s\n---\n' "$skill" >"$release/skills/$skill/SKILL.md"
 done
 for cli in room sidecar refeather; do printf '#!/bin/sh\n' >"$release/bin/$cli"; chmod +x "$release/bin/$cli"; done
+printf 'export default function () { return [] }\n' >"$release/omp-tools/feather-communication.js"
 ln -s "$release" "$current"
 
 install=("$ROOT/bin/refeather" install-capabilities --release "$release" --target-root "$current"
-  --claude-skills-dir "$claude" --codex-skills-dir "$codex" --bin-dir "$bindir" --backup-dir "$backup")
+  --claude-skills-dir "$claude" --codex-skills-dir "$codex" --bin-dir "$bindir"
+  --omp-tools-dir "$omptools" --backup-dir "$backup")
 "${install[@]}"
 "${install[@]}" # idempotent
 
@@ -30,6 +33,7 @@ for harness in "$claude" "$codex"; do
   done
 done
 for cli in room sidecar refeather; do [ "$(readlink "$bindir/$cli")" = "$current/bin/$cli" ]; done
+[ "$(readlink "$omptools/feather-communication.js")" = "$current/omp-tools/feather-communication.js" ]
 
 rm "$claude/feather"
 printf 'user-owned skill\n' >"$claude/feather"

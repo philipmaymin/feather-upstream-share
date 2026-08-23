@@ -183,19 +183,71 @@ PY
 }
 
 cmd_complain() {
-  resolve_room
-  [ -n "${1:-}" ] || die 'usage: room complain "<what is annoying>"'
-  local source="$ROOM_NAME" friction="$ROOMS_DIR/friction"
+  local complaint_id="" source_override="" wake=1 duplicate=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id)
+        complaint_id="${2:-}"
+        [[ "$complaint_id" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || die "invalid complaint id"
+        shift 2
+        ;;
+      --source)
+        source_override="${2:-}"
+        [[ "$source_override" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "invalid complaint source"
+        shift 2
+        ;;
+      --no-wake)
+        wake=0
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *) break ;;
+    esac
+  done
+  [ -n "${1:-}" ] || die 'usage: room complain [--id <id>] [--source <label>] [--no-wake] "<what is annoying>"'
+  local source friction="$ROOMS_DIR/friction" marker=""
+  if [ -n "$source_override" ]; then
+    source="$source_override"
+  else
+    resolve_room
+    source="$ROOM_NAME"
+  fi
+  [ "$source" = "friction" ] && wake=0
   mkdir -p "$ROOMS_DIR"
   exec 9>"$ROOMS_DIR/.friction.lock"
   flock 9 || die "could not lock #friction"
   if [ ! -f "$friction/AGENTS.md" ]; then
     "$0" new friction >/dev/null || die "could not create #friction"
   fi
-  printf -- '- %s Complaint from #%s: %s\n' "$(date -u +%Y-%m-%d\ %H:%M)" "$source" "$1" >>"$friction/notes.md"
-  # Wake #friction without making complaint recording depend on its API call.
-  ( "$0" -r friction wake >/dev/null 2>&1 9>&- & )
-  echo "flagged in #friction"
+  if [ -n "$complaint_id" ]; then
+    marker="[id:$complaint_id] "
+    if grep -Fq -- "$marker" "$friction/notes.md"; then
+      duplicate=1
+    fi
+  fi
+  if [ "$duplicate" -eq 0 ]; then
+    printf -- '- %s %sComplaint from #%s: %s\n' "$(date -u +%Y-%m-%d\ %H:%M)" "$marker" "$source" "$1" >>"$friction/notes.md" || die "could not record complaint in #friction"
+  fi
+  if [ "$wake" -eq 1 ]; then
+    # Wake #friction so a paused queue resumes and processes this complaint.
+    # Detached and best-effort: the complaint is already recorded above, so waking
+    # must never fail or block `complain`. fd 9 is closed in the child so the
+    # flock frees as soon as this function returns.
+    ( "$0" -r friction wake >/dev/null 2>&1 9>&- & )
+  fi
+  if [ "$duplicate" -eq 1 ]; then
+    printf "already flagged in #friction from #%s" "$source"
+  else
+    printf "flagged in #friction from #%s" "$source"
+  fi
+  if [ "$wake" -eq 1 ]; then
+    echo " (wake requested)"
+  else
+    echo " (wake skipped)"
+  fi
 }
 
 cmd_pulse() {
