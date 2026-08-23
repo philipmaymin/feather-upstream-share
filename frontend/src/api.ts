@@ -158,6 +158,7 @@ export interface ContentBlock {
   text?: string
   thinking?: string
   name?: string
+  intent?: string
   id?: string
   tool_use_id?: string
   input?: any

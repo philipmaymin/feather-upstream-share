@@ -12,7 +12,7 @@ import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation,
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
 import { listPendingMessages, putPendingMessage, patchPendingMessage, deletePendingMessage } from './lib/messageOutbox.js'
 import { appUrl } from './lib/appPath.js'
-import { deriveTellUserState, tellUserTransition } from './lib/tellUserStatus.js'
+import { deriveToolIntentState, toolIntentTransition } from './lib/toolIntentStatus.js'
 
 interface QuickLink { label: string; url: string }
 type AgentId = 'claude' | 'codex' | 'omp'
@@ -237,7 +237,7 @@ export default function App() {
   let pendingRetryTimer: ReturnType<typeof setTimeout> | undefined
   const [uploading, setUploading] = createSignal(false)
   const [working, setWorking] = createSignal(false)
-  const [tellUserStatus, setTellUserStatus] = createSignal('')
+  const [toolIntentStatus, setToolIntentStatus] = createSignal('')
   const [dragging, setDragging] = createSignal(false)
   const [menuOpen, setMenuOpen] = createSignal(false)
   const [historyIdx, setHistoryIdx] = createSignal(-1)
@@ -390,16 +390,16 @@ export default function App() {
     }
     setUnreadSessions(unread)
     setSessions(visibleSessions)
-    if (active && (working() || tellUserStatus())) {
+    if (active && (working() || toolIntentStatus())) {
       const listed = visibleSessions.find(session => session.id === active)
       if (listed && !listed.isActive) {
         setWorking(false)
-        setTellUserStatus('')
+        setToolIntentStatus('')
       } else if (!listed) {
         findSessionMeta(active, visibleSessions).then(session => {
           if (currentId() === active && session && !session.isActive) {
             setWorking(false)
-            setTellUserStatus('')
+            setToolIntentStatus('')
           }
         })
       }
@@ -513,7 +513,7 @@ export default function App() {
     workingTimer = window.setTimeout(() => {
       if (working()) {
         setWorking(false)
-        setTellUserStatus('')
+        setToolIntentStatus('')
       }
     }, 5 * 60 * 1000)
   }
@@ -637,7 +637,7 @@ export default function App() {
     setLoadingMore(false)
     setMessages([])
     setHasMore(false)
-    setTellUserStatus('')
+    setToolIntentStatus('')
     setActivity(null)
     setQuestion(null)
     setText(loadDraft(id))
@@ -683,11 +683,11 @@ export default function App() {
     const msgs = result.messages
     if (msgs.length > 0) {
       const last = msgs[msgs.length - 1]
-      const tellUserState = deriveTellUserState(msgs)
+      const toolIntentState = deriveToolIntentState(msgs)
       const turnEnded = last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence'
-      setTellUserStatus(!isActive || turnEnded ? '' : tellUserState.status)
+      setToolIntentStatus(!isActive || turnEnded ? '' : toolIntentState.status)
       if (!isActive || turnEnded) setWorking(false)
-      else if (last.role === 'user' || tellUserState.working) setWorking(true)
+      else if (last.role === 'user' || toolIntentState.working) setWorking(true)
       else setWorking(false) // assistant mid-stream but no new SSE yet; let SSE update it
       // Extract cwd from last user message and update header
       for (let i = msgs.length - 1; i >= 0; i--) {
@@ -698,7 +698,7 @@ export default function App() {
         }
       }
     } else {
-      setTellUserStatus('')
+      setToolIntentStatus('')
       setWorking(isActive)
     }
     appendPendingMessages(id)
@@ -719,12 +719,12 @@ export default function App() {
       clearTimeout(assistantDoneTimer)
       // If new content arrives while a question is showing, it was a false positive
       if (question() && msg.role === 'assistant' && !msg.stopReason) setQuestion(null)
-      const tellUserUpdate = tellUserTransition(tellUserStatus(), msg)
-      setTellUserStatus(tellUserUpdate.status)
+      const toolIntentUpdate = toolIntentTransition(toolIntentStatus(), msg)
+      setToolIntentStatus(toolIntentUpdate.status)
       // Use stop_reason to accurately track working state
       if (msg.stopReason === 'end_turn' || msg.stopReason === 'stop_sequence') {
         setWorking(false)
-        setTellUserStatus('')
+        setToolIntentStatus('')
         clearTimeout(workingTimer)
         // Refresh session list to pick up auto-generated title
         const cur = sessions().find(s => s.id === id)
@@ -734,7 +734,7 @@ export default function App() {
       } else if (msg.role === 'user') {
         setWorking(true)
         startWorkingTimeout()
-      } else if (tellUserUpdate.working === true) {
+      } else if (toolIntentUpdate.working === true) {
         setWorking(true)
         startWorkingTimeout()
       } else if (msg.role === 'assistant' && !msg.stopReason) {
@@ -743,7 +743,7 @@ export default function App() {
         assistantDoneTimer = window.setTimeout(() => {
           if (isCurrentSelection(id, generation) && working()) {
             setWorking(false)
-            setTellUserStatus('')
+            setToolIntentStatus('')
             clearTimeout(workingTimer)
           }
         }, 5000)
@@ -890,7 +890,7 @@ export default function App() {
     await interruptSession(id)
     if (id === currentId()) {
       setWorking(false)
-      setTellUserStatus('')
+      setToolIntentStatus('')
     }
   }
 
@@ -923,7 +923,7 @@ export default function App() {
     setLastSession(null)
     setMessages([])
     setWorking(false)
-    setTellUserStatus('')
+    setToolIntentStatus('')
     setActivity(null)
     setQuestion(null)
     setSidebar(false)
@@ -1056,7 +1056,7 @@ export default function App() {
               : previous.map(message => message.uuid === optimisticId ? { ...message, delivery: 'sent' as const } : message)
           })
           setWorking(true)
-          setTellUserStatus('')
+          setToolIntentStatus('')
           startWorkingTimeout()
         }
       } catch (error: any) {
@@ -1354,7 +1354,7 @@ export default function App() {
     const session = headerSession()
     if (!loading() && session && !session.isActive) {
       setWorking(false)
-      setTellUserStatus('')
+      setToolIntentStatus('')
     }
   })
 
@@ -1405,7 +1405,7 @@ export default function App() {
   })
 
   const tabStyle = (t: string) => ({
-    padding: '6px 16px', border: 'none', 'border-bottom': tab() === t ? '2px solid #4aba6a' : '2px solid transparent',
+    padding: '9px 14px', border: 'none', 'border-bottom': tab() === t ? '2px solid #4aba6a' : '2px solid transparent',
     background: 'none', color: tab() === t ? '#e5e5e5' : '#666', 'font-size': '13px', 'font-weight': '600', cursor: 'pointer',
     '-webkit-tap-highlight-color': 'transparent', 'flex-shrink': '0',
   })
@@ -1843,7 +1843,7 @@ export default function App() {
             />
           }>
             <div style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
-              <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (composerReady()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (loadedSessionId()) toggleStar(loadedSessionId()!, uuid) }} working={working()} statusText={tellUserStatus()} scrollRefCb={(el) => { messageScrollRef = el }} sessionId={loadedSessionId()} />
+              <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (composerReady()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (loadedSessionId()) toggleStar(loadedSessionId()!, uuid) }} working={working()} statusText={toolIntentStatus()} scrollRefCb={(el) => { messageScrollRef = el }} sessionId={loadedSessionId()} />
             </div>
             <div style={{ display: tab() === 'files' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%' }}>
               {/* Mode toggle */}
@@ -1989,6 +1989,36 @@ export default function App() {
                         <div style={{ 'font-size': '10px', color: '#5a6472', 'font-family': 'monospace', 'margin-bottom': '3px' }}>{formatFeedTime(update.ts)}</div>
                         <div style={{ 'font-size': '13px', color: '#d0d4da', 'line-height': '1.5', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{update.text}</div>
                       </div>
+                    )}
+                  </For>
+                </Show>
+              </div>
+            </div>
+            <div data-testid="friction-panel" style={{ display: tab() === 'friction' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>
+              <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '12px 16px 24px' }}>
+                <div style={{ display: 'flex', 'align-items': 'baseline', gap: '8px', 'margin-bottom': '10px' }}>
+                  <span style={{ color: '#d7dbe2', 'font-size': '14px', 'font-weight': '700' }}>#friction</span>
+                  <span style={{ color: '#5f6875', 'font-size': '11px' }}>{frictionList().length} complaint{frictionList().length === 1 ? '' : 's'}</span>
+                </div>
+                <Show when={frictionError()}>
+                  <div style={{ color: '#d45555', 'font-size': '13px', padding: '8px 0' }}>{frictionError()}</div>
+                </Show>
+                <Show when={frictionLoading()}>
+                  <div style={{ color: '#666', 'font-size': '13px', padding: '8px 0' }}>Loading friction…</div>
+                </Show>
+                <Show when={!frictionLoading() && !frictionError()}>
+                  <For each={frictionList()} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '8px 0' }}>No complaints in #friction.</div>}>
+                    {(complaint) => (
+                      <article style={{ padding: '11px 0', 'border-bottom': '1px solid #171b22' }}>
+                        <div style={{ display: 'flex', 'align-items': 'center', gap: '7px', 'margin-bottom': '5px' }}>
+                          <span style={{ color: '#d7a85a', 'font-size': '11px', 'font-weight': '600' }}>#{complaint.source}</span>
+                          <span style={{ color: '#4f5865', 'font-size': '10px', 'font-family': 'monospace' }}>{fmtFeedTime(complaint.timestamp)}</span>
+                        </div>
+                        <div style={{ color: '#d0d4da', 'font-size': '13px', 'line-height': '1.45', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{complaint.summary}</div>
+                        <Show when={complaint.evidence}>
+                          <div style={{ color: '#77818f', 'font-size': '11px', 'line-height': '1.4', 'font-family': 'monospace', 'margin-top': '6px', padding: '6px 8px', background: '#090d12', 'border-radius': '6px', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{complaint.evidence}</div>
+                        </Show>
+                      </article>
                     )}
                   </For>
                 </Show>
@@ -2140,7 +2170,7 @@ export default function App() {
               const inactive = s && !s.isActive && !working()
               const dotColor = working() ? '#f5a742' : inactive ? '#666' : '#4aba6a'
               const act = activity()?.replace(/^[^a-zA-Z]+/, '')
-              const label = working() ? (tellUserStatus() || act || 'Working...') : inactive ? 'Inactive' : 'Ready'
+              const label = working() ? (toolIntentStatus() || act || 'Working...') : inactive ? 'Inactive' : 'Ready'
               const labelColor = working() ? '#f5a742' : inactive ? '#666' : '#555'
               return <>
                 <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: dotColor, transition: 'background 0.3s', 'flex-shrink': '0', cursor: working() ? 'pointer' : 'default' }} onClick={() => { if (working() && currentId()) handleInterruptConfirm(currentId()!) }} />

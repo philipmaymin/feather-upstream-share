@@ -67,6 +67,7 @@ describe('parseOmpMessage: toolCall → tool_use normalization', () => {
     assert.equal(b.id, 'toolu_001')
     assert.equal(b.name, 'bash')
     assert.deepEqual(b.input, { command: 'ls -la', _i: 'listing files' })
+    assert.equal(b.intent, 'listing files')
   })
 
   it('parses assistant message with only toolCall blocks (previously dropped)', () => {

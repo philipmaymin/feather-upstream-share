@@ -502,7 +502,7 @@ test.describe('Live updates', () => {
     await expect(page.getByRole('paragraph').filter({ hasText: 'This message arrived via SSE live update!' })).toBeVisible({ timeout: 10000 })
   })
 
-  test('tell_user replaces the live status and a final answer clears it', async ({ page }) => {
+  test('native OMP tool intent replaces the live status and a final answer clears it', async ({ page }) => {
     const streamRequest = page.waitForRequest(request => request.url().includes(`/api/sessions/${TEST_SESSION_ID}/stream`))
     await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
     await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 10000 })
@@ -513,7 +513,7 @@ test.describe('Live updates', () => {
       isSidechain: false, isMeta: false,
       message: {
         role: 'assistant',
-        content: [{ type: 'tool_use', id: 'status-tool-1', name: 'tell_user', input: { message: 'Inspecting upload recovery.' } }],
+        content: [{ type: 'tool_use', id: 'status-tool-1', name: 'read', input: { file_path: '/tmp/upload' }, intent: 'Inspecting upload recovery.' }],
       },
     })
     const firstStatus = page.getByRole('status').filter({ hasText: 'Inspecting upload recovery.' })
@@ -524,7 +524,7 @@ test.describe('Live updates', () => {
       isSidechain: false, isMeta: false,
       message: {
         role: 'assistant',
-        content: [{ type: 'tool_use', id: 'status-tool-2', name: 'tell_user', input: { message: 'Testing the repaired upload.' } }],
+        content: [{ type: 'tool_use', id: 'status-tool-2', name: 'bash', input: { command: 'npm test' }, intent: 'Testing the repaired upload.' }],
       },
     })
     await expect(page.getByRole('status').filter({ hasText: 'Testing the repaired upload.' })).toBeVisible({ timeout: 10000 })
