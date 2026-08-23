@@ -36,6 +36,7 @@ describe('omp launch config', () => {
     const command = ompLaunchCommand('--session-dir /tmp/omp-session', 'openai-codex/gpt-5.6-sol', 'xhigh')
     assert.match(command, /omp token openai-codex --list/)
     assert.match(command, /omp auth-broker login openai-codex-device/)
+    assert.match(command, /omp config set startup\.setupWizard false/)
     assert.match(command, /exec omp --model openai-codex\/gpt-5\.6-sol --thinking xhigh --session-dir/)
   })
 
