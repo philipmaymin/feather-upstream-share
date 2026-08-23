@@ -2324,12 +2324,32 @@ app.get('/api/sessions', (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
     const project = req.query.project || null;
-    const sessions = project
-      ? discoverSessions(limit, project)
-      : [...sessionsSnapshotCache.get()]
+    const query = String(req.query.q || '').trim();
+    const queryLc = query.toLowerCase();
+    let sessions;
+    if (project) {
+      sessions = discoverSessions(limit, project);
+      if (queryLc) sessions = sessions.filter(session =>
+        session.id.toLowerCase().includes(queryLc) || session.title.toLowerCase().includes(queryLc));
+    } else if (queryLc) {
+      const cachedMatches = [...sessionsSnapshotCache.get()].filter(session =>
+        session.id.toLowerCase().includes(queryLc) || session.title.toLowerCase().includes(queryLc));
+      // A deep-linked historical chat can fall outside the 300-item snapshot.
+      // Resolve an exact id through the catalog's required-id path without
+      // turning every activity refresh into an unbounded transcript parse.
+      const exact = cachedMatches.some(session => session.id === query)
+        ? []
+        : discoverSessions(0, null, [query]);
+      const byId = new Map([...exact, ...cachedMatches].map(session => [session.id, session]));
+      sessions = [...byId.values()]
+        .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+        .slice(0, limit);
+    } else {
+      sessions = [...sessionsSnapshotCache.get()]
           .sort((a, b) => (b[SESSION_SOURCE_MTIME] || 0) - (a[SESSION_SOURCE_MTIME] || 0))
           .slice(0, limit)
           .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+    }
     res.json({ sessions });
   }
   catch (e) { res.status(500).json({ error: e.message }); }

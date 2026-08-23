@@ -301,6 +301,11 @@ describe('GET /api/sessions', () => {
     assert.ok(found, `test session ${TEST_SESSION_ID} not found`)
     assert.equal(found.title, 'What is the meaning of life?')
   })
+
+  it('finds an exact session by id for deep-link activity checks', async () => {
+    const { sessions } = await (await fetch(`${BASE}/api/sessions?q=${encodeURIComponent(TEST_SESSION_ID)}&limit=5`)).json()
+    assert.ok(sessions.some(session => session.id === TEST_SESSION_ID))
+  })
 })
 
 // ── Messages ────────────────────────────────────────────────────────────────
