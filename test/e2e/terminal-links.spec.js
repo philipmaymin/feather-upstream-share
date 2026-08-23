@@ -33,6 +33,7 @@ test.afterAll(() => {
 test('long wrapped login URLs can be tapped, opened, and copied on mobile', async ({ page }) => {
   let terminalSocket
   let terminalCols = 0
+  let terminalRows = 0
   await page.addInitScript(() => {
     // @ts-ignore test observation hooks
     window.__terminalOpened = []
@@ -52,7 +53,10 @@ test('long wrapped login URLs can be tapped, opened, and copied on mobile', asyn
     socket.onMessage(message => {
       try {
         const parsed = JSON.parse(String(message))
-        if (parsed.type === 'resize') terminalCols = parsed.cols
+        if (parsed.type === 'resize') {
+          terminalCols = parsed.cols
+          terminalRows = parsed.rows
+        }
       } catch {}
     })
   })
@@ -70,20 +74,24 @@ test('long wrapped login URLs can be tapped, opened, and copied on mobile', asyn
   await emptyLinksButton.click()
   await expect(page.getByText('No complete links found yet.')).toBeVisible()
 
-  await expect.poll(() => Boolean(terminalSocket) && terminalCols > 20).toBe(true)
+  await expect.poll(() => Boolean(terminalSocket) && terminalCols > 20 && terminalRows > 2).toBe(true)
   const indent = '    '
   const width = terminalCols - indent.length
+  // Match OMP's login screen: the complete destination is attached to a
+  // short OSC 8 label, followed by only the first two rows of the raw URL.
+  const visibleUrl = LOGIN_URL.slice(0, width * 2)
   const rows = []
-  for (let offset = 0; offset < LOGIN_URL.length; offset += width) {
-    rows.push((indent + LOGIN_URL.slice(offset, offset + width)).padEnd(terminalCols))
+  for (let offset = 0; offset < visibleUrl.length; offset += width) {
+    rows.push((indent + visibleUrl.slice(offset, offset + width)).padEnd(terminalCols))
   }
-  terminalSocket.send(rows.join('\r\n'))
+  terminalSocket.send(`\u001b]8;;${LOGIN_URL}\u001b\\Open login URL\u001b]8;;\u001b\\\r\n${rows.join('\r\n')}`)
   await expect(emptyLinksButton).toHaveText('Links (1)', { timeout: 10000 })
 
   const canvas = page.locator('canvas')
   const box = await canvas.boundingBox()
   if (!box) throw new Error('terminal canvas is not visible')
-  await page.touchscreen.tap(box.x + 35, box.y + 8)
+  const rowHeight = box.height / terminalRows
+  await page.touchscreen.tap(box.x + 35, box.y + rowHeight * 1.5)
   await expect.poll(() => page.evaluate(() => {
     // @ts-ignore test observation hooks
     return window.__terminalOpened

@@ -1,5 +1,6 @@
 const HTTP_URL = /https?:\/\/[^\s<>"'`]+/giu
 const HTTP_PREFIX = /https?:\/\//giu
+const OSC8_HTTP_URL = /\u001B\]8;[^;]*;(https?:\/\/.*?)(?:\u0007|\u001B\\)/gisu
 const SIMPLE_TRAILING_PUNCTUATION = /[.,;:!?]+$/u
 const URL_BREAK = /[\s<>"'`]/u
 
@@ -41,6 +42,30 @@ export function extractHttpUrls(text) {
     ordered.set(url, true)
   }
   return [...ordered.keys()]
+}
+
+// OSC 8 links often use a short label (or print a separately truncated URL)
+// while keeping the complete destination in terminal metadata. Preserve that
+// destination before control-sequence stripping discards it.
+export function extractOsc8HttpUrls(text) {
+  const urls = []
+  OSC8_HTTP_URL.lastIndex = 0
+  let match = OSC8_HTTP_URL.exec(text)
+  while (match) {
+    try {
+      const url = new URL(match[1])
+      if (url.protocol === 'http:' || url.protocol === 'https:') urls.push(url.href)
+    } catch {}
+    match = OSC8_HTTP_URL.exec(text)
+  }
+  return urls
+}
+
+// If a TUI renders only a prefix of an explicit OSC 8 target, make the visible
+// prefix open that complete target. Candidates are newest-first; this matters
+// when an OAuth flow has emitted multiple links with the same long prefix.
+export function completeTerminalUrl(value, candidates) {
+  return candidates.find(candidate => candidate === value || candidate.startsWith(value)) || value
 }
 
 // Terminal UIs often lay text out themselves instead of letting the terminal

@@ -2,7 +2,7 @@ import { onMount, onCleanup, createEffect, createSignal, Show, For } from 'solid
 import { init, Terminal as GhosttyTerm, FitAddon, OSC8LinkProvider } from 'ghostty-web'
 import type { ILink, ILinkProvider } from 'ghostty-web'
 import { appWebSocketUrl } from '../lib/appPath.js'
-import { extractHttpUrls, findTerminalLineUrls, stripTerminalControlSequences } from '../lib/terminalLinks.js'
+import { completeTerminalUrl, extractHttpUrls, extractOsc8HttpUrls, findTerminalLineUrls, stripTerminalControlSequences } from '../lib/terminalLinks.js'
 
 const BASE_WS = appWebSocketUrl('/api/terminal')
 
@@ -108,6 +108,7 @@ export function Terminal(props: { sessionId: string | null }) {
   const [copied, setCopied] = createSignal(false)
   const [hasSelection, setHasSelection] = createSignal(false)
   const [terminalLinks, setTerminalLinks] = createSignal<string[]>([])
+  const [explicitLinkTargets, setExplicitLinkTargets] = createSignal<string[]>([])
   const [showLinks, setShowLinks] = createSignal(false)
   const [copiedLink, setCopiedLink] = createSignal('')
 
@@ -153,13 +154,27 @@ export function Terminal(props: { sessionId: string | null }) {
   function scanRawOutput(data: unknown) {
     if (typeof data !== 'string') return
     rawOutput = (rawOutput + data).slice(-65536)
-    rememberLinks(extractHttpUrls(stripTerminalControlSequences(rawOutput)))
+    const explicitTargets = extractOsc8HttpUrls(rawOutput)
+    if (explicitTargets.length) setExplicitLinkTargets(previous => {
+      const next = [...previous]
+      for (const target of explicitTargets) {
+        const existing = next.indexOf(target)
+        if (existing >= 0) next.splice(existing, 1)
+        next.unshift(target)
+      }
+      return next.slice(0, 20)
+    })
+    rememberLinks([
+      ...explicitTargets,
+      ...extractHttpUrls(stripTerminalControlSequences(rawOutput)),
+    ])
   }
 
   async function connect(sessionId: string) {
     disconnect()
     const generation = connectionGeneration
     setTerminalLinks([])
+    setExplicitLinkTargets([])
     setShowLinks(false)
     setCopiedLink('')
     rawOutput = ''
@@ -185,7 +200,10 @@ export function Terminal(props: { sessionId: string | null }) {
       const providers: ILinkProvider[] = []
       try {
         const wrappedProvider = tapProvider({
-          provideLinks: (row, callback) => callback(term ? wrappedUrlLinks(term, row) : undefined),
+          provideLinks: (row, callback) => callback(term ? wrappedUrlLinks(term, row).map(link => {
+            const target = completeTerminalUrl(link.text, explicitLinkTargets())
+            return { ...link, text: target, activate: () => openTerminalUrl(target) }
+          }) : undefined),
         }, rememberLinks)
         const osc8Provider = tapProvider(new OSC8LinkProvider(term as any), rememberLinks)
         providers.push(osc8Provider, wrappedProvider)

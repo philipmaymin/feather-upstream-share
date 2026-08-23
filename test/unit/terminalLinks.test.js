@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  cleanTerminalUrl, findHttpUrls, extractHttpUrls, findTerminalLineUrls,
+  cleanTerminalUrl, completeTerminalUrl, findHttpUrls, extractHttpUrls, extractOsc8HttpUrls, findTerminalLineUrls,
   stripTerminalControlSequences,
 } from '../../frontend/src/lib/terminalLinks.js'
 
@@ -58,4 +58,20 @@ test('terminal escape sequences can be stripped before raw URL extraction', () =
   const output = `\u001b[32m${url.slice(0, 24)}\u001b[0m${url.slice(24)}\u001b[2K`
   assert.equal(stripTerminalControlSequences(output), url)
   assert.deepEqual(extractHttpUrls(stripTerminalControlSequences(output)), [url])
+})
+
+test('a printed URL prefix inherits its complete OSC 8 destination', () => {
+  const url = 'https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_123&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=long_value'
+  const visible = url.slice(0, 78)
+  const output = `\u001b]8;;${url}\u001b\\Open login URL\u001b]8;;\u001b\\\n${visible}\n`
+
+  assert.deepEqual(extractOsc8HttpUrls(output), [url])
+  assert.deepEqual(extractHttpUrls(stripTerminalControlSequences(output)), [visible])
+  assert.equal(completeTerminalUrl(visible, extractOsc8HttpUrls(output)), url)
+})
+
+test('terminal URL completion prefers the newest matching destination', () => {
+  const prefix = 'https://auth.example.test/login?client_id=app'
+  assert.equal(completeTerminalUrl(prefix, [`${prefix}&state=new`, `${prefix}&state=old`]), `${prefix}&state=new`)
+  assert.equal(completeTerminalUrl('https://other.test/path', [`${prefix}&state=new`]), 'https://other.test/path')
 })
