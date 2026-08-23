@@ -101,6 +101,9 @@ export function Terminal(props: { sessionId: string | null }) {
   let fitAddon: FitAddon | null = null
   let ws: WebSocket | null = null
   let rawOutput = ''
+  let removeMobileInputFallback: (() => void) | null = null
+  let keyboardEnterPending = false
+  let keyboardEnterTimer: number | undefined
   let connectionGeneration = 0
   const [copied, setCopied] = createSignal(false)
   const [hasSelection, setHasSelection] = createSignal(false)
@@ -221,6 +224,25 @@ export function Terminal(props: { sessionId: string | null }) {
           }
         })
       }
+
+      // iOS may expose the software keyboard's Return only as beforeinput,
+      // without the keydown Ghostty expects. Ghostty prevents beforeinput by
+      // default, so translate the two Return forms before they disappear.
+      const handleMobileBeforeInput = (event: InputEvent) => {
+        const isReturn = event.inputType === 'insertLineBreak' || event.inputType === 'insertParagraph'
+          || (event.inputType === 'insertText' && (event.data === '\n' || event.data === '\r'))
+        if (!isReturn) return
+        event.preventDefault()
+        if (keyboardEnterPending) {
+          keyboardEnterPending = false
+          if (keyboardEnterTimer !== undefined) window.clearTimeout(keyboardEnterTimer)
+          keyboardEnterTimer = undefined
+          return
+        }
+        try { ws?.send('\r') } catch {}
+      }
+      containerRef.addEventListener('beforeinput', handleMobileBeforeInput as EventListener, true)
+      removeMobileInputFallback = () => containerRef?.removeEventListener('beforeinput', handleMobileBeforeInput as EventListener, true)
     }
 
     // Track selection changes
@@ -248,7 +270,17 @@ export function Terminal(props: { sessionId: string | null }) {
       }
     }
 
-    activeTerm.onData((data) => { try { if (generation === connectionGeneration) socket.send(data) } catch {} })
+    activeTerm.onData((data) => {
+      if (data === '\r') {
+        keyboardEnterPending = true
+        if (keyboardEnterTimer !== undefined) window.clearTimeout(keyboardEnterTimer)
+        keyboardEnterTimer = window.setTimeout(() => {
+          keyboardEnterPending = false
+          keyboardEnterTimer = undefined
+        }, 0)
+      }
+      try { if (generation === connectionGeneration) socket.send(data) } catch {}
+    })
     activeTerm.onResize(({ cols, rows }) => {
       try { if (generation === connectionGeneration) socket.send(JSON.stringify({ type: 'resize', cols, rows })) } catch {}
       queueMicrotask(scanTerminalLinks)
@@ -257,6 +289,11 @@ export function Terminal(props: { sessionId: string | null }) {
 
   function disconnect() {
     connectionGeneration++
+    removeMobileInputFallback?.()
+    removeMobileInputFallback = null
+    keyboardEnterPending = false
+    if (keyboardEnterTimer !== undefined) window.clearTimeout(keyboardEnterTimer)
+    keyboardEnterTimer = undefined
     ws?.close()
     ws = null
     term?.dispose()
@@ -367,6 +404,13 @@ export function Terminal(props: { sessionId: string | null }) {
     <div style={{ height: '100%', width: '100%', display: 'flex', 'flex-direction': 'column', background: '#0a0e14' }}>
       {/* Terminal toolbar */}
       <div style={{ display: 'flex', gap: '6px', padding: '6px 8px', 'border-bottom': '1px solid #1e1e1e', 'flex-shrink': '0', 'overflow-x': 'auto' }}>
+        <button
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => sendKey('\r')}
+          aria-label="Enter"
+          title="Enter"
+          style={{ ...keyStyle, 'font-size': '12px', 'min-width': '66px' }}
+        >Enter ↵</button>
         <button onClick={toggleLinks} aria-controls="terminal-links" aria-expanded={showLinks()} style={{ ...btnStyle, color: showLinks() ? '#4aba6a' : '#73b8ff' }}>
           {terminalLinks().length > 0 ? `Links (${terminalLinks().length})` : 'Links'}
         </button>

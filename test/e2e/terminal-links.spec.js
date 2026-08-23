@@ -100,3 +100,57 @@ test('long wrapped login URLs can be tapped, opened, and copied on mobile', asyn
     return window.__terminalCopied
   })).toBe(LOGIN_URL)
 })
+
+test('mobile Return input and the visible Enter control both reach the terminal', async ({ page }) => {
+  const terminalInput = []
+  let terminalSocket
+  await page.routeWebSocket(/\/api\/terminal\?session=/, socket => {
+    terminalSocket = socket
+    socket.onMessage(message => {
+      const value = String(message)
+      try {
+        if (JSON.parse(value).type === 'resize') return
+      } catch {}
+      terminalInput.push(value)
+    })
+  })
+
+  await page.goto(`${BASE}/#${SESSION_ID}`)
+  await expect(page.getByText(TITLE, { exact: true }).first()).toBeVisible({ timeout: 10000 })
+  await page.getByRole('button', { name: 'Terminal', exact: true }).click()
+  await expect.poll(() => Boolean(terminalSocket)).toBe(true)
+
+  const hiddenInput = page.locator('textarea[aria-label="Terminal input"]')
+  await expect(hiddenInput).toBeAttached()
+  await hiddenInput.evaluate(element => element.dispatchEvent(new InputEvent('beforeinput', {
+    bubbles: true,
+    cancelable: true,
+    inputType: 'insertLineBreak',
+  })))
+  await expect.poll(() => terminalInput.filter(value => value === '\r').length).toBe(1)
+
+  // Keyboards that emit both events must still produce exactly one Return.
+  await hiddenInput.evaluate(element => {
+    element.dispatchEvent(new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      key: 'Enter',
+      code: 'Enter',
+    }))
+    element.dispatchEvent(new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'insertParagraph',
+    }))
+  })
+  await expect.poll(() => terminalInput.filter(value => value === '\r').length).toBe(2)
+
+  const enterButton = page.getByRole('button', { name: 'Enter', exact: true })
+  await expect(enterButton).toBeVisible()
+  const box = await enterButton.boundingBox()
+  expect(box).not.toBeNull()
+  expect(box.x).toBeGreaterThanOrEqual(0)
+  expect(box.x + box.width).toBeLessThanOrEqual(390)
+  await enterButton.click()
+  await expect.poll(() => terminalInput.filter(value => value === '\r').length).toBe(3)
+})
