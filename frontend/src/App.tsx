@@ -154,6 +154,12 @@ export default function App() {
   const [messages, setMessages] = createSignal<Message[]>([])
   const [sidebar, setSidebar] = createSignal(false)
   const [loading, setLoading] = createSignal(false)
+  // The selected chat and the transcript rendered beneath it are separate
+  // pieces of state. Never enable message-producing controls until a guarded
+  // transcript load has committed for the selected chat.
+  const [loadedSessionId, setLoadedSessionId] = createSignal<string | null>(null)
+  const [chatLoadError, setChatLoadError] = createSignal('')
+  const composerReady = () => currentId() !== null && loadedSessionId() === currentId()
   const [creating, setCreating] = createSignal(false)
   const [text, setText] = createSignal('')
   const [tab, setTab] = createSignal<'chat' | 'files' | 'terminal'>('chat')
@@ -323,6 +329,8 @@ export default function App() {
   const currentJsFile = document.querySelector<HTMLScriptElement>('script[src*="index-"]')?.src.match(/index-[^.]+\.js/)?.[0] || null
 
   let cleanupSSE: (() => void) | null = null
+  let selectionGeneration = 0
+  let messagesAbortController: AbortController | null = null
   let mediaRecorder: MediaRecorder | null = null
   let mediaStream: MediaStream | null = null
   let audioChunks: Blob[] = []
@@ -331,6 +339,20 @@ export default function App() {
   let fileInputRef: HTMLInputElement | undefined
   let dragCounter = 0
   let mediaRestoreGeneration = 0
+
+  function cancelSelectionWork() {
+    selectionGeneration++
+    messagesAbortController?.abort()
+    messagesAbortController = null
+    cleanupSSE?.()
+    cleanupSSE = null
+    clearTimeout(workingTimer)
+    clearTimeout(assistantDoneTimer)
+  }
+
+  function isCurrentSelection(id: string, generation: number) {
+    return generation === selectionGeneration && currentId() === id
+  }
 
   // Update sessions and detect unread changes
   function updateSessions(newSessions: SessionMeta[]) {
@@ -377,7 +399,7 @@ export default function App() {
     if (uploading()) return
     const sessionId = currentId()
     const boxId = 'local' as const
-    if (!sessionId) return
+    if (!sessionId || loadedSessionId() !== sessionId) return
     const added: PendingFile[] = []
     for (const f of fileList) {
       if (f.size > MAX_UPLOAD_BYTES) {
@@ -542,7 +564,7 @@ export default function App() {
       window.removeEventListener('resize', setVh)
     })
   })
-  onCleanup(() => { if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer); if (pendingRetryTimer) clearTimeout(pendingRetryTimer); clearPendingMedia(); cleanupSSE?.(); document.removeEventListener('keydown', onGlobalKeyDown) })
+  onCleanup(() => { if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer); if (pendingRetryTimer) clearTimeout(pendingRetryTimer); clearPendingMedia(); cancelSelectionWork(); document.removeEventListener('keydown', onGlobalKeyDown) })
 
   // Autoresize textarea on programmatic text changes (draft restore on session
   // select, voice dictation, history navigation). The onInput handler covers
@@ -565,12 +587,20 @@ export default function App() {
       // Save scroll position of current session
       if (messageScrollRef) scrollPositions.set(prev, messageScrollRef.scrollTop)
     }
+    cancelSelectionWork()
+    const generation = selectionGeneration
+    const abortController = new AbortController()
+    messagesAbortController = abortController
     dismissMediaNotice()
     setCurrentId(id)
+    setLoadedSessionId(null)
+    setChatLoadError('')
     location.hash = id
     setSidebar(false)
     setLoading(true)
+    setLoadingMore(false)
     setMessages([])
+    setHasMore(false)
     setWorking(false)
     setActivity(null)
     setQuestion(null)
@@ -587,49 +617,59 @@ export default function App() {
       setLastSession({ id, title: 'New session', updatedAt: new Date().toISOString(), isActive: true })
       // Session not in filtered list; fetch unfiltered to get full metadata (cwd, title, etc.)
       fetchSessions().then(all => {
+        if (!isCurrentSelection(id, generation)) return
         const found = all.find(a => a.id === id)
         if (found) setLastSession(found)
       }).catch(() => {})
     }
-    cleanupSSE?.()
-    clearTimeout(workingTimer)
+    let result: Awaited<ReturnType<typeof fetchMessages>>
     try {
-      const result = await fetchMessages(id)
-      setMessages(result.messages)
-      setHasMore(result.hasMore)
-      // Determine working state from loaded messages.
-      // Only mark as working if the session is actually active (has a running tmux process).
-      // Inactive/timed-out sessions should never show as working.
-      const sessionMeta = sessions().find(x => x.id === id) || lastSession()
-      const isActive = sessionMeta?.isActive ?? false
-      const msgs = result.messages
-      if (msgs.length > 0) {
-        const last = msgs[msgs.length - 1]
-        if (!isActive) setWorking(false)
-        else if (last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence') setWorking(false)
-        else if (last.role === 'user') setWorking(true)
-        else setWorking(false) // assistant mid-stream but no new SSE yet; let SSE update it
-        // Extract cwd from last user message and update header
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          if (msgs[i].cwd) {
-            const ls = lastSession()
-            if (ls && ls.id === id && !ls.cwd) setLastSession({ ...ls, cwd: msgs[i].cwd })
-            break
-          }
+      result = await fetchMessages(id, 0, abortController.signal)
+    } catch (error: any) {
+      if (!isCurrentSelection(id, generation)) return
+      messagesAbortController = null
+      setLoading(false)
+      setChatLoadError(error?.name === 'AbortError' ? '' : 'This chat could not be loaded. Sending is locked to protect the wrong chat.')
+      return
+    }
+    if (!isCurrentSelection(id, generation)) return
+    messagesAbortController = null
+    setMessages(result.messages)
+    setHasMore(result.hasMore)
+    // Determine working state from loaded messages.
+    // Only mark as working if the session is actually active (has a running tmux process).
+    // Inactive/timed-out sessions should never show as working.
+    const sessionMeta = sessions().find(x => x.id === id) || lastSession()
+    const isActive = sessionMeta?.isActive ?? false
+    const msgs = result.messages
+    if (msgs.length > 0) {
+      const last = msgs[msgs.length - 1]
+      if (!isActive) setWorking(false)
+      else if (last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence') setWorking(false)
+      else if (last.role === 'user') setWorking(true)
+      else setWorking(false) // assistant mid-stream but no new SSE yet; let SSE update it
+      // Extract cwd from last user message and update header
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].cwd) {
+          const ls = lastSession()
+          if (ls && ls.id === id && !ls.cwd) setLastSession({ ...ls, cwd: msgs[i].cwd })
+          break
         }
       }
-    } catch {}
+    }
     appendPendingMessages(id)
+    setLoadedSessionId(id)
     setLoading(false)
     // Restore scroll position if we have one saved
     const savedScroll = scrollPositions.get(id)
     if (savedScroll !== undefined) {
       requestAnimationFrame(() => {
-        if (messageScrollRef) messageScrollRef.scrollTop = savedScroll
+        if (isCurrentSelection(id, generation) && messageScrollRef) messageScrollRef.scrollTop = savedScroll
       })
     }
     setSSEStatus('connected')
-    cleanupSSE = subscribeMessages(id, (msg) => {
+    const unsubscribe = subscribeMessages(id, (msg) => {
+      if (!isCurrentSelection(id, generation) || loadedSessionId() !== id) return
       // Clear assistant-done debounce on any incoming message
       clearTimeout(assistantDoneTimer)
       // If new content arrives while a question is showing, it was a false positive
@@ -650,7 +690,7 @@ export default function App() {
         // Assistant message without stop_reason: JSONL may never get end_turn.
         // Debounce: if no more messages arrive in 5s, assume the turn is done.
         assistantDoneTimer = window.setTimeout(() => {
-          if (working()) {
+          if (isCurrentSelection(id, generation) && working()) {
             setWorking(false)
             clearTimeout(workingTimer)
           }
@@ -690,8 +730,13 @@ export default function App() {
         deletePendingMessage(deliveredPendingId)
         refreshPendingMessages()
       }
-    }, setSSEStatus, setActivity, setQuestion)
-    queueMicrotask(() => retryPendingMessages(id))
+    },
+    status => { if (isCurrentSelection(id, generation)) setSSEStatus(status) },
+    activity => { if (isCurrentSelection(id, generation)) setActivity(activity) },
+    nextQuestion => { if (isCurrentSelection(id, generation)) setQuestion(nextQuestion) })
+    if (!isCurrentSelection(id, generation)) unsubscribe()
+    else cleanupSSE = unsubscribe
+    queueMicrotask(() => { if (isCurrentSelection(id, generation)) retryPendingMessages(id) })
   }
 
   function doSearch(query: string) {
@@ -783,9 +828,11 @@ export default function App() {
     setMenuOpen(false)
     await deleteSession(id)
     dismissMediaNotice()
+    cancelSelectionWork()
     setCurrentId(null)
+    setLoadedSessionId(null)
+    setChatLoadError('')
     location.hash = ''
-    cleanupSSE?.()
     setMessages([])
     updateSessions(await fetchSessions())
   }
@@ -794,8 +841,10 @@ export default function App() {
     dismissMediaNotice()
     const id = currentId()
     if (id) saveDraft(id, text())
-    cleanupSSE?.()
+    cancelSelectionWork()
     setCurrentId(null)
+    setLoadedSessionId(null)
+    setChatLoadError('')
     setLastSession(null)
     setMessages([])
     setWorking(false)
@@ -816,7 +865,8 @@ export default function App() {
 
   async function loadEarlier() {
     const id = currentId()
-    if (!id || loadingMore()) return
+    const generation = selectionGeneration
+    if (!id || loadedSessionId() !== id || loadingMore()) return
     setLoadingMore(true)
     // Capture viewport anchor so prepending older messages doesn't jump the
     // view. After setMessages resolves on the next frame, we restore by
@@ -826,6 +876,7 @@ export default function App() {
       : null
     try {
       const result = await fetchMessages(id, messages().length)
+      if (!isCurrentSelection(id, generation) || loadedSessionId() !== id) return
       setMessages(prev => [...result.messages, ...prev])
       setHasMore(result.hasMore)
       if (anchor && messageScrollRef) {
@@ -835,7 +886,7 @@ export default function App() {
         })
       }
     } catch {}
-    setLoadingMore(false)
+    if (isCurrentSelection(id, generation)) setLoadingMore(false)
   }
 
   async function toggleStar(sessionId: string, msgUuid: string) {
@@ -1080,7 +1131,7 @@ export default function App() {
       return
     }
     const recordingTarget = { sessionId: currentId(), capturedText: text().trim() }
-    if (!recordingTarget.sessionId) return
+    if (!recordingTarget.sessionId || loadedSessionId() !== recordingTarget.sessionId) return
     try { mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }) }
     catch { return }
     audioChunks = []
@@ -1117,8 +1168,13 @@ export default function App() {
 
   async function sendComposedMessage(rawText: string, pending: PendingFile[] = files()) {
     const val = rawText.trim()
-    if ((!val && !pending.length) || !currentId()) return
-    const targetId = currentId()!
+    const selectedId = currentId()
+    if ((!val && !pending.length) || !selectedId) return
+    if (loadedSessionId() !== selectedId) {
+      showMediaNotice('Wait for this chat to finish loading before sending.')
+      return
+    }
+    const targetId = selectedId
     let safelyQueued = false
     setUploading(true)
     setMediaNotice('')
@@ -1621,6 +1677,12 @@ export default function App() {
         <Show when={sseStatus() === 'reconnecting' && currentId()}>
           <div style={{ padding: '4px 16px', background: '#c4993a', color: '#000', 'font-size': '12px', 'font-weight': '600', 'text-align': 'center', 'flex-shrink': '0' }}>Reconnecting...</div>
         </Show>
+        <Show when={chatLoadError() && currentId()}>
+          <div role="alert" style={{ padding: '7px 12px', background: '#2a1515', color: '#ff9b93', 'font-size': '12px', display: 'flex', 'align-items': 'center', 'justify-content': 'center', gap: '10px', 'flex-shrink': '0' }}>
+            <span>{chatLoadError()}</span>
+            <button onClick={() => { const id = currentId(); if (id) select(id) }} style={{ background: '#4a2525', border: '1px solid #7b3e3e', color: '#ffd0cc', 'border-radius': '5px', padding: '3px 8px', cursor: 'pointer' }}>Retry</button>
+          </div>
+        </Show>
 
         {/* Content */}
         <div style={{ flex: '1', overflow: 'hidden' }}>
@@ -1634,7 +1696,7 @@ export default function App() {
             />
           }>
             <div style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
-              <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (currentId()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (currentId()) toggleStar(currentId()!, uuid) }} working={working()} scrollRefCb={(el) => { messageScrollRef = el }} sessionId={currentId()} />
+              <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (composerReady()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (loadedSessionId()) toggleStar(loadedSessionId()!, uuid) }} working={working()} scrollRefCb={(el) => { messageScrollRef = el }} sessionId={loadedSessionId()} />
             </div>
             <div style={{ display: tab() === 'files' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%' }}>
               {/* Mode toggle */}
@@ -1825,10 +1887,11 @@ export default function App() {
         </Show>
 
         {/* Question popup */}
-        <Show when={question() && currentId() && tab() === 'chat'}>
+        <Show when={question() && composerReady() && tab() === 'chat'}>
           {(() => {
             const q = question()!
             const handleAnswer = async (type: string, index?: number, text?: string) => {
+              if (!composerReady()) return
               const id = currentId()!
               try { await answerQuestion(id, { type, index, text }) } catch {}
               setQuestion(null)
@@ -1998,7 +2061,7 @@ export default function App() {
           <div style={{ padding: '8px 12px', 'padding-bottom': 'max(8px, env(safe-area-inset-bottom))', 'border-top': files().length ? 'none' : '1px solid #1e1e1e', background: '#0a0e14', display: 'flex', gap: '6px', 'align-items': 'flex-end', 'flex-shrink': '0', position: 'relative' }}>
             {/* Toolbar icons left of textarea */}
             <div style={{ display: 'flex', 'align-items': 'center', gap: '2px', 'flex-shrink': '0', height: '42px' }}>
-              <button onClick={() => fileInputRef?.click()} style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', width: '32px', height: '32px' }} title="Attach file">
+              <button onClick={() => { if (composerReady()) fileInputRef?.click() }} disabled={!composerReady()} style={{ background: 'none', border: 'none', color: composerReady() ? '#666' : '#333', cursor: composerReady() ? 'pointer' : 'wait', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', width: '32px', height: '32px' }} title={composerReady() ? 'Attach file' : 'Loading chat…'}>
                 <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="10" y1="4" x2="10" y2="16" /><line x1="4" y1="10" x2="16" y2="10" /></svg>
               </button>
               <Show when={currentId() && (starred()[currentId()!]?.length || 0) > 0}>
@@ -2007,13 +2070,14 @@ export default function App() {
                   <span style={{ 'font-size': '11px', 'font-weight': '600', color: '#c4993a' }}>{starred()[currentId()!]?.length}</span>
                 </button>
               </Show>
-              <button onClick={toggleVoice} disabled={transcribing()} style={{ background: listening() ? 'rgba(212,85,85,0.15)' : 'none', border: 'none', 'border-radius': '8px', cursor: transcribing() ? 'wait' : 'pointer', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', width: '32px', height: '32px', transition: 'color 0.15s' }} title={transcribing() ? 'Transcribing...' : listening() ? 'Stop & transcribe' : 'Record voice memo (max 25 MB)'} aria-label={transcribing() ? 'Transcribing...' : listening() ? 'Stop & transcribe' : 'Record voice memo (max 25 MB)'}>
+              <button onClick={toggleVoice} disabled={transcribing() || !composerReady()} style={{ background: listening() ? 'rgba(212,85,85,0.15)' : 'none', border: 'none', 'border-radius': '8px', cursor: transcribing() || !composerReady() ? 'wait' : 'pointer', padding: '6px', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center', width: '32px', height: '32px', transition: 'color 0.15s' }} title={!composerReady() ? 'Loading chat…' : transcribing() ? 'Transcribing...' : listening() ? 'Stop & transcribe' : 'Record voice memo (max 25 MB)'} aria-label={!composerReady() ? 'Loading chat' : transcribing() ? 'Transcribing...' : listening() ? 'Stop & transcribe' : 'Record voice memo (max 25 MB)'}>
                 <svg width="14" height="18" viewBox="0 0 14 18" fill="none" stroke={listening() ? '#d45555' : '#666'} stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="1" width="6" height="9" rx="3" fill={listening() ? 'rgba(212,85,85,0.2)' : 'none'} /><path d="M1 7.5a6 6 0 0 0 12 0" /><line x1="7" y1="13.5" x2="7" y2="16" /><line x1="4.5" y1="16" x2="9.5" y2="16" /></svg>
               </button>
             </div>
             {/* Textarea */}
             <div style={{ flex: '1', position: 'relative', 'min-width': '0', display: 'flex', 'flex-direction': 'column', 'justify-content': 'flex-end' }}>
               <textarea ref={textareaRef} value={text()}
+                disabled={!composerReady()}
                 onInput={(e) => { const value = e.target.value; setText(value); if (currentId()) saveDraft(currentId()!, value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px' }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
@@ -2032,8 +2096,8 @@ export default function App() {
                 onPaste={(e) => { const items = e.clipboardData?.items; if (!items) return; const imgs = [...items].filter(i => i.type.startsWith('image/')); if (imgs.length) { e.preventDefault(); addFiles(imgs.map(i => new File([i.getAsFile()!], 'pasted-image.png', { type: i.type }))) } if (isMobile) { const ta = e.currentTarget; setTimeout(() => { ta.blur(); ta.focus() }, 50) } }}
                 onFocus={() => { if (messageScrollRef) setTimeout(() => messageScrollRef!.scrollTo({ top: messageScrollRef!.scrollHeight }), 300) }}
                 enterkeyhint="send"
-                placeholder="Send a message..." rows={1}
-                style={{ width: '100%', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '12px', padding: '10px 14px', color: '#e5e5e5', 'font-size': '16px', 'font-family': 'inherit', resize: 'none', outline: 'none', 'line-height': '1.4', 'max-height': '120px', '-webkit-appearance': 'none', 'box-sizing': 'border-box', overflow: 'auto', 'scrollbar-width': 'none' }} />
+                placeholder={composerReady() ? 'Send a message...' : chatLoadError() ? 'Chat unavailable' : 'Loading chat…'} rows={1}
+                style={{ width: '100%', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '12px', padding: '10px 14px', color: '#e5e5e5', opacity: composerReady() ? '1' : '0.65', 'font-size': '16px', 'font-family': 'inherit', resize: 'none', outline: 'none', 'line-height': '1.4', 'max-height': '120px', '-webkit-appearance': 'none', 'box-sizing': 'border-box', overflow: 'auto', 'scrollbar-width': 'none' }} />
               <Show when={text().length > 0}>
                 <div style={{ position: 'absolute', right: '8px', bottom: '2px', 'font-size': '10px', color: text().length >= 500 ? '#fab283' : '#555', 'line-height': '1', 'pointer-events': 'none' }}>
                   {text().length >= 1000 ? (text().length / 1000).toFixed(1) + 'k' : text().length}
@@ -2043,7 +2107,7 @@ export default function App() {
             {/* Send button (hidden on mobile, keyboard has its own) */}
             <Show when={!isMobile}>
               <div style={{ 'flex-shrink': '0', height: '42px', display: 'flex', 'align-items': 'center' }}>
-                <button onClick={handleSend} disabled={uploading() || transcribing()} title={listening() ? 'Stop, transcribe & send' : 'Send'} style={{ background: (text().trim() || files().length || listening()) ? '#4aba6a' : '#333', color: (text().trim() || files().length || listening()) ? '#000' : '#666', border: 'none', 'border-radius': '50%', padding: '0', width: '36px', height: '36px', cursor: (text().trim() || files().length || listening()) ? 'pointer' : 'default', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center' }}>{uploading() || transcribing() ? '...' : <svg width="14" height="16" viewBox="0 0 14 16" fill="currentColor"><polygon points="0,0 14,8 0,16" /></svg>}</button>
+                <button onClick={handleSend} disabled={uploading() || transcribing() || !composerReady()} title={!composerReady() ? 'Loading chat…' : listening() ? 'Stop, transcribe & send' : 'Send'} style={{ background: composerReady() && (text().trim() || files().length || listening()) ? '#4aba6a' : '#333', color: composerReady() && (text().trim() || files().length || listening()) ? '#000' : '#666', border: 'none', 'border-radius': '50%', padding: '0', width: '36px', height: '36px', cursor: composerReady() && (text().trim() || files().length || listening()) ? 'pointer' : composerReady() ? 'default' : 'wait', '-webkit-tap-highlight-color': 'transparent', display: 'flex', 'align-items': 'center', 'justify-content': 'center' }}>{uploading() || transcribing() ? '...' : <svg width="14" height="16" viewBox="0 0 14 16" fill="currentColor"><polygon points="0,0 14,8 0,16" /></svg>}</button>
               </div>
             </Show>
           </div>

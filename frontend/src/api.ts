@@ -202,11 +202,11 @@ export async function deletePath(path: string): Promise<void> {
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`)
 }
 
-export async function fetchMessages(id: string, before = 0): Promise<{ messages: Message[], hasMore: boolean }> {
+export async function fetchMessages(id: string, before = 0, signal?: AbortSignal): Promise<{ messages: Message[], hasMore: boolean }> {
   const url = before > 0
     ? `${BASE}/api/sessions/${id}/messages?before=${before}`
     : `${BASE}/api/sessions/${id}/messages`
-  const r = await fetch(url)
+  const r = await fetch(url, { signal })
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
   return await r.json()
 }
