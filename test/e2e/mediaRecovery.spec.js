@@ -155,6 +155,7 @@ test('oversized attachments are rejected before any upload request', async ({ pa
   await page.route('**/api/upload', route => { uploads++; return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ path: '/tmp/should-not-upload' }) }) })
   try {
     await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
+    await expect(page.locator('textarea')).toBeEnabled()
     await page.locator('input[type=file]').setInputFiles(oversizedPath)
     await expect(page.getByText(`${path.basename(oversizedPath)} is larger than the 50 MB upload limit.`)).toBeVisible()
     expect(uploads).toBe(0)
@@ -306,4 +307,49 @@ test('voice transcription uses the mounted prefix and inserts recovered text', a
   await page.clock.fastForward(5000)
   await expect(page.getByText('Voice memo recovered successfully.')).toHaveCount(0)
   expect(transcriptPath).toBe('/feather2/api/transcribe')
+})
+
+test('one voice Send includes the caption, transcript, and pending attachment', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: {
+      getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }),
+    } })
+    class FakeRecorder {
+      static isTypeSupported() { return true }
+      constructor(_stream, options) { this.mimeType = options?.mimeType || 'audio/webm'; this.state = 'inactive' }
+      start() { this.state = 'recording' }
+      stop() {
+        this.state = 'inactive'
+        this.ondataavailable?.({ data: new Blob([new Uint8Array(2048)], { type: this.mimeType }) })
+        this.onstop?.()
+      }
+    }
+    window.MediaRecorder = FakeRecorder
+    window.AudioContext = class {
+      createMediaStreamSource() { return { connect() {} } }
+      createAnalyser() { return { fftSize: 0, frequencyBinCount: 1, getByteFrequencyData() {} } }
+      close() {}
+    }
+  })
+  await page.route('**/api/transcribe', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ transcript: 'spoken detail' }) }))
+  await page.route('**/api/upload', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ path: '/tmp/voice-photo.png' }) }))
+  const sends = []
+  await page.route(`**/api/sessions/${sessionId}/send`, async route => {
+    sends.push(JSON.parse(route.request().postData() || '{}').text || '')
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, sentAt: new Date().toISOString() }) })
+  })
+
+  await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
+  await page.locator('textarea').fill('photo context')
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+  await page.locator('input[type=file]').setInputFiles({ name: 'voice-photo.png', mimeType: 'image/png', buffer: png })
+  await expect(page.locator('img[src^="blob:"]')).toBeVisible()
+  await page.getByRole('button', { name: /Record voice memo/ }).first().click()
+  await page.locator('button[title="Stop, transcribe & send"]').last().click()
+
+  await expect.poll(() => sends.length).toBe(1)
+  expect(sends[0]).toContain('photo context spoken detail')
+  expect(sends[0]).toContain('[Attached image: /tmp/voice-photo.png]')
+  await expect(page.locator('img[src^="blob:"]')).toHaveCount(0)
+  await expect(page.locator('textarea')).toHaveValue('')
 })

@@ -154,3 +154,52 @@ test('mobile Return input and the visible Enter control both reach the terminal'
   await enterButton.click()
   await expect.poll(() => terminalInput.filter(value => value === '\r').length).toBe(3)
 })
+
+test('a silent zombie event stream reconnects from its last event id', async ({ page }) => {
+  await page.addInitScript(() => {
+    // Keep the production timeout meaningful while making this regression fast.
+    const nativeSetTimeout = window.setTimeout.bind(window)
+    // @ts-ignore preserve the native call shape for the app
+    window.setTimeout = (handler, delay, ...args) => nativeSetTimeout(handler, delay === 40_000 ? 2000 : delay, ...args)
+    class FakeEventSource extends EventTarget {
+      url
+      closed = false
+      onerror = null
+      constructor(url) {
+        super()
+        this.url = String(url)
+        // @ts-ignore test observation hook
+        ;(window.__fakeEventSources ||= []).push(this)
+        queueMicrotask(() => this.dispatchEvent(new Event('connected')))
+      }
+      close() { this.closed = true }
+    }
+    // @ts-ignore deliberately replacing the browser transport
+    window.EventSource = FakeEventSource
+  })
+
+  await page.goto(`${BASE}/#${SESSION_ID}`)
+  await expect.poll(() => page.evaluate(() => {
+    // @ts-ignore test observation hook
+    return window.__fakeEventSources?.length || 0
+  })).toBe(1)
+  await page.evaluate(() => {
+    // @ts-ignore test observation hook
+    const source = window.__fakeEventSources[0]
+    source.dispatchEvent(new MessageEvent('message', {
+      data: JSON.stringify({ uuid: 'zombie-offset', role: 'assistant', timestamp: new Date().toISOString(), content: [{ type: 'text', text: 'offset marker' }] }),
+      lastEventId: '123',
+    }))
+  })
+
+  await expect.poll(() => page.evaluate(() => {
+    // @ts-ignore test observation hook
+    return window.__fakeEventSources?.length || 0
+  })).toBeGreaterThanOrEqual(2)
+  const state = await page.evaluate(() => {
+    // @ts-ignore test observation hook
+    return { firstClosed: window.__fakeEventSources[0].closed, secondUrl: window.__fakeEventSources[1].url }
+  })
+  expect(state.firstClosed).toBe(true)
+  expect(state.secondUrl).toContain('lastEventId=123')
+})

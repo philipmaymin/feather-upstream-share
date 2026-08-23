@@ -415,15 +415,56 @@ export function subscribeMessages(
   let closed = false
   let retries = 0
   let lastEventId = ''
+  let generation = 0
+  let watchdog: ReturnType<typeof setTimeout> | null = null
+  let retryTimer: ReturnType<typeof setTimeout> | null = null
+  // The server sends a heartbeat every 15 seconds. Mobile network changes can
+  // leave EventSource looking open without delivering either data or errors,
+  // so treat 40 quiet seconds as a dead stream and resume from the last offset.
+  const IDLE_TIMEOUT = 40_000
+
+  function clearWatchdog() {
+    if (watchdog) clearTimeout(watchdog)
+    watchdog = null
+  }
+
+  function reconnect(source: EventSource, sourceGeneration: number, delay = 0) {
+    if (closed || sourceGeneration !== generation || source !== es) return
+    generation++ // invalidate every handler on the dead source before close()
+    clearWatchdog()
+    try { source.close() } catch {}
+    es = null
+    onStatus?.('reconnecting')
+    if (retryTimer) clearTimeout(retryTimer)
+    retryTimer = setTimeout(() => {
+      retryTimer = null
+      connect()
+    }, delay)
+  }
+
+  function armWatchdog(source: EventSource, sourceGeneration: number) {
+    clearWatchdog()
+    watchdog = setTimeout(() => reconnect(source, sourceGeneration), IDLE_TIMEOUT)
+  }
 
   function connect() {
     if (closed) return
+    const sourceGeneration = ++generation
     const url = lastEventId
       ? `${BASE}/api/sessions/${id}/stream?lastEventId=${lastEventId}`
       : `${BASE}/api/sessions/${id}/stream`
-    es = new EventSource(url)
+    const source = new EventSource(url)
+    es = source
+    armWatchdog(source, sourceGeneration)
 
-    es.addEventListener('connected', () => {
+    const alive = () => {
+      if (closed || sourceGeneration !== generation || source !== es) return false
+      armWatchdog(source, sourceGeneration)
+      return true
+    }
+
+    source.addEventListener('connected', () => {
+      if (!alive()) return
       retries = 0
       onStatus?.('connected')
       // On reconnect, check if last message has stopReason (Claude finished while disconnected)
@@ -431,6 +472,7 @@ export function subscribeMessages(
         fetch(`${BASE}/api/sessions/${id}/messages`)
           .then(r => r.ok ? r.json() : null)
           .then(data => {
+            if (closed || sourceGeneration !== generation || source !== es) return
             if (!data?.messages?.length) return
             const last = data.messages[data.messages.length - 1]
             if (last.stopReason) onMessage(last) // Re-emit so working state clears
@@ -438,25 +480,35 @@ export function subscribeMessages(
           .catch(() => {})
       }
     })
-    es.addEventListener('message', (e) => {
+    source.addEventListener('heartbeat', () => { alive() })
+    source.addEventListener('message', (e) => {
+      if (!alive()) return
       if (e.lastEventId) lastEventId = e.lastEventId
       try { onMessage(JSON.parse(e.data)) } catch {}
     })
-    es.addEventListener('activity', (e) => {
+    source.addEventListener('activity', (e) => {
+      if (!alive()) return
       try { onActivity?.(JSON.parse(e.data).activity) } catch {}
     })
-    es.addEventListener('question', (e) => {
+    source.addEventListener('question', (e) => {
+      if (!alive()) return
       try { onQuestion?.(JSON.parse(e.data).question) } catch {}
     })
-    es.onerror = () => {
-      es?.close(); es = null
-      if (closed) return
+    source.onerror = () => {
+      if (closed || sourceGeneration !== generation || source !== es) return
       retries++
-      onStatus?.('reconnecting')
-      setTimeout(connect, Math.min(1000 * 2 ** Math.min(retries - 1, 5), 30000))
+      reconnect(source, sourceGeneration, Math.min(1000 * 2 ** Math.min(retries - 1, 5), 30000))
     }
   }
 
   connect()
-  return () => { closed = true; es?.close(); es = null }
+  return () => {
+    closed = true
+    generation++
+    clearWatchdog()
+    if (retryTimer) clearTimeout(retryTimer)
+    retryTimer = null
+    es?.close()
+    es = null
+  }
 }

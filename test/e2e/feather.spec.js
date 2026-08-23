@@ -409,9 +409,10 @@ test.describe('Chat input', () => {
 
 test.describe('Tab switching', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto(BASE)
-    await page.waitForLoadState('networkidle')
-    await selectTestSession(page)
+    // Open by hash so these tab regressions also cover resuming a direct link
+    // and do not depend on the server's intentionally stale session-list cache.
+    await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
+    await expect(page.locator('p').filter({ hasText: 'Thanks, that makes sense!' }).first()).toBeVisible({ timeout: 10000 })
   })
 
   test('chat tab is active by default', async ({ page }) => {
@@ -441,6 +442,49 @@ test.describe('Tab switching', () => {
 
     await expect(page.locator('.markdown').first()).toBeVisible()
   })
+
+  test('prompts tab shows only user asks and hides the composer', async ({ page }) => {
+    await page.getByRole('button', { name: 'Prompts', exact: true }).click()
+    const panel = page.getByTestId('prompts-panel')
+    await expect(panel).toBeVisible()
+    await expect(panel).toContainText('Explain how **markdown** rendering works in `Feather`')
+    await expect(panel).toContainText('Thanks, that makes sense!')
+    await expect(panel).not.toContainText('Feather uses marked')
+    await expect(page.locator('textarea[placeholder="Send a message..."]')).not.toBeVisible()
+  })
+
+  test('updates tab explains chats that are not assigned to a Room', async ({ page }) => {
+    await page.getByRole('button', { name: 'Updates', exact: true }).click()
+    const panel = page.getByTestId('updates-panel')
+    await expect(panel).toBeVisible()
+    await expect(panel).toContainText("This chat isn't in a Room")
+    await expect(page.locator('textarea[placeholder="Send a message..."]')).not.toBeVisible()
+  })
+})
+
+test('updates tab loads the selected chat Room feed newest first', async ({ page }) => {
+  const room = {
+    name: 'e2e-room', cwd: '/tmp/e2e-room', active: false, latest: null, updatedAt: null,
+    sessions: [{ id: TEST_SESSION_ID, title: 'Explain how markdown rendering works', updatedAt: '2025-06-15T14:01:00Z', isActive: false }],
+    updates: { count: 2, latestAt: '2025-06-15T14:03:00Z', latest: 'newest room update' },
+    pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null },
+  }
+  await page.route('**/api/rooms', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ rooms: [room] }) }))
+  await page.route('**/api/rooms/e2e-room/updates', route => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ updates: [
+      { id: 'one', ts: '2025-06-15T14:02:00Z', text: 'older room update' },
+      { id: 'two', ts: '2025-06-15T14:03:00Z', text: 'newest room update' },
+    ] }),
+  }))
+  await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
+  await expect(page.locator('p').filter({ hasText: 'Thanks, that makes sense!' }).first()).toBeVisible({ timeout: 10000 })
+  await page.getByRole('button', { name: 'Updates', exact: true }).click()
+
+  const panel = page.getByTestId('updates-panel')
+  await expect(panel).toContainText('Updates for #e2e-room')
+  await expect(panel).toContainText('newest room update')
+  const feedText = await panel.innerText()
+  expect(feedText.indexOf('newest room update')).toBeLessThan(feedText.indexOf('older room update'))
 })
 
 // ── Live SSE updates in the browser ─────────────────────────────────────────

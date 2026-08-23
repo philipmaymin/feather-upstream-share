@@ -19,6 +19,7 @@ import { paneHasReadyPrompt } from './lib/terminal-ready.js';
 import { ensureStateLayout, resolveStatePaths } from './lib/state-paths.js';
 import { createJsonState, isJsonRecord } from './lib/json-state.js';
 import { encodeProjectPath, groupRoomSessions } from './lib/rooms.js';
+import { resolveOmpModel, resolveOmpThinking, ompModelFlags } from './lib/omp.js';
 
 // Load ~/.env if present
 try {
@@ -41,6 +42,8 @@ const SUPPORTED_AGENTS = new Set(['claude', 'codex', 'omp']);
 const DEFAULT_AGENT = SUPPORTED_AGENTS.has(process.env.FEATHER_DEFAULT_AGENT)
   ? process.env.FEATHER_DEFAULT_AGENT
   : 'omp';
+const OMP_MODEL = resolveOmpModel(process.env);
+const OMP_THINKING = resolveOmpThinking(process.env);
 const READ_ONLY_MODE = envEnabled(process.env.FEATHER_READ_ONLY);
 const ROOM_PULSES_ENABLED = !READ_ONLY_MODE && !/^(0|false|no|off)$/i.test(String(process.env.FEATHER_ROOM_PULSES || '').trim());
 const configuredPulseInterval = Number(process.env.FEATHER_ROOM_PULSE_INTERVAL_MS);
@@ -454,7 +457,7 @@ function spawnTmuxCodex(name, codexArgs, dir) {
 // way upstream invokes it (oh-my-pi installs add themselves to ~/.bashrc).
 function spawnTmuxOmp(name, ompArgs, dir) {
   try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
-  const ompCmd = `omp ${ompArgs} --allow-home`;
+  const ompCmd = `omp ${ompModelFlags(OMP_MODEL, OMP_THINKING)}${ompArgs} --allow-home`;
   const shellCmd = `tmux new-session -d -s ${name} -c "${dir}" "bash --rcfile ~/.bashrc -ic '${ompCmd}'" \\; set-option -t ${name} prefix M-a`;
   execFileSync('bash', ['-c', shellCmd], { stdio: 'ignore', encoding: 'utf8' });
 }
@@ -1541,19 +1544,37 @@ app.get('/api/health', (_req, res) => res.json({
 // under ~/.npm-global/bin (codex, omp) resolve the same way they do when spawned
 // (the systemd PATH the server runs under doesn't include them). Returns the
 // last non-empty output line, or null if the binary is absent.
+const agentVersionCache = new Map();
 function agentVersion(bin) {
+  if (agentVersionCache.has(bin)) return agentVersionCache.get(bin);
+  let version = null;
   try {
-    const out = execFileSync('bash', ['--rcfile', path.join(HOME || '/home/user', '.bashrc'), '-ic', `${bin} --version`], { encoding: 'utf8', timeout: 5000 });
-    return out.split('\n').map(s => s.trim()).filter(Boolean).pop() || null;
-  } catch { return null; }
+    if (READ_ONLY_MODE) {
+      // A capability GET must not launch a harness: OMP 18 writes audit logs
+      // even for --version. Probe a predictable PATH without sourcing rc files.
+      const searchPath = [path.join(HOME, '.local/bin'), path.join(HOME, '.npm-global/bin'), process.env.PATH || ''].join(':');
+      const found = searchPath.split(':').some(dir => {
+        if (!dir) return false;
+        try { fs.accessSync(path.join(dir, bin), fs.constants.X_OK); return true; }
+        catch { return false; }
+      });
+      if (!found) throw new Error(`${bin} not found`);
+      version = 'installed';
+    } else {
+      const out = execFileSync('bash', ['--rcfile', path.join(HOME || '/home/user', '.bashrc'), '-ic', `${bin} --version`], { encoding: 'utf8', timeout: 5000 });
+      version = out.split('\n').map(s => s.trim()).filter(Boolean).pop() || null;
+    }
+  } catch {}
+  agentVersionCache.set(bin, version);
+  return version;
 }
 
 app.get('/api/agents', (_req, res) => {
   const agents = [{ id: 'claude', label: 'Claude Code', available: true, default: DEFAULT_AGENT === 'claude' }];
   const codexVer = agentVersion('codex');
-  agents.push(codexVer ? { id: 'codex', label: `Codex ${codexVer}`, available: true, default: DEFAULT_AGENT === 'codex' } : { id: 'codex', label: 'Codex', available: false, default: DEFAULT_AGENT === 'codex' });
+  agents.push(codexVer ? { id: 'codex', label: codexVer === 'installed' ? 'Codex' : `Codex ${codexVer}`, available: true, default: DEFAULT_AGENT === 'codex' } : { id: 'codex', label: 'Codex', available: false, default: DEFAULT_AGENT === 'codex' });
   const ompVer = agentVersion('omp');
-  agents.push(ompVer ? { id: 'omp', label: `oh-my-pi ${ompVer}`, available: true, default: DEFAULT_AGENT === 'omp' } : { id: 'omp', label: 'oh-my-pi', available: false, default: DEFAULT_AGENT === 'omp' });
+  agents.push(ompVer ? { id: 'omp', label: ompVer === 'installed' ? 'oh-my-pi' : `oh-my-pi ${ompVer}`, available: true, default: DEFAULT_AGENT === 'omp' } : { id: 'omp', label: 'oh-my-pi', available: false, default: DEFAULT_AGENT === 'omp' });
   res.json({ agents });
 });
 
@@ -2512,7 +2533,16 @@ app.post('/api/sessions/:id/fork', (req, res) => {
     const id = req.params.id;
     const cwd = req.body?.cwd || HOME;
     const forkName = `f-f${Date.now().toString(36)}`;
-    spawnTmuxClaude(forkName, `--resume ${id} --fork-session`, cwd);
+    if (getAgentForSession(id) === 'omp') {
+      // OMP has no --fork-session; resume its conversation in a second tmux.
+      // spawnTmuxOmp centrally applies the configured model/thinking defaults.
+      const sessionDir = path.join(OMP_SESSIONS, id);
+      const ompId = getOmpSessionId(id);
+      const resumeArg = ompId ? `--resume ${ompId}` : '--continue';
+      spawnTmuxOmp(forkName, `${resumeArg} --session-dir ${sessionDir}`, cwd);
+    } else {
+      spawnTmuxClaude(forkName, `--resume ${id} --fork-session`, cwd);
+    }
     sessionsSnapshotCache.invalidate();
     roomSnapshotCache.invalidate();
     res.json({ ok: true, tmux: forkName });

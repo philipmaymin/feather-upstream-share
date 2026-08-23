@@ -82,7 +82,7 @@ describe('Room keep-working scheduler', () => {
       assert.ok(state.active.nextRunAtMs > Date.now())
       const launches = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n')
       assert.equal(launches.length, 1)
-      assert.match(launches[0], /omp -p --auto-approve .*pulse\.md/)
+      assert.match(launches[0], /omp --model openai-codex\/gpt-5\.6-sol --thinking xhigh -p --auto-approve .*pulse\.md/)
       assert.equal(JSON.parse(fs.readFileSync(path.join(home, '.feather/room-sessions.json'), 'utf8'))[state.idle.sessionId], 'idle')
 
       const pause = await fetch(`http://127.0.0.1:${port}/api/rooms/idle/pulse`, {

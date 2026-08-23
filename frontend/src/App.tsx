@@ -5,8 +5,8 @@ import { MessageView } from './components/MessageView'
 import { Terminal } from './components/Terminal'
 import { SidecarThread } from './components/Sidecar'
 import RoomsHome from './RoomsHome'
-import type { SessionMeta, Message, QuestionData, SidecarGroup } from './api'
-import { fetchSessions, fetchRooms, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
+import type { SessionMeta, Message, QuestionData, SidecarGroup, RoomUpdate } from './api'
+import { fetchSessions, fetchRooms, fetchRoomUpdates, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
 import type { SearchResult } from './api'
 import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
@@ -162,7 +162,11 @@ export default function App() {
   const composerReady = () => currentId() !== null && loadedSessionId() === currentId()
   const [creating, setCreating] = createSignal(false)
   const [text, setText] = createSignal('')
-  const [tab, setTab] = createSignal<'chat' | 'files' | 'terminal'>('chat')
+  const [tab, setTab] = createSignal<'chat' | 'prompts' | 'updates' | 'files' | 'terminal'>('chat')
+  const [updatesList, setUpdatesList] = createSignal<RoomUpdate[]>([])
+  const [updatesLoading, setUpdatesLoading] = createSignal(false)
+  const [updatesError, setUpdatesError] = createSignal<string | null>(null)
+  const [updatesRoomName, setUpdatesRoomName] = createSignal<string | null>(null)
   const [filesMode, setFilesMode] = createSignal<'changed' | 'browse'>('browse')
   const TEXT_EXTS = new Set(['.txt', '.md', '.js', '.ts', '.tsx', '.jsx', '.json', '.html', '.css', '.py', '.rb', '.go', '.rs', '.sh', '.yml', '.yaml', '.toml', '.cfg', '.conf', '.ini', '.env', '.sql', '.csv', '.xml', '.log', '.jsonl', '.svelte', '.vue', '.astro', '.mjs', '.cjs'])
   const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico'])
@@ -339,9 +343,11 @@ export default function App() {
   let fileInputRef: HTMLInputElement | undefined
   let dragCounter = 0
   let mediaRestoreGeneration = 0
+  let updatesGeneration = 0
 
   function cancelSelectionWork() {
     selectionGeneration++
+    updatesGeneration++
     messagesAbortController?.abort()
     messagesAbortController = null
     cleanupSSE?.()
@@ -1077,11 +1083,25 @@ export default function App() {
           await persistMediaPatch(memo.id, { transcript })
         }
         if (memo.intent === 'send') {
-          await sendSessionText([memo.capturedText, transcript].filter(Boolean).join(' '), memo.sessionId, memo.id)
-          const draft = memo.sessionId === currentId() ? text() : loadDraft(memo.sessionId)
+          const onCurrent = memo.sessionId === currentId()
+          // One tap sends the whole composer. Voice previously sent only its
+          // transcript and left attached files behind for a surprising second tap.
+          const pending = onCurrent ? files() : []
+          const parts: string[] = [[memo.capturedText, transcript].filter(Boolean).join(' ')].filter(Boolean)
+          for (const file of pending) {
+            const uploadPath = await uploadPendingFile(file)
+            parts.push(file.isImage ? `[Attached image: ${uploadPath}]` : `[Attached file: ${uploadPath}] (${file.name})`)
+          }
+          await sendSessionText(parts.join('\n'), memo.sessionId, memo.id)
+          for (const file of pending) {
+            URL.revokeObjectURL(file.dataUrl)
+            await deleteMediaRecord(file.id).catch(() => {})
+          }
+          if (onCurrent && pending.length) setFiles(previous => previous.filter(file => !pending.some(sent => sent.id === file.id)))
+          const draft = onCurrent ? text() : loadDraft(memo.sessionId)
           if (draft === memo.capturedText) {
             saveDraft(memo.sessionId, '')
-            if (memo.sessionId === currentId()) setText('')
+            if (onCurrent) setText('')
           }
         } else {
           const previous = memo.sessionId === currentId() ? text().trim() : loadDraft(memo.sessionId).trim()
@@ -1308,7 +1328,53 @@ export default function App() {
   const tabStyle = (t: string) => ({
     padding: '6px 16px', border: 'none', 'border-bottom': tab() === t ? '2px solid #4aba6a' : '2px solid transparent',
     background: 'none', color: tab() === t ? '#e5e5e5' : '#666', 'font-size': '13px', 'font-weight': '600', cursor: 'pointer',
-    '-webkit-tap-highlight-color': 'transparent',
+    '-webkit-tap-highlight-color': 'transparent', 'flex-shrink': '0',
+  })
+
+  // User-only transcript view. Tool-result user turns are implementation
+  // traffic, not prompts, so include only messages with non-empty text blocks.
+  const userPrompts = () => messages().filter(message => message.role === 'user' &&
+    (message.content || []).some(block => block.type === 'text' && (block.text || '').trim()))
+  const promptText = (message: Message) => (message.content || [])
+    .filter(block => block.type === 'text').map(block => block.text || '').join('\n').trim()
+  const formatFeedTime = (timestamp: string | null | undefined) => {
+    if (!timestamp) return ''
+    const date = new Date(timestamp)
+    if (Number.isNaN(date.getTime())) return ''
+    return date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+  }
+  let promptsScroller: HTMLDivElement | undefined
+  createEffect(() => {
+    if (tab() !== 'prompts') return
+    const scroller = promptsScroller
+    if (scroller) requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight })
+  })
+
+  async function loadSessionUpdates(id: string, generation: number) {
+    setUpdatesLoading(true)
+    setUpdatesError(null)
+    setUpdatesRoomName(null)
+    setUpdatesList([])
+    try {
+      const rooms = await fetchRooms(1000)
+      if (generation !== updatesGeneration || tab() !== 'updates' || currentId() !== id) return
+      const room = rooms.find(candidate => candidate.sessions.some(session => session.id === id))
+      if (!room) return
+      const updates = await fetchRoomUpdates(room.name)
+      if (generation !== updatesGeneration || tab() !== 'updates' || currentId() !== id) return
+      setUpdatesRoomName(room.name)
+      setUpdatesList(updates)
+    } catch (error: any) {
+      if (generation === updatesGeneration && tab() === 'updates' && currentId() === id) setUpdatesError(error?.message || String(error))
+    } finally {
+      if (generation === updatesGeneration && tab() === 'updates' && currentId() === id) setUpdatesLoading(false)
+    }
+  }
+  createEffect(() => {
+    const id = currentId()
+    const active = tab() === 'updates'
+    const generation = ++updatesGeneration
+    if (active && id) loadSessionUpdates(id, generation)
   })
 
   async function handleLogin(e: Event) {
@@ -1665,11 +1731,13 @@ export default function App() {
 
         {/* Tabs */}
         <Show when={currentId()}>
-          <div style={{ display: 'flex', 'align-items': 'center', 'border-bottom': '1px solid #1e1e1e', 'padding-left': '16px', 'flex-shrink': '0' }}>
+          <div style={{ display: 'flex', 'align-items': 'center', 'border-bottom': '1px solid #1e1e1e', 'padding-left': '16px', 'flex-shrink': '0', 'overflow-x': 'auto', 'scrollbar-width': 'none', '-webkit-overflow-scrolling': 'touch' }}>
             <button onClick={() => setTab('chat')} style={tabStyle('chat')}>Chat</button>
+            <button onClick={() => setTab('prompts')} style={tabStyle('prompts')}>Prompts</button>
+            <button onClick={() => setTab('updates')} style={tabStyle('updates')}>Updates</button>
             <button onClick={() => { setTab('files'); if (!browseDir()) openFileBrowser() }} style={tabStyle('files')}>Files{touchedFiles().length > 0 ? ` (${touchedFiles().length})` : ''}</button>
             <button onClick={() => setTab('terminal')} style={tabStyle('terminal')}>Terminal</button>
-            <span style={{ 'margin-left': 'auto', 'padding-right': '12px', 'font-size': '10px', color: '#444' }}>{__BUILD_TIME__}</span>
+            <Show when={!isMobile}><span style={{ 'margin-left': 'auto', 'padding-right': '12px', 'font-size': '10px', color: '#444', 'flex-shrink': '0' }}>{__BUILD_TIME__}</span></Show>
           </div>
         </Show>
 
@@ -1811,6 +1879,41 @@ export default function App() {
             </div>
             <div style={{ display: tab() === 'terminal' ? 'block' : 'none', height: '100%' }}>
               <Terminal sessionId={tab() === 'terminal' ? currentId() : null} />
+            </div>
+            <div data-testid="prompts-panel" style={{ display: tab() === 'prompts' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>
+              <div ref={promptsScroller} style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '12px 16px 24px' }}>
+                <Show when={hasMore()}>
+                  <button onClick={loadEarlier} disabled={loadingMore()} style={{ display: 'block', margin: '0 auto 12px', background: '#1a1a2e', border: '1px solid #333', color: '#aaa', 'border-radius': '7px', padding: '6px 12px', 'font-size': '12px', cursor: loadingMore() ? 'wait' : 'pointer' }}>{loadingMore() ? 'Loading…' : 'Load earlier prompts'}</button>
+                </Show>
+                <For each={userPrompts()} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '16px 4px' }}>No prompts yet in this chat.</div>}>
+                  {(message) => (
+                    <div style={{ 'margin-bottom': '10px', padding: '10px 12px', background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '10px' }}>
+                      <div style={{ 'font-size': '10px', color: '#5a6472', 'font-family': 'monospace', 'margin-bottom': '4px' }}>{formatFeedTime(message.timestamp)}</div>
+                      <div style={{ 'font-size': '14px', color: '#e0e3e8', 'line-height': '1.5', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{promptText(message)}</div>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </div>
+            <div data-testid="updates-panel" style={{ display: tab() === 'updates' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>
+              <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '12px 16px 24px' }}>
+                <Show when={updatesError()}><div style={{ color: '#d45555', 'font-size': '13px', padding: '8px 4px' }}>{updatesError()}</div></Show>
+                <Show when={updatesLoading()}><div style={{ color: '#666', 'font-size': '13px', padding: '8px 4px' }}>Loading updates…</div></Show>
+                <Show when={!updatesLoading() && !updatesError() && !updatesRoomName()}>
+                  <div style={{ color: '#666', 'font-size': '13px', padding: '8px 4px', 'line-height': '1.5' }}>This chat isn't in a Room, so it has no Updates feed. Updates live per Room — open the Rooms home screen to see them.</div>
+                </Show>
+                <Show when={updatesRoomName()}>
+                  <div style={{ 'font-size': '12px', color: '#7a8290', 'margin-bottom': '10px' }}>Updates for <span style={{ color: '#9aa4b2', 'font-weight': '600' }}>#{updatesRoomName()}</span></div>
+                  <For each={[...updatesList()].reverse()} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '4px' }}>No updates yet in this Room.</div>}>
+                    {(update) => (
+                      <div style={{ padding: '9px 0', 'border-bottom': '1px solid #14141c' }}>
+                        <div style={{ 'font-size': '10px', color: '#5a6472', 'font-family': 'monospace', 'margin-bottom': '3px' }}>{formatFeedTime(update.ts)}</div>
+                        <div style={{ 'font-size': '13px', color: '#d0d4da', 'line-height': '1.5', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{update.text}</div>
+                      </div>
+                    )}
+                  </For>
+                </Show>
+              </div>
             </div>
           </Show>
         </div>
