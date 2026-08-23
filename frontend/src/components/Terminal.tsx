@@ -2,7 +2,7 @@ import { onMount, onCleanup, createEffect, createSignal, Show, For } from 'solid
 import { init, Terminal as GhosttyTerm, FitAddon, OSC8LinkProvider } from 'ghostty-web'
 import type { ILink, ILinkProvider } from 'ghostty-web'
 import { appWebSocketUrl } from '../lib/appPath.js'
-import { findHttpUrls } from '../lib/terminalLinks.js'
+import { extractHttpUrls, findTerminalLineUrls, stripTerminalControlSequences } from '../lib/terminalLinks.js'
 
 const BASE_WS = appWebSocketUrl('/api/terminal')
 
@@ -38,51 +38,21 @@ function lineText(line: any) {
 export function wrappedUrlLinks(term: GhosttyTerm, row: number, activate = openTerminalUrl): ILink[] {
   const buffer = term.buffer.active
   if (row < 0 || row >= buffer.length || !buffer.getLine(row)) return []
-  let firstRow = row
-  while (firstRow > 0 && buffer.getLine(firstRow)?.isWrapped) firstRow--
-  let lastRow = row
-  while (lastRow + 1 < buffer.length && buffer.getLine(lastRow + 1)?.isWrapped) lastRow++
-
-  let logicalLine = ''
-  const widths: number[] = []
+  const firstRow = Math.max(0, row - 64)
+  const lastRow = Math.min(buffer.length - 1, row + 64)
+  const lines: string[] = []
   for (let current = firstRow; current <= lastRow; current++) {
     const line = buffer.getLine(current)
-    if (!line) break
-    const text = lineText(line)
-    widths.push(text.length)
-    logicalLine += current === lastRow ? text.trimEnd() : text
+    lines.push(line ? lineText(line) : '')
   }
 
-  const links: ILink[] = []
-  for (const match of findHttpUrls(logicalLine)) {
-    let startOffset = match.index
-    let endOffset = match.index + match.url.length - 1
-    let startRow = firstRow
-    let endRow = firstRow
-    let startX = startOffset
-    let endX = endOffset
-    for (let index = 0; index < widths.length; index++) {
-      const width = widths[index]
-      if (startOffset >= width) {
-        startOffset -= width
-        startRow++
-      } else if (startRow === firstRow + index) {
-        startX = startOffset
-      }
-      if (endOffset >= width) {
-        endOffset -= width
-        endRow++
-      } else if (endRow === firstRow + index) {
-        endX = endOffset
-      }
-    }
-    links.push({
-      text: match.url,
-      range: { start: { x: startX, y: startRow }, end: { x: endX, y: endRow } },
-      activate: () => activate(match.url),
-    })
-  }
-  return links
+  return findTerminalLineUrls(lines, firstRow)
+    .filter(link => row >= link.start.y && row <= link.end.y)
+    .map(link => ({
+      text: link.url,
+      range: { start: link.start, end: link.end },
+      activate: () => activate(link.url),
+    }))
 }
 
 function pointInLink(link: ILink, column: number, row: number) {
@@ -130,6 +100,7 @@ export function Terminal(props: { sessionId: string | null }) {
   let term: GhosttyTerm | null = null
   let fitAddon: FitAddon | null = null
   let ws: WebSocket | null = null
+  let rawOutput = ''
   let connectionGeneration = 0
   const [copied, setCopied] = createSignal(false)
   const [hasSelection, setHasSelection] = createSignal(false)
@@ -147,7 +118,12 @@ export function Terminal(props: { sessionId: string | null }) {
         if (existing >= 0) ordered.splice(existing, 1)
         ordered.push(link)
       }
-      return ordered.reverse().slice(0, 20)
+      // A hard-wrapped OAuth URL can briefly look like a valid shorter URL
+      // before the following rows arrive. Prefer its later, complete form.
+      const complete = ordered.filter(link => !ordered.some(other => (
+        other !== link && link.includes('?') && other.length > link.length + 8 && other.startsWith(link)
+      )))
+      return complete.reverse().slice(0, 20)
     })
   }
 
@@ -156,15 +132,25 @@ export function Terminal(props: { sessionId: string | null }) {
     const seen = new Set<string>()
     const found: string[] = []
     const buffer = term.buffer.active
-    for (let row = Math.max(0, buffer.length - 500); row < buffer.length; row++) {
-      for (const link of wrappedUrlLinks(term, row)) {
-        const key = `${link.range.start.y}:${link.range.start.x}:${link.text}`
-        if (seen.has(key)) continue
-        seen.add(key)
-        found.push(link.text)
-      }
+    const firstRow = Math.max(0, buffer.length - 500)
+    const lines: string[] = []
+    for (let row = firstRow; row < buffer.length; row++) {
+      const line = buffer.getLine(row)
+      lines.push(line ? lineText(line) : '')
+    }
+    for (const link of findTerminalLineUrls(lines, firstRow)) {
+      const key = `${link.start.y}:${link.start.x}:${link.url}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      found.push(link.url)
     }
     rememberLinks(found)
+  }
+
+  function scanRawOutput(data: unknown) {
+    if (typeof data !== 'string') return
+    rawOutput = (rawOutput + data).slice(-65536)
+    rememberLinks(extractHttpUrls(stripTerminalControlSequences(rawOutput)))
   }
 
   async function connect(sessionId: string) {
@@ -173,6 +159,7 @@ export function Terminal(props: { sessionId: string | null }) {
     setTerminalLinks([])
     setShowLinks(false)
     setCopiedLink('')
+    rawOutput = ''
     await ensureInit()
     if (generation !== connectionGeneration) return
 
@@ -246,7 +233,9 @@ export function Terminal(props: { sessionId: string | null }) {
     const socket = new WebSocket(`${BASE_WS}?session=${sessionId}`)
     ws = socket
     socket.onmessage = (e) => {
-      if (generation === connectionGeneration && term === activeTerm) activeTerm.write(e.data, scanTerminalLinks)
+      if (generation !== connectionGeneration || term !== activeTerm) return
+      scanRawOutput(e.data)
+      activeTerm.write(e.data, scanTerminalLinks)
     }
     socket.onclose = () => {
       if (generation === connectionGeneration && term === activeTerm) activeTerm.write('\r\n\x1b[90m[disconnected]\x1b[0m\r\n')
@@ -361,6 +350,7 @@ export function Terminal(props: { sessionId: string | null }) {
     display: 'flex',
     'align-items': 'center',
     gap: '4px',
+    'flex-shrink': '0',
   }
 
   const keyStyle = {
@@ -377,16 +367,14 @@ export function Terminal(props: { sessionId: string | null }) {
     <div style={{ height: '100%', width: '100%', display: 'flex', 'flex-direction': 'column', background: '#0a0e14' }}>
       {/* Terminal toolbar */}
       <div style={{ display: 'flex', gap: '6px', padding: '6px 8px', 'border-bottom': '1px solid #1e1e1e', 'flex-shrink': '0', 'overflow-x': 'auto' }}>
+        <button onClick={toggleLinks} aria-controls="terminal-links" aria-expanded={showLinks()} style={{ ...btnStyle, color: showLinks() ? '#4aba6a' : '#73b8ff' }}>
+          {terminalLinks().length > 0 ? `Links (${terminalLinks().length})` : 'Links'}
+        </button>
         <button onClick={handleSelectAll} style={btnStyle}>Select All</button>
         <button onClick={handleCopy} style={{ ...btnStyle, color: copied() ? '#4aba6a' : '#aaa' }}>
           {copied() ? 'Copied!' : hasSelection() ? 'Copy Selection' : 'Copy All'}
         </button>
         <button onClick={handlePaste} style={btnStyle}>Paste</button>
-        <Show when={terminalLinks().length > 0}>
-          <button onClick={toggleLinks} aria-expanded={showLinks()} style={{ ...btnStyle, color: showLinks() ? '#4aba6a' : '#73b8ff' }}>
-            Links ({terminalLinks().length})
-          </button>
-        </Show>
         {KEYS.map(([seq, label, aria]) => (
           <button
             onMouseDown={(e) => e.preventDefault()}
@@ -397,14 +385,18 @@ export function Terminal(props: { sessionId: string | null }) {
           >{label}</button>
         ))}
       </div>
-      <Show when={showLinks() && terminalLinks().length > 0}>
-        <div data-testid="terminal-links" style={{ padding: '6px 8px', background: '#0d1117', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'flex-direction': 'column', gap: '6px', 'max-height': '35%', overflow: 'auto', 'flex-shrink': '0' }}>
-          <For each={terminalLinks()}>{link => (
-            <div style={{ display: 'flex', 'align-items': 'center', gap: '8px', 'min-width': '0' }}>
-              <a href={link} target="_blank" rel="noopener noreferrer" title={link} style={{ flex: '1', 'min-width': '0', color: '#73b8ff', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{link}</a>
-              <button onClick={() => copyLink(link)} style={{ ...btnStyle, padding: '4px 9px', color: copiedLink() === link ? '#4aba6a' : '#aaa', 'flex-shrink': '0' }}>{copiedLink() === link ? 'Copied!' : 'Copy'}</button>
-            </div>
-          )}</For>
+      <Show when={showLinks()}>
+        <div id="terminal-links" data-testid="terminal-links" aria-live="polite" style={{ padding: '8px', background: '#0d1117', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'flex-direction': 'column', gap: '6px', 'max-height': '35%', overflow: 'auto', 'flex-shrink': '0' }}>
+          <Show when={terminalLinks().length > 0} fallback={(
+            <div style={{ color: '#888', 'font-size': '12px', padding: '3px 2px' }}>No complete links found yet. Keep this open and new terminal links will appear here.</div>
+          )}>
+            <For each={terminalLinks()}>{link => (
+              <div style={{ display: 'flex', 'align-items': 'center', gap: '8px', 'min-width': '0' }}>
+                <a href={link} target="_blank" rel="noopener noreferrer" title={link} style={{ flex: '1', 'min-width': '0', color: '#73b8ff', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{link}</a>
+                <button onClick={() => copyLink(link)} style={{ ...btnStyle, padding: '4px 9px', color: copiedLink() === link ? '#4aba6a' : '#aaa', 'flex-shrink': '0' }}>{copiedLink() === link ? 'Copied!' : 'Copy'}</button>
+              </div>
+            )}</For>
+          </Show>
         </div>
       </Show>
       <div ref={containerRef}

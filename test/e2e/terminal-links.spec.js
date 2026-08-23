@@ -31,6 +31,8 @@ test.afterAll(() => {
 })
 
 test('long wrapped login URLs can be tapped, opened, and copied on mobile', async ({ page }) => {
+  let terminalSocket
+  let terminalCols = 0
   await page.addInitScript(() => {
     // @ts-ignore test observation hooks
     window.__terminalOpened = []
@@ -46,18 +48,37 @@ test('long wrapped login URLs can be tapped, opened, and copied on mobile', asyn
     })
   })
   await page.routeWebSocket(/\/api\/terminal\?session=/, socket => {
-    let sent = false
-    socket.onMessage(() => {
-      if (sent) return
-      sent = true
-      socket.send(LOGIN_URL)
+    terminalSocket = socket
+    socket.onMessage(message => {
+      try {
+        const parsed = JSON.parse(String(message))
+        if (parsed.type === 'resize') terminalCols = parsed.cols
+      } catch {}
     })
   })
 
   await page.goto(`${BASE}/#${SESSION_ID}`)
   await expect(page.getByText(TITLE, { exact: true }).first()).toBeVisible({ timeout: 10000 })
   await page.getByRole('button', { name: 'Terminal', exact: true }).click()
-  await expect(page.getByRole('button', { name: 'Links (1)' })).toBeVisible({ timeout: 10000 })
+
+  const emptyLinksButton = page.locator('button[aria-controls="terminal-links"]')
+  await expect(emptyLinksButton).toBeVisible({ timeout: 10000 })
+  const linksButtonBox = await emptyLinksButton.boundingBox()
+  expect(linksButtonBox).not.toBeNull()
+  expect(linksButtonBox.x).toBeGreaterThanOrEqual(0)
+  expect(linksButtonBox.x + linksButtonBox.width).toBeLessThanOrEqual(390)
+  await emptyLinksButton.click()
+  await expect(page.getByText('No complete links found yet.')).toBeVisible()
+
+  await expect.poll(() => Boolean(terminalSocket) && terminalCols > 20).toBe(true)
+  const indent = '    '
+  const width = terminalCols - indent.length
+  const rows = []
+  for (let offset = 0; offset < LOGIN_URL.length; offset += width) {
+    rows.push((indent + LOGIN_URL.slice(offset, offset + width)).padEnd(terminalCols))
+  }
+  terminalSocket.send(rows.join('\r\n'))
+  await expect(emptyLinksButton).toHaveText('Links (1)', { timeout: 10000 })
 
   const canvas = page.locator('canvas')
   const box = await canvas.boundingBox()
@@ -68,7 +89,6 @@ test('long wrapped login URLs can be tapped, opened, and copied on mobile', asyn
     return window.__terminalOpened
   })).toEqual([LOGIN_URL])
 
-  await page.getByRole('button', { name: 'Links (1)' }).click()
   const link = page.getByRole('link', { name: LOGIN_URL })
   await expect(link).toHaveAttribute('href', LOGIN_URL)
   await expect(link).toHaveAttribute('target', '_blank')
