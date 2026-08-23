@@ -20,6 +20,7 @@ import { ensureStateLayout, resolveStatePaths } from './lib/state-paths.js';
 import { createJsonState, isJsonRecord } from './lib/json-state.js';
 import { encodeProjectPath, groupRoomSessions } from './lib/rooms.js';
 import { resolveOmpModel, resolveOmpThinking, ompLaunchCommand, ompTmuxArgs } from './lib/omp.js';
+import { ompSessionIdFromHead } from './lib/omp-session.js';
 import { inferLegacyTmuxOwner, legacyTmuxSessionName, tmuxSessionName } from './lib/tmux-session.js';
 import { extractOsc8HttpUrls } from './lib/terminal-hyperlinks.js';
 
@@ -208,6 +209,7 @@ function findJsonlPath(sessionId, agent) {
 function getAgentForSession(sessionId) {
   const meta = readMeta();
   if (meta[sessionId]?.agent) return meta[sessionId].agent;
+  if (findOmpJsonlPath(sessionId)) return 'omp';
   // Auto-detect codex sessions discovered from disk (id is the codex UUID itself)
   if (UUID_RE.test(sessionId) && findCodexJsonlPath(sessionId)) return 'codex';
   return 'claude';
@@ -359,13 +361,14 @@ function getOmpSessionId(featherId) {
   if (!fpath) return null;
   try {
     const fd = fs.openSync(fpath, 'r');
-    const buf = Buffer.alloc(Math.min(4096, fs.fstatSync(fd).size));
-    fs.readSync(fd, buf, 0, buf.length, 0);
-    fs.closeSync(fd);
-    const d = JSON.parse(buf.toString('utf8').split('\n')[0]);
-    if (d.type === 'session' && d.id) return d.id;
-  } catch {}
-  return null;
+    try {
+      const buf = Buffer.alloc(Math.min(64 * 1024, fs.fstatSync(fd).size));
+      fs.readSync(fd, buf, 0, buf.length, 0);
+      return ompSessionIdFromHead(buf.toString('utf8'));
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch { return null; }
 }
 
 function extractCodexTitle(buf) {
@@ -631,8 +634,8 @@ function spawnOrResume(id, cwd, resume = false, agent = null) {
     watchOmpSessionDir(sessionDir, id);
     if (resume) {
       const ompId = getOmpSessionId(id);
-      const resumeArg = ompId ? `--resume ${ompId}` : '--continue';
-      spawnTmuxOmp(name, `${resumeArg} --session-dir ${sessionDir}`, cwd || HOME);
+      if (!ompId) throw new Error(`Cannot resume OMP session ${id}: exact OMP session id not found`);
+      spawnTmuxOmp(name, `--resume ${ompId} --session-dir ${sessionDir}`, cwd || HOME);
     } else {
       const meta = readMeta();
       meta[id] = { ...(meta[id] || {}), agent: 'omp', cwd: cwd || HOME };
@@ -2108,8 +2111,10 @@ function launchRoomPulse(name) {
     writeMeta(meta);
     ROOM_ASSIGN_STATE.update(current => ({ ...current, [id]: name }));
     watchOmpSessionDir(sessionDir, id);
-    const ompId = findOmpJsonlPath(id) ? getOmpSessionId(id) : null;
-    const resumeArg = ompId ? `--resume ${ompId}` : (findOmpJsonlPath(id) ? '--continue' : '');
+    const hasTranscript = !!findOmpJsonlPath(id);
+    const ompId = hasTranscript ? getOmpSessionId(id) : null;
+    if (hasTranscript && !ompId) throw new Error(`Cannot resume OMP session ${id}: exact OMP session id not found`);
+    const resumeArg = ompId ? `--resume ${ompId}` : '';
     spawnTmuxOmp(tmuxName(id), `${resumeArg} -p --auto-approve @${promptFile} --session-dir ${sessionDir}`.trim(), cwd, { interactive: false });
   } catch (error) {
     ROOM_PULSES_STATE.update(current => ({
@@ -2690,8 +2695,8 @@ app.post('/api/sessions/:id/fork', (req, res) => {
       // spawnTmuxOmp centrally applies the configured model/thinking defaults.
       const sessionDir = path.join(OMP_SESSIONS, id);
       const ompId = getOmpSessionId(id);
-      const resumeArg = ompId ? `--resume ${ompId}` : '--continue';
-      spawnTmuxOmp(forkName, `${resumeArg} --session-dir ${sessionDir}`, cwd);
+      if (!ompId) throw new Error(`Cannot fork OMP session ${id}: exact OMP session id not found`);
+      spawnTmuxOmp(forkName, `--resume ${ompId} --session-dir ${sessionDir}`, cwd);
     } else {
       spawnTmuxClaude(forkName, `--resume ${id} --fork-session`, cwd);
     }
