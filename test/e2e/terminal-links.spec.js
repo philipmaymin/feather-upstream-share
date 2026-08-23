@@ -115,8 +115,10 @@ test('long wrapped login URLs can be tapped, opened, and copied on mobile', asyn
 test('mobile Return input and the visible Enter control both reach the terminal', async ({ page }) => {
   const terminalInput = []
   let terminalSocket
+  let terminalConnections = 0
   await page.routeWebSocket(/\/api\/terminal\?session=/, socket => {
     terminalSocket = socket
+    terminalConnections++
     socket.onMessage(message => {
       const value = String(message)
       try {
@@ -158,12 +160,33 @@ test('mobile Return input and the visible Enter control both reach the terminal'
 
   const enterButton = page.getByRole('button', { name: 'Enter', exact: true })
   await expect(enterButton).toBeVisible()
-  const box = await enterButton.boundingBox()
-  expect(box).not.toBeNull()
-  expect(box.x).toBeGreaterThanOrEqual(0)
-  expect(box.x + box.width).toBeLessThanOrEqual(390)
-  await enterButton.click()
+  const tapButton = async (name) => {
+    const button = page.getByRole('button', { name, exact: true })
+    await button.evaluate(element => element.scrollIntoView({ block: 'nearest', inline: 'center' }))
+    const box = await button.boundingBox()
+    expect(box).not.toBeNull()
+    expect(box.x).toBeGreaterThanOrEqual(0)
+    expect(box.x + box.width).toBeLessThanOrEqual(390)
+    await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2)
+  }
+
+  await tapButton('Enter')
   await expect.poll(() => terminalInput.filter(value => value === '\r').length).toBe(3)
+
+  for (const [name, sequence] of [
+    ['Escape', '\x1b'], ['Left arrow', '\x1b[D'], ['Down arrow', '\x1b[B'],
+    ['Up arrow', '\x1b[A'], ['Right arrow', '\x1b[C'],
+  ]) {
+    await tapButton(name)
+    await expect.poll(() => terminalInput.filter(value => value === sequence).length).toBe(1)
+  }
+
+  // A backend restart used to leave the toolbar alive but permanently bound
+  // to a closed socket. A tap during the reconnect is queued and delivered.
+  await terminalSocket.close()
+  await tapButton('Enter')
+  await expect.poll(() => terminalConnections).toBe(2)
+  await expect.poll(() => terminalInput.filter(value => value === '\r').length).toBe(4)
 })
 
 test('a silent zombie event stream reconnects from its last event id', async ({ page }) => {

@@ -100,6 +100,8 @@ export function Terminal(props: { sessionId: string | null }) {
   let term: GhosttyTerm | null = null
   let fitAddon: FitAddon | null = null
   let ws: WebSocket | null = null
+  let reconnectTimer: number | undefined
+  let pendingTerminalInput: string[] = []
   let rawOutput = ''
   let removeMobileInputFallback: (() => void) | null = null
   let keyboardEnterPending = false
@@ -111,6 +113,16 @@ export function Terminal(props: { sessionId: string | null }) {
   const [explicitLinkTargets, setExplicitLinkTargets] = createSignal<string[]>([])
   const [showLinks, setShowLinks] = createSignal(false)
   const [copiedLink, setCopiedLink] = createSignal('')
+
+  function sendTerminalData(data: string) {
+    try {
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(data)
+        return
+      }
+    } catch {}
+    pendingTerminalInput = [...pendingTerminalInput, data].slice(-100)
+  }
 
   function rememberLinks(values: string[]) {
     const links = values.map(safeHttpUrl).filter((value): value is string => Boolean(value))
@@ -273,7 +285,7 @@ export function Terminal(props: { sessionId: string | null }) {
           keyboardEnterTimer = undefined
           return
         }
-        try { ws?.send('\r') } catch {}
+        sendTerminalData('\r')
       }
       containerRef.addEventListener('beforeinput', handleMobileBeforeInput as EventListener, true)
       removeMobileInputFallback = () => containerRef?.removeEventListener('beforeinput', handleMobileBeforeInput as EventListener, true)
@@ -286,32 +298,49 @@ export function Terminal(props: { sessionId: string | null }) {
       })
     }
 
-    const socket = new WebSocket(`${BASE_WS}?session=${sessionId}`)
-    ws = socket
-    socket.onmessage = (e) => {
+    let connectedOnce = false
+    const openSocket = () => {
       if (generation !== connectionGeneration || term !== activeTerm) return
-      if (typeof e.data === 'string' && e.data.startsWith('{')) {
-        try {
-          const control = JSON.parse(e.data)
-          if (control?.type === 'terminal-links' && Array.isArray(control.links)) {
-            rememberExplicitTargets(control.links)
-            return
-          }
-        } catch {}
+      const socket = new WebSocket(`${BASE_WS}?session=${sessionId}`)
+      let socketOpened = false
+      ws = socket
+      socket.onmessage = (e) => {
+        if (generation !== connectionGeneration || term !== activeTerm || ws !== socket) return
+        if (typeof e.data === 'string' && e.data.startsWith('{')) {
+          try {
+            const control = JSON.parse(e.data)
+            if (control?.type === 'terminal-links' && Array.isArray(control.links)) {
+              rememberExplicitTargets(control.links)
+              return
+            }
+          } catch {}
+        }
+        scanRawOutput(e.data)
+        activeTerm.write(e.data, scanTerminalLinks)
       }
-      scanRawOutput(e.data)
-      activeTerm.write(e.data, scanTerminalLinks)
-    }
-    socket.onclose = () => {
-      if (generation === connectionGeneration && term === activeTerm) activeTerm.write('\r\n\x1b[90m[disconnected]\x1b[0m\r\n')
-    }
-
-    socket.onopen = () => {
-      if (generation === connectionGeneration && fitAddon && ws === socket) {
+      socket.onclose = (event) => {
+        if (generation !== connectionGeneration || term !== activeTerm || ws !== socket) return
+        ws = null
+        if (socketOpened) activeTerm.write('\r\n\x1b[90m[disconnected — reconnecting…]\x1b[0m\r\n')
+        if (event.code === 1000 && event.reason === 'Session not active') return
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = undefined
+          openSocket()
+        }, 750)
+      }
+      socket.onopen = () => {
+        if (generation !== connectionGeneration || fitAddon === null || ws !== socket) return
+        socketOpened = true
+        if (connectedOnce) activeTerm.write('\r\n\x1b[90m[reconnected]\x1b[0m\r\n')
+        connectedOnce = true
         const dims = fitAddon.proposeDimensions()
         if (dims) socket.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }))
+        const queued = pendingTerminalInput
+        pendingTerminalInput = []
+        for (const data of queued) socket.send(data)
       }
     }
+    openSocket()
 
     activeTerm.onData((data) => {
       if (data === '\r') {
@@ -322,10 +351,10 @@ export function Terminal(props: { sessionId: string | null }) {
           keyboardEnterTimer = undefined
         }, 0)
       }
-      try { if (generation === connectionGeneration) socket.send(data) } catch {}
+      if (generation === connectionGeneration) sendTerminalData(data)
     })
     activeTerm.onResize(({ cols, rows }) => {
-      try { if (generation === connectionGeneration) socket.send(JSON.stringify({ type: 'resize', cols, rows })) } catch {}
+      try { if (generation === connectionGeneration && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows })) } catch {}
       queueMicrotask(scanTerminalLinks)
     })
   }
@@ -337,6 +366,9 @@ export function Terminal(props: { sessionId: string | null }) {
     keyboardEnterPending = false
     if (keyboardEnterTimer !== undefined) window.clearTimeout(keyboardEnterTimer)
     keyboardEnterTimer = undefined
+    if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
+    reconnectTimer = undefined
+    pendingTerminalInput = []
     ws?.close()
     ws = null
     term?.dispose()
@@ -393,7 +425,7 @@ export function Terminal(props: { sessionId: string | null }) {
   // A phone keyboard has no arrow or escape keys. Send the same bytes a
   // physical key would write, then return focus to the terminal.
   function sendKey(seq: string) {
-    try { ws?.send(seq) } catch {}
+    sendTerminalData(seq)
     try { (term as any)?.focus?.() } catch {}
   }
 
