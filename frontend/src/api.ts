@@ -46,6 +46,7 @@ export interface RoomInfo {
   latest: { role: string; text: string } | null
   updatedAt: string | null
   updates: { count: number; latestAt: string | null; latest: string | null }
+  friction: { count: number; latestAt: string | null; latest: string | null }
   pulse: {
     enabled: boolean
     status: 'waiting' | 'working' | 'paused' | 'error'
@@ -78,6 +79,7 @@ function normalizeRoom(room: RoomInfo): RoomInfo {
     latest: pulseWasNewest ? null : room.latest,
     updatedAt: pulseWasNewest ? (sessions[0]?.updatedAt || room.updates?.latestAt || null) : room.updatedAt,
     updates: room.updates || { count: 0, latestAt: null, latest: null },
+    friction: room.friction || { count: 0, latestAt: null, latest: null },
     pulse,
   }
 }
@@ -112,9 +114,22 @@ export async function fetchRooms(maxAgeMs = 0): Promise<RoomInfo[]> {
 
 export interface RoomUpdate { id: string | null; ts: string | null; text: string }
 
+export interface FrictionComplaint {
+  id: string
+  timestamp: string
+  source: string
+  summary: string
+  evidence: string | null
+}
+
 export async function fetchRoomUpdates(room: string): Promise<RoomUpdate[]> {
   const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/updates`)
   return (await responseJson<{ updates: RoomUpdate[] }>(response)).updates
+}
+
+export async function fetchRoomFriction(room: string): Promise<FrictionComplaint[]> {
+  const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/friction`)
+  return (await responseJson<{ complaints: FrictionComplaint[] }>(response)).complaints
 }
 
 export async function createRoom(name: string): Promise<{ name: string; cwd: string }> {

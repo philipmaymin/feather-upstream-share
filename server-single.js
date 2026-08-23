@@ -19,6 +19,7 @@ import { paneHasReadyPrompt } from './lib/terminal-ready.js';
 import { ensureStateLayout, resolveStatePaths } from './lib/state-paths.js';
 import { createJsonState, isJsonRecord } from './lib/json-state.js';
 import { encodeProjectPath, groupRoomSessions } from './lib/rooms.js';
+import { parseFrictionNotes } from './lib/friction.js';
 import { resolveOmpModel, resolveOmpThinking, ompLaunchCommand, ompTmuxArgs } from './lib/omp.js';
 import { ompSessionIdFromHead } from './lib/omp-session.js';
 import { inferLegacyTmuxOwner, legacyTmuxSessionName, tmuxSessionName } from './lib/tmux-session.js';
@@ -1612,7 +1613,7 @@ app.use(express.json());
 const READ_ONLY_API_ROUTES = [
   /^\/api\/health$/,
   /^\/api\/(agents|rooms|version|projects|search|sessions|running|usage|digest|me)$/,
-  /^\/api\/rooms\/[^/]+\/updates$/,
+  /^\/api\/rooms\/[^/]+\/(updates|friction)$/,
   SESSION_READ_ROUTE,
   /^\/api\/sidecar$/,
   /^\/api\/sidecar\/[^/]+$/,
@@ -1876,6 +1877,25 @@ function appendRoomUpdate(name, text) {
   return entry;
 }
 
+function readFrictionComplaints() {
+  const notesPath = path.join(ROOMS_HOME_DIR, 'friction', 'notes.md');
+  try {
+    return parseFrictionNotes(fs.readFileSync(notesPath, 'utf8'));
+  } catch {
+    return [];
+  }
+}
+
+function roomFrictionSummary(name, complaints) {
+  const matching = complaints.filter(complaint => complaint.source === name);
+  const newest = matching[matching.length - 1] || null;
+  return {
+    count: matching.length,
+    latestAt: newest?.timestamp || null,
+    latest: newest?.summary || null,
+  };
+}
+
 function buildRoomsSnapshot() {
   const names = listRoomDirs();
   const assignments = readRoomAssignments();
@@ -1893,6 +1913,7 @@ function buildRoomsSnapshot() {
     sessions: allSessions,
     assignments,
   });
+  const frictionComplaints = readFrictionComplaints();
 
   const rooms = names.map(name => {
     const sessions = byRoom.get(name);
@@ -1918,6 +1939,7 @@ function buildRoomsSnapshot() {
       latest,
       updatedAt,
       updates: roomUpdatesSummary(name),
+      friction: roomFrictionSummary(name, frictionComplaints),
     };
   });
   rooms.sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0));
@@ -1931,6 +1953,19 @@ roomSnapshotCache = createSnapshotCache(buildRoomsSnapshot, { ttlMs: 10_000 });
 app.get('/api/rooms', (_req, res) => {
   try { res.json({ rooms: roomSnapshotCache.get() }); }
   catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.get('/api/rooms/:name/friction', (req, res) => {
+  try {
+    const { name } = req.params;
+    if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
+    const complaints = readFrictionComplaints()
+      .filter(complaint => complaint.source === name)
+      .reverse();
+    res.json({ complaints, count: complaints.length });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
 });
 
 app.post('/api/rooms', (req, res) => {

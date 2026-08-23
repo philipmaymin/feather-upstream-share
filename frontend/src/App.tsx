@@ -1994,36 +1994,6 @@ export default function App() {
                 </Show>
               </div>
             </div>
-            <div data-testid="friction-panel" style={{ display: tab() === 'friction' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>
-              <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '12px 16px 24px' }}>
-                <div style={{ display: 'flex', 'align-items': 'baseline', gap: '8px', 'margin-bottom': '10px' }}>
-                  <span style={{ color: '#d7dbe2', 'font-size': '14px', 'font-weight': '700' }}>#friction</span>
-                  <span style={{ color: '#5f6875', 'font-size': '11px' }}>{frictionList().length} complaint{frictionList().length === 1 ? '' : 's'}</span>
-                </div>
-                <Show when={frictionError()}>
-                  <div style={{ color: '#d45555', 'font-size': '13px', padding: '8px 0' }}>{frictionError()}</div>
-                </Show>
-                <Show when={frictionLoading()}>
-                  <div style={{ color: '#666', 'font-size': '13px', padding: '8px 0' }}>Loading friction…</div>
-                </Show>
-                <Show when={!frictionLoading() && !frictionError()}>
-                  <For each={frictionList()} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '8px 0' }}>No complaints in #friction.</div>}>
-                    {(complaint) => (
-                      <article style={{ padding: '11px 0', 'border-bottom': '1px solid #171b22' }}>
-                        <div style={{ display: 'flex', 'align-items': 'center', gap: '7px', 'margin-bottom': '5px' }}>
-                          <span style={{ color: '#d7a85a', 'font-size': '11px', 'font-weight': '600' }}>#{complaint.source}</span>
-                          <span style={{ color: '#4f5865', 'font-size': '10px', 'font-family': 'monospace' }}>{fmtFeedTime(complaint.timestamp)}</span>
-                        </div>
-                        <div style={{ color: '#d0d4da', 'font-size': '13px', 'line-height': '1.45', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{complaint.summary}</div>
-                        <Show when={complaint.evidence}>
-                          <div style={{ color: '#77818f', 'font-size': '11px', 'line-height': '1.4', 'font-family': 'monospace', 'margin-top': '6px', padding: '6px 8px', background: '#090d12', 'border-radius': '6px', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{complaint.evidence}</div>
-                        </Show>
-                      </article>
-                    )}
-                  </For>
-                </Show>
-              </div>
-            </div>
           </Show>
         </div>
 
