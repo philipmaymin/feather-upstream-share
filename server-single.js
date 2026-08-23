@@ -19,7 +19,7 @@ import { paneHasReadyPrompt } from './lib/terminal-ready.js';
 import { ensureStateLayout, resolveStatePaths } from './lib/state-paths.js';
 import { createJsonState, isJsonRecord } from './lib/json-state.js';
 import { encodeProjectPath, groupRoomSessions } from './lib/rooms.js';
-import { resolveOmpModel, resolveOmpThinking, ompModelFlags } from './lib/omp.js';
+import { resolveOmpModel, resolveOmpThinking, ompLaunchCommand, ompTmuxArgs } from './lib/omp.js';
 import { inferLegacyTmuxOwner, legacyTmuxSessionName, tmuxSessionName } from './lib/tmux-session.js';
 import { extractOsc8HttpUrls } from './lib/terminal-hyperlinks.js';
 
@@ -547,11 +547,13 @@ function spawnTmuxCodex(name, codexArgs, dir) {
 
 // omp is launched via an interactive rc shell so it resolves on PATH the same
 // way upstream invokes it (oh-my-pi installs add themselves to ~/.bashrc).
-function spawnTmuxOmp(name, ompArgs, dir) {
+function spawnTmuxOmp(name, ompArgs, dir, options = {}) {
   try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
-  const ompCmd = `omp ${ompModelFlags(OMP_MODEL, OMP_THINKING)}${ompArgs} --allow-home`;
-  const shellCmd = `tmux new-session -d -s ${name} -c "${dir}" "bash --rcfile ~/.bashrc -ic '${ompCmd}'" \\; set-option -t ${name} prefix M-a`;
-  execFileSync('bash', ['-c', shellCmd], { stdio: 'ignore', encoding: 'utf8' });
+  const ompCmd = ompLaunchCommand(ompArgs, OMP_MODEL, OMP_THINKING, options);
+  // Pass tmux arguments directly. The device-auth wrapper includes a quoted
+  // status message; interpolating it into a second `bash -c` command corrupts
+  // the nested quoting and makes the new pane exit immediately.
+  execFileSync('tmux', ompTmuxArgs(name, dir, ompCmd), { stdio: 'ignore', encoding: 'utf8' });
 }
 
 // Codex doesn't accept a preset session id. We snapshot existing rollout files,
@@ -2108,7 +2110,7 @@ function launchRoomPulse(name) {
     watchOmpSessionDir(sessionDir, id);
     const ompId = findOmpJsonlPath(id) ? getOmpSessionId(id) : null;
     const resumeArg = ompId ? `--resume ${ompId}` : (findOmpJsonlPath(id) ? '--continue' : '');
-    spawnTmuxOmp(tmuxName(id), `${resumeArg} -p --auto-approve @${promptFile} --session-dir ${sessionDir}`.trim(), cwd);
+    spawnTmuxOmp(tmuxName(id), `${resumeArg} -p --auto-approve @${promptFile} --session-dir ${sessionDir}`.trim(), cwd, { interactive: false });
   } catch (error) {
     ROOM_PULSES_STATE.update(current => ({
       ...current,

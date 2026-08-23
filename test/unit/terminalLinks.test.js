@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  cleanTerminalUrl, completeTerminalUrl, findHttpUrls, extractHttpUrls, extractOsc8HttpUrls, findTerminalLineUrls,
+  cleanTerminalUrl, completeTerminalUrl, extractDeviceCodes, findHttpUrls, extractHttpUrls, extractOsc8HttpUrls, findTerminalLineUrls,
   stripTerminalControlSequences,
 } from '../../frontend/src/lib/terminalLinks.js'
 
@@ -19,6 +19,11 @@ test('terminal URL extraction deduplicates while preserving the latest order', (
   assert.deepEqual(extractHttpUrls('https://a.test x https://b.test y https://a.test'), [
     'https://b.test', 'https://a.test',
   ])
+})
+
+test('OMP device login codes survive terminal decoration and deduplicate', () => {
+  const output = '\u001b[36mEnter code: 8tip-ri00e\u001b[0m\nWaiting (code: ignored)\nEnter code: ABCD-12345'
+  assert.deepEqual(extractDeviceCodes(stripTerminalControlSequences(output)), ['8TIP-RI00E', 'ABCD-12345'])
 })
 
 test('terminal URLs hard-wrapped by a TUI are reconstructed across indented rows', () => {

@@ -45,6 +45,19 @@ export function extractHttpUrls(text) {
   return [...ordered.keys()]
 }
 
+export function extractDeviceCodes(text) {
+  const ordered = new Map()
+  const pattern = /\bEnter code:\s*([A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+)\b/giu
+  let match = pattern.exec(text)
+  while (match) {
+    const code = match[1].toUpperCase()
+    ordered.delete(code)
+    ordered.set(code, true)
+    match = pattern.exec(text)
+  }
+  return [...ordered.keys()]
+}
+
 // Terminal UIs often lay text out themselves instead of letting the terminal
 // soft-wrap it. In that case every physical row is marked as a separate line,
 // even though a long OAuth URL visibly continues at the left edge of the next

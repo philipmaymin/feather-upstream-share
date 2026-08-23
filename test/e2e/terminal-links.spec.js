@@ -110,6 +110,21 @@ test('long wrapped login URLs can be tapped, opened, and copied on mobile', asyn
     // @ts-ignore test observation hooks
     return window.__terminalCopied
   })).toBe(LOGIN_URL)
+
+  await emptyLinksButton.click()
+  await expect(page.locator('#terminal-links')).toBeHidden()
+  const deviceUrl = 'https://auth.openai.com/codex/device'
+  const deviceCode = '8TIP-RI00E'
+  terminalSocket.send(`\r\nOpen this URL in your browser:\r\n${deviceUrl}\r\nEnter code: ${deviceCode}\r\n`)
+  await expect(emptyLinksButton).toHaveText('Login')
+  await expect(page.locator('#terminal-links')).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Open ChatGPT device login' })).toHaveAttribute('href', deviceUrl)
+  await expect(page.getByText(deviceCode, { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: `Copy login code ${deviceCode}` }).click()
+  await expect.poll(() => page.evaluate(() => {
+    // @ts-ignore test observation hooks
+    return window.__terminalCopied
+  })).toBe(deviceCode)
 })
 
 test('mobile Return input and the visible Enter control both reach the terminal', async ({ page }) => {
@@ -180,6 +195,16 @@ test('mobile Return input and the visible Enter control both reach the terminal'
     await tapButton(name)
     await expect.poll(() => terminalInput.filter(value => value === sequence).length).toBe(1)
   }
+
+  // iOS can suppress the compatibility click after terminal focus changes.
+  // The touch pointer path must send by itself and suppress a later click so
+  // one physical tap never becomes two terminal keys.
+  const escapeButton = page.getByRole('button', { name: 'Escape', exact: true })
+  await escapeButton.evaluate(element => {
+    element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'touch' }))
+    element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }))
+  })
+  await expect.poll(() => terminalInput.filter(value => value === '\x1b').length).toBe(2)
 
   // A backend restart used to leave the toolbar alive but permanently bound
   // to a closed socket. A tap during the reconnect is queued and delivered.

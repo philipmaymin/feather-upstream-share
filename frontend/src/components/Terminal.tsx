@@ -2,7 +2,7 @@ import { onMount, onCleanup, createEffect, createSignal, Show, For } from 'solid
 import { init, Terminal as GhosttyTerm, FitAddon, OSC8LinkProvider } from 'ghostty-web'
 import type { ILink, ILinkProvider } from 'ghostty-web'
 import { appWebSocketUrl } from '../lib/appPath.js'
-import { completeTerminalUrl, extractHttpUrls, extractOsc8HttpUrls, findTerminalLineUrls, stripTerminalControlSequences } from '../lib/terminalLinks.js'
+import { completeTerminalUrl, extractDeviceCodes, extractHttpUrls, extractOsc8HttpUrls, findTerminalLineUrls, stripTerminalControlSequences } from '../lib/terminalLinks.js'
 
 const BASE_WS = appWebSocketUrl('/api/terminal')
 
@@ -106,13 +106,16 @@ export function Terminal(props: { sessionId: string | null }) {
   let removeMobileInputFallback: (() => void) | null = null
   let keyboardEnterPending = false
   let keyboardEnterTimer: number | undefined
+  let lastTouchKeyAt = 0
   let connectionGeneration = 0
   const [copied, setCopied] = createSignal(false)
   const [hasSelection, setHasSelection] = createSignal(false)
   const [terminalLinks, setTerminalLinks] = createSignal<string[]>([])
+  const [terminalCodes, setTerminalCodes] = createSignal<string[]>([])
   const [explicitLinkTargets, setExplicitLinkTargets] = createSignal<string[]>([])
   const [showLinks, setShowLinks] = createSignal(false)
   const [copiedLink, setCopiedLink] = createSignal('')
+  const [copiedCode, setCopiedCode] = createSignal('')
 
   function sendTerminalData(data: string) {
     try {
@@ -193,18 +196,29 @@ export function Terminal(props: { sessionId: string | null }) {
     rawOutput = (rawOutput + data).slice(-65536)
     const explicitTargets = extractOsc8HttpUrls(rawOutput)
     rememberExplicitTargets(explicitTargets)
+    const printable = stripTerminalControlSequences(rawOutput)
     rememberLinks([
-      ...extractHttpUrls(stripTerminalControlSequences(rawOutput)),
+      ...extractHttpUrls(printable),
     ])
+    const codes = extractDeviceCodes(printable)
+    if (codes.length) {
+      if (terminalCodes().length === 0) {
+        setShowLinks(true)
+        queueMicrotask(() => { try { fitAddon?.fit() } catch {} })
+      }
+      setTerminalCodes(codes.slice(-5).reverse())
+    }
   }
 
   async function connect(sessionId: string) {
     disconnect()
     const generation = connectionGeneration
     setTerminalLinks([])
+    setTerminalCodes([])
     setExplicitLinkTargets([])
     setShowLinks(false)
     setCopiedLink('')
+    setCopiedCode('')
     rawOutput = ''
     await ensureInit()
     if (generation !== connectionGeneration) return
@@ -369,6 +383,7 @@ export function Terminal(props: { sessionId: string | null }) {
     if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
     reconnectTimer = undefined
     pendingTerminalInput = []
+    lastTouchKeyAt = 0
     ws?.close()
     ws = null
     term?.dispose()
@@ -403,6 +418,12 @@ export function Terminal(props: { sessionId: string | null }) {
     setTimeout(() => setCopiedLink(current => current === link ? '' : current), 1500)
   }
 
+  async function copyCode(code: string) {
+    if (!await writeClipboard(code)) return
+    setCopiedCode(code)
+    setTimeout(() => setCopiedCode(current => current === code ? '' : current), 1500)
+  }
+
   function toggleLinks() {
     setShowLinks(value => !value)
     queueMicrotask(() => { try { fitAddon?.fit() } catch {} })
@@ -427,6 +448,21 @@ export function Terminal(props: { sessionId: string | null }) {
   function sendKey(seq: string) {
     sendTerminalData(seq)
     try { (term as any)?.focus?.() } catch {}
+  }
+
+  function sendKeyFromPointer(event: PointerEvent, seq: string) {
+    if (event.pointerType !== 'touch' && event.pointerType !== 'pen') return
+    event.preventDefault()
+    lastTouchKeyAt = performance.now()
+    sendKey(seq)
+  }
+
+  function sendKeyFromClick(_event: MouseEvent, seq: string) {
+    // iOS may suppress its synthetic click after terminal focus changes. Send
+    // on the native touch pointer path, and ignore the compatibility click if
+    // the browser still emits one. Mouse and keyboard clicks continue here.
+    if (performance.now() - lastTouchKeyAt < 750) return
+    sendKey(seq)
   }
 
   const KEYS: [string, string, string][] = [
@@ -473,6 +509,7 @@ export function Terminal(props: { sessionId: string | null }) {
     'min-height': '40px',
     'justify-content': 'center',
     'flex-shrink': '0',
+    'touch-action': 'manipulation',
   }
 
   return (
@@ -481,13 +518,14 @@ export function Terminal(props: { sessionId: string | null }) {
       <div style={{ display: 'flex', gap: '6px', padding: '6px 8px', 'border-bottom': '1px solid #1e1e1e', 'flex-shrink': '0', 'overflow-x': 'auto' }}>
         <button
           onMouseDown={(e) => e.preventDefault()}
-          onClick={() => sendKey('\r')}
+          onPointerUp={(e) => sendKeyFromPointer(e, '\r')}
+          onClick={(e) => sendKeyFromClick(e, '\r')}
           aria-label="Enter"
           title="Enter"
           style={{ ...keyStyle, 'font-size': '12px', 'min-width': '66px' }}
         >Enter ↵</button>
         <button onClick={toggleLinks} aria-controls="terminal-links" aria-expanded={showLinks()} style={{ ...btnStyle, color: showLinks() ? '#4aba6a' : '#73b8ff' }}>
-          {terminalLinks().length > 0 ? `Links (${terminalLinks().length})` : 'Links'}
+          {terminalCodes().length > 0 ? 'Login' : terminalLinks().length > 0 ? `Links (${terminalLinks().length})` : 'Links'}
         </button>
         <button onClick={handleSelectAll} style={btnStyle}>Select All</button>
         <button onClick={handleCopy} style={{ ...btnStyle, color: copied() ? '#4aba6a' : '#aaa' }}>
@@ -497,7 +535,8 @@ export function Terminal(props: { sessionId: string | null }) {
         {KEYS.map(([seq, label, aria]) => (
           <button
             onMouseDown={(e) => e.preventDefault()}
-            onClick={() => sendKey(seq)}
+            onPointerUp={(e) => sendKeyFromPointer(e, seq)}
+            onClick={(e) => sendKeyFromClick(e, seq)}
             aria-label={aria}
             title={aria}
             style={keyStyle}
@@ -506,12 +545,19 @@ export function Terminal(props: { sessionId: string | null }) {
       </div>
       <Show when={showLinks()}>
         <div id="terminal-links" data-testid="terminal-links" aria-live="polite" style={{ padding: '8px', background: '#0d1117', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'flex-direction': 'column', gap: '6px', 'max-height': '35%', overflow: 'auto', 'flex-shrink': '0' }}>
-          <Show when={terminalLinks().length > 0} fallback={(
+          <Show when={terminalLinks().length > 0 || terminalCodes().length > 0} fallback={(
             <div style={{ color: '#888', 'font-size': '12px', padding: '3px 2px' }}>No complete links found yet. Keep this open and new terminal links will appear here.</div>
           )}>
+            <For each={terminalCodes()}>{code => (
+              <div style={{ display: 'flex', 'align-items': 'center', gap: '8px', 'min-width': '0' }}>
+                <span style={{ color: '#aaa', 'font-size': '12px' }}>Login code</span>
+                <code style={{ color: '#e5e5e5', 'font-size': '15px', 'font-weight': '700', 'letter-spacing': '0.08em' }}>{code}</code>
+                <button aria-label={`Copy login code ${code}`} onClick={() => copyCode(code)} style={{ ...btnStyle, padding: '4px 9px', color: copiedCode() === code ? '#4aba6a' : '#aaa', 'flex-shrink': '0' }}>{copiedCode() === code ? 'Copied!' : 'Copy code'}</button>
+              </div>
+            )}</For>
             <For each={terminalLinks()}>{link => (
               <div style={{ display: 'flex', 'align-items': 'center', gap: '8px', 'min-width': '0' }}>
-                <a href={link} target="_blank" rel="noopener noreferrer" title={link} style={{ flex: '1', 'min-width': '0', color: '#73b8ff', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{link}</a>
+                <a href={link} target="_blank" rel="noopener noreferrer" title={link} style={{ flex: '1', 'min-width': '0', color: '#73b8ff', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{link === 'https://auth.openai.com/codex/device' ? 'Open ChatGPT device login' : link}</a>
                 <button onClick={() => copyLink(link)} style={{ ...btnStyle, padding: '4px 9px', color: copiedLink() === link ? '#4aba6a' : '#aaa', 'flex-shrink': '0' }}>{copiedLink() === link ? 'Copied!' : 'Copy'}</button>
               </div>
             )}</For>
