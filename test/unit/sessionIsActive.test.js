@@ -20,8 +20,19 @@ describe('sessionIsActive', () => {
   const now = 1_000_000_000_000
 
   it('is active when tmux is alive and the JSONL was written recently', () => {
-    const active = new Set([prefix])
+    const active = new Set([id])
     assert.equal(sessionIsActive(active, id, now - 60_000, now), true)
+  })
+
+  it('does not confuse full ids that share their first eight characters', () => {
+    const sibling = `${prefix}-ffff-ffff-ffff-ffffffffffff`
+    const active = new Set([sibling])
+    assert.equal(sessionIsActive(active, id, now - 60_000, now), false)
+    assert.equal(sessionIsActive(active, sibling, now - 60_000, now), true)
+  })
+
+  it('temporarily recognizes tmux sessions from older 8-character releases', () => {
+    assert.equal(sessionIsActive(new Set([prefix]), id, now - 60_000, now), true)
   })
 
   it('is NOT active when tmux is alive but the last write is older than ACTIVE_MS', () => {

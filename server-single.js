@@ -11,7 +11,7 @@ import { parseMessage, parseCodexMessage, parseMessageForAgent } from './lib/par
 import * as sidecar from './lib/sidecar.js';
 import { createKeyedLock } from './lib/sendlock.js';
 import { codexPasteBufferArgs } from './lib/tmux-input.js';
-import { sessionIsActive, sessionIsRoomPulse, lastMessageMs, latestSessionActivityMs } from './lib/sessions.js';
+import { activeTmuxCreatedAt, activeTmuxHas, sessionIsActive, sessionIsRoomPulse, lastMessageMs, latestSessionActivityMs } from './lib/sessions.js';
 import { resolveCodexWatchId, codexAdoptionPending } from './lib/codex-watch.js';
 import * as webpush from './lib/webpush.js';
 import { createSnapshotCache } from './lib/snapshot-cache.js';
@@ -20,6 +20,8 @@ import { ensureStateLayout, resolveStatePaths } from './lib/state-paths.js';
 import { createJsonState, isJsonRecord } from './lib/json-state.js';
 import { encodeProjectPath, groupRoomSessions } from './lib/rooms.js';
 import { resolveOmpModel, resolveOmpThinking, ompModelFlags } from './lib/omp.js';
+import { inferLegacyTmuxOwner, legacyTmuxSessionName, tmuxSessionName } from './lib/tmux-session.js';
+import { extractOsc8HttpUrls } from './lib/terminal-hyperlinks.js';
 
 // Load ~/.env if present
 try {
@@ -415,7 +417,37 @@ function ensureCodexTrust(cwd) {
 // ── Tmux management ────────────────────────────────────────────────────────
 
 function tmuxName(id) {
-  return `f-${id.slice(0, 8)}`;
+  return tmuxSessionName(id);
+}
+
+const legacyTmuxOwners = new Map();
+
+function tmuxSessionExists(name) {
+  // tmux otherwise accepts a unique prefix as a target. That would let a
+  // missing legacy f-<id8> name resolve to the wrong full-id sibling.
+  try { execFileSync('tmux', ['has-session', '-t', `=${name}`], { stdio: 'ignore' }); return true; }
+  catch { return false; }
+}
+
+function existingTmuxName(id) {
+  const canonical = tmuxName(id);
+  if (tmuxSessionExists(canonical)) return canonical;
+  const legacy = legacyTmuxSessionName(id);
+  return tmuxSessionExists(legacy) && legacyTmuxOwners.get(legacy) === String(id) ? legacy : canonical;
+}
+
+function terminalHyperlinkTargets(name) {
+  try {
+    const pane = execFileSync('tmux', ['capture-pane', '-p', '-e', '-t', name, '-S', '-500'],
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024 });
+    return [...new Set(extractOsc8HttpUrls(pane))].slice(-20).reverse();
+  } catch { return []; }
+}
+
+function killTmuxSessions(id) {
+  for (const name of new Set([tmuxName(id), legacyTmuxSessionName(id)])) {
+    try { execFileSync('tmux', ['kill-session', '-t', `=${name}`], { stdio: 'ignore' }); } catch {}
+  }
 }
 
 function getActiveTmuxSessions() {
@@ -425,16 +457,76 @@ function getActiveTmuxSessions() {
     const active = new Map();
     for (const line of out.split('\n')) {
       const [name, created] = line.split('|');
-      if (name?.startsWith(prefix)) active.set(name.slice(prefix.length), Number(created) * 1000 || 0);
+      if (!name?.startsWith(prefix)) continue;
+      const legacyOwner = /^f-[A-Za-z0-9_-]{8}$/.test(name) ? legacyTmuxOwners.get(name) : null;
+      // An unowned legacy prefix is ambiguous by definition. Ignoring it is
+      // safer than marking every same-prefix chat active.
+      if (/^f-[A-Za-z0-9_-]{8}$/.test(name) && !legacyOwner) continue;
+      active.set(legacyOwner || name.slice(prefix.length), Number(created) * 1000 || 0);
     }
     return active;
   } catch { return new Map(); }
 }
 
 function tmuxIsActive(id) {
-  try { execFileSync('tmux', ['has-session', '-t', tmuxName(id)], { stdio: 'ignore' }); return true; }
-  catch { return false; }
+  return tmuxSessionExists(tmuxName(id)) || existingTmuxName(id) !== tmuxName(id);
 }
+
+function listClaudeSessionIds() {
+  const ids = [];
+  const root = projectsDir();
+  if (!fs.existsSync(root)) return ids;
+  for (const project of fs.readdirSync(root)) {
+    try {
+      for (const file of fs.readdirSync(path.join(root, project))) {
+        if (file.endsWith('.jsonl')) ids.push(file.slice(0, -6));
+      }
+    } catch {}
+  }
+  return ids;
+}
+
+function migrateLegacyTmuxSessions(renameSessions) {
+  const knownIds = new Set([
+    ...Object.keys(readMeta()),
+    ...(fs.existsSync(OMP_SESSIONS) ? fs.readdirSync(OMP_SESSIONS) : []),
+    ...listCodexJsonlFiles().map(file => file.uuid),
+    ...listClaudeSessionIds(),
+  ]);
+  let names = [];
+  try {
+    names = execFileSync('tmux', ['list-sessions', '-F', '#{session_name}'],
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim().split('\n').filter(Boolean);
+  } catch { return; }
+  for (const name of names) {
+    if (!/^f-[A-Za-z0-9_-]{8}$/.test(name)) continue;
+    let startCommand = '';
+    try {
+      startCommand = execFileSync('tmux', ['display-message', '-p', '-t', name, '#{pane_start_command}'],
+        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch {}
+    const owner = inferLegacyTmuxOwner(name, startCommand, knownIds);
+    if (!owner) {
+      if (renameSessions) console.warn(`[tmux] could not safely migrate ambiguous legacy session ${name}`);
+      continue;
+    }
+    legacyTmuxOwners.set(name, owner);
+    if (!renameSessions) continue;
+    const canonical = tmuxName(owner);
+    if (tmuxSessionExists(canonical)) {
+      console.warn(`[tmux] kept legacy session ${name}; canonical ${canonical} already exists`);
+      continue;
+    }
+    try {
+      execFileSync('tmux', ['rename-session', '-t', name, canonical], { stdio: 'ignore' });
+      console.log(`[tmux] migrated ${name} -> ${canonical}`);
+    } catch (error) { console.warn(`[tmux] could not migrate ${name}:`, error.message); }
+  }
+}
+
+const shouldMigrateTmux = !READ_ONLY_MODE
+  && !/^(0|false|no|off)$/i.test(String(process.env.FEATHER_MIGRATE_TMUX || '').trim());
+migrateLegacyTmuxSessions(shouldMigrateTmux);
 
 function spawnTmuxClaude(name, claudeArgs, dir) {
   try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
@@ -693,16 +785,13 @@ async function sendInputToSessionIdempotent(id, text, messageId) {
 }
 
 async function sendInputToSessionUnlocked(id, text) {
-  const name = tmuxName(id);
+  let name = existingTmuxName(id);
   const agent = getAgentForSession(id);
-  let sessionExists = false;
-  try {
-    execFileSync('tmux', ['has-session', '-t', name], { stdio: 'ignore' });
-    sessionExists = true;
-  } catch {}
+  const sessionExists = tmuxSessionExists(name);
 
   if (!sessionExists) {
     spawnOrResume(id, null, true, agent);
+    name = tmuxName(id);
     if (agent === 'codex') await waitForAgentReady(name, agent);
   }
 
@@ -1337,7 +1426,7 @@ if (!READ_ONLY_MODE) setInterval(() => {
   try {
     for (const [sid, clients] of sseClients.entries()) {
       if (clients.size === 0) continue;
-      const name = tmuxName(sid);
+      const name = existingTmuxName(sid);
       let pane;
       try { pane = capturePaneLines(name); } catch { continue; }
       const lines = pane.lines;
@@ -1966,7 +2055,7 @@ app.post('/api/rooms/:name/pulse', (req, res) => {
     // Pausing means stop now, not merely "do not launch again". Persist the
     // disabled state first so the scheduler cannot race a replacement worker.
     if (!req.body.enabled && previous?.sessionId) {
-      try { execFileSync('tmux', ['kill-session', '-t', tmuxName(previous.sessionId)], { stdio: 'ignore' }); } catch {}
+      killTmuxSessions(previous.sessionId);
     }
     const pulse = roomPulse(name, now);
     roomSnapshotCache.update(rooms => rooms.map(room => room.name === name ? { ...room, pulse } : room));
@@ -2214,7 +2303,7 @@ app.get('/api/search', (req, res) => {
           title: meta[sessionId]?.title || info.firstUserText || sessionId.slice(0, 8),
           snippet, matchCount,
           updatedAt: stat.mtime.toISOString(),
-          isActive: active.has(sessionId.slice(0, 8)),
+          isActive: activeTmuxHas(active, sessionId),
           projectId: dir,
           projectLabel: labels[dir] || null,
           cwd: info.cwd || projectIdToCwd(dir) || null,
@@ -2253,7 +2342,7 @@ app.get('/api/running', (req, res) => {
       let question = null;
       let activity = null;
       try {
-        const { lines } = capturePaneLines(tmuxName(session.id));
+        const { lines } = capturePaneLines(existingTmuxName(session.id));
         activity = extractActivity(lines);
         question = extractQuestion(lines, !!activity);
       } catch {}
@@ -2361,7 +2450,7 @@ function digestItems(since, limit) {
     let working = false;
     if (session.isActive) {
       try {
-        const { lines } = capturePaneLines(tmuxName(session.id));
+        const { lines } = capturePaneLines(existingTmuxName(session.id));
         const activity = extractActivity(lines);
         question = extractQuestion(lines, !!activity);
         working = !question && !!activity;
@@ -2425,7 +2514,7 @@ app.get('/api/sessions/:id/stream', (req, res) => {
   res.write('event: connected\ndata: {}\n\n');
 
   // Send current activity immediately on connect
-  const curActivity = lastActivity.get(sid) ?? extractActivity(tmuxName(sid));
+  const curActivity = lastActivity.get(sid) ?? extractActivity(existingTmuxName(sid));
   if (curActivity) {
     res.write(`event: activity\ndata: ${JSON.stringify({ activity: curActivity })}\n\n`);
     if (!lastActivity.has(sid)) lastActivity.set(sid, curActivity);
@@ -2499,7 +2588,7 @@ app.post('/api/sessions/:id/resume', async (req, res) => {
 
 app.post('/api/sessions/:id/interrupt', (req, res) => {
   try {
-    execFileSync('tmux', ['send-keys', '-t', tmuxName(req.params.id), 'C-c'], { stdio: 'ignore' });
+    execFileSync('tmux', ['send-keys', '-t', existingTmuxName(req.params.id), 'C-c'], { stdio: 'ignore' });
     sessionsSnapshotCache.invalidate();
     roomSnapshotCache.invalidate();
     res.json({ ok: true });
@@ -2509,7 +2598,7 @@ app.post('/api/sessions/:id/interrupt', (req, res) => {
 
 app.post('/api/sessions/:id/answer', (req, res) => {
   try {
-    const name = tmuxName(req.params.id);
+    const name = existingTmuxName(req.params.id);
     const { type, index, text } = req.body;
     if (type === 'selector' && typeof index === 'number') {
       // For selector: send Down arrow `index` times, then Enter
@@ -2538,7 +2627,7 @@ app.post('/api/sessions/:id/answer', (req, res) => {
 app.post('/api/sessions/:id/delete', (req, res) => {
   try {
     const id = req.params.id;
-    try { execFileSync('tmux', ['kill-session', '-t', tmuxName(id)], { stdio: 'ignore' }); } catch {}
+    killTmuxSessions(id);
     const fpath = findJsonlPath(id);
     if (fpath) fs.unlinkSync(fpath);
     const meta = readMeta();
@@ -2609,7 +2698,7 @@ function sidecarGcIfDriverGone(group) {
   if (!driver || tmuxIsActive(driver.sessionId)) return false;
   for (const member of group.members) {
     if (!member.spawned) continue;
-    try { execFileSync('tmux', ['kill-session', '-t', tmuxName(member.sessionId)], { stdio: 'ignore' }); } catch {}
+    killTmuxSessions(member.sessionId);
   }
   sidecar.teardownGroup(group.id);
   sidecarClients.delete(group.id);
@@ -2771,7 +2860,7 @@ app.post('/api/sidecar/:id/peers/:role/delete', (req, res) => {
     const member = group.members.find(candidate => candidate.role === req.params.role);
     if (!member) return res.status(404).json({ error: `no member with role ${req.params.role}` });
     if (!member.spawned) return res.status(400).json({ error: 'the driver cannot be removed' });
-    try { execFileSync('tmux', ['kill-session', '-t', tmuxName(member.sessionId)], { stdio: 'ignore' }); } catch {}
+    killTmuxSessions(member.sessionId);
     sidecar.removeMember(group.id, req.params.role);
     res.json({ ok: true });
   } catch (error) { res.status(500).json({ error: error.message }); }
@@ -2783,7 +2872,7 @@ app.post('/api/sidecar/:id/delete', (req, res) => {
     if (!group) return res.status(404).json({ error: 'not found' });
     for (const member of group.members) {
       if (!member.spawned) continue;
-      try { execFileSync('tmux', ['kill-session', '-t', tmuxName(member.sessionId)], { stdio: 'ignore' }); } catch {}
+      killTmuxSessions(member.sessionId);
     }
     sidecar.teardownGroup(group.id);
     sidecarClients.delete(group.id);
@@ -3068,14 +3157,14 @@ function reapIdleSessions() {
     const meta = readMeta();
     for (const { uuid, fpath, mtime } of listCodexJsonlFiles()) {
       const id = resolveCodexWatchId(uuid, meta);
-      if (!active.has(id.slice(0, 8))) continue;
+      if (!activeTmuxHas(active, id)) continue;
       const activity = latestSessionActivityMs(
         lastActivityMs(fpath, 'codex', mtime.getTime()),
-        active.get(id.slice(0, 8)) || 0,
+        activeTmuxCreatedAt(active, id),
       );
       if (now - activity > IDLE_MS) {
-        const name = tmuxName(id);
-        try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
+        const name = existingTmuxName(id);
+        killTmuxSessions(id);
         console.log(`[reaper] killed idle Codex session ${name} (inactive ${Math.round((now - activity) / 60000)}m)`);
       }
     }
@@ -3084,18 +3173,18 @@ function reapIdleSessions() {
   // Reap omp sessions.
   try {
     for (const id of fs.readdirSync(OMP_SESSIONS)) {
-      if (!active.has(id.slice(0, 8))) continue;
+      if (!activeTmuxHas(active, id)) continue;
       const dirPath = path.join(OMP_SESSIONS, id);
       const files = fs.readdirSync(dirPath).filter(file => file.endsWith('.jsonl')).sort().reverse();
       if (!files.length) continue;
       const fpath = path.join(dirPath, files[0]);
       const activity = latestSessionActivityMs(
         lastActivityMs(fpath, 'omp', fs.statSync(fpath).mtimeMs),
-        active.get(id.slice(0, 8)) || 0,
+        activeTmuxCreatedAt(active, id),
       );
       if (now - activity > IDLE_MS) {
-        const name = tmuxName(id);
-        try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
+        const name = existingTmuxName(id);
+        killTmuxSessions(id);
         console.log(`[reaper] killed idle OMP session ${name} (inactive ${Math.round((now - activity) / 60000)}m)`);
       }
     }
@@ -3109,15 +3198,15 @@ function reapIdleSessions() {
       for (const file of fs.readdirSync(dirPath)) {
         if (!file.endsWith('.jsonl')) continue;
         const id = file.replace('.jsonl', '');
-        if (!active.has(id.slice(0, 8))) continue;
+        if (!activeTmuxHas(active, id)) continue;
         const fpath = path.join(dirPath, file);
         const activity = latestSessionActivityMs(
           lastActivityMs(fpath, 'claude', fs.statSync(fpath).mtimeMs),
-          active.get(id.slice(0, 8)) || 0,
+          activeTmuxCreatedAt(active, id),
         );
         if (now - activity > IDLE_MS) {
-          const name = tmuxName(id);
-          try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
+          const name = existingTmuxName(id);
+          killTmuxSessions(id);
           console.log(`[reaper] killed idle Claude session ${name} (inactive ${Math.round((now - activity) / 60000)}m)`);
         }
       }
@@ -3344,6 +3433,18 @@ wss.on('connection', (ws, req) => {
   cleanEnv.TERM = 'xterm-256color';
 
   let term;
+  let terminalSessionName = null;
+  let hyperlinkProbe = '';
+  let hyperlinkScanTimer = null;
+  let lastHyperlinkPayload = '';
+  const sendTerminalHyperlinks = () => {
+    if (!terminalSessionName || ws.readyState !== WS.OPEN) return;
+    const links = terminalHyperlinkTargets(terminalSessionName);
+    const payload = JSON.stringify(links);
+    if (!links.length || payload === lastHyperlinkPayload) return;
+    lastHyperlinkPayload = payload;
+    ws.send(JSON.stringify({ type: 'terminal-links', links }));
+  };
   if (isShell) {
     term = pty.spawn('bash', ['-l'], {
       name: 'xterm-256color', cols: 120, rows: 30, env: cleanEnv, cwd: HOME,
@@ -3352,13 +3453,27 @@ wss.on('connection', (ws, req) => {
     const sessionId = url.searchParams.get('session');
     if (!sessionId) { ws.close(1008, 'session required'); return; }
     if (!tmuxIsActive(sessionId)) { ws.close(1000, 'Session not active'); return; }
-
-    term = pty.spawn('tmux', ['attach', '-t', tmuxName(sessionId)], {
+    terminalSessionName = existingTmuxName(sessionId);
+    sendTerminalHyperlinks();
+    term = pty.spawn('tmux', ['attach', '-t', terminalSessionName], {
       name: 'xterm-256color', cols: 120, rows: 30, env: cleanEnv,
     });
   }
 
-  term.onData(data => { try { ws.send(data); } catch {} });
+  term.onData(data => {
+    try { ws.send(data); } catch {}
+    if (!terminalSessionName) return;
+    hyperlinkProbe = (hyperlinkProbe + data).slice(-2048);
+    if (!/https?:\/\//i.test(hyperlinkProbe)) return;
+    hyperlinkProbe = '';
+    if (hyperlinkScanTimer) clearTimeout(hyperlinkScanTimer);
+    // tmux redraws visible URL prefixes without forwarding their OSC 8 target.
+    // By the time the redraw reaches us, capture-pane has retained that target.
+    hyperlinkScanTimer = setTimeout(() => {
+      hyperlinkScanTimer = null;
+      sendTerminalHyperlinks();
+    }, 100);
+  });
   term.onExit(() => { try { ws.close(); } catch {} });
 
   ws.on('message', (msg) => {
@@ -3370,7 +3485,10 @@ wss.on('connection', (ws, req) => {
     term.write(str);
   });
 
-  ws.on('close', () => { try { term.kill(); } catch {} });
+  ws.on('close', () => {
+    if (hyperlinkScanTimer) clearTimeout(hyperlinkScanTimer);
+    try { term.kill(); } catch {}
+  });
 });
 
 server.listen(PORT, '0.0.0.0', () => {

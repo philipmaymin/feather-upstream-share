@@ -46,10 +46,11 @@ describe('Room keep-working scheduler', () => {
     fs.writeFileSync(path.join(binDir, 'tmux'), [
       '#!/bin/sh',
       'case "$1" in',
-      '  list-sessions) now=$(date +%s); while IFS= read -r name; do printf "%s|%s\\n" "$name" "$now"; done < "$TMUX_REG"; exit 0 ;;',
-      '  has-session) grep -qxF "$3" "$TMUX_REG"; exit $? ;;',
+      '  list-sessions) now=$(date +%s); while IFS= read -r name; do case "$*" in *session_created*) printf "%s|%s\\n" "$name" "$now" ;; *) printf "%s\\n" "$name" ;; esac; done < "$TMUX_REG"; exit 0 ;;',
+      '  has-session) target=${3#=}; grep -qxF "$target" "$TMUX_REG"; exit $? ;;',
       '  new-session) case "$*" in *rooms/broken*) exit 1;; esac; args="$*"; name=""; while [ $# -gt 0 ]; do [ "$1" = "-s" ] && name="$2"; shift; done; [ -n "$name" ] && printf "%s\\n" "$name" >> "$TMUX_REG"; printf "%s\\n" "$args" >> "$TMUX_TEST_LOG"; exit 0 ;;',
-      '  kill-session) grep -vxF "$3" "$TMUX_REG" > "$TMUX_REG.tmp" || true; mv "$TMUX_REG.tmp" "$TMUX_REG"; exit 0 ;;',
+      '  kill-session) target=${3#=}; grep -vxF "$target" "$TMUX_REG" > "$TMUX_REG.tmp" || true; mv "$TMUX_REG.tmp" "$TMUX_REG"; exit 0 ;;',
+      '  rename-session) old=${3#=}; new=$4; sed "s|^$old$|$new|" "$TMUX_REG" > "$TMUX_REG.tmp"; mv "$TMUX_REG.tmp" "$TMUX_REG"; exit 0 ;;',
       'esac',
       'exit 0',
     ].join('\n'))
@@ -90,7 +91,7 @@ describe('Room keep-working scheduler', () => {
       })
       assert.equal(pause.status, 200)
       assert.equal((await pause.json()).pulse.status, 'paused')
-      assert.equal(fs.readFileSync(tmuxReg, 'utf8').split('\n').includes(`f-${state.idle.sessionId.slice(0, 8)}`), false,
+      assert.equal(fs.readFileSync(tmuxReg, 'utf8').split('\n').includes(`f-${state.idle.sessionId}`), false,
         'pausing a Room must stop its running background tmux session immediately')
 
     } finally {
@@ -123,8 +124,8 @@ describe('Room keep-working scheduler', () => {
     fs.writeFileSync(path.join(binDir, 'tmux'), [
       '#!/bin/sh',
       'case "$1" in',
-      '  list-sessions) if [ -f "$TMUX_REG" ]; then now=$(date +%s); while IFS= read -r n; do printf "%s|%s\\n" "$n" "$now"; done < "$TMUX_REG"; fi; exit 0 ;;',
-      '  has-session) if [ -f "$TMUX_REG" ] && grep -qxF "$3" "$TMUX_REG"; then exit 0; fi; exit 1 ;;',
+      '  list-sessions) if [ -f "$TMUX_REG" ]; then now=$(date +%s); while IFS= read -r n; do case "$*" in *session_created*) printf "%s|%s\\n" "$n" "$now" ;; *) printf "%s\\n" "$n" ;; esac; done < "$TMUX_REG"; fi; exit 0 ;;',
+      '  has-session) target=${3#=}; if [ -f "$TMUX_REG" ] && grep -qxF "$target" "$TMUX_REG"; then exit 0; fi; exit 1 ;;',
       '  new-session) name=""; while [ $# -gt 0 ]; do [ "$1" = "-s" ] && name="$2"; shift; done; [ -n "$name" ] && printf "%s\\n" "$name" >> "$TMUX_REG"; printf "launch %s\\n" "$name" >> "$TMUX_TEST_LOG"; exit 0 ;;',
       'esac',
       'exit 0',

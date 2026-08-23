@@ -310,8 +310,8 @@ describe('server-enforced read-only canary', () => {
     assert.equal(unkeyedTwo.status, 200)
 
     const calls = fs.readFileSync(fx.tmuxLog, 'utf8').trim().split('\n')
-    assert.equal(calls.filter(call => call === 'send-keys -t f-readonly -l deliver once').length, 1)
-    assert.equal(calls.filter(call => call === 'send-keys -t f-readonly -l legacy retry').length, 2)
+    assert.equal(calls.filter(call => call === `send-keys -t f-${fx.sessionId} -l deliver once`).length, 1)
+    assert.equal(calls.filter(call => call === `send-keys -t f-${fx.sessionId} -l legacy retry`).length, 2)
     const receiptsFile = path.join(fx.state, 'uploads/.message-receipts.json')
     const stored = JSON.parse(fs.readFileSync(receiptsFile, 'utf8'))
     assert.deepEqual(stored[fx.sessionId]['voice-recovery-0001'].response, firstReceipt)

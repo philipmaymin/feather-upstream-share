@@ -161,6 +161,7 @@ export default function App() {
   const [chatLoadError, setChatLoadError] = createSignal('')
   const composerReady = () => currentId() !== null && loadedSessionId() === currentId()
   const [creating, setCreating] = createSignal(false)
+  const [resumingId, setResumingId] = createSignal<string | null>(null)
   const [text, setText] = createSignal('')
   const [tab, setTab] = createSignal<'chat' | 'prompts' | 'updates' | 'files' | 'terminal'>('chat')
   const [updatesList, setUpdatesList] = createSignal<RoomUpdate[]>([])
@@ -815,10 +816,29 @@ export default function App() {
   }
 
   async function handleResume(id: string) {
+    if (resumingId()) return
     const sess = sessions().find(s => s.id === id)
-    await resumeSession(id, sess?.cwd ?? undefined)
-    updateSessions(await fetchSessions())
-    await select(id)
+    setResumingId(id)
+    showMediaNotice('Resuming chat…')
+    try {
+      const response = await resumeSession(id, sess?.cwd ?? undefined)
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}))
+        throw new Error(detail.error || `HTTP ${response.status}`)
+      }
+      // The sessions endpoint deliberately serves a stale snapshot while it
+      // refreshes. Preserve the resume acknowledgement instead of immediately
+      // painting this chat inactive again.
+      const refreshed = (await fetchSessions()).map(item => item.id === id ? { ...item, isActive: true } : item)
+      updateSessions(refreshed)
+      setLastSession(previous => previous?.id === id ? { ...previous, isActive: true } : previous)
+      await select(id)
+      showMediaNotice('Chat resumed.', 2500)
+    } catch (error: any) {
+      showMediaNotice(`Could not resume chat — ${error?.message || error}`)
+    } finally {
+      setResumingId(null)
+    }
   }
 
   async function handleInterrupt(id: string) {
@@ -1708,8 +1728,8 @@ export default function App() {
                   <div onClick={() => setMenuOpen(false)} style={{ position: 'fixed', inset: '0', 'z-index': '99' }} />
                   <div style={{ position: 'absolute', right: '0', top: '100%', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '8px', 'box-shadow': '0 4px 12px rgba(0,0,0,0.5)', 'z-index': '100', 'min-width': '140px', overflow: 'hidden' }}>
                     <Show when={!s().isActive}>
-                      <button onClick={() => { handleResume(s().id); setMenuOpen(false) }}
-                        style={{ display: 'block', width: '100%', padding: '10px 16px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#4aba6a', 'font-size': '13px', 'text-align': 'left', cursor: 'pointer' }}>Resume</button>
+                      <button onClick={() => { handleResume(s().id); setMenuOpen(false) }} disabled={resumingId() === s().id}
+                        style={{ display: 'block', width: '100%', padding: '10px 16px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#4aba6a', 'font-size': '13px', 'text-align': 'left', cursor: resumingId() === s().id ? 'wait' : 'pointer' }}>{resumingId() === s().id ? 'Resuming…' : 'Resume'}</button>
                     </Show>
                     <Show when={s().isActive}>
                       <button onClick={() => { handleInterrupt(s().id); setMenuOpen(false) }}

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # sidecar — talk to your Feather sidecar peers from inside an agent session.
-# Self-identifies via the tmux session name (feather-<id8>); Feather resolves
+# Self-identifies via the tmux session name (f-<full-id>); Feather resolves
 # which group this session belongs to.
 #
 #   sidecar post --to <role|a,b|all> <text...>   send to a peer, several, or all
@@ -26,7 +26,8 @@ self_prefix() {
   local s
   s=$(tmux display-message -p '#S' 2>/dev/null) || die "not inside a tmux session"
   case "$s" in
-    feather-*) printf '%s' "${s#feather-}" ;;
+    f-*) printf '%s' "${s#f-}" ;;
+    feather-*) printf '%s' "${s#feather-}" ;; # pre-f-* compatibility
     *) die "not a feather session (tmux session: $s)" ;;
   esac
 }
@@ -40,7 +41,7 @@ resolve_group() {
   local ids
   ids=$(curl -fsS "$BASE/api/sidecar" \
     | jq -r --arg p "$prefix" \
-      '.groups[] | select(.status=="active") | select(any(.members[]; .sessionId[0:8]==$p)) | .id')
+      '.groups[] | select(.status=="active") | select(any(.members[]; .sessionId==$p or .sessionId[0:8]==$p)) | .id')
   local n; n=$(printf '%s\n' "$ids" | grep -c . || true)
   [ "$n" -ge 1 ] || die "no active sidecar group for this session"
   [ "$n" -eq 1 ] || die "this session is in $n active groups — pass --group <id> (sidecar whoami to list)"
@@ -49,7 +50,7 @@ resolve_group() {
 
 self_role() { # $1 prefix, $2 gid
   curl -fsS "$BASE/api/sidecar/$2" \
-    | jq -r --arg p "$1" '.group.members[] | select(.sessionId[0:8]==$p) | .role' | head -1
+    | jq -r --arg p "$1" '.group.members[] | select(.sessionId==$p or .sessionId[0:8]==$p) | .role' | head -1
 }
 
 cmd="${1:-}"; shift || true
@@ -138,7 +139,7 @@ case "$cmd" in
     echo "session prefix: $prefix"
     curl -fsS "$BASE/api/sidecar" \
       | jq -r --arg p "$prefix" \
-        '.groups[] | select(any(.members[]; .sessionId[0:8]==$p)) | "group \(.id) [\(.status)] roles: \([.members[].role] | join(", "))"'
+        '.groups[] | select(any(.members[]; .sessionId==$p or .sessionId[0:8]==$p)) | "group \(.id) [\(.status)] roles: \([.members[].role] | join(", "))"'
     ;;
   ""|-h|--help|help)
     echo "usage: sidecar {post --to <role|a,b|all> <text> | read [--since N] [--from role] | wait --from <role|all> --count N [--timeout S] | whoami} [--group <id>]"

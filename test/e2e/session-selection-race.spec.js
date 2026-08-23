@@ -106,3 +106,33 @@ test('late transcript responses cannot cross chat identity or receive a send', a
   await page.locator('button:has(svg polygon)').click()
   await expect.poll(() => sentTo).toEqual([TARGET_ID])
 })
+
+test('resume reports progress and stays active across a stale sessions refresh', async ({ page }) => {
+  let resumePosts = 0
+  await page.route('**/api/sessions**', async route => {
+    const url = new URL(route.request().url())
+    if (url.pathname !== '/api/sessions') return route.continue()
+    const response = await route.fetch()
+    const body = await response.json()
+    body.sessions = body.sessions.map(session => session.id === TARGET_ID ? { ...session, isActive: false } : session)
+    await route.fulfill({ response, json: body })
+  })
+  await page.route(`**/api/sessions/${TARGET_ID}/resume`, async route => {
+    resumePosts++
+    await new Promise(resolve => setTimeout(resolve, 500))
+    await route.fulfill({ json: { ok: true } })
+  })
+
+  await page.goto(`${BASE}/#${TARGET_ID}`)
+  await expect(page.getByText(TARGET_MESSAGE, { exact: true })).toBeVisible()
+  const menu = page.locator('button').filter({ hasText: '⋮' })
+  await menu.click()
+  await page.getByRole('button', { name: 'Resume', exact: true }).click()
+  await expect(page.getByRole('status')).toContainText('Resuming chat…')
+  await expect(page.getByRole('status')).toContainText('Chat resumed.')
+  expect(resumePosts).toBe(1)
+
+  await menu.click()
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0)
+})

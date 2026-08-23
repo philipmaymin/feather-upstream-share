@@ -77,21 +77,24 @@ test('long wrapped login URLs can be tapped, opened, and copied on mobile', asyn
   await expect.poll(() => Boolean(terminalSocket) && terminalCols > 20 && terminalRows > 2).toBe(true)
   const indent = '    '
   const width = terminalCols - indent.length
-  // Match OMP's login screen: the complete destination is attached to a
-  // short OSC 8 label, followed by only the first two rows of the raw URL.
-  const visibleUrl = LOGIN_URL.slice(0, width * 2)
+  // Match OMP's live login screen: tmux first redraws a valid-looking prefix,
+  // then Feather recovers the complete preserved OSC 8 target from the pane.
+  const visibleUrl = LOGIN_URL.slice(0, width)
   const rows = []
   for (let offset = 0; offset < visibleUrl.length; offset += width) {
     rows.push((indent + visibleUrl.slice(offset, offset + width)).padEnd(terminalCols))
   }
-  terminalSocket.send(`\u001b]8;;${LOGIN_URL}\u001b\\Open login URL\u001b]8;;\u001b\\\r\n${rows.join('\r\n')}`)
+  terminalSocket.send(rows.join('\r\n'))
   await expect(emptyLinksButton).toHaveText('Links (1)', { timeout: 10000 })
+  terminalSocket.send(JSON.stringify({ type: 'terminal-links', links: [LOGIN_URL] }))
+  await expect(page.getByRole('link', { name: LOGIN_URL })).toHaveAttribute('href', LOGIN_URL)
+  await expect(emptyLinksButton).toHaveText('Links (1)')
 
   const canvas = page.locator('canvas')
   const box = await canvas.boundingBox()
   if (!box) throw new Error('terminal canvas is not visible')
   const rowHeight = box.height / terminalRows
-  await page.touchscreen.tap(box.x + 35, box.y + rowHeight * 1.5)
+  await page.touchscreen.tap(box.x + 35, box.y + rowHeight * 0.5)
   await expect.poll(() => page.evaluate(() => {
     // @ts-ignore test observation hooks
     return window.__terminalOpened

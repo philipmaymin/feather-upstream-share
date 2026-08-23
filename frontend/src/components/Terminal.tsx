@@ -124,11 +124,36 @@ export function Terminal(props: { sessionId: string | null }) {
       }
       // A hard-wrapped OAuth URL can briefly look like a valid shorter URL
       // before the following rows arrive. Prefer its later, complete form.
-      const complete = ordered.filter(link => !ordered.some(other => (
-        other !== link && link.includes('?') && other.length > link.length + 8 && other.startsWith(link)
-      )))
+      const complete = ordered.filter(link => (
+        !explicitLinkTargets().some(target => (
+          target !== link && target.length > link.length + 8 && target.startsWith(link)
+        ))
+        && !ordered.some(other => (
+          other !== link && link.includes('?') && other.length > link.length + 8 && other.startsWith(link)
+        ))
+      ))
       return complete.reverse().slice(0, 20)
     })
+  }
+
+  function rememberExplicitTargets(values: string[]) {
+    const targets = values.map(safeHttpUrl).filter((value): value is string => Boolean(value))
+    if (!targets.length) return
+    setExplicitLinkTargets(previous => {
+      const next = [...previous]
+      for (const target of targets) {
+        const existing = next.indexOf(target)
+        if (existing >= 0) next.splice(existing, 1)
+        next.unshift(target)
+      }
+      return next.slice(0, 20)
+    })
+    // A tmux redraw can expose a valid-looking prefix before the preserved OSC
+    // 8 target reaches us. Drop that dead endpoint once its full target arrives.
+    setTerminalLinks(previous => previous.filter(link => !targets.some(target => (
+      target !== link && target.length > link.length + 8 && target.startsWith(link)
+    ))))
+    rememberLinks(targets)
   }
 
   function scanTerminalLinks() {
@@ -155,17 +180,8 @@ export function Terminal(props: { sessionId: string | null }) {
     if (typeof data !== 'string') return
     rawOutput = (rawOutput + data).slice(-65536)
     const explicitTargets = extractOsc8HttpUrls(rawOutput)
-    if (explicitTargets.length) setExplicitLinkTargets(previous => {
-      const next = [...previous]
-      for (const target of explicitTargets) {
-        const existing = next.indexOf(target)
-        if (existing >= 0) next.splice(existing, 1)
-        next.unshift(target)
-      }
-      return next.slice(0, 20)
-    })
+    rememberExplicitTargets(explicitTargets)
     rememberLinks([
-      ...explicitTargets,
       ...extractHttpUrls(stripTerminalControlSequences(rawOutput)),
     ])
   }
@@ -274,6 +290,15 @@ export function Terminal(props: { sessionId: string | null }) {
     ws = socket
     socket.onmessage = (e) => {
       if (generation !== connectionGeneration || term !== activeTerm) return
+      if (typeof e.data === 'string' && e.data.startsWith('{')) {
+        try {
+          const control = JSON.parse(e.data)
+          if (control?.type === 'terminal-links' && Array.isArray(control.links)) {
+            rememberExplicitTargets(control.links)
+            return
+          }
+        } catch {}
+      }
       scanRawOutput(e.data)
       activeTerm.write(e.data, scanTerminalLinks)
     }
