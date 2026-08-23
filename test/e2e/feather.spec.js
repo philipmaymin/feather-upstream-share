@@ -188,11 +188,10 @@ test.describe('Session selection', () => {
 
 test.describe('Message rendering', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto(BASE)
-    await page.waitForLoadState('networkidle')
-    await selectTestSession(page)
-    // Wait for messages to load
-    await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 5000 })
+    // Use the exact deep link. A synthetic transcript can be older than the
+    // bounded sidebar snapshot on a busy host, but exact resume must still work.
+    await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
+    await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 10000 })
   })
 
   test('user message renders as right-aligned bubble', async ({ page }) => {
@@ -278,36 +277,33 @@ test.describe('Message rendering', () => {
     await expect(preview.locator('body')).not.toContainText('<h1>')
   })
 
-  test('thinking block renders as collapsible details', async ({ page }) => {
-    const details = page.locator('details').filter({ has: page.locator('summary', { hasText: 'Thinking...' }) }).first()
-    await expect(details).toBeVisible()
-    const summary = details.locator('summary')
-    await expect(summary).toHaveText('Thinking...')
-
-    // Click to expand
+  test('thinking is folded into quiet Details beside the final answer', async ({ page }) => {
+    await expect(page.getByText(/Feather uses .*marked.* with GFM support/)).toBeVisible()
+    const summary = page.getByTestId('work-log-summary').first()
+    await expect(summary).toContainText('Details')
+    await expect(page.getByText('Let me explain the markdown pipeline step by step.')).not.toBeVisible()
     await summary.click()
-    await page.waitForTimeout(200)
-    const text = await details.locator('div').innerText()
-    expect(text).toContain('markdown pipeline')
+    const detail = page.getByTestId('work-log-detail').first()
+    await expect(detail).toContainText('1 execution step')
+    await expect(detail).toContainText('markdown pipeline')
   })
 
-  test('tool_use block shows tool name', async ({ page }) => {
-    await page.getByText('3 tool steps', { exact: false }).click()
-    // Should see "Read" in monospace
+  test('tool_use block is preserved inside Details', async ({ page }) => {
+    await page.getByTestId('work-log-summary').filter({ hasText: 'issue' }).click()
     const toolUse = page.locator('text=Read').first()
     await expect(toolUse).toBeVisible()
   })
 
-  test('tool_result shows output label', async ({ page }) => {
-    await page.getByText('3 tool steps', { exact: false }).click()
-    // Tool results render with lowercase "output" label
+  test('tool_result shows output label inside Details', async ({ page }) => {
+    await page.getByTestId('work-log-summary').filter({ hasText: 'issue' }).click()
     const result = page.locator('summary:has-text("output")')
     await expect(result.first()).toBeVisible()
   })
 
-  test('error tool_result shows error label', async ({ page }) => {
-    await page.getByText('3 tool steps', { exact: false }).click()
-    // Error tool results render with lowercase "error" label
+  test('failed work is flagged quietly and its error remains reachable', async ({ page }) => {
+    const summary = page.getByTestId('work-log-summary').filter({ hasText: 'issue' })
+    await expect(summary).toContainText('1 issue')
+    await summary.click()
     const error = page.locator('summary:has-text("error")')
     await expect(error.first()).toBeVisible()
   })
@@ -325,9 +321,8 @@ test.describe('Message rendering', () => {
 
 test.describe('Chat input', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto(BASE)
-    await page.waitForLoadState('networkidle')
-    await selectTestSession(page)
+    await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
+    await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 10000 })
   })
 
   test('chat input is visible on chat tab', async ({ page }) => {
@@ -491,10 +486,10 @@ test('updates tab loads the selected chat Room feed newest first', async ({ page
 
 test.describe('Live updates', () => {
   test('new message appears in real-time via SSE', async ({ page }) => {
-    await page.goto(BASE)
-    await page.waitForLoadState('networkidle')
-    await selectTestSession(page)
+    const streamRequest = page.waitForRequest(request => request.url().includes(`/api/sessions/${TEST_SESSION_ID}/stream`))
+    await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
     await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 5000 })
+    await streamRequest
 
     const liveUuid = `e2e-live-${Date.now()}`
     writeLine({
@@ -504,7 +499,44 @@ test.describe('Live updates', () => {
     })
 
     // The new message should appear without page reload
-    await expect(page.locator('text=This message arrived via SSE live update!')).toBeVisible({ timeout: 10000 })
+    await expect(page.getByRole('paragraph').filter({ hasText: 'This message arrived via SSE live update!' })).toBeVisible({ timeout: 10000 })
+  })
+
+  test('tell_user replaces the live status and a final answer clears it', async ({ page }) => {
+    const streamRequest = page.waitForRequest(request => request.url().includes(`/api/sessions/${TEST_SESSION_ID}/stream`))
+    await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
+    await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 10000 })
+    await streamRequest
+
+    writeLine({
+      type: 'assistant', uuid: `e2e-status-1-${Date.now()}`, timestamp: '2025-06-15T14:06:00Z',
+      isSidechain: false, isMeta: false,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'status-tool-1', name: 'tell_user', input: { message: 'Inspecting upload recovery.' } }],
+      },
+    })
+    const firstStatus = page.getByRole('status').filter({ hasText: 'Inspecting upload recovery.' })
+    await expect(firstStatus).toBeVisible({ timeout: 10000 })
+
+    writeLine({
+      type: 'assistant', uuid: `e2e-status-2-${Date.now()}`, timestamp: '2025-06-15T14:06:05Z',
+      isSidechain: false, isMeta: false,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'status-tool-2', name: 'tell_user', input: { message: 'Testing the repaired upload.' } }],
+      },
+    })
+    await expect(page.getByRole('status').filter({ hasText: 'Testing the repaired upload.' })).toBeVisible({ timeout: 10000 })
+    await expect(firstStatus).not.toBeVisible()
+
+    writeLine({
+      type: 'assistant', uuid: `e2e-status-final-${Date.now()}`, timestamp: '2025-06-15T14:06:10Z',
+      isSidechain: false, isMeta: false,
+      message: { role: 'assistant', content: 'Status lifecycle complete.' },
+    })
+    await expect(page.getByText('Status lifecycle complete.')).toBeVisible({ timeout: 10000 })
+    await expect(page.getByRole('status').filter({ hasText: 'Testing the repaired upload.' })).not.toBeVisible()
   })
 })
 

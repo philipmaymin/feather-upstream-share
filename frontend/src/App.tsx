@@ -12,6 +12,7 @@ import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation,
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
 import { listPendingMessages, putPendingMessage, patchPendingMessage, deletePendingMessage } from './lib/messageOutbox.js'
 import { appUrl } from './lib/appPath.js'
+import { deriveTellUserState, tellUserTransition } from './lib/tellUserStatus.js'
 
 interface QuickLink { label: string; url: string }
 type AgentId = 'claude' | 'codex' | 'omp'
@@ -236,6 +237,7 @@ export default function App() {
   let pendingRetryTimer: ReturnType<typeof setTimeout> | undefined
   const [uploading, setUploading] = createSignal(false)
   const [working, setWorking] = createSignal(false)
+  const [tellUserStatus, setTellUserStatus] = createSignal('')
   const [dragging, setDragging] = createSignal(false)
   const [menuOpen, setMenuOpen] = createSignal(false)
   const [historyIdx, setHistoryIdx] = createSignal(-1)
@@ -361,6 +363,16 @@ export default function App() {
     return generation === selectionGeneration && currentId() === id
   }
 
+  async function findSessionMeta(id: string, recent: SessionMeta[] = sessions()) {
+    const listed = recent.find(session => session.id === id)
+    if (listed) return listed
+    try {
+      return (await fetchSessions(null, id, 5)).find(session => session.id === id)
+    } catch {
+      return undefined
+    }
+  }
+
   // Update sessions and detect unread changes
   function updateSessions(newSessions: SessionMeta[]) {
     const visibleSessions = newSessions.filter(session => !isRoomPulseSession(session))
@@ -378,6 +390,20 @@ export default function App() {
     }
     setUnreadSessions(unread)
     setSessions(visibleSessions)
+    if (active && (working() || tellUserStatus())) {
+      const listed = visibleSessions.find(session => session.id === active)
+      if (listed && !listed.isActive) {
+        setWorking(false)
+        setTellUserStatus('')
+      } else if (!listed) {
+        findSessionMeta(active, visibleSessions).then(session => {
+          if (currentId() === active && session && !session.isActive) {
+            setWorking(false)
+            setTellUserStatus('')
+          }
+        })
+      }
+    }
   }
 
   // Swipe gesture state
@@ -485,7 +511,10 @@ export default function App() {
   function startWorkingTimeout() {
     clearTimeout(workingTimer)
     workingTimer = window.setTimeout(() => {
-      if (working()) setWorking(false)
+      if (working()) {
+        setWorking(false)
+        setTellUserStatus('')
+      }
     }, 5 * 60 * 1000)
   }
 
@@ -608,7 +637,7 @@ export default function App() {
     setLoadingMore(false)
     setMessages([])
     setHasMore(false)
-    setWorking(false)
+    setTellUserStatus('')
     setActivity(null)
     setQuestion(null)
     setText(loadDraft(id))
@@ -619,15 +648,17 @@ export default function App() {
     unread.delete(id)
     setUnreadSessions(unread)
     let s = sessions().find(s => s.id === id)
+    setWorking(!!s?.isActive)
+    const sessionMetaPromise = s ? Promise.resolve(s) : findSessionMeta(id)
     if (s) { lastSeenUpdatedAt.set(id, s.updatedAt); setLastSession(s) }
     else {
       setLastSession({ id, title: 'New session', updatedAt: new Date().toISOString(), isActive: true })
-      // Session not in filtered list; fetch unfiltered to get full metadata (cwd, title, etc.)
-      fetchSessions().then(all => {
+      // The selected chat may be older than the bounded sidebar snapshot. Ask
+      // for its exact ID instead of scanning every transcript.
+      sessionMetaPromise.then(found => {
         if (!isCurrentSelection(id, generation)) return
-        const found = all.find(a => a.id === id)
         if (found) setLastSession(found)
-      }).catch(() => {})
+      })
     }
     let result: Awaited<ReturnType<typeof fetchMessages>>
     try {
@@ -646,14 +677,17 @@ export default function App() {
     // Determine working state from loaded messages.
     // Only mark as working if the session is actually active (has a running tmux process).
     // Inactive/timed-out sessions should never show as working.
-    const sessionMeta = sessions().find(x => x.id === id) || lastSession()
+    const sessionMeta = await sessionMetaPromise
+    if (!isCurrentSelection(id, generation)) return
     const isActive = sessionMeta?.isActive ?? false
     const msgs = result.messages
     if (msgs.length > 0) {
       const last = msgs[msgs.length - 1]
-      if (!isActive) setWorking(false)
-      else if (last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence') setWorking(false)
-      else if (last.role === 'user') setWorking(true)
+      const tellUserState = deriveTellUserState(msgs)
+      const turnEnded = last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence'
+      setTellUserStatus(!isActive || turnEnded ? '' : tellUserState.status)
+      if (!isActive || turnEnded) setWorking(false)
+      else if (last.role === 'user' || tellUserState.working) setWorking(true)
       else setWorking(false) // assistant mid-stream but no new SSE yet; let SSE update it
       // Extract cwd from last user message and update header
       for (let i = msgs.length - 1; i >= 0; i--) {
@@ -663,6 +697,9 @@ export default function App() {
           break
         }
       }
+    } else {
+      setTellUserStatus('')
+      setWorking(isActive)
     }
     appendPendingMessages(id)
     setLoadedSessionId(id)
@@ -677,13 +714,17 @@ export default function App() {
     setSSEStatus('connected')
     const unsubscribe = subscribeMessages(id, (msg) => {
       if (!isCurrentSelection(id, generation) || loadedSessionId() !== id) return
+      if (messages().some(existing => existing.uuid === msg.uuid)) return
       // Clear assistant-done debounce on any incoming message
       clearTimeout(assistantDoneTimer)
       // If new content arrives while a question is showing, it was a false positive
       if (question() && msg.role === 'assistant' && !msg.stopReason) setQuestion(null)
+      const tellUserUpdate = tellUserTransition(tellUserStatus(), msg)
+      setTellUserStatus(tellUserUpdate.status)
       // Use stop_reason to accurately track working state
       if (msg.stopReason === 'end_turn' || msg.stopReason === 'stop_sequence') {
         setWorking(false)
+        setTellUserStatus('')
         clearTimeout(workingTimer)
         // Refresh session list to pick up auto-generated title
         const cur = sessions().find(s => s.id === id)
@@ -693,12 +734,16 @@ export default function App() {
       } else if (msg.role === 'user') {
         setWorking(true)
         startWorkingTimeout()
+      } else if (tellUserUpdate.working === true) {
+        setWorking(true)
+        startWorkingTimeout()
       } else if (msg.role === 'assistant' && !msg.stopReason) {
         // Assistant message without stop_reason: JSONL may never get end_turn.
         // Debounce: if no more messages arrive in 5s, assume the turn is done.
         assistantDoneTimer = window.setTimeout(() => {
           if (isCurrentSelection(id, generation) && working()) {
             setWorking(false)
+            setTellUserStatus('')
             clearTimeout(workingTimer)
           }
         }, 5000)
@@ -843,6 +888,10 @@ export default function App() {
 
   async function handleInterrupt(id: string) {
     await interruptSession(id)
+    if (id === currentId()) {
+      setWorking(false)
+      setTellUserStatus('')
+    }
   }
 
   function handleInterruptConfirm(id: string) {
@@ -874,6 +923,7 @@ export default function App() {
     setLastSession(null)
     setMessages([])
     setWorking(false)
+    setTellUserStatus('')
     setActivity(null)
     setQuestion(null)
     setSidebar(false)
@@ -1006,6 +1056,7 @@ export default function App() {
               : previous.map(message => message.uuid === optimisticId ? { ...message, delivery: 'sent' as const } : message)
           })
           setWorking(true)
+          setTellUserStatus('')
           startWorkingTimeout()
         }
       } catch (error: any) {
@@ -1298,6 +1349,14 @@ export default function App() {
 
   // Effective session for header display (cur() is live, lastSession is fallback)
   const headerSession = () => cur() || lastSession()
+
+  createEffect(() => {
+    const session = headerSession()
+    if (!loading() && session && !session.isActive) {
+      setWorking(false)
+      setTellUserStatus('')
+    }
+  })
 
   createEffect(() => {
     const s = headerSession()
@@ -1784,7 +1843,7 @@ export default function App() {
             />
           }>
             <div style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
-              <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (composerReady()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (loadedSessionId()) toggleStar(loadedSessionId()!, uuid) }} working={working()} scrollRefCb={(el) => { messageScrollRef = el }} sessionId={loadedSessionId()} />
+              <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (composerReady()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (loadedSessionId()) toggleStar(loadedSessionId()!, uuid) }} working={working()} statusText={tellUserStatus()} scrollRefCb={(el) => { messageScrollRef = el }} sessionId={loadedSessionId()} />
             </div>
             <div style={{ display: tab() === 'files' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%' }}>
               {/* Mode toggle */}
@@ -2081,7 +2140,7 @@ export default function App() {
               const inactive = s && !s.isActive && !working()
               const dotColor = working() ? '#f5a742' : inactive ? '#666' : '#4aba6a'
               const act = activity()?.replace(/^[^a-zA-Z]+/, '')
-              const label = working() ? (act || 'Working...') : inactive ? 'Inactive' : 'Ready'
+              const label = working() ? (tellUserStatus() || act || 'Working...') : inactive ? 'Inactive' : 'Ready'
               const labelColor = working() ? '#f5a742' : inactive ? '#666' : '#555'
               return <>
                 <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: dotColor, transition: 'background 0.3s', 'flex-shrink': '0', cursor: working() ? 'pointer' : 'default' }} onClick={() => { if (working() && currentId()) handleInterruptConfirm(currentId()!) }} />

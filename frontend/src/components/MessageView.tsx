@@ -426,7 +426,7 @@ function toolSummary(name: string, input: any): string {
 // the next microtask so text children are mounted before fixLinks walks them.
 const linkifyRef = (el: HTMLElement) => queueMicrotask(() => fixLinks(el))
 
-function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, onExpandTable?: (html: string) => void) {
+function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, onExpandTable?: (html: string) => void, getResult?: (toolUseId: string) => ContentBlock | undefined) {
   if (block.type === 'text' && block.text) {
     return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => queueMicrotask(() => enhanceMarkdown(el, onImageClick, onExpandTable))} />
   }
@@ -451,6 +451,7 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
     const isImageFile = (name === 'Read' || name === 'Write') && inp.file_path && IMAGE_EXTS.has(((inp.file_path as string).substring((inp.file_path as string).lastIndexOf('.')).toLowerCase()))
     const imagePath = toolImagePath(block.name || '', inp) || (isImageFile ? inp.file_path as string : '')
     const hasDetail = SPECIAL_TOOL_DETAILS.has(name) || !!genericInput || !!imagePath
+    const result = block.id ? getResult?.(block.id) : undefined
     return <>
       <details style={{ margin: '3px 0', 'font-size': '11px', 'font-family': "'SF Mono', Menlo, monospace", 'border-top': '1px solid #ffffff0a' }}>
         <summary style={{ padding: '2px 0', cursor: hasDetail ? 'pointer' : 'default', 'list-style': hasDetail ? undefined : 'none', color: '#999' }}>
@@ -478,6 +479,7 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
         const imgSrc = appUrl(`/api/files/raw?path=${encodeURIComponent(resolvedPath)}`)
         return <img src={imgSrc} onClick={() => onImageClick?.(imgSrc)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '6px', display: 'block', cursor: 'zoom-in' }} />
       })()}
+      {result && renderBlock(result, onImageClick, onExpandTable)}
     </>
   }
   if (block.type === 'tool_result') {
@@ -511,6 +513,60 @@ function formatFullDate(iso: string) {
     const d = new Date(iso)
     return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   } catch { return '' }
+}
+
+// Consecutive reasoning/tool messages belong to one assistant turn. Keep that
+// execution trace available behind one quiet disclosure and attach it to the
+// final answer when one follows.
+function isTraceAssistantMsg(m: Message): boolean {
+  if (m.role !== 'assistant' || !m.content || m.content.length === 0) return false
+  if (m.content.some(block => block.type === 'tool_use' && block.name === 'AskUserQuestion')) return false
+  const hasTool = m.content.some(block => block.type === 'tool_use' || block.type === 'tool_result')
+  const hasThinking = m.content.some(block => block.type === 'thinking')
+  const hasText = m.content.some(block => block.type === 'text' && block.text?.trim())
+  return hasTool || (hasThinking && !hasText)
+}
+
+function canAttachTraceToMessage(m: Message): boolean {
+  if (m.role !== 'assistant' || !m.content?.some(block => block.type === 'text' && block.text?.trim())) return false
+  return !m.content.some(block => block.type === 'tool_use' && block.name === 'AskUserQuestion')
+}
+
+type RenderItem =
+  | { kind: 'msg'; msg: Message }
+  | { kind: 'chain'; messages: Message[] }
+  | { kind: 'turn'; msg: Message; trace: Message[] }
+
+function buildRenderItems(messages: Message[], isPureToolResult: (m: Message) => boolean): RenderItem[] {
+  const out: RenderItem[] = []
+  let i = 0
+  while (i < messages.length) {
+    const m = messages[i]
+    if (isPureToolResult(m)) { i++; continue }
+    if (isTraceAssistantMsg(m)) {
+      const chain: Message[] = [m]
+      let j = i + 1
+      while (j < messages.length) {
+        const next = messages[j]
+        if (isPureToolResult(next)) { j++; continue }
+        if (!isTraceAssistantMsg(next)) break
+        chain.push(next)
+        j++
+      }
+      const next = messages[j]
+      if (next && canAttachTraceToMessage(next) && !isTraceAssistantMsg(next)) {
+        out.push({ kind: 'turn', msg: next, trace: chain })
+        i = j + 1
+      } else {
+        out.push({ kind: 'chain', messages: chain })
+        i = j
+      }
+    } else {
+      out.push({ kind: 'msg', msg: m })
+      i++
+    }
+  }
+  return out
 }
 
 
@@ -562,6 +618,23 @@ const markdownCSS = `
 .markdown hr { border: none; border-top: 1px solid #333; margin: 12px 0; }
 .markdown strong { font-weight: 600; }
 
+/* Execution details: quiet at rest, full fidelity on demand */
+.work-log { width: 100%; margin-top: 3px; }
+.work-log > summary::-webkit-details-marker { display: none; }
+.work-log-summary { display: flex; align-items: center; gap: 5px; width: max-content; min-height: 28px; padding: 0 2px; border: none; background: transparent; color: #666; font-size: 11px; cursor: pointer; list-style: none; user-select: none; transition: color 120ms ease; }
+.work-log-summary:hover { color: #999; }
+.work-log-summary:focus-visible { outline: 2px solid #4aba6a; outline-offset: 2px; border-radius: 4px; }
+.work-log-chevron { display: inline-block; transition: transform 120ms ease; }
+.work-log[open] .work-log-chevron { transform: rotate(90deg); }
+.work-log-issue { display: inline-flex; align-items: center; gap: 4px; color: #c4993a; }
+.work-log-issue-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.work-log-detail { margin-top: 6px; padding: 10px 12px; border: 1px solid #2a2a3a; border-radius: 9px; background: #0d1117; font-size: 13px; line-height: 1.5; }
+.work-log-meta { margin-bottom: 8px; color: #555; font-size: 10px; }
+.work-log-reasoning { margin: 2px 0 4px; padding-left: 8px; border-left: 1px solid rgba(192,132,252,0.3); color: #999; font-size: 12px; line-height: 1.4; }
+.work-log-reasoning p { margin: 0 0 4px; }
+.work-log-reasoning p:last-child { margin-bottom: 0; }
+.work-log-reasoning ul, .work-log-reasoning ol { margin: 2px 0 4px; }
+
 /* Message action buttons - show on hover */
 .star-btn, .action-menu-btn { -webkit-tap-highlight-color: transparent; }
 div:hover > div > .star-btn, div:hover > div > .action-menu-btn { opacity: 0.6 !important; }
@@ -595,7 +668,7 @@ div:hover > div > .star-btn, div:hover > div > .action-menu-btn { opacity: 0.6 !
 
 // ── Component ───────────────────────────────────────────────────────────────
 
-export function MessageView(props: { messages: Message[], loading: boolean, hasMore?: boolean, loadingMore?: boolean, onLoadEarlier?: () => void, onAnswer?: (text: string) => void, starred?: Set<string>, onToggleStar?: (uuid: string) => void, working?: boolean, scrollRefCb?: (el: HTMLDivElement) => void, sessionId?: string | null }) {
+export function MessageView(props: { messages: Message[], loading: boolean, hasMore?: boolean, loadingMore?: boolean, onLoadEarlier?: () => void, onAnswer?: (text: string) => void, starred?: Set<string>, onToggleStar?: (uuid: string) => void, working?: boolean, statusText?: string | null, scrollRefCb?: (el: HTMLDivElement) => void, sessionId?: string | null }) {
   const [lightbox, setLightbox] = createSignal<string | null>(null)
   const [pdfViewer, setPdfViewer] = createSignal<string | null>(null)
   const [expandedTable, setExpandedTable] = createSignal<string | null>(null)
@@ -628,7 +701,6 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
   const [newMsgCount, setNewMsgCount] = createSignal(0)
   const [actionMenu, setActionMenu] = createSignal<string | null>(null)
   const [actionFeedback, setActionFeedback] = createSignal<string | null>(null)
-  const [expandedRuns, setExpandedRuns] = createSignal<Set<string>>(new Set())
   let prevMsgLen = props.messages.length
 
   // ResizeObserver fires after layout and before paint, so we can set
@@ -722,33 +794,74 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
 
   const menuBtnStyle = { display: 'block', width: '100%', padding: '8px 14px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#e5e5e5', 'font-size': '12px', 'text-align': 'left' as const, cursor: 'pointer', 'white-space': 'nowrap' as const }
 
-  // Auto-collapse consecutive internal-only messages (tool_use / tool_result /
-  // thinking with no visible text) into a single expandable group so that a
-  // long agent run doesn't drown out the user/assistant signal.
-  const RUN_COLLAPSE_THRESHOLD = 3
-  const hasVisibleText = (msg: Message) =>
-    !msg.internal &&
-    (msg.content || []).some(b => b.type === 'text' && (b.text || '').trim().length > 0)
-
-  type GroupedItem = { kind: 'msg'; msg: Message } | { kind: 'run'; msgs: Message[] }
-  const groupedItems = createMemo<GroupedItem[]>(() => {
-    const result: GroupedItem[] = []
-    let run: Message[] = []
-    const flush = () => { if (run.length) { result.push({ kind: 'run', msgs: run }); run = [] } }
-    for (const msg of props.messages) {
-      if (hasVisibleText(msg)) { flush(); result.push({ kind: 'msg', msg }) }
-      else run.push(msg)
+  const toolResultsById = createMemo(() => {
+    const results = new Map<string, ContentBlock>()
+    for (const message of props.messages) {
+      for (const block of message.content || []) {
+        if (block.type === 'tool_result' && block.tool_use_id) results.set(block.tool_use_id, block)
+      }
     }
-    flush()
-    return result
+    return results
+  })
+  const getResult = (id: string) => toolResultsById().get(id)
+  const toolUseIds = createMemo(() => {
+    const ids = new Set<string>()
+    for (const message of props.messages) {
+      for (const block of message.content || []) {
+        if (block.type === 'tool_use' && block.id) ids.add(block.id)
+      }
+    }
+    return ids
   })
 
-  const renderMsg = (msg: Message) => {
+  function isPureToolResultMsg(message: Message): boolean {
+    if (!message.content?.length) return false
+    return message.content.every(block => block.type === 'tool_result' || (block.type === 'text' && !block.text?.trim()))
+      && message.content.some(block => block.type === 'tool_result')
+      && message.content.filter(block => block.type === 'tool_result').every(block => !!block.tool_use_id && toolUseIds().has(block.tool_use_id))
+  }
+
+  function renderWorkLog(messages: Message[]) {
+    const blocks = messages.flatMap(message => message.content || [])
+    const traceBlocks = blocks.filter(block => block.type === 'thinking' || block.type === 'tool_use' || block.type === 'tool_result')
+    const renderedToolUseIds = new Set(traceBlocks.filter(block => block.type === 'tool_use' && block.id).map(block => block.id!))
+    const errorCount = traceBlocks.filter(block =>
+      block.type === 'tool_result' ? !!block.is_error && (!block.tool_use_id || !renderedToolUseIds.has(block.tool_use_id)) :
+      block.type === 'tool_use' && block.id ? !!getResult(block.id)?.is_error : false
+    ).length
+    const last = messages[messages.length - 1]
+    return <details class="work-log">
+      <summary class="work-log-summary" data-testid="work-log-summary">
+        <span class="work-log-chevron">›</span>
+        <span style={{ 'font-weight': '600' }}>Details</span>
+        <Show when={errorCount > 0}>
+          <span class="work-log-issue"><span class="work-log-issue-dot" />{errorCount} issue{errorCount === 1 ? '' : 's'}</span>
+        </Show>
+      </summary>
+      <div class="work-log-detail" data-testid="work-log-detail">
+        <div class="work-log-meta">{traceBlocks.length} execution step{traceBlocks.length === 1 ? '' : 's'} · {formatTime(last?.timestamp || '')}</div>
+        <For each={messages}>{(message) => <For each={message.content}>{(block) => {
+          if (block.type === 'tool_result' && block.tool_use_id && renderedToolUseIds.has(block.tool_use_id)) return null
+          if (block.type === 'thinking' && block.thinking) {
+            return <div class="markdown work-log-reasoning" innerHTML={renderMarkdown(block.thinking)} ref={(element) => queueMicrotask(() => enhanceMarkdown(element, (src) => setLightbox(src), openExpandedTable))} />
+          }
+          return renderBlock(block, (src) => setLightbox(src), openExpandedTable, getResult)
+        }}</For>}</For>
+      </div>
+    </details>
+  }
+
+  const renderMsg = (msg: Message, trace: Message[] = []) => {
     const textBlock = msg.content?.find(b => b.type === 'text' && b.text)
     const { cleanText, images, files } = textBlock?.text ? extractImages(textBlock.text) : { cleanText: textBlock?.text || '', images: [], files: [] }
     const hasImages = images.length > 0
     const hasFiles = files.length > 0
     const hasAttachments = hasImages || hasFiles
+    const inlineTraceBlocks = msg.role === 'assistant' ? (msg.content || []).filter(block =>
+      block.type === 'thinking' || block.type === 'tool_result' ||
+      (block.type === 'tool_use' && block.name !== 'AskUserQuestion')
+    ) : []
+    const workLogMessages = inlineTraceBlocks.length > 0 ? [...trace, { ...msg, content: inlineTraceBlocks }] : trace
 
     return <div style={{ display: 'flex', 'flex-direction': 'column', 'align-items': msg.role === 'user' ? 'flex-end' : 'flex-start', 'margin-bottom': '10px' }}>
       <div data-uuid={msg.uuid} data-role={msg.role} style={{
@@ -769,12 +882,14 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
         )}</For>
         <div style={hasAttachments ? { padding: '4px 8px 4px' } : {}}>
           <For each={msg.content}>{(block) => {
+            if (msg.role === 'assistant' && (block.type === 'thinking' || block.type === 'tool_result' || (block.type === 'tool_use' && block.name !== 'AskUserQuestion'))) return null
             if (block.type === 'text' && block.text) {
               const display = hasAttachments ? cleanText : block.text
               return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => queueMicrotask(() => enhanceMarkdown(el, (src) => setLightbox(src), openExpandedTable))} /> : null
             }
             return renderBlock(block, (src) => setLightbox(src), openExpandedTable)
           }}</For>
+          <Show when={msg.role === 'assistant' && workLogMessages.length > 0}>{renderWorkLog(workLogMessages)}</Show>
         </div>
       </div>
       <div style={{ display: 'flex', 'align-items': 'center', gap: '4px', 'margin-top': '4px', padding: '0 4px', 'justify-content': msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
@@ -859,41 +974,24 @@ export function MessageView(props: { messages: Message[], loading: boolean, hasM
         <div onClick={() => setActionMenu(null)} style={{ position: 'fixed', inset: '0', 'z-index': '90' }} />
       </Show>
 
-      <For each={groupedItems()}>{(item) => {
+      <For each={buildRenderItems(props.messages, isPureToolResultMsg)}>{(item) => {
         if (item.kind === 'msg') return renderMsg(item.msg)
-        if (item.msgs.length < RUN_COLLAPSE_THRESHOLD) {
-          return <For each={item.msgs}>{(msg) => renderMsg(msg)}</For>
-        }
-        const key = item.msgs[0].uuid
-        const expanded = () => expandedRuns().has(key)
-        const toggle = () => setExpandedRuns(prev => {
-          const next = new Set(prev)
-          if (next.has(key)) next.delete(key); else next.add(key)
-          return next
-        })
-        return (
-          <div style={{ margin: '6px 0' }}>
-            <div onClick={toggle} style={{ 'text-align': 'center', cursor: 'pointer', padding: '4px 0', '-webkit-tap-highlight-color': 'transparent' }}>
-              <span style={{ display: 'inline-block', padding: '3px 10px', background: '#14141c', border: '1px solid #2a2a3a', color: '#888', 'font-size': '11px', 'border-radius': '12px' }}>
-                {expanded() ? '\u25BE' : '\u25B8'} {item.msgs.length} tool steps
-              </span>
-            </div>
-            <Show when={expanded()}>
-              <div style={{ 'border-left': '2px solid #2a2a3a', 'margin-left': '12px', 'padding-left': '10px', 'margin-top': '4px' }}>
-                <For each={item.msgs}>{(msg) => renderMsg(msg)}</For>
-              </div>
-            </Show>
-          </div>
-        )
+        if (item.kind === 'turn') return renderMsg(item.msg, item.trace)
+        // Keep an unfinished or failed trace reachable even before a final
+        // answer arrives; it stays collapsed so it does not dominate chat.
+        return <div style={{ margin: '4px 0 10px', 'max-width': '85%' }}>{renderWorkLog(item.messages)}</div>
       }}</For>
 
       {/* Typing indicator — always mounted, opacity-toggled so mount/unmount
           doesn't shift layout and trigger a pin-scroll every time working flips. */}
       <div style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px', opacity: props.working ? '1' : '0', transition: 'opacity 0.12s', 'pointer-events': props.working ? 'auto' : 'none' }}>
-        <div style={{ padding: '10px 16px', 'border-radius': '16px 16px 16px 4px', background: '#1a1a2e', display: 'flex', gap: '4px', 'align-items': 'center' }}>
+        <div role="status" aria-live="polite" style={{ padding: '10px 16px', 'border-radius': '16px 16px 16px 4px', background: '#1a1a2e', display: 'flex', gap: '4px', 'align-items': 'center', 'max-width': '92%' }}>
           <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out infinite' }} />
           <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.2s infinite' }} />
           <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.4s infinite' }} />
+          <Show when={props.statusText}>
+            <span style={{ 'margin-left': '6px', 'font-size': '12px', color: '#999', 'line-height': '1.35', 'word-break': 'break-word' }}>{props.statusText}</span>
+          </Show>
         </div>
       </div>
       </div>
