@@ -817,6 +817,61 @@ function summarizeReply(text) {
 // ── Session discovery ──────────────────────────────────────────────────────
 
 const SESSION_SOURCE_MTIME = Symbol('sessionSourceMtime');
+// Parsing transcript heads/tails dominates session discovery. Most transcripts
+// are immutable, so retain the parsed fields and last real-message timestamp
+// until either size or mtime changes. A warm refresh then stats the catalog and
+// reparses only chats that actually received data.
+const sessionParseCache = new Map();
+
+function readFileHead(filePath, maxBytes) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buffer = Buffer.alloc(Math.min(maxBytes, fs.fstatSync(fd).size));
+    fs.readSync(fd, buffer, 0, buffer.length, 0);
+    return buffer;
+  } catch { return Buffer.alloc(0); }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+function cachedCandidateInfo(candidate, meta) {
+  const mtimeMs = candidate.mtime.getTime();
+  let cached = sessionParseCache.get(candidate.fpath);
+  if (!cached || cached.agent !== candidate.agent || cached.mtimeMs !== mtimeMs || cached.size !== candidate.size) {
+    let info;
+    if (candidate.agent === 'codex') {
+      const buffer = readFileHead(candidate.fpath, CODEX_HEAD_BYTES);
+      info = {
+        firstUserText: extractCodexTitle(buffer), cwd: extractCodexCwd(buffer),
+        isTitleGen: false, isWorker: buffer.includes('AUTO_WORKER=TRUE'),
+      };
+    } else if (candidate.agent === 'omp') {
+      const buffer = readFileHead(candidate.fpath, 65536);
+      info = { firstUserText: extractOmpTitle(buffer), cwd: null, isTitleGen: false, isWorker: false };
+    } else {
+      info = extractSessionInfo(candidate.fpath);
+    }
+    cached = { agent: candidate.agent, mtimeMs, size: candidate.size, info, activityMs: null };
+    sessionParseCache.set(candidate.fpath, cached);
+  }
+
+  const info = { ...cached.info };
+  const cwd = meta[candidate.id]?.cwdOverride || info.cwd || meta[candidate.id]?.cwd || null;
+  if (candidate.agent !== 'claude' || !info.isWorker) {
+    info.isWorker = info.isWorker
+      || /^\/home\/[^/]+\/(?:auto|autoweb)-/.test(cwd || '')
+      || /^\/home\/[^/]+\/\.feather\/room-runs\//.test(cwd || '');
+  }
+  return info;
+}
+
+function cachedCandidateActivity(candidate) {
+  const cached = sessionParseCache.get(candidate.fpath);
+  if (cached?.activityMs) return cached.activityMs;
+  const activityMs = lastActivityMs(candidate.fpath, candidate.agent, candidate.mtime.getTime());
+  if (cached) cached.activityMs = activityMs;
+  return activityMs;
+}
 
 function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
   const projDir = projectsDir();
@@ -840,7 +895,7 @@ function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
           try {
             const stat = fs.statSync(fpath);
             if (stat.size < 50) continue;
-            candidates.push({ id: file.replace('.jsonl', ''), fpath, mtime: stat.mtime, projectId: dir, agent: 'claude' });
+            candidates.push({ id: file.replace('.jsonl', ''), fpath, mtime: stat.mtime, size: stat.size, projectId: dir, agent: 'claude' });
           } catch {}
         }
       } catch {}
@@ -851,7 +906,7 @@ function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
   if (!projectFilter) {
     for (const { uuid, fpath, mtime, size } of listCodexJsonlFiles()) {
       if (size < 50) continue;
-      candidates.push({ id: codexLocalIds.get(uuid) || uuid, fpath, mtime, projectId: null, agent: 'codex' });
+      candidates.push({ id: codexLocalIds.get(uuid) || uuid, fpath, mtime, size, projectId: null, agent: 'codex' });
     }
   }
 
@@ -867,59 +922,45 @@ function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
         const fpath = path.join(dirPath, files[0]);
         const stat = fs.statSync(fpath);
         if (stat.size < 50) continue;
-        candidates.push({ id: dir, fpath, mtime: stat.mtime, projectId: null, agent: 'omp' });
+        candidates.push({ id: dir, fpath, mtime: stat.mtime, size: stat.size, projectId: null, agent: 'omp' });
       } catch {}
     }
   }
 
   candidates.sort((a, b) => b.mtime - a.mtime);
-
-  // Pre-compute session info once per candidate. Codex needs a bigger read
-  // window than claude — its session_meta + permissions block alone is ~15KB.
-  const withInfo = candidates.map(c => {
-    if (c.agent === 'codex') {
-      let buf;
-      try {
-        const fd = fs.openSync(c.fpath, 'r');
-        try {
-          buf = Buffer.alloc(Math.min(CODEX_HEAD_BYTES, fs.fstatSync(fd).size));
-          fs.readSync(fd, buf, 0, buf.length, 0);
-        } finally {
-          fs.closeSync(fd);
-        }
-      } catch { buf = Buffer.alloc(0); }
-      const cwd = meta[c.id]?.cwdOverride || extractCodexCwd(buf) || meta[c.id]?.cwd || null;
-      const isWorker = buf.includes('AUTO_WORKER=TRUE')
-        || /^\/home\/[^/]+\/(?:auto|autoweb)-/.test(cwd || '')
-        || /^\/home\/[^/]+\/\.feather\/room-runs\//.test(cwd || '');
-      return { ...c, info: { firstUserText: extractCodexTitle(buf), cwd, isTitleGen: false, isWorker } };
-    }
-    if (c.agent === 'omp') {
-      let buf;
-      try { buf = fs.readFileSync(c.fpath).slice(0, 65536); } catch { buf = Buffer.alloc(0); }
-      const cwd = meta[c.id]?.cwdOverride || meta[c.id]?.cwd || null;
-      const isWorker = /^\/home\/[^/]+\/(?:auto|autoweb)-/.test(cwd || '')
-        || /^\/home\/[^/]+\/\.feather\/room-runs\//.test(cwd || '');
-      return { ...c, info: { firstUserText: extractOmpTitle(buf), cwd, isTitleGen: false, isWorker } };
-    }
-    const info = extractSessionInfo(c.fpath);
-    if (/^\/home\/[^/]+\/\.feather\/room-runs\//.test(info.cwd || '')) info.isWorker = true;
-    return { ...c, info };
-  });
-
-  const filtered = withInfo.filter(c => !c.info.isTitleGen && !c.info.isWorker && !sessionIsRoomPulse(meta[c.id]));
   const required = new Set(requiredIds);
-  const top = filtered
-    .filter((candidate, index) => index < limit || required.has(candidate.id))
-    .sort((a, b) => b.mtime - a.mtime);
+  const top = [];
+  const addedPaths = new Set();
+  const include = candidate => {
+    if (addedPaths.has(candidate.fpath)) return;
+    const info = cachedCandidateInfo(candidate, meta);
+    if (info.isTitleGen || info.isWorker || sessionIsRoomPulse(meta[candidate.id])) return;
+    top.push({ ...candidate, info });
+    addedPaths.add(candidate.fpath);
+  };
+  // Parse only as far into the mtime-sorted catalog as needed. The old code
+  // parsed every historical transcript before slicing to the newest 300.
+  for (const candidate of candidates) {
+    if (top.length >= Math.max(0, limit)) break;
+    include(candidate);
+  }
+  // Portable Room assignments can require an older chat outside that window.
+  if (required.size) {
+    for (const candidate of candidates) if (required.has(candidate.id)) include(candidate);
+  }
+  top.sort((a, b) => b.mtime - a.mtime);
+  if (!projectFilter) {
+    const existingPaths = new Set(candidates.map(candidate => candidate.fpath));
+    for (const filePath of sessionParseCache.keys()) if (!existingPaths.has(filePath)) sessionParseCache.delete(filePath);
+  }
   const active = getActiveTmuxSessions();
   const now = Date.now();
   const labels = readUserJson('project-labels.json', {});
 
-  const sessions = top.map(({ id, fpath, mtime, projectId: candidateProjectId, agent, info }) => {
+  const sessions = top.map(({ id, fpath, mtime, size, projectId: candidateProjectId, agent, info }) => {
     const cwd = meta[id]?.cwdOverride || info.cwd || meta[id]?.cwd || (candidateProjectId ? projectIdToCwd(candidateProjectId) : null) || null;
     const projectId = candidateProjectId || (cwd ? encodeProjectPath(cwd) : null);
-    const activityMs = lastActivityMs(fpath, agent, mtime.getTime());
+    const activityMs = cachedCandidateActivity({ id, fpath, mtime, size, agent });
     const session = {
       id, title: meta[id]?.title || info.firstUserText || id.slice(0, 8),
       updatedAt: new Date(activityMs).toISOString(),
