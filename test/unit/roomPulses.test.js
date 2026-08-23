@@ -49,6 +49,7 @@ describe('Room keep-working scheduler', () => {
       '  list-sessions) now=$(date +%s); while IFS= read -r name; do printf "%s|%s\\n" "$name" "$now"; done < "$TMUX_REG"; exit 0 ;;',
       '  has-session) grep -qxF "$3" "$TMUX_REG"; exit $? ;;',
       '  new-session) case "$*" in *rooms/broken*) exit 1;; esac; args="$*"; name=""; while [ $# -gt 0 ]; do [ "$1" = "-s" ] && name="$2"; shift; done; [ -n "$name" ] && printf "%s\\n" "$name" >> "$TMUX_REG"; printf "%s\\n" "$args" >> "$TMUX_TEST_LOG"; exit 0 ;;',
+      '  kill-session) grep -vxF "$3" "$TMUX_REG" > "$TMUX_REG.tmp" || true; mv "$TMUX_REG.tmp" "$TMUX_REG"; exit 0 ;;',
       'esac',
       'exit 0',
     ].join('\n'))
@@ -83,6 +84,14 @@ describe('Room keep-working scheduler', () => {
       assert.equal(launches.length, 1)
       assert.match(launches[0], /omp -p --auto-approve .*pulse\.md/)
       assert.equal(JSON.parse(fs.readFileSync(path.join(home, '.feather/room-sessions.json'), 'utf8'))[state.idle.sessionId], 'idle')
+
+      const pause = await fetch(`http://127.0.0.1:${port}/api/rooms/idle/pulse`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }),
+      })
+      assert.equal(pause.status, 200)
+      assert.equal((await pause.json()).pulse.status, 'paused')
+      assert.equal(fs.readFileSync(tmuxReg, 'utf8').split('\n').includes(`f-${state.idle.sessionId.slice(0, 8)}`), false,
+        'pausing a Room must stop its running background tmux session immediately')
 
     } finally {
       child.kill('SIGTERM')

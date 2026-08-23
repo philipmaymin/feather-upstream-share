@@ -39,9 +39,9 @@ test('attaches and detaches an existing chat without duplicate Room rows', async
 
   await page.goto(BASE)
   await expect(page.getByText('#marriage')).toBeVisible()
-  await expect(page.getByTestId('pulse-marriage')).toHaveText('Keep working')
+  await expect(page.getByTestId('pulse-marriage')).toHaveText('Stop background')
   await page.getByTestId('pulse-marriage').click()
-  await expect(page.getByTestId('pulse-marriage')).toHaveText('Paused')
+  await expect(page.getByTestId('pulse-marriage')).toHaveText('Start background')
   await page.locator('button:has-text("›")').click()
   await page.getByTestId('attach-existing-marriage').click()
   await expect(page.getByTestId('attach-picker-marriage')).toBeVisible()

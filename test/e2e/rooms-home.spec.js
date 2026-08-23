@@ -7,10 +7,14 @@ const ROOM_FIXTURE = {
   rooms: [{
     name: 'instant-room',
     cwd: '/home/user/rooms/instant-room',
-    sessions: [],
-    active: false,
-    latest: null,
-    updatedAt: null,
+    sessions: [{
+      id: 'pulse-session', title: 'Keep working: #instant-room', updatedAt: '2026-08-22T12:00:00Z',
+      isActive: true, agent: 'omp',
+    }],
+    active: true,
+    latest: { role: 'user', text: '<file name="/tmp/pulse.md">Keep working on this room.</file>' },
+    updatedAt: '2026-08-22T12:00:00Z',
+    pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: 'pulse-session' },
   }],
 }
 
@@ -54,9 +58,14 @@ test('serves fingerprinted frontend assets as immutable', async ({ page }) => {
   expect(response.headers()['cache-control']).toContain('immutable')
 })
 
-test('makes OMP the primary new-room chat and keeps room harness controls one level down', async ({ page }) => {
+test('puts OMP, Claude Code, and Codex on the Rooms home and hides pulse worker internals', async ({ page }) => {
   let createdAgent
   await page.route('**/api/rooms', route => route.fulfill({ json: ROOM_FIXTURE }))
+  await page.route('**/api/agents', route => route.fulfill({ json: { agents: [
+    { id: 'claude', label: 'Claude Code', available: true },
+    { id: 'codex', label: 'Codex', available: true },
+    { id: 'omp', label: 'oh-my-pi', available: true, default: true },
+  ] } }))
   await page.route('**/api/sessions', async route => {
     if (route.request().method() !== 'POST') return route.continue()
     createdAgent = JSON.parse(route.request().postData() || '{}').agent
@@ -65,12 +74,18 @@ test('makes OMP the primary new-room chat and keeps room harness controls one le
   await page.route('**/api/rooms/*/assign', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, assignments: {} }) }))
 
   await page.goto(BASE)
+  await expect(page.getByTestId('new-chat-launcher')).toBeVisible()
+  await expect(page.getByRole('button', { name: '+ OMP' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '+ Claude Code' }).first()).toBeVisible()
+  await expect(page.getByRole('button', { name: '+ Codex' }).first()).toBeVisible()
+  await expect(page.getByTestId('background-work-status')).toContainText('all paused')
+  await expect(page.getByText('pulse.md')).toHaveCount(0)
+  await expect(page.getByText('Keep working: #instant-room')).toHaveCount(0)
   await page.getByText('#instant-room', { exact: true }).click()
   await expect(page.getByRole('button', { name: '+ New OMP chat' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Claude Code' })).not.toBeVisible()
   await page.getByText('Room options', { exact: true }).click()
-  await expect(page.getByRole('button', { name: 'Claude Code' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Codex' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Claude Code', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Codex', exact: true })).toBeVisible()
   const harness = page.getByLabel('Default harness for #instant-room')
   await expect(harness).toHaveValue('omp')
   await harness.selectOption('codex')
@@ -79,4 +94,24 @@ test('makes OMP the primary new-room chat and keeps room harness controls one le
 
   await page.getByRole('button', { name: '+ New OMP chat' }).click()
   await expect.poll(() => createdAgent).toBe('omp')
+})
+
+test('stops background work in every enabled room from one visible control', async ({ page }) => {
+  const stopped = []
+  const rooms = ['first-room', 'second-room'].map(name => ({
+    name, cwd: `/home/user/rooms/${name}`, sessions: [], active: false, latest: null, updatedAt: null,
+    pulse: { enabled: true, status: 'waiting', lastRunAt: null, nextRunAt: '2026-08-22T12:15:00Z', sessionId: null },
+  }))
+  await page.route('**/api/rooms', route => route.fulfill({ json: { rooms } }))
+  await page.route('**/api/rooms/*/pulse', async route => {
+    stopped.push(new URL(route.request().url()).pathname.split('/')[3])
+    await route.fulfill({ json: { ok: true, pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null } } })
+  })
+
+  await page.goto(BASE)
+  await expect(page.getByTestId('background-work-status')).toContainText('2 rooms enabled')
+  await page.getByTestId('pause-all-background').click()
+  await expect.poll(() => stopped.sort()).toEqual(['first-room', 'second-room'])
+  await expect(page.getByTestId('background-work-status')).toContainText('all paused')
+  await expect(page.getByTestId('pause-all-background')).toHaveCount(0)
 })

@@ -14,6 +14,15 @@ import { listPendingMessages, putPendingMessage, patchPendingMessage, deletePend
 import { appUrl } from './lib/appPath.js'
 
 interface QuickLink { label: string; url: string }
+type AgentId = 'claude' | 'codex' | 'omp'
+
+const isRoomPulseSession = (session: Pick<SessionMeta, 'title'>) => /^Keep working: #/.test(session.title || '')
+const agentBadgeLabel = (agent?: AgentId) => agent === 'omp' ? 'OMP' : agent === 'codex' ? 'Codex' : 'Claude'
+const agentBadgeColors = (agent?: AgentId) => agent === 'omp'
+  ? { background: '#3a2a1e', color: '#e0a050' }
+  : agent === 'codex'
+    ? { background: '#2a1e3a', color: '#c084fc' }
+    : { background: '#1e2a3a', color: '#73b8ff' }
 
 type FileStatus = 'draft' | 'uploading' | 'uploaded' | 'failed'
 type VoiceStatus = 'transcribing' | 'failed' | 'delivered'
@@ -325,9 +334,10 @@ export default function App() {
 
   // Update sessions and detect unread changes
   function updateSessions(newSessions: SessionMeta[]) {
+    const visibleSessions = newSessions.filter(session => !isRoomPulseSession(session))
     const active = currentId()
     const unread = new Set(unreadSessions())
-    for (const s of newSessions) {
+    for (const s of visibleSessions) {
       const prev = lastSeenUpdatedAt.get(s.id)
       if (prev && s.updatedAt !== prev && s.id !== active) {
         unread.add(s.id)
@@ -338,7 +348,7 @@ export default function App() {
       }
     }
     setUnreadSessions(unread)
-    setSessions(newSessions)
+    setSessions(visibleSessions)
   }
 
   // Swipe gesture state
@@ -691,7 +701,7 @@ export default function App() {
     searchTimer = setTimeout(async () => {
       try {
         const results = await searchSessions(query)
-        setSearchResults(results)
+        setSearchResults(results.filter(result => !isRoomPulseSession(result)))
       } catch {}
       setSearching(false)
     }, 300)
@@ -733,7 +743,7 @@ export default function App() {
     messageScrollRef.scrollTo({ top: messageScrollRef.scrollTop + offset })
   }
 
-  async function handleNew(newTab = false, agent: 'claude' | 'codex' | 'omp' = 'omp') {
+  async function handleNew(newTab = false, agent: AgentId = 'omp') {
     setCreating(true)
     // Open the window synchronously to avoid popup blockers (iOS Safari
     // blocks window.open after an await breaks the user-gesture chain)
@@ -1353,25 +1363,24 @@ export default function App() {
           {/* Sessions tab */}
           <Show when={sidebarTab() === 'sessions'}>
             {/* New session + search buttons */}
-            <div style={{ padding: '8px 16px', display: 'flex', gap: '8px', position: 'relative' }}>
-              <button onClick={() => handleNew()} disabled={creating()} style={{ flex: '1', padding: '10px', background: creating() ? '#1a1a2e' : '#e0a050', color: creating() ? '#666' : '#111', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '700', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
-                {creating() ? 'Starting...' : '+ New OMP'}
-              </button>
-              <button onClick={() => handleNew(true)} disabled={creating()} title="Open new OMP chat in a new tab" style={{ padding: '10px 12px', background: creating() ? '#1a1a2e' : '#b97d32', color: creating() ? '#666' : '#111', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
-                &#8599;
-              </button>
-              <details style={{ position: 'relative' }}>
-                <summary title="Fallback agents" style={{ 'list-style': 'none', padding: '10px 11px', background: '#141820', color: '#777', border: '1px solid #2a2f38', 'border-radius': '8px', 'font-size': '13px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Other</summary>
-                <div style={{ position: 'absolute', top: '44px', right: '0', width: '150px', padding: '6px', background: '#11151c', border: '1px solid #333', 'border-radius': '9px', 'box-shadow': '0 8px 24px rgba(0,0,0,.45)', 'z-index': '80', display: 'flex', 'flex-direction': 'column', gap: '5px' }}>
-                  <button onClick={() => handleNew(false, 'claude')} disabled={creating()} style={{ padding: '7px 9px', background: 'none', border: '1px solid #29313b', color: '#73b8ff', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Claude Code</button>
-                  <Show when={codexAvailable()}>
-                    <button onClick={() => handleNew(false, 'codex')} disabled={creating()} style={{ padding: '7px 9px', background: 'none', border: '1px solid #332a3d', color: '#c084fc', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Codex</button>
-                  </Show>
-                </div>
-              </details>
-              <button onClick={() => { setSearchOpen(!searchOpen()); if (!searchOpen()) { setSearchQuery(''); setSearchResults([]) } }} title="Search chats" style={{ padding: '10px 12px', background: searchOpen() ? '#4aba6a' : '#1a1a2e', color: searchOpen() ? '#000' : '#888', border: '1px solid #333', 'border-radius': '8px', 'font-size': '14px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
-                &#x1F50D;
-              </button>
+            <div style={{ padding: '8px 16px', display: 'flex', 'flex-direction': 'column', gap: '7px', position: 'relative' }}>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button onClick={() => handleNew()} disabled={creating()} style={{ flex: '1', padding: '10px', background: creating() ? '#1a1a2e' : '#e0a050', color: creating() ? '#666' : '#111', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '700', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                  {creating() ? 'Starting...' : '+ New OMP'}
+                </button>
+                <button onClick={() => handleNew(true)} disabled={creating()} title="Open new OMP chat in a new tab" style={{ padding: '10px 12px', background: creating() ? '#1a1a2e' : '#b97d32', color: creating() ? '#666' : '#111', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                  &#8599;
+                </button>
+                <button onClick={() => { setSearchOpen(!searchOpen()); if (!searchOpen()) { setSearchQuery(''); setSearchResults([]) } }} title="Search chats" style={{ padding: '10px 12px', background: searchOpen() ? '#4aba6a' : '#1a1a2e', color: searchOpen() ? '#000' : '#888', border: '1px solid #333', 'border-radius': '8px', 'font-size': '14px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                  &#x1F50D;
+                </button>
+              </div>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button onClick={() => handleNew(false, 'claude')} disabled={creating()} style={{ flex: '1', padding: '7px 9px', background: '#15202a', border: '1px solid #344657', color: '#73b8ff', 'border-radius': '7px', cursor: 'pointer', 'font-size': '12px', 'font-weight': '700' }}>+ Claude Code</button>
+                <Show when={codexAvailable()}>
+                  <button onClick={() => handleNew(false, 'codex')} disabled={creating()} style={{ flex: '1', padding: '7px 9px', background: '#251b31', border: '1px solid #49345e', color: '#c084fc', 'border-radius': '7px', cursor: 'pointer', 'font-size': '12px', 'font-weight': '700' }}>+ Codex</button>
+                </Show>
+              </div>
             </div>
             {/* Search input */}
             <Show when={searchOpen()}>
@@ -1457,9 +1466,7 @@ export default function App() {
                               <div style={{ 'font-size': '10px', color: '#444', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{s.projectLabel}</div>
                             </Show>
                           </div>
-                          <Show when={s.agent === 'codex'}>
-                            <span style={{ 'font-size': '9px', padding: '1px 5px', 'border-radius': '3px', background: '#2a1e3a', color: '#c084fc', 'flex-shrink': '0', 'font-weight': '600' }}>codex</span>
-                          </Show>
+                          <span style={{ 'font-size': '9px', padding: '1px 5px', 'border-radius': '3px', ...agentBadgeColors(s.agent), 'flex-shrink': '0', 'font-weight': '600' }}>{agentBadgeLabel(s.agent)}</span>
                           <span style={{ 'font-size': '11px', color: '#555', 'flex-shrink': '0' }}>{timeAgo(s.updatedAt)}</span>
                         </div>
                       }>
@@ -1542,7 +1549,7 @@ export default function App() {
       <div style={{ flex: '1', display: 'flex', 'flex-direction': 'column', 'min-width': '0', height: '100%', position: 'relative' }}>
         {/* Header */}
         <div style={{ padding: '8px 16px 0 100px', 'padding-top': 'max(8px, env(safe-area-inset-top))', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'align-items': 'center', gap: '8px', 'min-height': '48px', 'flex-shrink': '0' }}>
-          <Show when={headerSession()} fallback={<span style={{ color: '#666', 'font-size': '14px' }}>{currentId() ? 'Loading...' : 'Select a session'}</span>}>
+          <Show when={headerSession()} fallback={<span style={{ color: '#888', 'font-size': '14px', 'font-weight': '600' }}>{currentId() ? 'Loading...' : 'Feather'}</span>}>
             {(s) => <>
               <Show when={s().isActive}><span style={{ width: '8px', height: '8px', 'border-radius': '50%', background: '#4aba6a', 'flex-shrink': '0' }} /></Show>
               <Show when={renaming()} fallback={
@@ -1618,7 +1625,13 @@ export default function App() {
         {/* Content */}
         <div style={{ flex: '1', overflow: 'hidden' }}>
           <Show when={currentId()} fallback={
-            <RoomsHome onOpen={select} onSessionsChanged={() => fetchSessions().then(updateSessions).catch(() => {})} />
+            <RoomsHome
+              onOpen={select}
+              onNewChat={(agent) => handleNew(false, agent)}
+              onSessionsChanged={() => fetchSessions().then(updateSessions).catch(() => {})}
+              creating={creating()}
+              codexAvailable={codexAvailable()}
+            />
           }>
             <div style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
               <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (currentId()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (currentId()) toggleStar(currentId()!, uuid) }} working={working()} scrollRefCb={(el) => { messageScrollRef = el }} sessionId={currentId()} />

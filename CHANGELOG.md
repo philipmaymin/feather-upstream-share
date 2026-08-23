@@ -1,3 +1,9 @@
+## 2026-08-23 - Visible harnesses and controllable background work
+- **OMP, Claude Code, and Codex are visible where chats start.** The Rooms home now has direct launch buttons for all available harnesses, the sidebar no longer hides Claude and Codex under an “Other” menu, and every session row identifies its harness.
+- **Room background work can be stopped reliably.** The Rooms home shows a global background-work status and a one-click Stop all control. Pausing an individual Room now terminates an in-flight worker immediately instead of only preventing its next scheduled run.
+- **Autonomous pulse workers no longer clutter normal navigation.** Their implementation sessions are excluded from the sidebar, Room chat counts, latest-message snippets, active dots, and tap targets; existing user chat history is unchanged.
+- **The Rooms shell is clearer.** The idle header now says Feather instead of the misleading “Select a session,” and Room cards use explicit Start background / Stop background actions.
+
 ## 2026-08-22 - Faster Rooms and local Markdown images
 - **Rooms stay responsive as chat history grows.** Feather now serves cached room and session snapshots immediately and refreshes stale transcript data in the background, while room and chat mutations still invalidate the cache at once.
 - **The Rooms list now feels instant in the browser too.** Feather paints the last good room snapshot immediately while refreshing it quietly, overlaps the first Rooms request with authentication, and keeps fingerprinted frontend bundles cached instead of revalidating them on every reload.

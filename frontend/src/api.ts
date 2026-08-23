@@ -62,13 +62,23 @@ let roomsRequest: Promise<RoomInfo[]> | null = null
 let roomsFetchedAt = 0
 
 function normalizeRoom(room: RoomInfo): RoomInfo {
+  const pulse = room.pulse || {
+    enabled: true, status: 'waiting' as const, lastRunAt: null,
+    nextRunAt: null, sessionId: null, error: null,
+  }
+  const originalSessions = Array.isArray(room.sessions) ? room.sessions : []
+  const pulseWasNewest = originalSessions[0]
+    && (originalSessions[0].id === pulse.sessionId || /^Keep working: #/.test(originalSessions[0].title || ''))
+  const sessions = originalSessions.filter(session =>
+    session.id !== pulse.sessionId && !/^Keep working: #/.test(session.title || ''))
   return {
     ...room,
+    sessions,
+    active: sessions.some(session => session.isActive),
+    latest: pulseWasNewest ? null : room.latest,
+    updatedAt: pulseWasNewest ? (sessions[0]?.updatedAt || room.updates?.latestAt || null) : room.updatedAt,
     updates: room.updates || { count: 0, latestAt: null, latest: null },
-    pulse: room.pulse || {
-      enabled: true, status: 'waiting', lastRunAt: null,
-      nextRunAt: null, sessionId: null, error: null,
-    },
+    pulse,
   }
 }
 

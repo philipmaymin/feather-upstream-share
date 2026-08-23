@@ -104,18 +104,22 @@ function sendButton(page) {
 test.describe('App shell', () => {
   test('shows empty state when no session selected', async ({ page }) => {
     await page.goto(BASE)
-    await expect(page.getByText('Select a session', { exact: true })).toBeVisible({ timeout: 10000 })
+    await expect(page.getByText('Feather', { exact: true }).last()).toBeVisible({ timeout: 10000 })
     // No tabs should be visible
     await expect(page.locator('button:has-text("Chat")')).not.toBeVisible()
     await expect(page.locator('button:has-text("Terminal")')).not.toBeVisible()
   })
 
-  test('hamburger opens sidebar with Feather title and New button', async ({ page }) => {
+  test('hamburger exposes every chat harness without a nested menu', async ({ page }) => {
     await page.goto(BASE)
     await page.waitForLoadState('networkidle')
     await openSidebar(page)
-    await expect(page.getByText('Feather', { exact: true })).toBeVisible()
+    await expect(page.getByText('Feather', { exact: true }).first()).toBeVisible()
     await expect(page.locator('button:has-text("+ New OMP")')).toBeVisible()
+    await expect(page.getByRole('button', { name: '+ Claude Code' }).last()).toBeVisible()
+    await expect(page.getByRole('button', { name: '+ Codex' }).last()).toBeVisible()
+    await expect(page.getByText('Other', { exact: true })).not.toBeVisible()
+    await expect(page.getByText(/^Keep working: #/)).toHaveCount(0)
   })
 
   test('sidebar closes with Escape key', async ({ page }) => {

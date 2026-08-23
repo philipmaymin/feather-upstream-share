@@ -75,7 +75,13 @@ function updateTimeLabel(iso: string | null) {
   return ago && ago !== 'now' ? `${when} · ${ago} ago` : `${when} · just now`
 }
 
-export default function RoomsHome(props: { onOpen: (id: string) => void, onSessionsChanged?: () => void }) {
+export default function RoomsHome(props: {
+  onOpen: (id: string) => void
+  onNewChat: (agent: AgentId) => void
+  onSessionsChanged?: () => void
+  creating?: boolean
+  codexAvailable?: boolean
+}) {
   // Keep the last successful snapshot visible while a fresh one loads. This
   // makes returning home immediate instead of flashing an empty loading view.
   const [rooms, setRooms] = createSignal<RoomInfo[] | null>(cachedRoomsSnapshot())
@@ -221,6 +227,23 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
     finally { setBusy(false) }
   }
 
+  async function pauseAllPulses() {
+    const enabledRooms = (rooms() || []).filter(room => room.pulse.enabled)
+    if (!enabledRooms.length) return
+    setBusy(true)
+    try {
+      const stopped = await Promise.all(enabledRooms.map(async room => ({
+        name: room.name,
+        pulse: await setRoomPulse(room.name, false),
+      })))
+      const byName = new Map(stopped.map(item => [item.name, item.pulse]))
+      setRooms(current => current?.map(room => byName.has(room.name)
+        ? { ...room, pulse: byName.get(room.name)! }
+        : room) || null)
+    } catch (e: any) { alert(e.message) }
+    finally { setBusy(false) }
+  }
+
   const unreadCount = (room: RoomInfo) => Math.max(0, room.updates.count - (seen()[room.name] || 0))
 
   function markSeen(room: RoomInfo) {
@@ -294,6 +317,28 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
             style={{ background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', 'font-size': '13px', 'font-weight': '600', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>+ New room</button>
         </div>
 
+        <div data-testid="new-chat-launcher" style={{ background: '#0d1117', border: '1px solid #262b33', 'border-radius': '12px', padding: '12px', 'margin-bottom': '10px' }}>
+          <div style={{ display: 'flex', 'align-items': 'center', gap: '8px', 'flex-wrap': 'wrap' }}>
+            <span style={{ color: '#9aa4b2', 'font-size': '12px', 'font-weight': '700', 'margin-right': '2px' }}>New chat</span>
+            <button onClick={() => props.onNewChat('omp')} disabled={busy() || props.creating}
+              style={{ background: '#e0a050', border: 'none', color: '#111', 'font-size': '12px', 'font-weight': '800', padding: '7px 12px', 'border-radius': '8px', cursor: 'pointer' }}>+ OMP</button>
+            <button onClick={() => props.onNewChat('claude')} disabled={busy() || props.creating}
+              style={{ background: '#15202a', border: '1px solid #344657', color: '#73b8ff', 'font-size': '12px', 'font-weight': '700', padding: '6px 11px', 'border-radius': '8px', cursor: 'pointer' }}>+ Claude Code</button>
+            <Show when={props.codexAvailable}>
+              <button onClick={() => props.onNewChat('codex')} disabled={busy() || props.creating}
+                style={{ background: '#251b31', border: '1px solid #49345e', color: '#c084fc', 'font-size': '12px', 'font-weight': '700', padding: '6px 11px', 'border-radius': '8px', cursor: 'pointer' }}>+ Codex</button>
+            </Show>
+          </div>
+          <div data-testid="background-work-status" style={{ display: 'flex', 'align-items': 'center', gap: '8px', 'margin-top': '11px', 'padding-top': '10px', 'border-top': '1px solid #1c2128', color: '#78828f', 'font-size': '11px' }}>
+            <span style={{ width: '7px', height: '7px', 'border-radius': '50%', background: (rooms() || []).some(room => room.pulse.enabled) ? '#e0a050' : '#4f5965' }} />
+            <span>Background work: <strong style={{ color: '#aeb6c0', 'font-weight': '600' }}>{(rooms() || []).some(room => room.pulse.enabled) ? `${(rooms() || []).filter(room => room.pulse.enabled).length} room${(rooms() || []).filter(room => room.pulse.enabled).length === 1 ? '' : 's'} enabled` : 'all paused'}</strong></span>
+            <Show when={(rooms() || []).some(room => room.pulse.enabled)}>
+              <button data-testid="pause-all-background" onClick={pauseAllPulses} disabled={busy()}
+                style={{ 'margin-left': 'auto', background: '#24191a', border: '1px solid #5c3336', color: '#e18a8e', 'font-size': '11px', 'font-weight': '700', padding: '4px 9px', 'border-radius': '7px', cursor: 'pointer' }}>Stop all</button>
+            </Show>
+          </div>
+        </div>
+
         <Show when={error()}>
           <div style={{ color: '#d45555', 'font-size': '13px', padding: '8px 4px' }}>{error()}</div>
         </Show>
@@ -324,7 +369,7 @@ export default function RoomsHome(props: { onOpen: (id: string) => void, onSessi
                     <button data-testid={`pulse-${room.name}`} onClick={(event) => togglePulse(room, event)} disabled={busy()}
                       aria-pressed={room.pulse.enabled}
                       style={{ background: room.pulse.enabled ? '#152a1c' : 'transparent', border: `1px solid ${room.pulse.enabled ? '#2a4a34' : '#333'}`, color: room.pulse.enabled ? '#69c77f' : '#777', 'font-size': '11px', 'font-weight': '600', padding: '3px 8px', 'border-radius': '999px', cursor: 'pointer' }}>
-                      {room.pulse.enabled ? 'Keep working' : 'Paused'}
+                      {room.pulse.enabled ? 'Stop background' : 'Start background'}
                     </button>
                     <span style={{ color: room.pulse.status === 'error' ? '#d48166' : '#666', 'font-size': '11px' }}>{pulseLabel(room)}</span>
                     <button data-testid={`updates-${room.name}`} onClick={(event) => openUpdates(room, event)}

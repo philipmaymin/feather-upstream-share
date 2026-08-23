@@ -1,6 +1,15 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { sessionIsActive, ACTIVE_MS, messageTimestampMs, lastMessageMs, latestSessionActivityMs } from '../../lib/sessions.js'
+import { sessionIsActive, sessionIsRoomPulse, ACTIVE_MS, messageTimestampMs, lastMessageMs, latestSessionActivityMs } from '../../lib/sessions.js'
+
+describe('sessionIsRoomPulse', () => {
+  it('recognizes explicit and legacy Room pulse metadata', () => {
+    assert.equal(sessionIsRoomPulse({ background: 'room-pulse', title: 'anything' }), true)
+    assert.equal(sessionIsRoomPulse({ title: 'Keep working: #feather' }), true)
+    assert.equal(sessionIsRoomPulse({ title: 'Keep working on my draft' }), false)
+    assert.equal(sessionIsRoomPulse(null), false)
+  })
+})
 
 // Regression: finished sessions kept showing the green "active" dot because
 // isActive was true whenever a feather-* tmux session existed, which lingers up

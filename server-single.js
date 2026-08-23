@@ -11,7 +11,7 @@ import { parseMessage, parseCodexMessage, parseMessageForAgent } from './lib/par
 import * as sidecar from './lib/sidecar.js';
 import { createKeyedLock } from './lib/sendlock.js';
 import { codexPasteBufferArgs } from './lib/tmux-input.js';
-import { sessionIsActive, lastMessageMs, latestSessionActivityMs } from './lib/sessions.js';
+import { sessionIsActive, sessionIsRoomPulse, lastMessageMs, latestSessionActivityMs } from './lib/sessions.js';
 import { resolveCodexWatchId, codexAdoptionPending } from './lib/codex-watch.js';
 import * as webpush from './lib/webpush.js';
 import { createSnapshotCache } from './lib/snapshot-cache.js';
@@ -904,7 +904,7 @@ function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
     return { ...c, info };
   });
 
-  const filtered = withInfo.filter(c => !c.info.isTitleGen && !c.info.isWorker);
+  const filtered = withInfo.filter(c => !c.info.isTitleGen && !c.info.isWorker && !sessionIsRoomPulse(meta[c.id]));
   const required = new Set(requiredIds);
   const top = filtered
     .filter((candidate, index) => index < limit || required.has(candidate.id))
@@ -1891,6 +1891,7 @@ app.post('/api/rooms/:name/pulse', (req, res) => {
     if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
     if (typeof req.body?.enabled !== 'boolean') throw httpError(400, 'enabled must be true or false');
     const now = Date.now();
+    const previous = ROOM_PULSES_STATE.read()[name];
     ROOM_PULSES_STATE.update(current => ({
       ...current,
       [name]: pulseRecord(current[name], {
@@ -1900,6 +1901,11 @@ app.post('/api/rooms/:name/pulse', (req, res) => {
         error: null,
       }),
     }));
+    // Pausing means stop now, not merely "do not launch again". Persist the
+    // disabled state first so the scheduler cannot race a replacement worker.
+    if (!req.body.enabled && previous?.sessionId) {
+      try { execFileSync('tmux', ['kill-session', '-t', tmuxName(previous.sessionId)], { stdio: 'ignore' }); } catch {}
+    }
     const pulse = roomPulse(name, now);
     roomSnapshotCache.update(rooms => rooms.map(room => room.name === name ? { ...room, pulse } : room));
     res.json({ ok: true, pulse });
@@ -1945,7 +1951,7 @@ function launchRoomPulse(name) {
       }),
     }));
     const meta = readMeta();
-    meta[id] = { ...(meta[id] || {}), agent: 'omp', cwd, title: `Keep working: #${name}` };
+    meta[id] = { ...(meta[id] || {}), agent: 'omp', cwd, title: `Keep working: #${name}`, background: 'room-pulse' };
     writeMeta(meta);
     ROOM_ASSIGN_STATE.update(current => ({ ...current, [id]: name }));
     watchOmpSessionDir(sessionDir, id);
