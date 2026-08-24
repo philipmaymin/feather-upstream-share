@@ -70,6 +70,13 @@ test('mirrors parent and child execution across completion, replay, and responsi
     { type: 'assistant_snapshot', subagentId: 'child-1', messageId: 'child-answer-1', text: 'Child answer is arriving.' },
     { type: 'tool_execution_update', subagentId: 'child-1', toolCallId: 'child-grep', toolName: 'grep', partialResult: 'Nested match found.' },
   ])
+
+  writeLine({
+    type: 'assistant', uuid: `native-live-trace-${Date.now()}`, timestamp: new Date().toISOString(), isSidechain: false, isMeta: false,
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: 'durable-parent-read', name: 'Read', input: { path: '/tmp/durable-parent' } }] },
+  })
+  await page.waitForTimeout(300)
+  await expect(page.getByTestId('live-work-turn')).toHaveCount(0)
   expect(started.status).toBe(204)
 
   const todo = page.getByTestId('omp-todo')

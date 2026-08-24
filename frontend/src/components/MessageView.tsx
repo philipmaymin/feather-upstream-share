@@ -1237,13 +1237,13 @@ export function MessageView(props: MessageViewProps) {
     </details>
   }
 
-  const renderMsg = (msg: Message, trace: Message[] = []) => {
+  const renderMsg = (msg: Message, trace: Message[] = [], suppressWork = false) => {
     const textBlock = msg.content?.find(b => b.type === 'text' && b.text)
     const { cleanText, images, files } = textBlock?.text ? extractImages(textBlock.text) : { cleanText: textBlock?.text || '', images: [], files: [] }
     const hasImages = images.length > 0
     const hasFiles = files.length > 0
     const hasAttachments = hasImages || hasFiles
-    const inlineTraceBlocks = msg.role === 'assistant' ? (msg.content || []).filter(block =>
+    const inlineTraceBlocks = msg.role === 'assistant' && !suppressWork ? (msg.content || []).filter(block =>
       block.type === 'thinking' || block.type === 'tool_result' ||
       (block.type === 'tool_use' && !isQuestionBlock(block))
     ) : []
@@ -1397,8 +1397,12 @@ export function MessageView(props: MessageViewProps) {
       </Show>
 
       <For each={renderItems()}>{(item) => {
-        if (item.kind === 'msg') return renderMsg(item.msg)
-        if (item.kind === 'turn') return renderMsg(item.msg, item.trace)
+        // The live OMP mirror is the authoritative view of the current turn.
+        // Do not show the same legacy transcript trace again in Details.
+        const mirroredCurrentTurn = (props.work?.timeline.length || 0) > 0 && item === renderItems().at(-1)
+        if (item.kind === 'msg') return renderMsg(item.msg, [], mirroredCurrentTurn)
+        if (item.kind === 'turn') return renderMsg(item.msg, mirroredCurrentTurn ? [] : item.trace, mirroredCurrentTurn)
+        if (mirroredCurrentTurn) return null
         // Keep an unfinished or failed trace reachable even before a final
         // answer arrives; it stays collapsed so it does not dominate chat.
         const isLiveWork = props.working && item === renderItems().at(-1)
