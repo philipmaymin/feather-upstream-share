@@ -998,44 +998,57 @@ export function MessageView(props: MessageViewProps) {
     )
   }
 
-  function renderTimelineItems(scope: () => OmpWorkScope) {
+  function hideParentOrchestration(item: OmpTimelineItem) {
+    if (item.kind !== 'tool') return false
+    const name = item.toolName.toLowerCase()
+    if (name === 'task') return true
+    if (name !== 'hub' || !item.args || typeof item.args !== 'object' || Array.isArray(item.args)) return false
+    const op = String((item.args as Record<string, unknown>).op || '').toLowerCase()
+    return op === 'wait' || op === 'jobs' || op === 'inbox' || op === 'list'
+  }
+
+  function renderTimelineItems(timeline: () => OmpTimelineItem[]) {
     return (
       <ol class="execution-timeline">
-        <Index each={scope().timeline}>{(item) => <ExecutionEntry item={item()} />}</Index>
+        <Index each={timeline()}>{(item) => <ExecutionEntry item={item()} />}</Index>
       </ol>
     )
   }
 
   function renderExecutionTimeline(scope: () => OmpWorkScope, testId: string, inspector = false) {
-    const summary = () => activeOmpStep(scope())
+    const visibleTimeline = createMemo(() => inspector ? scope().timeline : scope().timeline.filter(item => !hideParentOrchestration(item)))
+    const visibleScope = () => ({ ...scope(), timeline: visibleTimeline() })
+    const summary = () => activeOmpStep(visibleScope())
     if (inspector) {
       return (
         <section class="execution-log" data-testid={testId} aria-label="Agent execution timeline">
           <div class="execution-summary">
             <span class="execution-title">Execution</span>
-            <span class="execution-active">{summary() || `${scope().timeline.length} steps`}</span>
+            <span class="execution-active">{summary() || `${visibleTimeline().length} steps`}</span>
             <span class="execution-status" style={{ color: executionStatusColor(scope().runStatus) }}>{executionStatusMark(scope().runStatus)} {executionStatusLabel(scope().runStatus)}</span>
           </div>
           <div class="execution-detail">
-            <div class="execution-meta">{scope().timeline.length} chronological step{scope().timeline.length === 1 ? '' : 's'}</div>
-            {renderTimelineItems(scope)}
+            <div class="execution-meta">{visibleTimeline().length} chronological step{visibleTimeline().length === 1 ? '' : 's'}</div>
+            {renderTimelineItems(visibleTimeline)}
           </div>
         </section>
       )
     }
     return (
-      <details class="execution-log" data-testid={testId}>
-        <summary class="execution-summary" data-testid={`${testId}-summary`}>
-          <span class="execution-chevron">›</span>
-          <span class="execution-title">Execution</span>
-          <span class="execution-active">{summary() || `${scope().timeline.length} steps`}</span>
-          <span class="execution-status" style={{ color: executionStatusColor(scope().runStatus) }}>{executionStatusMark(scope().runStatus)} {executionStatusLabel(scope().runStatus)}</span>
-        </summary>
-        <div class="execution-detail">
-          <div class="execution-meta">{scope().timeline.length} chronological step{scope().timeline.length === 1 ? '' : 's'}</div>
-          {renderTimelineItems(scope)}
-        </div>
-      </details>
+      <Show when={visibleTimeline().length > 0}>
+        <details class="execution-log" data-testid={testId}>
+          <summary class="execution-summary" data-testid={`${testId}-summary`}>
+            <span class="execution-chevron">›</span>
+            <span class="execution-title">Execution</span>
+            <span class="execution-active">{summary() || `${visibleTimeline().length} steps`}</span>
+            <span class="execution-status" style={{ color: executionStatusColor(scope().runStatus) }}>{executionStatusMark(scope().runStatus)} {executionStatusLabel(scope().runStatus)}</span>
+          </summary>
+          <div class="execution-detail">
+            <div class="execution-meta">{visibleTimeline().length} chronological step{visibleTimeline().length === 1 ? '' : 's'}</div>
+            {renderTimelineItems(visibleTimeline)}
+          </div>
+        </details>
+      </Show>
     )
   }
 
