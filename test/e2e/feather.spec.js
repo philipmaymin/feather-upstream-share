@@ -288,6 +288,25 @@ test.describe('Message rendering', () => {
     await expect(detail).toContainText('markdown pipeline')
   })
 
+  test('an open Details panel stays open while later execution updates arrive', async ({ page }) => {
+    const workLog = page.locator('details.work-log').first()
+    await workLog.locator('summary').click()
+    await expect(workLog).toHaveJSProperty('open', true)
+
+    const updateUuid = 'e2e-details-later-update'
+    if (!fs.readFileSync(testSessionPath, 'utf8').includes(updateUuid)) {
+      writeLine({
+        type: 'assistant', uuid: updateUuid, timestamp: new Date().toISOString(),
+        isSidechain: false, isMeta: false,
+        message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'A later execution update arrived.' }] },
+      })
+    }
+
+    await expect(page.getByTestId('work-log-summary')).toHaveCount(3)
+    await expect(workLog).toHaveJSProperty('open', true)
+    await expect(workLog.getByText('markdown pipeline')).toBeVisible()
+  })
+
   test('Details precedes the final answer in chronological turn order', async ({ page }) => {
     const bubble = page.locator('[data-role="assistant"]').filter({ hasText: 'Feather uses marked with GFM support.' }).first()
     const chronological = await bubble.evaluate(element => {

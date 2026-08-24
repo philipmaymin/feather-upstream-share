@@ -767,6 +767,7 @@ export function MessageView(props: MessageViewProps) {
   const [newMsgCount, setNewMsgCount] = createSignal(0)
   const [actionMenu, setActionMenu] = createSignal<string | null>(null)
   const [actionFeedback, setActionFeedback] = createSignal<string | null>(null)
+  const [openWorkLogs, setOpenWorkLogs] = createSignal<Set<string>>(new Set())
   let prevMsgLen = props.messages.length
   let prevStreamText = props.assistantStream?.text || ''
 
@@ -847,6 +848,7 @@ export function MessageView(props: MessageViewProps) {
     prevStreamText = props.assistantStream?.text || ''
     setNewMsgCount(0)
     setPinned(true)
+    setOpenWorkLogs(new Set())
   }, { defer: true }))
 
   // ResizeObserver is the single pin writer — it catches every size change
@@ -895,6 +897,11 @@ export function MessageView(props: MessageViewProps) {
   }
 
   function renderWorkLog(messages: Message[]) {
+    // buildRenderItems returns fresh wrapper objects as a turn grows. Native
+    // <details> state would therefore reset whenever a later SSE update
+    // replaced the DOM node. The first trace message is stable for the life of
+    // the execution chain, so keep the user's disclosure choice against it.
+    const disclosureKey = messages[0]?.uuid || messages[0]?.timestamp || 'work-log'
     const blocks = messages.flatMap(message => message.content || [])
     const traceBlocks = blocks.filter(block => block.type === 'thinking' || block.type === 'tool_use' || block.type === 'tool_result')
     const renderedToolUseIds = new Set(traceBlocks.filter(block => block.type === 'tool_use' && block.id).map(block => block.id!))
@@ -903,7 +910,16 @@ export function MessageView(props: MessageViewProps) {
       block.type === 'tool_use' && block.id ? !!getResult(block.id)?.is_error : false
     ).length
     const last = messages[messages.length - 1]
-    return <details class="work-log">
+    return <details class="work-log" open={openWorkLogs().has(disclosureKey)} onToggle={(event) => {
+      const open = event.currentTarget.open
+      setOpenWorkLogs(current => {
+        if (current.has(disclosureKey) === open) return current
+        const next = new Set(current)
+        if (open) next.add(disclosureKey)
+        else next.delete(disclosureKey)
+        return next
+      })
+    }}>
       <summary class="work-log-summary" data-testid="work-log-summary">
         <span class="work-log-chevron">›</span>
         <span style={{ 'font-weight': '600' }}>Details</span>
