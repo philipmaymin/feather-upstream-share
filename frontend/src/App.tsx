@@ -5,7 +5,7 @@ import { MessageView } from './components/MessageView'
 import { Terminal } from './components/Terminal'
 import { SidecarThread } from './components/Sidecar'
 import RoomsHome from './RoomsHome'
-import type { SessionMeta, Message, QuestionData, SidecarGroup, RoomUpdate, OmpBridgeEvent, OmpAsyncJob } from './api'
+import type { SessionMeta, Message, QuestionData, SidecarGroup, RoomUpdate, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot } from './api'
 import { fetchSessions, fetchRooms, fetchRoomUpdates, fetchMessages, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
 import type { SearchResult } from './api'
 import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
@@ -14,6 +14,7 @@ import { listPendingMessages, putPendingMessage, patchPendingMessage, deletePend
 import { appUrl } from './lib/appPath.js'
 import { deriveToolIntentState, isFinalAssistantMessage, toolIntentTransition } from './lib/toolIntentStatus.js'
 import { deriveTodoSnapshot, todoSnapshotFromDetails, todoSnapshotFromMessage } from './lib/ompTodo.js'
+import { createOmpMirrorState, reduceOmpMirrorState } from './lib/ompMirror.js'
 
 interface QuickLink { label: string; url: string }
 type AgentId = 'claude' | 'codex' | 'omp'
@@ -36,25 +37,8 @@ interface StoredVoiceMedia extends StoredMediaBase { kind: 'audio'; status: Voic
 type StoredMedia = StoredFileMedia | StoredVoiceMedia
 interface PendingMessage { id: string; sessionId: string; text: string; createdAt: number; attempts: number; error?: string }
 interface AssistantStream { id: string; text: string; ended: boolean }
-interface TodoTask { content: string; status: string }
-interface TodoPhase { name: string; tasks: TodoTask[] }
-interface TodoSnapshot { phases: TodoPhase[]; completed: number; total: number; active: string | null }
 interface OmpNotice { kind: 'retry' | 'compaction' | 'credential'; text: string }
 interface OmpApproval { toolCallId: string; toolName: string; approvalMode: string; reason?: string }
-interface OmpSubagent {
-  id: string
-  agent: string
-  status: string
-  index: number
-  detached: boolean
-  description?: string
-  intent?: string
-  resolvedModel?: string
-  toolCount?: number
-  requests?: number
-  tokens?: number
-  durationMs?: number
-}
 interface OmpRuntimeState {
   modelProvider?: string
   modelId?: string
@@ -272,10 +256,10 @@ export default function App() {
   const [dragging, setDragging] = createSignal(false)
   const [toolIntentHistory, setToolIntentHistory] = createSignal<string[]>([])
   const [assistantStream, setAssistantStream] = createSignal<AssistantStream | null>(null)
-  const [todoSnapshot, setTodoSnapshot] = createSignal<TodoSnapshot | null>(null)
+  const [todoSnapshot, setTodoSnapshot] = createSignal<OmpTodoSnapshot | null>(null)
+  const [ompMirror, setOmpMirror] = createSignal<OmpMirrorState>(createOmpMirrorState())
   const [ompNotice, setOmpNotice] = createSignal<OmpNotice | null>(null)
   const [ompApproval, setOmpApproval] = createSignal<OmpApproval | null>(null)
-  const [ompSubagents, setOmpSubagents] = createSignal<OmpSubagent[]>([])
   const [ompJobs, setOmpJobs] = createSignal<OmpAsyncJob[]>([])
   const [ompRuntime, setOmpRuntime] = createSignal<OmpRuntimeState | null>(null)
   let assistantStreamStaleTimer: number | undefined
@@ -286,9 +270,9 @@ export default function App() {
   }
   function clearOmpLiveSurfaces() {
     setTodoSnapshot(null)
+    setOmpMirror(createOmpMirrorState())
     setOmpNotice(null)
     setOmpApproval(null)
-    setOmpSubagents([])
     setOmpJobs([])
     setOmpRuntime(null)
   }
@@ -678,8 +662,15 @@ export default function App() {
   })
 
   function handleOmpEvent(event: OmpBridgeEvent) {
-    if (event.type === 'todo' && event.phases) {
-      setTodoSnapshot(todoSnapshotFromDetails({ phases: event.phases }))
+    setOmpMirror(current => reduceOmpMirrorState(current, event))
+
+    if (event.type === 'subagent_lifecycle' || event.type === 'subagent_progress') return
+    if (event.type === 'todo') {
+      if (!event.subagentId && event.phases) setTodoSnapshot(todoSnapshotFromDetails({ phases: event.phases }))
+      return
+    }
+    if (event.type === 'work_snapshot' || event.type === 'tool_execution_start' || event.type === 'tool_execution_update' || event.type === 'tool_execution_end') {
+      if (!event.subagentId && event.type !== 'tool_execution_end') setWorking(true)
       return
     }
     if (event.type === 'tool_approval_requested' && event.toolCallId && event.toolName && event.approvalMode) {
@@ -693,27 +684,6 @@ export default function App() {
     }
     if (event.type === 'tool_approval_resolved') {
       setOmpApproval(current => current?.toolCallId === event.toolCallId ? null : current)
-      return
-    }
-    if ((event.type === 'subagent_lifecycle' || event.type === 'subagent_progress') && event.id && event.agent && event.status && event.index !== undefined) {
-      setOmpSubagents(current => {
-        const previous = current.find(agent => agent.id === event.id)
-        const next: OmpSubagent = {
-          id: event.id!,
-          agent: event.agent!,
-          status: event.status!,
-          index: event.index!,
-          detached: !!event.detached,
-          description: event.description ?? previous?.description,
-          intent: event.intent ?? previous?.intent,
-          resolvedModel: event.resolvedModel ?? previous?.resolvedModel,
-          toolCount: event.toolCount ?? previous?.toolCount,
-          requests: event.requests ?? previous?.requests,
-          tokens: event.tokens ?? previous?.tokens,
-          durationMs: event.durationMs ?? previous?.durationMs,
-        }
-        return [next, ...current.filter(agent => agent.id !== next.id)].slice(0, 12)
-      })
       return
     }
     if (event.type === 'async_jobs' && event.running && event.recent) {
@@ -734,6 +704,7 @@ export default function App() {
       })
       return
     }
+    if (event.subagentId) return
     if (event.type === 'assistant_snapshot' && event.messageId && typeof event.text === 'string') {
       clearTimeout(assistantStreamStaleTimer)
       assistantStreamStaleTimer = undefined
@@ -2060,10 +2031,11 @@ export default function App() {
                 statusText={toolIntentStatus()}
                 intentHistory={toolIntentHistory()}
                 assistantStream={assistantStream()}
-                todo={todoSnapshot()}
+                work={ompMirror().parent}
+                todo={ompMirror().parent.todo || todoSnapshot()}
                 notice={ompNotice()}
                 approval={ompApproval()}
-                subagents={ompSubagents()}
+                subagents={ompMirror().childOrder.map(id => ompMirror().children[id]).filter(Boolean)}
                 jobs={ompJobs()}
                 runtime={ompRuntime()}
                 scrollRefCb={(el) => { messageScrollRef = el }}

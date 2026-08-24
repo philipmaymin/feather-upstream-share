@@ -96,10 +96,31 @@ const OMP_BRIDGE_TOKENS_DIR = path.join(OMP_SESSIONS, '.feather-bridge-tokens');
 const ompBridgeTokens = new Map();
 const ompBridgeLastSeen = new Map();
 const OMP_DISCOVERED_BRIDGE = path.join(HOME, '.omp/agent/extensions/feather-bridge.js');
+// Older bridge payloads remain accepted for compatibility, but only v4 marks
+// the complete execution mirror live for migration purposes.
+const OMP_BRIDGE_VERSION = 4;
+const OMP_WORK_THINKING_CHARS = 3_000;
+const OMP_BRIDGE_MAX_EVENT_BYTES = 120_000;
+const OMP_BRIDGE_JSON_LIMITS = Object.freeze({
+  maxDepth: 6,
+  maxNodes: 500,
+  maxArrayItems: 100,
+  maxObjectKeys: 100,
+  maxKeyBytes: 240,
+  maxStringBytes: 20_000,
+  maxTotalBytes: 80_000,
+});
+const OMP_REPLAY_MAX_SESSIONS = 64;
+const OMP_REPLAY_MAX_EVENTS = 128;
+const OMP_REPLAY_MAX_BYTES = 512_000;
 const OMP_BRIDGE_EVENT_TYPES = Object.freeze({
   assistant_snapshot: true,
+  work_snapshot: true,
   assistant_end: true,
   assistant_cancel: true,
+  tool_execution_start: true,
+  tool_execution_update: true,
+  tool_execution_end: true,
   agent_start: true,
   agent_end: true,
   auto_retry_start: true,
@@ -707,6 +728,7 @@ function spawnOrResume(id, cwd, resume = false, agent = null) {
   }
 
   if (resolvedAgent === 'omp') {
+    if (!resume) resetOmpBridgeSessionState(id);
     const sessionDir = path.join(OMP_SESSIONS, id);
     fs.mkdirSync(sessionDir, { recursive: true });
     watchOmpSessionDir(sessionDir, id);
@@ -1272,14 +1294,61 @@ if (!READ_ONLY_MODE) setInterval(() => {
 // ── SSE ─────────────────────────────────────────────────────────────────────
 
 const sseClients = new Map();
+const ssePendingWrites = new WeakMap();
+const SSE_WRITE_QUEUE_MAX_BYTES = 1_048_576;
+
+function closeSseClient(clients, res) {
+  clients.delete(res);
+  ssePendingWrites.delete(res);
+  try { res.end(); } catch {}
+}
+
+function flushSseWrites(clients, res, state) {
+  try {
+    while (!state.waiting && state.queue.length > 0) {
+      const chunk = state.queue.shift();
+      state.bytes -= Buffer.byteLength(chunk);
+      if (!res.write(chunk)) {
+        state.waiting = true;
+        res.once('drain', () => {
+          state.waiting = false;
+          flushSseWrites(clients, res, state);
+        });
+      }
+    }
+  } catch {
+    closeSseClient(clients, res);
+  }
+}
 
 function writeSse(clients, res, chunk) {
+  let state = ssePendingWrites.get(res);
+  if (!state) {
+    state = { queue: [], bytes: 0, waiting: false };
+    ssePendingWrites.set(res, state);
+  }
+  if (state.waiting) {
+    const bytes = Buffer.byteLength(chunk);
+    if (state.bytes + bytes > SSE_WRITE_QUEUE_MAX_BYTES) {
+      closeSseClient(clients, res);
+      return false;
+    }
+    state.queue.push(chunk);
+    state.bytes += bytes;
+    return true;
+  }
   try {
-    if (res.write(chunk)) return;
-    clients.delete(res);
-    res.end();
+    if (!res.write(chunk)) {
+      state.waiting = true;
+      res.once('drain', () => {
+        state.waiting = false;
+        flushSseWrites(clients, res, state);
+      });
+    }
+    return true;
   } catch {
-    clients.delete(res);
+    closeSseClient(clients, res);
+    return false;
   }
 }
 
@@ -1299,6 +1368,168 @@ function broadcastNamedEvent(sessionId, eventName, data) {
   if (!clients || clients.size === 0) return;
   const chunk = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of clients) writeSse(clients, res, chunk);
+}
+
+const ompBridgeReplay = new Map();
+let ompBridgeReplaySequence = 0;
+
+function resetOmpBridgeSessionState(sessionId) {
+  cancelOmpBridgeMigration(sessionId);
+  ompBridgeReplay.delete(sessionId);
+  ompBridgeLastSeen.delete(sessionId);
+  const clients = sseClients.get(sessionId);
+  if (clients) {
+    for (const res of clients) closeSseClient(clients, res);
+    sseClients.delete(sessionId);
+  }
+}
+
+function replayOwner(event) {
+  return event.subagentId || 'parent';
+}
+
+function replayKey(event) {
+  const owner = replayOwner(event);
+  if (event.type === 'agent_start' && !event.subagentId) return 'run:parent';
+  if (event.type === 'session_state' || event.type === 'async_jobs') return `singleton:${event.type}`;
+  if (event.type === 'todo') return `todo:${owner}`;
+  if (event.type === 'tool_approval_requested') return `approval:${event.toolCallId}`;
+  if (event.type === 'subagent_lifecycle' || event.type === 'subagent_progress') return `subagent:${event.id}`;
+  if (event.type.startsWith('tool_execution_')) return `tool:${owner}:${event.toolCallId}`;
+  if (event.type === 'assistant_snapshot' || event.type === 'work_snapshot') return `${event.type}:${owner}:${event.messageId}`;
+  if (event.type === 'assistant_cancel' && event.willContinue) return null;
+  if ((event.type === 'assistant_end' || event.type === 'assistant_cancel') && event.subagentId) {
+    return `terminal:${owner}:${event.messageId}`;
+  }
+  if (event.type === 'assistant_end' || event.type === 'assistant_cancel') return 'terminal:parent';
+  return null;
+}
+
+function replayStoreFor(sessionId) {
+  let store = ompBridgeReplay.get(sessionId);
+  if (store) {
+    store.touchedAt = Date.now();
+    return store;
+  }
+  if (ompBridgeReplay.size >= OMP_REPLAY_MAX_SESSIONS) {
+    let oldestId;
+    let oldestAt = Infinity;
+    for (const [id, candidate] of ompBridgeReplay) {
+      if (candidate.touchedAt < oldestAt) {
+        oldestId = id;
+        oldestAt = candidate.touchedAt;
+      }
+    }
+    if (oldestId) ompBridgeReplay.delete(oldestId);
+  }
+  store = { entries: new Map(), bytes: 0, touchedAt: Date.now() };
+  ompBridgeReplay.set(sessionId, store);
+  return store;
+}
+
+function deleteReplayEntries(store, predicate) {
+  for (const [key, entry] of store.entries) {
+    if (!predicate(entry.event)) continue;
+    store.entries.delete(key);
+    store.bytes -= entry.bytes;
+  }
+}
+
+function isParentTransientReplayEvent(event) {
+  return !event.subagentId && (
+    event.type === 'assistant_snapshot' ||
+    event.type === 'work_snapshot' ||
+    event.type.startsWith('tool_execution_')
+  );
+}
+
+function pruneSettledSubagentReplay(store) {
+  const running = new Set();
+  for (const { event } of store.entries.values()) {
+    if (event.type !== 'subagent_lifecycle' && event.type !== 'subagent_progress') continue;
+    if (event.status === 'started' || event.status === 'running' || event.status === 'working') running.add(event.id);
+  }
+  deleteReplayEntries(store, event => {
+    const childId = event.subagentId || ((event.type === 'subagent_lifecycle' || event.type === 'subagent_progress') ? event.id : null);
+    return childId && !running.has(childId);
+  });
+}
+
+function rememberOmpBridgeEvent(sessionId, event) {
+  const store = replayStoreFor(sessionId);
+  if (event.type === 'tool_approval_resolved') {
+    const key = `approval:${event.toolCallId}`;
+    const existing = store.entries.get(key);
+    if (existing) {
+      store.entries.delete(key);
+      store.bytes -= existing.bytes;
+    }
+    return;
+  }
+
+  if (event.type === 'agent_start' && !event.subagentId) {
+    deleteReplayEntries(store, candidate => isParentTransientReplayEvent(candidate)
+      || (!candidate.subagentId && (candidate.type === 'assistant_end' || candidate.type === 'assistant_cancel')));
+    pruneSettledSubagentReplay(store);
+  }
+
+  const parentTerminal = !event.subagentId
+    && (event.type === 'assistant_end' || event.type === 'assistant_cancel')
+    && !event.willContinue;
+  if (parentTerminal) {
+    deleteReplayEntries(store, isParentTransientReplayEvent);
+  } else if (isParentTransientReplayEvent(event)) {
+    const terminal = store.entries.get('terminal:parent');
+    if (terminal) {
+      store.entries.delete('terminal:parent');
+      store.bytes -= terminal.bytes;
+    }
+  }
+
+  const key = replayKey(event);
+  if (!key) return;
+  const previous = store.entries.get(key);
+  const mergePrevious = event.type.startsWith('tool_execution_')
+    || event.type === 'subagent_lifecycle'
+    || event.type === 'subagent_progress';
+  const replayEvent = previous && mergePrevious ? { ...previous.event, ...event, type: event.type } : event;
+  const bytes = Buffer.byteLength(JSON.stringify(replayEvent));
+  if (bytes > OMP_REPLAY_MAX_BYTES) return;
+  if (previous) store.bytes -= previous.bytes;
+  const updatedSequence = ++ompBridgeReplaySequence;
+  store.entries.set(key, {
+    event: replayEvent,
+    bytes,
+    sequence: previous?.sequence ?? updatedSequence,
+    updatedSequence,
+  });
+  store.bytes += bytes;
+
+  while (store.entries.size > OMP_REPLAY_MAX_EVENTS || store.bytes > OMP_REPLAY_MAX_BYTES) {
+    let oldestKey;
+    let oldestUpdatedSequence = Infinity;
+    for (const [candidateKey, entry] of store.entries) {
+      if (entry.updatedSequence < oldestUpdatedSequence) {
+        oldestKey = candidateKey;
+        oldestUpdatedSequence = entry.updatedSequence;
+      }
+    }
+    if (!oldestKey) break;
+    const oldest = store.entries.get(oldestKey);
+    store.entries.delete(oldestKey);
+    store.bytes -= oldest.bytes;
+  }
+}
+
+function replayOmpBridgeEvents(sessionId, clients, res) {
+  const store = ompBridgeReplay.get(sessionId);
+  if (!store) return;
+  store.touchedAt = Date.now();
+  const entries = [...store.entries.values()].sort((left, right) => left.sequence - right.sequence);
+  for (const { event } of entries) {
+    const chunk = `event: omp_event\ndata: ${JSON.stringify(event)}\n\n`;
+    if (!writeSse(clients, res, chunk)) break;
+  }
 }
 
 // ── Activity + question polling (single tmux capture per session) ───────────
@@ -1569,8 +1800,8 @@ const watchedDirs = new Set();
 const pendingOmpBridgeMigrations = new Map();
 
 function ompBridgeIsLive(sessionId, now = Date.now()) {
-  const lastSeen = ompBridgeLastSeen.get(sessionId);
-  return Number.isFinite(lastSeen) && now - lastSeen < 30_000;
+  const live = ompBridgeLastSeen.get(sessionId);
+  return Number.isFinite(live?.seenAt) && live.version >= OMP_BRIDGE_VERSION && now - live.seenAt < 30_000;
 }
 
 function cancelOmpBridgeMigration(sessionId) {
@@ -1854,7 +2085,64 @@ function bridgeNumber(value, min = 0, max = Number.MAX_SAFE_INTEGER) {
   return Number.isFinite(value) && value >= min && value <= max ? value : undefined;
 }
 
+const INVALID_BRIDGE_JSON = Symbol('invalid-bridge-json');
+
+function revalidateBridgeJson(value) {
+  const state = { nodes: 0, bytes: 0 };
+
+  function visit(candidate, depth) {
+    if (state.nodes >= OMP_BRIDGE_JSON_LIMITS.maxNodes) return INVALID_BRIDGE_JSON;
+    state.nodes += 1;
+    state.bytes += 8;
+    if (state.bytes > OMP_BRIDGE_JSON_LIMITS.maxTotalBytes) return INVALID_BRIDGE_JSON;
+
+    if (candidate === null || typeof candidate === 'boolean') return candidate;
+    if (typeof candidate === 'number') return Number.isFinite(candidate) ? candidate : INVALID_BRIDGE_JSON;
+    if (typeof candidate === 'string') {
+      const bytes = Buffer.byteLength(candidate);
+      if (bytes > OMP_BRIDGE_JSON_LIMITS.maxStringBytes || state.bytes + bytes > OMP_BRIDGE_JSON_LIMITS.maxTotalBytes) return INVALID_BRIDGE_JSON;
+      state.bytes += bytes;
+      return candidate;
+    }
+    if (!candidate || typeof candidate !== 'object' || depth >= OMP_BRIDGE_JSON_LIMITS.maxDepth) return INVALID_BRIDGE_JSON;
+    if (Array.isArray(candidate)) {
+      if (candidate.length > OMP_BRIDGE_JSON_LIMITS.maxArrayItems) return INVALID_BRIDGE_JSON;
+      const clean = [];
+      for (const item of candidate) {
+        const normalized = visit(item, depth + 1);
+        if (normalized === INVALID_BRIDGE_JSON) return INVALID_BRIDGE_JSON;
+        clean.push(normalized);
+      }
+      return clean;
+    }
+
+    const entries = Object.entries(candidate);
+    if (entries.length > OMP_BRIDGE_JSON_LIMITS.maxObjectKeys) return INVALID_BRIDGE_JSON;
+    const clean = Object.create(null);
+    for (const [key, item] of entries) {
+      const keyBytes = Buffer.byteLength(key);
+      if (!key || keyBytes > OMP_BRIDGE_JSON_LIMITS.maxKeyBytes || state.bytes + keyBytes > OMP_BRIDGE_JSON_LIMITS.maxTotalBytes) return INVALID_BRIDGE_JSON;
+      state.bytes += keyBytes;
+      const normalized = visit(item, depth + 1);
+      if (normalized === INVALID_BRIDGE_JSON) return INVALID_BRIDGE_JSON;
+      clean[key] = normalized;
+    }
+    return clean;
+  }
+
+  const clean = visit(value, 0);
+  return clean === INVALID_BRIDGE_JSON ? null : { value: clean };
+}
+
+function bridgeSubagentId(event) {
+  if (event.subagentId === undefined) return {};
+  const subagentId = bridgeString(event.subagentId, 128);
+  return subagentId ? { subagentId } : null;
+}
+
 function normalizeTodoEvent(event) {
+  const owner = bridgeSubagentId(event);
+  if (owner === null) return null;
   if (!Array.isArray(event.phases) || event.phases.length > 30) return null;
   const allowedStatuses = new Set(['pending', 'in_progress', 'completed', 'abandoned', 'blocked']);
   const phases = [];
@@ -1878,6 +2166,7 @@ function normalizeTodoEvent(event) {
     phases,
     ...(bridgeString(event.op, 20) !== undefined ? { op: event.op } : {}),
     isError: !!event.isError,
+    ...owner,
   };
 }
 
@@ -1899,14 +2188,61 @@ function normalizeAsyncJob(job) {
 function normalizeOmpBridgeEvent(event) {
   if (!event || typeof event !== 'object' || !OMP_BRIDGE_EVENT_TYPES[event.type]) return null;
   const type = event.type;
+  const owner = bridgeSubagentId(event);
+  if (owner === null) return null;
   if (type === 'assistant_snapshot') {
     const messageId = bridgeString(event.messageId, 128);
     const text = bridgeString(event.text, 100_000);
-    return messageId && text !== undefined ? { type, messageId, text } : null;
+    return messageId && text !== undefined ? { type, messageId, text, ...owner } : null;
+  }
+  if (type === 'work_snapshot') {
+    const messageId = bridgeString(event.messageId, 128);
+    if (!messageId || !Array.isArray(event.blocks) || event.blocks.length > 40) return null;
+    let thinkingChars = 0;
+    const blocks = [];
+    for (const block of event.blocks) {
+      if (block?.type === 'thinking') {
+        const thinking = bridgeString(block.thinking, OMP_WORK_THINKING_CHARS - thinkingChars);
+        if (thinking === undefined) return null;
+        thinkingChars += thinking.length;
+        blocks.push({ type: 'thinking', thinking });
+      } else if (block?.type === 'tool_use') {
+        const id = bridgeString(block.id, 128);
+        const name = bridgeString(block.name, 80);
+        if (!id || !name) return null;
+        blocks.push({ type: 'tool_use', id, name, ...(bridgeString(block.intent, 300) !== undefined ? { intent: block.intent } : {}) });
+      } else {
+        return null;
+      }
+    }
+    return { type, messageId, blocks, ...owner };
   }
   if (type === 'assistant_end' || type === 'assistant_cancel') {
     const messageId = bridgeString(event.messageId, 128);
-    return messageId ? { type, messageId } : null;
+    return messageId ? { type, messageId, ...(event.willContinue === true ? { willContinue: true } : {}), ...owner } : null;
+  }
+  if (type === 'tool_execution_start' || type === 'tool_execution_update' || type === 'tool_execution_end') {
+    const toolCallId = bridgeString(event.toolCallId, 128);
+    const toolName = bridgeString(event.toolName, 80);
+    if (!toolCallId || !toolName) return null;
+    const hasArgs = type !== 'tool_execution_end' && event.args !== undefined;
+    const hasPartialResult = type === 'tool_execution_update' && event.partialResult !== undefined;
+    const hasResult = type === 'tool_execution_end' && event.result !== undefined;
+    const args = hasArgs ? revalidateBridgeJson(event.args) : {};
+    const partialResult = hasPartialResult ? revalidateBridgeJson(event.partialResult) : {};
+    const result = hasResult ? revalidateBridgeJson(event.result) : {};
+    if (args === null || partialResult === null || result === null) return null;
+    return {
+      type,
+      toolCallId,
+      toolName,
+      ...(hasArgs ? { args: args.value } : {}),
+      ...(bridgeString(event.intent, 300) !== undefined ? { intent: event.intent } : {}),
+      ...(hasPartialResult ? { partialResult: partialResult.value } : {}),
+      ...(hasResult ? { result: result.value } : {}),
+      ...(type === 'tool_execution_end' && typeof event.isError === 'boolean' ? { isError: event.isError } : {}),
+      ...owner,
+    };
   }
   if (type === 'agent_start') return { type };
   if (type === 'agent_end') return { type, ...(typeof event.willContinue === 'boolean' ? { willContinue: event.willContinue } : {}) };
@@ -1977,6 +2313,11 @@ function normalizeOmpBridgeEvent(event) {
       status,
       index,
       detached: !!event.detached,
+      ...(bridgeString(event.agentSource, 20) !== undefined ? { agentSource: event.agentSource } : {}),
+      ...(bridgeString(event.task, 2_000) !== undefined ? { task: event.task } : {}),
+      ...(bridgeString(event.assignment, 1_000) !== undefined ? { assignment: event.assignment } : {}),
+      ...(bridgeString(event.sessionFile, 1_000) !== undefined ? { sessionFile: event.sessionFile } : {}),
+      ...(bridgeString(event.parentToolCallId, 128) !== undefined ? { parentToolCallId: event.parentToolCallId } : {}),
       ...(bridgeString(event.description, 300) !== undefined ? { description: event.description } : {}),
       ...(bridgeString(event.intent, 300) !== undefined ? { intent: event.intent } : {}),
       ...(bridgeString(event.resolvedModel, 160) !== undefined ? { resolvedModel: event.resolvedModel } : {}),
@@ -2031,9 +2372,15 @@ app.post('/api/internal/sessions/:id/events', (req, res) => {
   const events = req.body?.events;
   if (!Array.isArray(events) || events.length === 0 || events.length > 50) return res.status(400).json({ error: 'events must be a non-empty array (max 50)' });
   const normalized = events.map(normalizeOmpBridgeEvent);
-  if (normalized.some(event => event === null)) return res.status(400).json({ error: 'invalid bridge event' });
-  ompBridgeLastSeen.set(id, Date.now());
-  for (const event of normalized) broadcastNamedEvent(id, 'omp_event', event);
+  if (normalized.some(event => event === null || Buffer.byteLength(JSON.stringify(event)) > OMP_BRIDGE_MAX_EVENT_BYTES)) {
+    return res.status(400).json({ error: 'invalid bridge event' });
+  }
+  const bridgeVersion = Number.isSafeInteger(req.body?.version) ? req.body.version : 0;
+  ompBridgeLastSeen.set(id, { seenAt: Date.now(), version: bridgeVersion });
+  for (const event of normalized) {
+    rememberOmpBridgeEvent(id, event);
+    broadcastNamedEvent(id, 'omp_event', event);
+  }
   res.status(204).end();
 });
 
@@ -2940,17 +3287,17 @@ app.get('/api/sessions/:id/stream', (req, res) => {
   const clients = sseClients.get(sid);
   if (clients.size >= MAX_SSE_PER_SESSION) {
     const oldest = clients.values().next().value;
-    try { oldest.end(); } catch {}
-    clients.delete(oldest);
+    closeSseClient(clients, oldest);
   }
 
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-  res.write('event: connected\ndata: {}\n\n');
+  clients.add(res);
+  writeSse(clients, res, 'event: connected\ndata: {}\n\n');
 
   // Send current activity immediately on connect
   const curActivity = lastActivity.get(sid) ?? extractActivity(existingTmuxName(sid));
   if (curActivity) {
-    res.write(`event: activity\ndata: ${JSON.stringify({ activity: curActivity })}\n\n`);
+    writeSse(clients, res, `event: activity\ndata: ${JSON.stringify({ activity: curActivity })}\n\n`);
     if (!lastActivity.has(sid)) lastActivity.set(sid, curActivity);
   }
 
@@ -2969,16 +3316,22 @@ app.get('/api/sessions/:id/stream', (req, res) => {
           for (const line of buf.toString('utf8').split('\n').filter(Boolean)) {
             offset += Buffer.byteLength(line + '\n');
             const parsed = parseMessageForAgent(line, getAgentForSession(sid));
-            if (parsed) res.write(`id: ${offset}\nevent: message\ndata: ${JSON.stringify(parsed)}\n\n`);
+            if (parsed) writeSse(clients, res, `id: ${offset}\nevent: message\ndata: ${JSON.stringify(parsed)}\n\n`);
           }
         }
       } catch {}
     }
   }
 
-  clients.add(res);
-  const hb = setInterval(() => { try { res.write('event: heartbeat\ndata: {}\n\n'); } catch { clearInterval(hb); } }, 15000);
-  res.on('close', () => { clearInterval(hb); clients.delete(res); });
+  replayOmpBridgeEvents(sid, clients, res);
+  const hb = setInterval(() => {
+    if (!writeSse(clients, res, 'event: heartbeat\ndata: {}\n\n')) clearInterval(hb);
+  }, 15000);
+  res.on('close', () => {
+    clearInterval(hb);
+    clients.delete(res);
+    ssePendingWrites.delete(res);
+  });
 });
 
 app.post('/api/sessions', (req, res) => {
@@ -3093,9 +3446,8 @@ app.post('/api/sessions/:id/delete', (req, res) => {
       return next;
     });
     ompBridgeTokens.delete(id);
-    ompBridgeLastSeen.delete(id);
     try { fs.unlinkSync(ompBridgeTokenPath(id)); } catch {}
-    sseClients.delete(id);
+    resetOmpBridgeSessionState(id);
     fileOffsets.delete(id);
     sessionsSnapshotCache.invalidate();
     roomSnapshotCache.invalidate();

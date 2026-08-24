@@ -26,6 +26,10 @@ const SUMMARY_META_KEYS = new Set([
   'response_length', 'yield_time_ms', 'max_output_tokens', 'timeout',
 ])
 
+function textValue(value) {
+  return typeof value === 'string' ? value : ''
+}
+
 function titleWords(value) {
   return value
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
@@ -41,22 +45,25 @@ function sentenceWords(value) {
 }
 
 export function canonicalToolName(raw) {
-  if (!raw) return 'tool'
-  const stripped = raw.replace(/^mcp__.+?__/, '') || raw
+  const source = String(raw || '')
+  if (!source) return 'tool'
+  const stripped = source.replace(/^mcp__.+?__/, '') || source
   const leaf = stripped.split('.').pop() || stripped
-  return TOOL_ALIASES[stripped.toLowerCase()] || TOOL_ALIASES[leaf.toLowerCase()] || titleWords(stripped)
+  const storedAlias = Object.hasOwn(TOOL_ALIASES, stripped.toLowerCase()) ? TOOL_ALIASES[stripped.toLowerCase()] : ''
+  const leafAlias = Object.hasOwn(TOOL_ALIASES, leaf.toLowerCase()) ? TOOL_ALIASES[leaf.toLowerCase()] : ''
+  return storedAlias || leafAlias || titleWords(stripped)
 }
 
 export function commandText(input) {
-  return (input?.command || input?.cmd || input?.raw || '').trim()
+  return [input?.command, input?.cmd, input?.raw].map(textValue).find(Boolean)?.trim() || ''
 }
 
 export function patchText(input) {
-  return (input?.raw || input?.input || input?.patch || '').trim()
+  return [input?.raw, input?.input, input?.patch].map(textValue).find(Boolean)?.trim() || ''
 }
 
 export function stdinText(input) {
-  return input?.chars || input?.input || ''
+  return [input?.chars, input?.input].map(textValue).find(Boolean) || ''
 }
 
 function patchSummary(input) {
@@ -164,8 +171,8 @@ function nestedToolCalls(raw) {
 }
 
 export function toolSummary(name, input) {
-  if (!input) return ''
-  const fp = input.file_path || input.path || ''
+  if (!input || typeof input !== 'object') return ''
+  const fp = textValue(input.file_path) || textValue(input.path)
   const short = fp.split('/').slice(-2).join('/')
   switch (name) {
     case 'Read': return short + (input.offset ? ` L${input.offset}` : '')
@@ -174,11 +181,14 @@ export function toolSummary(name, input) {
     case 'Bash': { const c = commandText(input).split('\n')[0]; return c.length > 80 ? c.slice(0, 80) + '…' : c }
     case 'Patch': return patchSummary(input)
     case 'Input': return stdinSummary(input)
-    case 'Grep': return `${input.pattern || ''}${input.path ? ' in ' + input.path : ''}`
-    case 'Glob': return input.pattern || ''
-    case 'Agent': { const d = input.description || (input.prompt || '').split('\n')[0]; return d ? (d.length > 80 ? d.slice(0, 80) + '…' : d) : '' }
-    case 'WebFetch': return input.url || ''
-    case 'WebSearch': return input.query || ''
+    case 'Grep': return `${textValue(input.pattern)}${textValue(input.path) ? ' in ' + textValue(input.path) : ''}`
+    case 'Glob': return textValue(input.pattern)
+    case 'Agent': {
+      const d = textValue(input.description) || textValue(input.prompt).split('\n')[0]
+      return d ? (d.length > 80 ? d.slice(0, 80) + '…' : d) : ''
+    }
+    case 'WebFetch': return textValue(input.url)
+    case 'WebSearch': return textValue(input.query)
     case 'Web': return webSummary(input)
     default: return genericSummary(input)
   }

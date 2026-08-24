@@ -61,6 +61,25 @@ async function waitForServer() {
   throw new Error(`test server did not report exact version ${EXPECTED_VERSION}: ${lastError?.message}\n${serverOutput}`)
 }
 
+async function readOmpSseEvents(reader, minimum) {
+  const decoder = new TextDecoder()
+  let payload = ''
+  while ((payload.match(/event: omp_event/g) || []).length < minimum) {
+    const read = await Promise.race([
+      reader.read(),
+      new Promise(resolve => setTimeout(() => resolve(null), 2_000)),
+    ])
+    if (!read || read.done || !read.value) break
+    payload += decoder.decode(read.value)
+  }
+  const events = payload.split('\n\n').flatMap((frame) => {
+    if (!frame.includes('event: omp_event')) return []
+    const data = frame.split('\n').find(line => line.startsWith('data: '))
+    return data ? [JSON.parse(data.slice(6))] : []
+  })
+  return { events, payload }
+}
+
 before(async () => {
   let port
   let stateDir
@@ -579,7 +598,7 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
       const accepted = await fetch(`${BASE}/api/internal/sessions/${sessionId}/events`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Feather-Bridge-Token': token },
-        body: JSON.stringify({ events: [{
+        body: JSON.stringify({ version: 4, events: [{
           type: 'assistant_snapshot',
           messageId: 'm1',
           text: 'Hello',
@@ -601,6 +620,163 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
     } finally {
       ctrl.abort()
       try { fs.unlinkSync(path.join(tokenDir, tokenName)) } catch {}
+    }
+  })
+
+  it('revalidates v4 tool data and replays coalesced parent and child live state', async () => {
+    const sessionId = `omp-replay-${Date.now()}`
+    const token = 'test-replay-secret'
+    const tokenDir = path.join(fixtureHome, '.feather', 'omp-sessions', '.feather-bridge-tokens')
+    fs.mkdirSync(tokenDir, { recursive: true })
+    const tokenName = createHash('sha256').update(sessionId).digest('hex')
+    const tokenPath = path.join(tokenDir, tokenName)
+    fs.writeFileSync(tokenPath, token, { mode: 0o600 })
+    const post = events => fetch(`${BASE}/api/internal/sessions/${sessionId}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Feather-Bridge-Token': token },
+      body: JSON.stringify({ version: 4, events }),
+    })
+
+    const ctrl = new AbortController()
+    const terminalCtrl = new AbortController()
+    try {
+      const accepted = await post([{
+        type: 'agent_start',
+      }, {
+        type: 'assistant_snapshot',
+        messageId: 'parent-message',
+        text: 'Parent answer',
+      }, {
+        type: 'work_snapshot',
+        messageId: 'parent-message',
+        blocks: [{ type: 'thinking', thinking: 'Parent work' }],
+      }, {
+        type: 'tool_execution_start',
+        toolCallId: 'parent-tool',
+        toolName: 'bash',
+        args: { command: 'printf safe' },
+        intent: 'Starting',
+        rawProviderEvent: 'must not spread',
+      }, {
+        type: 'tool_execution_update',
+        toolCallId: 'parent-tool',
+        toolName: 'bash',
+        args: { command: 'printf safe' },
+        partialResult: { output: 'partial' },
+      }, {
+        type: 'todo',
+        phases: [{ name: 'Parent', tasks: [{ content: 'Mirror work', status: 'in_progress' }] }],
+        isError: false,
+      }, {
+        type: 'session_state',
+        modelProvider: 'openai',
+        modelId: 'gpt-5.6',
+        serviceTiers: {},
+      }, {
+        type: 'async_jobs',
+        running: [],
+        recent: [],
+        delivery: { queued: 0, delivering: false },
+      }, {
+        type: 'tool_approval_requested',
+        toolCallId: 'approval-1',
+        toolName: 'write',
+        approvalMode: 'write',
+      }, {
+        type: 'subagent_lifecycle',
+        id: 'child-1',
+        agent: 'scout',
+        status: 'started',
+        index: 0,
+        detached: false,
+        agentSource: 'bundled',
+        task: 'Inspect bridge',
+        assignment: 'Map event flow',
+        sessionFile: '/tmp/child.jsonl',
+        parentToolCallId: 'parent-task',
+      }, {
+        type: 'assistant_snapshot',
+        messageId: 'child-message',
+        text: 'Child answer',
+        subagentId: 'child-1',
+      }, {
+        type: 'work_snapshot',
+        messageId: 'child-message',
+        blocks: [{ type: 'thinking', thinking: 'Child work' }],
+        subagentId: 'child-1',
+      }, {
+        type: 'tool_execution_start',
+        toolCallId: 'child-tool',
+        toolName: 'read',
+        args: { path: '/tmp/input' },
+        subagentId: 'child-1',
+      }, {
+        type: 'tool_execution_end',
+        toolCallId: 'child-tool',
+        toolName: 'read',
+        result: { text: 'done' },
+        isError: false,
+        subagentId: 'child-1',
+      }, {
+        type: 'todo',
+        phases: [{ name: 'Child', tasks: [{ content: 'Inspect events', status: 'completed' }] }],
+        isError: false,
+        subagentId: 'child-1',
+      }, {
+        type: 'assistant_end',
+        messageId: 'child-message',
+        subagentId: 'child-1',
+      }])
+      assert.equal(accepted.status, 204)
+
+      let deep = 'leaf'
+      for (let index = 0; index < 8; index += 1) deep = { child: deep }
+      const rejected = await post([{
+        type: 'tool_execution_start',
+        toolCallId: 'invalid-tool',
+        toolName: 'read',
+        args: { deep, oversized: 'x'.repeat(20_001) },
+      }])
+      assert.equal(rejected.status, 400)
+
+      const stream = await fetch(`${BASE}/api/sessions/${sessionId}/stream`, { signal: ctrl.signal })
+      const replay = await readOmpSseEvents(stream.body.getReader(), 14)
+      assert.equal(replay.events.length, 14)
+      assert.equal(replay.events[0].type, 'agent_start')
+      assert.ok(replay.events.some(event => event.type === 'assistant_snapshot' && event.messageId === 'parent-message'))
+      assert.ok(replay.events.some(event => event.type === 'work_snapshot' && !event.subagentId))
+      const parentTool = replay.events.find(event => event.toolCallId === 'parent-tool')
+      assert.equal(parentTool.type, 'tool_execution_update')
+      assert.deepEqual(parentTool.partialResult, { output: 'partial' })
+      assert.equal('rawProviderEvent' in parentTool, false)
+      assert.ok(replay.events.some(event => event.type === 'todo' && !event.subagentId))
+      assert.ok(replay.events.some(event => event.type === 'session_state'))
+      assert.ok(replay.events.some(event => event.type === 'async_jobs'))
+      assert.ok(replay.events.some(event => event.type === 'tool_approval_requested'))
+      const metadata = replay.events.find(event => event.type === 'subagent_lifecycle')
+      assert.equal(metadata.agentSource, 'bundled')
+      assert.equal(metadata.parentToolCallId, 'parent-task')
+      const childEvents = replay.events.filter(event => event.subagentId === 'child-1')
+      assert.ok(childEvents.some(event => event.type === 'assistant_snapshot'))
+      assert.ok(childEvents.some(event => event.type === 'work_snapshot'))
+      assert.ok(childEvents.some(event => event.type === 'tool_execution_end'))
+      assert.ok(childEvents.some(event => event.type === 'todo'))
+      assert.ok(childEvents.some(event => event.type === 'assistant_end'))
+      ctrl.abort()
+
+      const ended = await post([{ type: 'assistant_end', messageId: 'parent-message' }])
+      assert.equal(ended.status, 204)
+      const terminalStream = await fetch(`${BASE}/api/sessions/${sessionId}/stream`, { signal: terminalCtrl.signal })
+      const terminalReplay = await readOmpSseEvents(terminalStream.body.getReader(), 12)
+      assert.ok(terminalReplay.events.some(event => event.type === 'assistant_end' && !event.subagentId))
+      assert.equal(terminalReplay.events.some(event => event.type === 'assistant_snapshot' && !event.subagentId), false)
+      assert.equal(terminalReplay.events.some(event => event.type === 'work_snapshot' && !event.subagentId), false)
+      assert.equal(terminalReplay.events.some(event => event.toolCallId === 'parent-tool'), false)
+      assert.ok(terminalReplay.events.some(event => event.subagentId === 'child-1' && event.type === 'tool_execution_end'))
+    } finally {
+      ctrl.abort()
+      terminalCtrl.abort()
+      try { fs.unlinkSync(tokenPath) } catch {}
     }
   })
 

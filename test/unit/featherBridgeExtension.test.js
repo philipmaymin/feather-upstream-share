@@ -150,16 +150,25 @@ describe('Feather OMP bridge extension', () => {
     })
 
     const harness = createHarness()
+    harness.ctx.sessionManager = { getSessionFile: () => path.join(sessionDir, 'session.jsonl') }
     featherBridgeExtension(harness.pi)
+    harness.emit('session_start', { type: 'session_start' })
     harness.emit('agent_start', { type: 'agent_start' })
     await settleDeliveryQueue()
 
     assert.equal(requests.length, 1)
+    const child = createHarness()
+    child.ctx.sessionManager = { getSessionFile: () => undefined }
+    featherBridgeExtension(child.pi)
+    child.emit('session_start', { type: 'session_start' })
+    child.emit('agent_start', { type: 'agent_start' })
+    await settleDeliveryQueue()
+    assert.equal(requests.length, 1, 'in-memory child agents must not post into the parent session')
     assert.equal(requests[0].url, BRIDGE_URL)
     assert.equal(requests[0].options.headers['X-Feather-Bridge-Token'], 'stored-secret')
   })
 
-  it('sends throttled full-text snapshots without leaking thinking', async (t) => {
+  it('keeps thinking out of answer snapshots and streams it through work snapshots', async (t) => {
     const requests = []
     installRuntime(t, async (...args) => {
       requests.push(parseRequest(...args))
@@ -208,18 +217,58 @@ describe('Feather OMP bridge extension', () => {
     await settleDeliveryQueue()
 
     const events = requests.flatMap((request) => request.body.events)
-    assert.deepEqual(events.map((event) => [event.type, event.text]), [
+    const answerEvents = events.filter(event => event.type !== 'work_snapshot')
+    assert.deepEqual(answerEvents.map((event) => [event.type, event.text]), [
       ['assistant_snapshot', 'Hel'],
       ['assistant_snapshot', 'Hello'],
       ['assistant_end', undefined],
     ])
+    const workEvents = events.filter(event => event.type === 'work_snapshot')
+    assert.equal(workEvents.length, 3)
+    assert.deepEqual(workEvents.at(-1).blocks, [{ type: 'thinking', thinking: 'final hidden thought' }])
     assert.equal(new Set(events.map((event) => event.messageId)).size, 1)
-    assert.equal(JSON.stringify(requests).includes('private'), false)
-    assert.equal(JSON.stringify(requests).includes('hidden thought'), false)
+    assert.equal(JSON.stringify(answerEvents).includes('private'), false)
+    assert.equal(JSON.stringify(answerEvents).includes('hidden thought'), false)
     assert.equal(requests[0].url, BRIDGE_URL)
     assert.equal(requests[0].options.headers['X-Feather-Bridge-Token'], 'bridge-secret')
-    assert.deepEqual(Object.keys(requests[0].body), ['events'])
+    assert.deepEqual(Object.keys(requests[0].body), ['version', 'events'])
+    assert.equal(requests[0].body.version, 4)
     assert.equal('sessionId' in events[0], false)
+  })
+
+  it('streams thinking-only and tool-only work, clears it, and caps aggregate thinking', async (t) => {
+    const requests = []
+    installRuntime(t, async (...args) => {
+      requests.push(parseRequest(...args))
+      return { ok: true, status: 200 }
+    })
+    const harness = createHarness()
+    featherBridgeExtension(harness.pi)
+
+    const thinking = assistant([
+      { type: 'thinking', thinking: 'a'.repeat(40_000) },
+      { type: 'thinking', thinking: 'b'.repeat(40_000) },
+    ])
+    harness.emit('message_start', { type: 'message_start', message: thinking })
+    harness.emit('message_update', { type: 'message_update', message: thinking })
+    harness.runNextTimer()
+    await settleDeliveryQueue()
+
+    const textOnly = assistant([{ type: 'text', text: 'Now answering' }])
+    harness.emit('message_update', { type: 'message_update', message: textOnly })
+    harness.runNextTimer()
+    await settleDeliveryQueue()
+    const toolOnly = assistant([{ type: 'toolCall', id: 'tool-only', name: '', arguments: { path: '/private' } }])
+    harness.emit('message_start', { type: 'message_start', message: toolOnly })
+    harness.emit('message_update', { type: 'message_update', message: toolOnly })
+    harness.runNextTimer()
+    await settleDeliveryQueue()
+
+    const workEvents = requests.flatMap(request => request.body.events).filter(event => event.type === 'work_snapshot')
+    assert.equal(workEvents[0].blocks.filter(block => block.type === 'thinking').reduce((total, block) => total + block.thinking.length, 0), 3_000)
+    assert.deepEqual(workEvents[1].blocks, [])
+    assert.deepEqual(workEvents[2].blocks, [{ type: 'tool_use', id: 'tool-only', name: 'tool' }])
+    assert.equal(JSON.stringify(workEvents).includes('/private'), false)
   })
 
   it('ends text-only messages and cancels messages containing any tool call', async (t) => {
@@ -247,17 +296,23 @@ describe('Feather OMP bridge extension', () => {
     ])
 
     const events = requests.flatMap((request) => request.body.events)
-    assert.deepEqual(events.map((event) => event.type), [
+    const answerEvents = events.filter(event => event.type !== 'work_snapshot')
+    assert.deepEqual(answerEvents.map((event) => event.type), [
       'assistant_snapshot',
       'assistant_end',
       'assistant_snapshot',
       'assistant_cancel',
     ])
-    assert.equal(events[0].messageId, events[1].messageId)
-    assert.equal(events[2].messageId, events[3].messageId)
-    assert.notEqual(events[0].messageId, events[2].messageId)
-    assert.equal(JSON.stringify(events).includes('tool rationale'), false)
-    assert.equal(JSON.stringify(events).includes('call-1'), false)
+    assert.equal(answerEvents[0].messageId, answerEvents[1].messageId)
+    assert.equal(answerEvents[2].messageId, answerEvents[3].messageId)
+    assert.equal(answerEvents[3].willContinue, true)
+    assert.notEqual(answerEvents[0].messageId, answerEvents[2].messageId)
+    const work = events.find(event => event.type === 'work_snapshot')
+    assert.deepEqual(work.blocks, [
+      { type: 'thinking', thinking: 'tool rationale' },
+      { type: 'tool_use', id: 'call-1', name: 'read' },
+    ])
+    assert.equal(JSON.stringify(work).includes('secret'), false)
   })
 
   it('coalesces unsent assistant snapshots behind a slow delivery', async (t) => {
@@ -292,6 +347,47 @@ describe('Feather OMP bridge extension', () => {
       { type: 'assistant_end', messageId: requests[1].body.events[0].messageId },
     ])
     assert.equal(JSON.stringify(requests).includes('First snapshot'), false)
+  })
+  it('falls back to answer-only streaming when a v1 server rejects work events', async (t) => {
+    const requests = []
+    installRuntime(t, async (...args) => {
+      const request = parseRequest(...args)
+      requests.push(request)
+      const workOnly = request.body.events.every(event => event.type === 'work_snapshot')
+      return { ok: !workOnly, status: workOnly ? 400 : 200 }
+    })
+    const harness = createHarness()
+    featherBridgeExtension(harness.pi)
+
+    const finishToolTurn = async (suffix) => {
+      const message = assistant([
+        { type: 'thinking', thinking: `thinking-${suffix}` },
+        { type: 'text', text: `answer-${suffix}` },
+        { type: 'toolCall', id: `tool-${suffix}`, name: 'read', arguments: { path: '/private' } },
+      ])
+      harness.emit('message_start', { type: 'message_start', message })
+      harness.emit('message_end', { type: 'message_end', message })
+      harness.runNextTimer()
+      await settleDeliveryQueue()
+      await settleDeliveryQueue()
+    }
+
+    await finishToolTurn('one')
+    assert.deepEqual(requests[0].body.events.map(event => event.type), ['work_snapshot'])
+    assert.deepEqual(requests[1].body.events.map(event => event.type), ['assistant_snapshot', 'assistant_cancel'])
+
+    const requestCount = requests.length
+    harness.emit('tool_execution_start', {
+      type: 'tool_execution_start',
+      toolCallId: 'legacy-hidden-tool',
+      toolName: 'read',
+      args: { path: '/private' },
+    })
+    await settleDeliveryQueue()
+    assert.equal(requests.length, requestCount, 'v1 fallback must suppress v4 tool events')
+    await finishToolTurn('two')
+    assert.equal(requests.length, requestCount + 1)
+    assert.deepEqual(requests.at(-1).body.events.map(event => event.type), ['assistant_snapshot', 'assistant_cancel'])
   })
 
   it('serializes posts and recovers after a rejected delivery', async (t) => {
@@ -340,6 +436,219 @@ describe('Feather OMP bridge extension', () => {
       errorMessage: 'rate limited',
       errorId: 429,
     }])
+  })
+
+  it('emits bounded parent tool lifecycle data without spreading raw events', async (t) => {
+    const requests = []
+    installRuntime(t, async (...args) => {
+      requests.push(parseRequest(...args))
+      return { ok: true, status: 200 }
+    })
+    const harness = createHarness()
+    featherBridgeExtension(harness.pi)
+
+    let tooDeep = 'leaf'
+    for (let index = 0; index < 10; index += 1) tooDeep = { child: tooDeep }
+    harness.emit('tool_execution_start', {
+      type: 'tool_execution_start',
+      toolCallId: 'parent-tool',
+      toolName: 'bash',
+      args: { huge: 'x'.repeat(50_000), items: Array.from({ length: 150 }, (_, index) => index), tooDeep },
+      intent: 'Inspecting bounded state',
+      privateProviderPayload: 'must not spread',
+    })
+    await settleDeliveryQueue()
+    harness.emit('tool_execution_update', {
+      type: 'tool_execution_update',
+      toolCallId: 'parent-tool',
+      toolName: 'bash',
+      args: { command: 'printf safe' },
+      partialResult: { output: 'partial' },
+      privateProviderPayload: 'must not spread',
+    })
+    await settleDeliveryQueue()
+    harness.emit('tool_execution_end', {
+      type: 'tool_execution_end',
+      toolCallId: 'parent-tool',
+      toolName: 'bash',
+      result: { output: 'done', nested: tooDeep },
+      isError: false,
+      privateProviderPayload: 'must not spread',
+    })
+    await settleDeliveryQueue()
+
+    const events = requests.flatMap(request => request.body.events)
+    assert.deepEqual(events.map(event => event.type), [
+      'tool_execution_start',
+      'tool_execution_update',
+      'tool_execution_end',
+    ])
+    assert.equal(events[0].args.huge.length <= 20_000, true)
+    assert.equal(events[0].args.items.length, 100)
+    assert.equal(events[1].partialResult.output, 'partial')
+    assert.equal(events[2].result.output, 'done')
+    assert.equal(events[2].isError, false)
+    assert.equal(JSON.stringify(events).includes('must not spread'), false)
+  })
+
+  it('coalesces queued tool lifecycle without losing earlier fields', async (t) => {
+    let releaseFirst
+    const firstDelivery = new Promise(resolve => { releaseFirst = resolve })
+    const requests = []
+    installRuntime(t, (...args) => {
+      requests.push(parseRequest(...args))
+      return requests.length === 1 ? firstDelivery : Promise.resolve({ ok: true, status: 200 })
+    })
+    const harness = createHarness()
+    featherBridgeExtension(harness.pi)
+
+    harness.emit('agent_start', { type: 'agent_start' })
+    harness.emit('tool_execution_start', {
+      type: 'tool_execution_start', toolCallId: 'fast-tool', toolName: 'read',
+      args: { path: '/tmp/fast' }, intent: 'Reading fast state',
+    })
+    harness.emit('tool_execution_update', {
+      type: 'tool_execution_update', toolCallId: 'fast-tool', toolName: 'read',
+      partialResult: { output: 'partial' },
+    })
+    harness.emit('tool_execution_end', {
+      type: 'tool_execution_end', toolCallId: 'fast-tool', toolName: 'read',
+      result: { output: 'done' }, isError: false,
+    })
+    assert.equal(requests.length, 1)
+
+    releaseFirst({ ok: true, status: 200 })
+    await settleDeliveryQueue()
+    await settleDeliveryQueue()
+    const replayable = requests[1].body.events.find(event => event.toolCallId === 'fast-tool')
+    assert.equal(replayable.type, 'tool_execution_end')
+    assert.deepEqual(replayable.args, { path: '/tmp/fast' })
+    assert.equal(replayable.intent, 'Reading fast state')
+    assert.deepEqual(replayable.partialResult, { output: 'partial' })
+    assert.deepEqual(replayable.result, { output: 'done' })
+  })
+
+  it('translates raw child assistant, tool, and Todo events onto one child timeline', async (t) => {
+    const requests = []
+    installRuntime(t, async (...args) => {
+      requests.push(parseRequest(...args))
+      return { ok: true, status: 200 }
+    })
+    const harness = createHarness()
+    featherBridgeExtension(harness.pi)
+
+    harness.emitBus('task:subagent:lifecycle', {
+      id: 'child-1',
+      agent: 'scout',
+      agentSource: 'bundled',
+      task: 'Map bridge behavior',
+      assignment: 'Inspect event coverage',
+      sessionFile: '/tmp/child.jsonl',
+      parentToolCallId: 'parent-task',
+      status: 'started',
+      index: 0,
+    })
+    harness.emitBus('task:subagent:event', {
+      id: 'child-1',
+      event: {
+        type: 'message_start',
+        message: assistant([{ type: 'text', text: 'Investigating' }]),
+      },
+    })
+    harness.emitBus('task:subagent:event', {
+      id: 'child-1',
+      event: {
+        type: 'message_update',
+        message: assistant([
+          { type: 'thinking', thinking: 'child work' },
+          { type: 'text', text: 'Investigating now' },
+        ]),
+      },
+    })
+    await settleDeliveryQueue()
+    for (const event of [{
+      type: 'tool_execution_start',
+      toolCallId: 'child-tool',
+      toolName: 'read',
+      args: { path: '/tmp/input' },
+      intent: 'Reading fixture',
+    }, {
+      type: 'tool_execution_update',
+      toolCallId: 'child-tool',
+      toolName: 'read',
+      args: { path: '/tmp/input' },
+      partialResult: { lines: 4 },
+    }, {
+      type: 'tool_execution_end',
+      toolCallId: 'child-tool',
+      toolName: 'read',
+      result: { text: 'fixture' },
+      isError: false,
+    }]) {
+      harness.emitBus('task:subagent:event', { id: 'child-1', event })
+      await settleDeliveryQueue()
+    }
+    harness.emitBus('task:subagent:event', {
+      id: 'child-1',
+      event: {
+        type: 'message_end',
+        message: {
+          role: 'toolResult',
+          toolName: 'todo',
+          details: { phases: [{ name: 'Child', tasks: [{ content: 'Inspect events', status: 'completed' }] }] },
+        },
+      },
+    })
+    harness.emitBus('task:subagent:event', {
+      id: 'child-1',
+      event: {
+        type: 'message_end',
+        message: assistant([{ type: 'text', text: 'Child complete' }]),
+      },
+    })
+    await settleDeliveryQueue()
+
+    const events = requests.flatMap(request => request.body.events)
+    const lifecycle = events.find(event => event.type === 'subagent_lifecycle')
+    assert.equal(lifecycle.agentSource, 'bundled')
+    assert.equal(lifecycle.parentToolCallId, 'parent-task')
+    assert.equal(lifecycle.task, 'Map bridge behavior')
+    const childEvents = events.filter(event => event.subagentId === 'child-1')
+    assert.ok(childEvents.some(event => event.type === 'assistant_snapshot' && event.text === 'Investigating now'))
+    assert.ok(childEvents.some(event => event.type === 'work_snapshot' && event.blocks[0]?.thinking === 'child work'))
+    assert.deepEqual(childEvents.filter(event => event.type.startsWith('tool_execution_')).map(event => event.type), [
+      'tool_execution_start',
+      'tool_execution_update',
+      'tool_execution_end',
+    ])
+    assert.ok(childEvents.some(event => event.type === 'todo' && event.phases[0].tasks[0].status === 'completed'))
+    assert.ok(childEvents.some(event => event.type === 'assistant_end' && event.messageId))
+  })
+
+  it('restores the latest persisted Todo snapshot from the active session branch', async (t) => {
+    const requests = []
+    installRuntime(t, async (...args) => {
+      requests.push(parseRequest(...args))
+      return { ok: true, status: 200 }
+    })
+    const harness = createHarness()
+    const todoEntry = (content) => ({
+      type: 'message',
+      message: {
+        role: 'toolResult',
+        toolName: 'todo',
+        details: { phases: [{ name: 'Restore', tasks: [{ content, status: 'in_progress' }] }] },
+      },
+    })
+    harness.ctx.sessionManager = {
+      getBranch: () => [todoEntry('Older task'), { type: 'message', message: assistant([{ type: 'text', text: 'work' }]) }, todoEntry('Latest task')],
+    }
+    featherBridgeExtension(harness.pi)
+    harness.emit('session_start', { type: 'session_start' })
+    await settleDeliveryQueue()
+
+    const todo = requests.flatMap(request => request.body.events).find(event => event.type === 'todo')
+    assert.equal(todo.phases[0].tasks[0].content, 'Latest task')
   })
 
   it('forwards native Todo, approval, subagent, job, and runtime state safely', async (t) => {

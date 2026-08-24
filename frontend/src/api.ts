@@ -180,6 +180,13 @@ export interface ContentBlock {
   content?: any
   details?: unknown
   is_error?: boolean
+  toolCallId?: string
+  toolName?: string
+  args?: unknown
+  partialResult?: unknown
+  result?: unknown
+  isError?: boolean
+  subagentId?: string
 }
 
 export interface Message {
@@ -443,6 +450,65 @@ export interface OmpAsyncJob {
   startTime: number
   label?: string
 }
+export interface OmpTodoSnapshot {
+  phases: OmpTodoPhase[]
+  completed: number
+  total: number
+  active: string | null
+}
+
+export type OmpExecutionStatus = 'running' | 'success' | 'error' | 'cancelled'
+
+export type OmpTimelineItem =
+  | { key: string; kind: 'thinking'; text: string; status: OmpExecutionStatus }
+  | {
+      key: string
+      kind: 'tool'
+      toolCallId: string
+      toolName: string
+      status: OmpExecutionStatus
+      args?: unknown
+      intent?: string
+      partialResult?: unknown
+      result?: unknown
+      isError?: boolean
+    }
+
+export interface OmpWorkScope {
+  timeline: OmpTimelineItem[]
+  todo: OmpTodoSnapshot | null
+  activeMessageId: string | null
+  runStatus: 'idle' | OmpExecutionStatus
+  assistantText: string
+  assistantEnded: boolean
+}
+
+export interface OmpSubagentState extends OmpWorkScope {
+  id: string
+  agent: string
+  status: string
+  index: number
+  detached: boolean
+  description?: string
+  intent?: string
+  resolvedModel?: string
+  agentSource?: string
+  task?: string
+  assignment?: string
+  sessionFile?: string
+  parentToolCallId?: string
+  toolCount?: number
+  requests?: number
+  tokens?: number
+  durationMs?: number
+}
+
+export interface OmpMirrorState {
+  parent: OmpWorkScope
+  children: Record<string, OmpSubagentState>
+  childOrder: string[]
+}
+
 
 export interface OmpBridgeEvent {
   type: string
@@ -464,6 +530,10 @@ export interface OmpBridgeEvent {
   approved?: boolean
   phases?: OmpTodoPhase[]
   isError?: boolean
+  args?: unknown
+  partialResult?: unknown
+  result?: unknown
+  subagentId?: string
   id?: string
   agent?: string
   status?: string
@@ -476,6 +546,11 @@ export interface OmpBridgeEvent {
   requests?: number
   tokens?: number
   durationMs?: number
+  agentSource?: string
+  task?: string
+  assignment?: string
+  sessionFile?: string
+  parentToolCallId?: string
   running?: OmpAsyncJob[]
   recent?: OmpAsyncJob[]
   delivery?: { queued: number; delivering: boolean }

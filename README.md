@@ -58,6 +58,16 @@ You're running Claude Code on a remote machine. You want to check on it from you
 
 Feather reads Claude's raw JSONL session files, streams updates via SSE, and connects to tmux sessions via WebSocket terminals. No database. No build pipeline beyond Vite. Just `node server-single.js`.
 
+### OMP live execution mirror
+
+OMP sessions remain normal interactive TUI processes in tmux, so Terminal mode
+is always available for direct intervention. A bounded protocol-v4 extension
+mirrors live reasoning, tool start/update/end events, Todo state, approvals,
+jobs, and nested subagent events into Chat. **Details** renders the parent run as
+one chronological timeline; each subagent is a selectable child with its own
+Todo and execution inspector. Current state is replayed after browser reconnects,
+while the durable JSONL transcript remains the historical source of truth.
+
 ## Rooms — durable workspaces
 
 A Room is a folder under `~/rooms/` that gives related Feather chats a shared
