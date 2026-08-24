@@ -1557,7 +1557,7 @@ export function MessageView(props: MessageViewProps) {
 
       {/* Typing indicator — always mounted, opacity-toggled so mount/unmount
           doesn't shift layout and trigger a pin-scroll every time working flips. */}
-      <div style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px', opacity: props.working ? '1' : '0', transition: 'opacity 0.12s', 'pointer-events': props.working ? 'auto' : 'none' }}>
+      <div data-testid="working-indicator" style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px', opacity: props.working ? '1' : '0', visibility: props.working ? 'visible' : 'hidden', transition: 'opacity 0.12s', 'pointer-events': props.working ? 'auto' : 'none' }}>
         <div role={props.statusText ? 'status' : undefined} aria-live={props.statusText ? 'polite' : undefined} aria-hidden={!props.working ? 'true' : undefined} style={{ padding: '10px 16px', 'border-radius': '16px 16px 16px 4px', background: '#1a1a2e', display: 'flex', gap: '4px', 'align-items': 'center', 'max-width': '92%' }}>
           <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out infinite' }} />
           <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.2s infinite' }} />

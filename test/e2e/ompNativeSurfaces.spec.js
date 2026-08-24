@@ -135,13 +135,9 @@ test('mirrors parent and child execution across completion, replay, and responsi
     { type: 'assistant_end', subagentId: 'child-1', messageId: 'child-answer-1' },
     { type: 'subagent_progress', id: 'child-1', agent: 'scout', status: 'completed', index: 0, resolvedModel: 'gpt-5.6-mini', toolCount: 1, requests: 2, tokens: 840, durationMs: 12400 },
     { type: 'assistant_end', messageId: 'answer-1' },
-    { type: 'tool_execution_start', toolCallId: 'parent-read', toolName: 'read', intent: 'Reading parent bridge state' },
-    { type: 'tool_execution_update', toolCallId: 'parent-read', toolName: 'read', partialResult: 'Replay must not regress completion.' },
-    { type: 'tool_execution_end', toolCallId: 'parent-read', toolName: 'read', result: 'Replay segment complete.', isError: false },
   ])
   expect(completed.status).toBe(204)
-
-  await expect(parentExecution).toHaveJSProperty('open', false)
+  await expect(page.getByTestId('working-indicator')).toBeHidden()
   await expect(parentExecution.getByTestId('omp-tool-card')).toHaveCount(1)
   await expect(parentExecution.getByTestId('omp-tool-card')).toHaveAttribute('data-status', 'success')
   await expect(parentExecution).toContainText('Success')
@@ -151,6 +147,14 @@ test('mirrors parent and child execution across completion, replay, and responsi
   await expect(inspector).toContainText('840 tokens')
   await expect(inspector.getByTestId('omp-subagent-answer')).toContainText('Child answer is complete.')
   await page.getByRole('button', { name: 'Chat', exact: true }).click()
+  const replayed = await postEvents([
+    { type: 'tool_execution_start', toolCallId: 'parent-read', toolName: 'read', intent: 'Reading parent bridge state' },
+    { type: 'tool_execution_update', toolCallId: 'parent-read', toolName: 'read', partialResult: 'Replay must not regress completion.' },
+    { type: 'tool_execution_end', toolCallId: 'parent-read', toolName: 'read', result: 'Replay segment complete.', isError: false },
+  ])
+  expect(replayed.status).toBe(204)
+  await expect(parentExecution).toHaveJSProperty('open', false)
+  await expect(parentExecution.getByTestId('omp-tool-card')).toHaveCount(1)
 
   writeLine({
     type: 'assistant', uuid: `native-stream-final-${Date.now()}`, timestamp: new Date().toISOString(), isSidechain: false, isMeta: false,
