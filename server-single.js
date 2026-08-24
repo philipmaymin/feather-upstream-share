@@ -25,6 +25,7 @@ import { resolveOmpModel, resolveOmpThinking, ompLaunchCommand, ompTmuxArgs } fr
 import { ompSessionCwdFromHead, ompSessionIdFromHead, ompTurnBoundaryFromLine } from './lib/omp-session.js';
 import { inferLegacyTmuxOwner, legacyTmuxSessionName, tmuxSessionName } from './lib/tmux-session.js';
 import { extractOsc8HttpUrls } from './lib/terminal-hyperlinks.js';
+import { prepareTmuxTerminal } from './lib/terminal-attach.js';
 
 // Load ~/.env if present
 try {
@@ -3893,7 +3894,9 @@ wss.on('connection', (ws, req) => {
   delete cleanEnv.TMUX; delete cleanEnv.TMUX_PANE;
   cleanEnv.TERM = 'xterm-256color';
 
-  let term;
+  let term = null;
+  let closed = false;
+  const pendingMessages = [];
   let terminalSessionName = null;
   let hyperlinkProbe = '';
   let hyperlinkScanTimer = null;
@@ -3906,49 +3909,68 @@ wss.on('connection', (ws, req) => {
     lastHyperlinkPayload = payload;
     ws.send(JSON.stringify({ type: 'terminal-links', links }));
   };
-  if (isShell) {
-    term = pty.spawn('bash', ['-l'], {
-      name: 'xterm-256color', cols: terminalCols, rows: terminalRows, env: cleanEnv, cwd: HOME,
-    });
-  } else {
-    const sessionId = url.searchParams.get('session');
-    if (!sessionId) { ws.close(1008, 'session required'); return; }
-    if (!tmuxIsActive(sessionId)) { ws.close(1000, 'Session not active'); return; }
-    terminalSessionName = existingTmuxName(sessionId);
-    sendTerminalHyperlinks();
-    term = pty.spawn('tmux', ['attach', '-t', terminalSessionName], {
-      name: 'xterm-256color', cols: terminalCols, rows: terminalRows, env: cleanEnv,
-    });
-  }
-
-  term.onData(data => {
-    try { ws.send(data); } catch {}
-    if (!terminalSessionName) return;
-    hyperlinkProbe = (hyperlinkProbe + data).slice(-2048);
-    if (!/https?:\/\//i.test(hyperlinkProbe)) return;
-    hyperlinkProbe = '';
-    if (hyperlinkScanTimer) clearTimeout(hyperlinkScanTimer);
-    // tmux redraws visible URL prefixes without forwarding their OSC 8 target.
-    // By the time the redraw reaches us, capture-pane has retained that target.
-    hyperlinkScanTimer = setTimeout(() => {
-      hyperlinkScanTimer = null;
-      sendTerminalHyperlinks();
-    }, 100);
-  });
-  term.onExit(() => { try { ws.close(); } catch {} });
-
-  ws.on('message', (msg) => {
-    const str = msg.toString();
+  const handleTerminalMessage = (str) => {
+    if (!term) {
+      pendingMessages.push(str);
+      if (pendingMessages.length > 100) pendingMessages.shift();
+      return;
+    }
     try {
       const parsed = JSON.parse(str);
       if (parsed.type === 'resize') { term.resize(parsed.cols, parsed.rows); return; }
     } catch {}
     term.write(str);
-  });
+  };
+
+  ws.on('message', (msg) => handleTerminalMessage(msg.toString()));
 
   ws.on('close', () => {
+    closed = true;
     if (hyperlinkScanTimer) clearTimeout(hyperlinkScanTimer);
-    try { term.kill(); } catch {}
+    try { term?.kill(); } catch {}
+  });
+
+  const startTerminal = async () => {
+    if (isShell) {
+      term = pty.spawn('bash', ['-l'], {
+        name: 'xterm-256color', cols: terminalCols, rows: terminalRows, env: cleanEnv, cwd: HOME,
+      });
+    } else {
+      const sessionId = url.searchParams.get('session');
+      if (!sessionId) { ws.close(1008, 'session required'); return; }
+      if (!tmuxIsActive(sessionId)) { ws.close(1000, 'Session not active'); return; }
+      terminalSessionName = existingTmuxName(sessionId);
+      sendTerminalHyperlinks();
+      // A new viewport makes OMP repaint its transcript on SIGWINCH. Let tmux
+      // absorb that detached repaint, then attach only after it has settled so
+      // the browser receives the current screen rather than the whole replay.
+      try { await prepareTmuxTerminal(terminalSessionName, terminalCols, terminalRows); } catch {}
+      if (closed || ws.readyState !== WS.OPEN) return;
+      term = pty.spawn('tmux', ['attach', '-t', terminalSessionName], {
+        name: 'xterm-256color', cols: terminalCols, rows: terminalRows, env: cleanEnv,
+      });
+    }
+
+    term.onData(data => {
+      try { ws.send(data); } catch {}
+      if (!terminalSessionName) return;
+      hyperlinkProbe = (hyperlinkProbe + data).slice(-2048);
+      if (!/https?:\/\//i.test(hyperlinkProbe)) return;
+      hyperlinkProbe = '';
+      if (hyperlinkScanTimer) clearTimeout(hyperlinkScanTimer);
+      // tmux redraws visible URL prefixes without forwarding their OSC 8 target.
+      // By the time the redraw reaches us, capture-pane has retained that target.
+      hyperlinkScanTimer = setTimeout(() => {
+        hyperlinkScanTimer = null;
+        sendTerminalHyperlinks();
+      }, 100);
+    });
+    term.onExit(() => { try { ws.close(); } catch {} });
+    for (const message of pendingMessages.splice(0)) handleTerminalMessage(message);
+  };
+
+  startTerminal().catch(() => {
+    try { ws.close(1011, 'Terminal failed to start'); } catch {}
   });
 });
 
