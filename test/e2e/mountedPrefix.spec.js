@@ -235,6 +235,7 @@ test('production prefix carries SPA assets, REST, SSE, media, files, export, WS,
   await expect(markdownImage).toHaveAttribute('src', /^\/feather2\/api\/files\/raw\?path=/)
   await expect.poll(() => markdownImage.evaluate(image => image.naturalWidth)).toBeGreaterThan(0)
 
+  await page.getByTestId('work-log-summary').click()
   const tool = page.locator('summary').filter({ hasText: 'View Image' })
   await tool.click()
   await expect(tool.locator('xpath=..').locator('img')).toHaveAttribute('src', /^\/feather2\/api\/files\/raw\?path=/)

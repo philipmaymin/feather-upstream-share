@@ -1429,21 +1429,29 @@ export function MessageView(props: MessageViewProps) {
       <Show when={actionMenu()}>
         <div onClick={() => setActionMenu(null)} style={{ position: 'fixed', inset: '0', 'z-index': '90' }} />
       </Show>
-      <For each={renderItems()}>{(item) => {
+      <For each={renderItems()}>{(item, itemIndex) => {
         // The live OMP mirror is the authoritative view of the current turn.
-        // Do not show the same legacy transcript trace again in Details.
-        const mirroredCurrentTurn = (props.work?.timeline.length || 0) > 0 && item === renderItems().at(-1)
-        if (item.kind === 'msg') return mirroredCurrentTurn && item.msg.role === 'assistant'
-          ? <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
-          : renderMsg(item.msg)
-        if (item.kind === 'turn') return mirroredCurrentTurn && item.msg.role === 'assistant'
-          ? <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
-          : renderMsg(item.msg, item.trace)
-        if (mirroredCurrentTurn) return null
+        // Keep this decision reactive: transcript messages often render before
+        // the replayed OMP timeline reaches the browser after a reload.
+        const isLatestItem = () => itemIndex() === renderItems().length - 1
+        const mirroredCurrentTurn = createMemo(() => (props.work?.timeline.length || 0) > 0 && isLatestItem())
+        if (item.kind === 'msg') return <Show
+          when={mirroredCurrentTurn() && item.msg.role === 'assistant'}
+          fallback={renderMsg(item.msg)}
+        >
+          <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
+        </Show>
+        if (item.kind === 'turn') return <Show
+          when={mirroredCurrentTurn() && item.msg.role === 'assistant'}
+          fallback={renderMsg(item.msg, item.trace)}
+        >
+          <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
+        </Show>
         // Keep an unfinished or failed trace reachable even before a final
         // answer arrives; it stays collapsed so it does not dominate chat.
-        const isLiveWork = props.working && item === renderItems().at(-1)
-        return <div data-testid={isLiveWork ? 'live-work-turn' : undefined} style={{ margin: '4px 0 10px', 'max-width': '85%' }}>{renderWorkLog(item.messages)}</div>
+        return <Show when={!mirroredCurrentTurn()}>
+          <div data-testid={props.working && isLatestItem() ? 'live-work-turn' : undefined} style={{ margin: '4px 0 10px', 'max-width': '85%' }}>{renderWorkLog(item.messages)}</div>
+        </Show>
       }}</For>
       <Show when={(props.work?.timeline.length || 0) > 0 && !workAttachedToAnswer()}>
         {renderParentExecution(() => props.work!)}
@@ -1565,6 +1573,7 @@ export function MessageView(props: MessageViewProps) {
 
       {/* Typing indicator — always mounted, opacity-toggled so mount/unmount
           doesn't shift layout and trigger a pin-scroll every time working flips. */}
+      <Show when={!props.standaloneAgents}>
       <div data-testid="working-indicator" style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px', opacity: props.working ? '1' : '0', visibility: props.working ? 'visible' : 'hidden', transition: 'opacity 0.12s', 'pointer-events': props.working ? 'auto' : 'none' }}>
         <div role={props.statusText ? 'status' : undefined} aria-live={props.statusText ? 'polite' : undefined} aria-hidden={!props.working ? 'true' : undefined} style={{ padding: '10px 16px', 'border-radius': '16px 16px 16px 4px', background: '#1a1a2e', display: 'flex', gap: '4px', 'align-items': 'center', 'max-width': '92%' }}>
           <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out infinite' }} />
@@ -1577,6 +1586,7 @@ export function MessageView(props: MessageViewProps) {
           </Show>
         </div>
       </div>
+      </Show>
       </div>
     </div>
     {/* Scroll to bottom button */}

@@ -336,11 +336,15 @@ export default function App() {
   const [showHidden, setShowHidden] = createSignal(localStorage.getItem('feather-show-hidden') === '1')
 
   async function openFileBrowser(dir?: string) {
-    const target = dir || browseDir() || sessionStats().cwd || '/home/user'
+    const target = dir || browseDir() || sessionStats().cwd || ''
     setBrowseLoading(true)
     try {
-      const hidden = showHidden() ? '&showHidden=1' : ''
-      const resp = await fetch(appUrl(`/api/files/list?dir=${encodeURIComponent(target)}${hidden}`))
+      const params = new URLSearchParams()
+      if (target) params.set('dir', target)
+      if (showHidden()) params.set('showHidden', '1')
+      // An omitted dir lets each fleet server use its own HOME. A hard-coded
+      // /home/user fallback broke Browse for Tobin, Maya, Stella, and Allan.
+      const resp = await fetch(appUrl(`/api/files/list?${params}`))
       const data = await resp.json()
       if (resp.ok) {
         setBrowseDir(data.dir)
