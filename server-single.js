@@ -13,6 +13,7 @@ import { createKeyedLock } from './lib/sendlock.js';
 import { codexPasteBufferArgs } from './lib/tmux-input.js';
 import { activeTmuxCreatedAt, activeTmuxHas, sessionIsActive, sessionIsRoomPulse, lastMessageMs, latestSessionActivityMs } from './lib/sessions.js';
 import { resolveCodexWatchId, codexAdoptionPending } from './lib/codex-watch.js';
+import { codexSessionIsWorkerFromHead } from './lib/codex-session.js';
 import * as webpush from './lib/webpush.js';
 import { createSnapshotCache } from './lib/snapshot-cache.js';
 import { paneHasReadyPrompt } from './lib/terminal-ready.js';
@@ -989,7 +990,7 @@ function cachedCandidateInfo(candidate, meta) {
       const buffer = readFileHead(candidate.fpath, CODEX_HEAD_BYTES);
       info = {
         firstUserText: extractCodexTitle(buffer), cwd: extractCodexCwd(buffer),
-        isTitleGen: false, isWorker: buffer.includes('AUTO_WORKER=TRUE'),
+        isTitleGen: false, isWorker: codexSessionIsWorkerFromHead(buffer),
       };
     } else if (candidate.agent === 'omp') {
       const buffer = readFileHead(candidate.fpath, 65536);
@@ -2552,32 +2553,43 @@ ROOM_ASSIGN_STATE.read();
 ROOM_PULSES_STATE.read();
 MESSAGE_RECEIPTS_STATE.read();
 
-// Verify that staging is a coherent build: index.html points to a JS bundle
-// that actually exists in staging/assets. Returns the matched JS filename, or null.
-function validateStaging() {
-  const stagingHtml = path.join(STAGING_DIR, 'index.html');
-  if (!fs.existsSync(stagingHtml)) return { ok: false, reason: 'no index.html' };
-  const html = fs.readFileSync(stagingHtml, 'utf8');
+// Verify that a static directory is a coherent build: index.html points to a
+// JS bundle that actually exists in assets. Returns the matched JS filename.
+function validateStaticBuild(directory) {
+  const indexHtml = path.join(directory, 'index.html');
+  if (!fs.existsSync(indexHtml)) return { ok: false, reason: 'no index.html' };
+  const html = fs.readFileSync(indexHtml, 'utf8');
   const match = html.match(/assets\/(index-[^.]+\.js)/);
   if (!match) return { ok: false, reason: 'no JS bundle in index.html' };
-  const jsPath = path.join(STAGING_DIR, 'assets', match[1]);
+  const jsPath = path.join(directory, 'assets', match[1]);
   if (!fs.existsSync(jsPath)) return { ok: false, reason: `missing asset ${match[1]}` };
-  return { ok: true, stagingJs: match[1] };
+  return { ok: true, js: match[1] };
 }
+
+function validateStaging() { return validateStaticBuild(STAGING_DIR); }
 
 app.get('/api/version', (_req, res) => {
   try {
-    const v = validateStaging();
+    const staged = validateStaging();
+    const active = validateStaticBuild(STATIC_DIR);
     const changelog = path.join(import.meta.dirname, 'CHANGELOG.md');
     const changes = fs.existsSync(changelog) ? fs.readFileSync(changelog, 'utf8') : '';
-    // Only advertise staging if it's coherent (assets exist to match index.html)
-    res.json({ stagingJs: v.ok ? v.stagingJs : null, changes });
+    // Immutable releases normally have no static-staging directory. Advertise
+    // the active asset in that case so an older open tab can detect a newly
+    // deployed release and offer a deliberate reload.
+    res.json({
+      stagingJs: staged.ok ? staged.js : (active.ok ? active.js : null),
+      activeJs: active.ok ? active.js : null,
+      changes: staged.ok ? changes : '',
+    });
   } catch { res.json({ stagingJs: null, changes: '' }); }
 });
 
 app.post('/api/update', (_req, res) => {
   try {
-    if (!fs.existsSync(STAGING_DIR)) return res.status(400).json({ error: 'No staging build' });
+    // Under an immutable release deployment, the update has already happened
+    // server-side. The old client only needs permission to reload itself.
+    if (!fs.existsSync(STAGING_DIR)) return res.json({ ok: true, reload: true });
     const v = validateStaging();
     if (!v.ok) return res.status(400).json({ error: `Staging invalid: ${v.reason}` });
     // Backup current static to rollback

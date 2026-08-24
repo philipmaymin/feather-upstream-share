@@ -115,7 +115,7 @@ async function startServer(fx, readOnly) {
     env: {
       ...process.env, HOME: fx.home, FEATHER_STATE_DIR: fx.state, PORT: String(port),
       PATH: `${fx.bin}:${process.env.PATH}`, FEATHER_READ_ONLY: readOnly ? '1' : '0',
-      FEATHER_DEEPGRAM_API_KEY: '',
+      FEATHER_DEEPGRAM_API_KEY: '', STATIC_OVERRIDE: 'static-test',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -210,6 +210,7 @@ describe('server-enforced read-only canary', () => {
       ['GET', '/api/push/key'],
       ['POST', '/api/sessions', { id: 'new-session', cwd: fx.home }],
       ['POST', `/api/sessions/${fx.sessionId}/send`, { text: 'no' }],
+      ['POST', `/api/sessions/${fx.sessionId}/keys`, { keys: ['Enter'] }],
       ['POST', `/api/sessions/${fx.sessionId}/resume`, {}],
       ['POST', `/api/sessions/${fx.sessionId}/interrupt`, {}],
       ['POST', `/api/sessions/${fx.sessionId}/delete`, {}],
@@ -261,6 +262,20 @@ describe('server-enforced read-only canary', () => {
     })
     assert.equal(response.status, 200)
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(fx.state, 'quick-links.json'), 'utf8')), [{ label: 'Normal mode', url: 'https://example.test' }])
+
+    const keys = await fetch(`${base}/api/sessions/${fx.sessionId}/keys`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: ['Enter', 'Escape', 'Left'] }),
+    })
+    assert.equal(keys.status, 200)
+    assert.match(fs.readFileSync(fx.tmuxLog, 'utf8'), new RegExp(`send-keys -t f-${fx.sessionId} Enter Escape Left`))
+
+    const version = await (await fetch(`${base}/api/version`)).json()
+    assert.match(version.activeJs, /^index-.+\.js$/)
+    assert.equal(version.stagingJs, version.activeJs)
+    const reload = await fetch(`${base}/api/update`, { method: 'POST' })
+    assert.equal(reload.status, 200)
+    assert.deepEqual(await reload.json(), { ok: true, reload: true })
 
     await expectOpenedUpgrade(`ws://127.0.0.1:${port}/api/shell`)
     for (const route of ['/api/shell/', '/api/shell-near-match', '/api/terminal/', '/api/terminal-near-match']) {

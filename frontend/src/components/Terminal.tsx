@@ -1,6 +1,7 @@
 import { onMount, onCleanup, createEffect, createSignal, Show, For } from 'solid-js'
 import { init, Terminal as GhosttyTerm, FitAddon, OSC8LinkProvider } from 'ghostty-web'
 import type { ILink, ILinkProvider } from 'ghostty-web'
+import { sendSessionKeys } from '../api'
 import { appWebSocketUrl } from '../lib/appPath.js'
 import { completeTerminalUrl, extractDeviceCodes, extractHttpUrls, extractOsc8HttpUrls, findTerminalLineUrls, stripTerminalControlSequences } from '../lib/terminalLinks.js'
 
@@ -106,6 +107,7 @@ export function Terminal(props: { sessionId: string | null }) {
   let removeMobileInputFallback: (() => void) | null = null
   let keyboardEnterPending = false
   let keyboardEnterTimer: number | undefined
+  let keyNoticeTimer: number | undefined
   let lastTouchKeyAt = 0
   let connectionGeneration = 0
   const [copied, setCopied] = createSignal(false)
@@ -116,6 +118,7 @@ export function Terminal(props: { sessionId: string | null }) {
   const [showLinks, setShowLinks] = createSignal(false)
   const [copiedLink, setCopiedLink] = createSignal('')
   const [copiedCode, setCopiedCode] = createSignal('')
+  const [keyNotice, setKeyNotice] = createSignal('')
 
   function sendTerminalData(data: string) {
     try {
@@ -380,6 +383,9 @@ export function Terminal(props: { sessionId: string | null }) {
     keyboardEnterPending = false
     if (keyboardEnterTimer !== undefined) window.clearTimeout(keyboardEnterTimer)
     keyboardEnterTimer = undefined
+    if (keyNoticeTimer !== undefined) window.clearTimeout(keyNoticeTimer)
+    keyNoticeTimer = undefined
+    setKeyNotice('')
     if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
     reconnectTimer = undefined
     pendingTerminalInput = []
@@ -443,34 +449,48 @@ export function Terminal(props: { sessionId: string | null }) {
     setHasSelection(true)
   }
 
-  // A phone keyboard has no arrow or escape keys. Send the same bytes a
-  // physical key would write, then return focus to the terminal.
-  function sendKey(seq: string) {
-    sendTerminalData(seq)
+  // Toolbar keys use the server's tmux endpoint instead of depending on the
+  // terminal canvas WebSocket. That path remains usable while Ghostty is
+  // reconnecting and gives a phone user visible success/failure feedback.
+  async function sendToolbarKey(key: string) {
+    const sessionId = props.sessionId
+    if (!sessionId) return
+    setKeyNotice(`Sending ${key}…`)
     try { (term as any)?.focus?.() } catch {}
+    try {
+      await sendSessionKeys(sessionId, [key])
+      if (props.sessionId === sessionId) setKeyNotice(`Sent ${key}`)
+    } catch {
+      if (props.sessionId === sessionId) setKeyNotice(`${key} failed — tap again`)
+    }
+    if (keyNoticeTimer !== undefined) window.clearTimeout(keyNoticeTimer)
+    keyNoticeTimer = window.setTimeout(() => {
+      setKeyNotice('')
+      keyNoticeTimer = undefined
+    }, 1800)
   }
 
-  function sendKeyFromPointer(event: PointerEvent, seq: string) {
+  function sendKeyFromPointer(event: PointerEvent, key: string) {
     if (event.pointerType !== 'touch' && event.pointerType !== 'pen') return
     event.preventDefault()
     lastTouchKeyAt = performance.now()
-    sendKey(seq)
+    void sendToolbarKey(key)
   }
 
-  function sendKeyFromClick(_event: MouseEvent, seq: string) {
+  function sendKeyFromClick(_event: MouseEvent, key: string) {
     // iOS may suppress its synthetic click after terminal focus changes. Send
     // on the native touch pointer path, and ignore the compatibility click if
     // the browser still emits one. Mouse and keyboard clicks continue here.
     if (performance.now() - lastTouchKeyAt < 750) return
-    sendKey(seq)
+    void sendToolbarKey(key)
   }
 
   const KEYS: [string, string, string][] = [
-    ['\x1b', 'ESC', 'Escape'],
-    ['\x1b[D', '←', 'Left arrow'],
-    ['\x1b[B', '↓', 'Down arrow'],
-    ['\x1b[A', '↑', 'Up arrow'],
-    ['\x1b[C', '→', 'Right arrow'],
+    ['Escape', 'ESC', 'Escape'],
+    ['Left', '←', 'Left arrow'],
+    ['Down', '↓', 'Down arrow'],
+    ['Up', '↑', 'Up arrow'],
+    ['Right', '→', 'Right arrow'],
   ]
 
   createEffect(() => {
@@ -518,8 +538,8 @@ export function Terminal(props: { sessionId: string | null }) {
       <div style={{ display: 'flex', gap: '6px', padding: '6px 8px', 'border-bottom': '1px solid #1e1e1e', 'flex-shrink': '0', 'overflow-x': 'auto' }}>
         <button
           onMouseDown={(e) => e.preventDefault()}
-          onPointerUp={(e) => sendKeyFromPointer(e, '\r')}
-          onClick={(e) => sendKeyFromClick(e, '\r')}
+          onPointerUp={(e) => sendKeyFromPointer(e, 'Enter')}
+          onClick={(e) => sendKeyFromClick(e, 'Enter')}
           aria-label="Enter"
           title="Enter"
           style={{ ...keyStyle, 'font-size': '12px', 'min-width': '66px' }}
@@ -532,16 +552,19 @@ export function Terminal(props: { sessionId: string | null }) {
           {copied() ? 'Copied!' : hasSelection() ? 'Copy Selection' : 'Copy All'}
         </button>
         <button onClick={handlePaste} style={btnStyle}>Paste</button>
-        {KEYS.map(([seq, label, aria]) => (
+        {KEYS.map(([key, label, aria]) => (
           <button
             onMouseDown={(e) => e.preventDefault()}
-            onPointerUp={(e) => sendKeyFromPointer(e, seq)}
-            onClick={(e) => sendKeyFromClick(e, seq)}
+            onPointerUp={(e) => sendKeyFromPointer(e, key)}
+            onClick={(e) => sendKeyFromClick(e, key)}
             aria-label={aria}
             title={aria}
             style={keyStyle}
           >{label}</button>
         ))}
+        <Show when={keyNotice()}>
+          <span role="status" style={{ color: keyNotice().includes('failed') ? '#e06c75' : '#4aba6a', 'font-size': '11px', 'white-space': 'nowrap', 'align-self': 'center', 'flex-shrink': '0' }}>{keyNotice()}</span>
+        </Show>
       </div>
       <Show when={showLinks()}>
         <div id="terminal-links" data-testid="terminal-links" aria-live="polite" style={{ padding: '8px', background: '#0d1117', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'flex-direction': 'column', gap: '6px', 'max-height': '35%', overflow: 'auto', 'flex-shrink': '0' }}>

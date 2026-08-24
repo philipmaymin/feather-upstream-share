@@ -127,10 +127,16 @@ test('long wrapped login URLs can be tapped, opened, and copied on mobile', asyn
   })).toBe(deviceCode)
 })
 
-test('mobile Return input and the visible Enter control both reach the terminal', async ({ page }) => {
+test('mobile Return input and visible toolbar controls both reach the terminal', async ({ page }) => {
   const terminalInput = []
+  const terminalKeys = []
   let terminalSocket
   let terminalConnections = 0
+  await page.route(/\/api\/sessions\/[^/]+\/keys$/, async route => {
+    const body = route.request().postDataJSON()
+    terminalKeys.push(...body.keys)
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) })
+  })
   await page.routeWebSocket(/\/api\/terminal\?session=/, socket => {
     terminalSocket = socket
     terminalConnections++
@@ -186,14 +192,15 @@ test('mobile Return input and the visible Enter control both reach the terminal'
   }
 
   await tapButton('Enter')
-  await expect.poll(() => terminalInput.filter(value => value === '\r').length).toBe(3)
+  await expect.poll(() => terminalKeys).toEqual(['Enter'])
+  await expect(page.getByRole('status')).toHaveText('Sent Enter')
 
-  for (const [name, sequence] of [
-    ['Escape', '\x1b'], ['Left arrow', '\x1b[D'], ['Down arrow', '\x1b[B'],
-    ['Up arrow', '\x1b[A'], ['Right arrow', '\x1b[C'],
+  for (const [name, key] of [
+    ['Escape', 'Escape'], ['Left arrow', 'Left'], ['Down arrow', 'Down'],
+    ['Up arrow', 'Up'], ['Right arrow', 'Right'],
   ]) {
     await tapButton(name)
-    await expect.poll(() => terminalInput.filter(value => value === sequence).length).toBe(1)
+    await expect.poll(() => terminalKeys.filter(value => value === key).length).toBe(1)
   }
 
   // iOS can suppress the compatibility click after terminal focus changes.
@@ -204,14 +211,18 @@ test('mobile Return input and the visible Enter control both reach the terminal'
     element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'touch' }))
     element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }))
   })
-  await expect.poll(() => terminalInput.filter(value => value === '\x1b').length).toBe(2)
+  await expect.poll(() => terminalKeys.filter(value => value === 'Escape').length).toBe(2)
 
-  // A backend restart used to leave the toolbar alive but permanently bound
-  // to a closed socket. A tap during the reconnect is queued and delivered.
+  // Canvas keyboard input still queues while the terminal WebSocket reconnects.
+  // Toolbar controls use the independent HTTP path tested above.
   await terminalSocket.close()
-  await tapButton('Enter')
+  await hiddenInput.evaluate(element => element.dispatchEvent(new InputEvent('beforeinput', {
+    bubbles: true,
+    cancelable: true,
+    inputType: 'insertLineBreak',
+  })))
   await expect.poll(() => terminalConnections).toBe(2)
-  await expect.poll(() => terminalInput.filter(value => value === '\r').length).toBe(4)
+  await expect.poll(() => terminalInput.filter(value => value === '\r').length).toBe(3)
 })
 
 test('a silent zombie event stream reconnects from its last event id', async ({ page }) => {
