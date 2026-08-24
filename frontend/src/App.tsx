@@ -1,4 +1,5 @@
 declare const __BUILD_TIME__: string
+declare const __BUILD_VERSION__: string
 import { createSignal, createEffect, createMemo, onMount, onCleanup, Show, For } from 'solid-js'
 import { marked } from 'marked'
 import { MessageView } from './components/MessageView'
@@ -593,6 +594,10 @@ export default function App() {
   }
 
   onMount(async () => {
+    // Expose the immutable build embedded in this resident bundle. Besides
+    // making stale-client checks testable, this avoids learning a misleading
+    // "baseline" from a server that may already have advanced.
+    document.documentElement.dataset.buildVersion = __BUILD_VERSION__
     // Set --vh for iOS keyboard handling
     function setVh() {
       const vh = (window.visualViewport?.height || window.innerHeight) * 0.01

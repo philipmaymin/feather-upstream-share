@@ -52,6 +52,8 @@ test.afterAll(() => {
 test('mirrors parent and child execution across completion, replay, and responsive layouts', async ({ page }) => {
   await page.goto(`${BASE}/#${SESSION_ID}`)
   await expect(page.getByText('Ready for deterministic bridge events.')).toBeVisible()
+  const health = await (await fetch(`${BASE}/api/health`)).json()
+  await expect(page.locator('html')).toHaveAttribute('data-build-version', health.version)
 
   const started = await postEvents([
     { type: 'agent_start' },
