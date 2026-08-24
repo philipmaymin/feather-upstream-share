@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 import { WebSocket } from 'ws'
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+const TEST_STATIC_OVERRIDE = fs.existsSync(path.join(REPO, 'static-test/index.html')) ? 'static-test' : 'static'
 const children = new Set()
 const tempRoots = new Set()
 
@@ -115,7 +116,7 @@ async function startServer(fx, readOnly) {
     env: {
       ...process.env, HOME: fx.home, FEATHER_STATE_DIR: fx.state, PORT: String(port),
       PATH: `${fx.bin}:${process.env.PATH}`, FEATHER_READ_ONLY: readOnly ? '1' : '0',
-      FEATHER_DEEPGRAM_API_KEY: '', STATIC_OVERRIDE: 'static-test',
+      FEATHER_DEEPGRAM_API_KEY: '', STATIC_OVERRIDE: TEST_STATIC_OVERRIDE,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
