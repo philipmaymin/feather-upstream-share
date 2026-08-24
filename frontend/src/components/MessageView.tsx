@@ -442,14 +442,18 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
   }
   if (block.type === 'tool_use') {
     const inp = block.input || {}
+    // OMP's native Read/Write tools use `path`; Claude uses `file_path`.
+    // Normalize both so native execution details remain inspectable and their
+    // local artifact paths get the same clickable Files preview treatment.
+    const filePath = inp.file_path || inp.path || ''
     const presented = toolPresentation(block.name || 'tool', inp)
     const name = presented.name
     const color = TOOL_COLORS[name] || '#999'
     const summary = presented.summary
     const genericInput = SPECIAL_TOOL_DETAILS.has(name) ? '' : toolInputText(inp)
     const pre = 'white-space:pre-wrap;font-size:10px;font-family:SF Mono,Menlo,monospace;padding:3px 0;max-height:160px;overflow:auto;margin:0;word-break:break-all;'
-    const isImageFile = (name === 'Read' || name === 'Write') && inp.file_path && IMAGE_EXTS.has(((inp.file_path as string).substring((inp.file_path as string).lastIndexOf('.')).toLowerCase()))
-    const imagePath = toolImagePath(block.name || '', inp) || (isImageFile ? inp.file_path as string : '')
+    const isImageFile = (name === 'Read' || name === 'Write') && filePath && IMAGE_EXTS.has((filePath.substring(filePath.lastIndexOf('.')).toLowerCase()))
+    const imagePath = toolImagePath(block.name || '', inp) || (isImageFile ? filePath : '')
     const hasDetail = SPECIAL_TOOL_DETAILS.has(name) || !!genericInput || !!imagePath
     const result = block.id ? getResult?.(block.id) : undefined
     return <>
@@ -471,7 +475,7 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
           {inp.prompt && <pre style={`${pre}color:#88c4ff`} ref={linkifyRef}>{(inp.prompt as string).slice(0, 800)}{(inp.prompt as string).length > 800 ? '...' : ''}</pre>}
         </>}
         {name === 'Grep' && inp.pattern && <pre style={`${pre}color:#c4a0c0`}>/{inp.pattern}/{inp.path ? ` in ${inp.path}` : ''}</pre>}
-        {name === 'Read' && inp.file_path && <pre style={`${pre}color:#88c4ff`} ref={linkifyRef}>{inp.file_path}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
+        {name === 'Read' && filePath && <pre style={`${pre}color:#88c4ff`} ref={linkifyRef}>{filePath}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
         {genericInput && <pre style={`${pre}color:#aaa`} ref={linkifyRef}>{genericInput}</pre>}
       </details>
       {imagePath && (() => {

@@ -81,7 +81,7 @@ test('puts OMP, Claude Code, and Codex on the Rooms home and hides pulse worker 
   await expect(page.getByTestId('background-work-status')).toContainText('all paused')
   await expect(page.getByText('pulse.md')).toHaveCount(0)
   await expect(page.getByText('Keep working: #instant-room')).toHaveCount(0)
-  await page.getByText('#instant-room', { exact: true }).click()
+  await page.locator('button:has-text("›")').click()
   await expect(page.getByRole('button', { name: '+ New OMP chat' })).toBeVisible()
   await page.getByText('Room options', { exact: true }).click()
   await expect(page.getByRole('button', { name: 'Claude Code', exact: true })).toBeVisible()
