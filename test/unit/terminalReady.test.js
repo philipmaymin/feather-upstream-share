@@ -13,9 +13,20 @@ describe('paneHasReadyPrompt', () => {
     assert.equal(paneHasReadyPrompt(pane, 'codex'), true)
   })
 
+  it('recognizes the OMP 18 composer after a resumed transcript', () => {
+    const pane = [
+      ' RESUME-CANARY-OK',
+      '',
+      '╭── π  > ⬢ GPT-5.6-Sol · ◕ xhigh > 🗑 /tmp > S0.05 ▶─◀ Reply with exactly RE… ──╮',
+      '╰─                                                                            ─╯',
+    ].join('\n')
+    assert.equal(paneHasReadyPrompt(pane, 'omp'), true)
+  })
+
   it('does not mistake another agent prompt for readiness', () => {
     assert.equal(paneHasReadyPrompt('› Run /review\n', 'claude'), false)
     assert.equal(paneHasReadyPrompt('❯\n', 'codex'), false)
+    assert.equal(paneHasReadyPrompt('❯\n', 'omp'), false)
   })
 
   it('ignores status-only panes', () => {
