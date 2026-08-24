@@ -81,11 +81,15 @@ test('mirrors parent and child execution across completion, replay, and responsi
   await expect(page.getByTestId('live-work-turn')).toHaveCount(0)
   expect(started.status).toBe(204)
 
-  const todo = page.getByTestId('omp-todo')
-  await expect(todo).toContainText('Todo · 1/2')
-  await expect(todo).toContainText('Verify child inspector')
-  expect(await todo.evaluate(element => getComputedStyle(element).position)).toBe('sticky')
-  expect(await todo.evaluate(element => element.getBoundingClientRect().height <= window.innerHeight * 0.31)).toBe(true)
+  await expect(page.getByTestId('omp-todo')).toHaveCount(0)
+  const promptsTab = page.getByRole('button', { name: 'Prompts', exact: true })
+  const todosTab = page.getByRole('button', { name: /Todos 1\/2/ })
+  await expect(todosTab).toBeVisible()
+  expect(await promptsTab.evaluate((prompts, todos) => !!(prompts.compareDocumentPosition(todos) & Node.DOCUMENT_POSITION_FOLLOWING), await todosTab.elementHandle())).toBe(true)
+  await todosTab.click()
+  await expect(page.getByTestId('todos-panel')).toContainText('Verify child inspector')
+  await expect(page.getByTestId('todos-panel')).toContainText('1/2')
+  await page.getByRole('button', { name: 'Chat', exact: true }).click()
 
   const parentExecution = page.getByTestId('omp-parent-execution')
   await expect(parentExecution).toBeVisible()
@@ -96,7 +100,18 @@ test('mirrors parent and child execution across completion, replay, and responsi
   await expect(parentExecution).toContainText('Reading parent bridge state')
   await parentExecution.getByTestId('omp-tool-card').click()
   await expect(parentExecution).toContainText('Parent state is arriving.')
+  await expect(page.getByTestId('assistant-stream')).toContainText('The parent is inspecting the bridge.')
+  expect(await page.evaluate(() => {
+    const execution = document.querySelector('[data-testid="omp-parent-execution"]')
+    const answer = document.querySelector('[data-testid="assistant-stream"]')
+    return !!execution && !!answer && !!(execution.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING)
+  })).toBe(true)
 
+  await expect(page.getByTestId('omp-subagents')).toBeHidden()
+  const agentsTab = page.getByRole('button', { name: /Agents 1/ })
+  await expect(agentsTab).toBeVisible()
+  await agentsTab.click()
+  await expect(page.getByTestId('agents-panel')).toBeVisible()
   const childCard = page.getByTestId('omp-subagent-child-1')
   await expect(childCard).toContainText('scout')
   await childCard.click()
@@ -109,6 +124,7 @@ test('mirrors parent and child execution across completion, replay, and responsi
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   await expect(inspector.getByTestId('omp-subagent-answer')).toContainText('Child answer is arriving.')
   await page.screenshot({ path: '/tmp/feather-omp-mirror-mobile.png', fullPage: false })
+  await page.getByRole('button', { name: 'Chat', exact: true }).click()
 
   const completed = await postEvents([
     { type: 'tool_execution_end', toolCallId: 'parent-read', toolName: 'read', result: 'Parent state complete.', isError: false },
@@ -126,10 +142,12 @@ test('mirrors parent and child execution across completion, replay, and responsi
   await expect(parentExecution.getByTestId('omp-tool-card')).toHaveCount(1)
   await expect(parentExecution.getByTestId('omp-tool-card')).toHaveAttribute('data-status', 'success')
   await expect(parentExecution).toContainText('Success')
+  await page.getByRole('button', { name: /Agents 1/ }).click()
   await expect(childCard).toContainText('Success')
   await expect(inspector).toContainText('12s')
   await expect(inspector).toContainText('840 tokens')
   await expect(inspector.getByTestId('omp-subagent-answer')).toContainText('Child answer is complete.')
+  await page.getByRole('button', { name: 'Chat', exact: true }).click()
 
   writeLine({
     type: 'assistant', uuid: `native-stream-final-${Date.now()}`, timestamp: new Date().toISOString(), isSidechain: false, isMeta: false,
@@ -137,9 +155,18 @@ test('mirrors parent and child execution across completion, replay, and responsi
   })
   await expect(page.getByText('The mirrored run is complete.')).toBeVisible()
   await expect(page.getByTestId('assistant-stream')).toHaveCount(0)
+  expect(await page.evaluate(() => {
+    const execution = document.querySelector('[data-testid="omp-parent-execution"]')
+    const answer = [...document.querySelectorAll('.asst-bubble')].find(element => element.textContent?.includes('The mirrored run is complete.'))
+    return !!execution && !!answer && !!(execution.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING)
+  })).toBe(true)
+
   await page.reload()
-  await expect(page.getByTestId('omp-todo')).toContainText('Verify child inspector')
+  await page.getByRole('button', { name: /Todos 1\/2/ }).click()
+  await expect(page.getByTestId('todos-panel')).toContainText('Verify child inspector')
+  await page.getByRole('button', { name: 'Chat', exact: true }).click()
   await expect(page.getByTestId('omp-parent-execution')).toContainText('Reading parent bridge state')
+  await page.getByRole('button', { name: /Agents 1/ }).click()
   await page.getByTestId('omp-subagent-child-1').click()
   await expect(page.getByTestId('omp-subagent-inspector')).toContainText('Inspect nested bridge events')
   await page.getByTestId('omp-subagent-inspector').getByTestId('omp-tool-card').click()

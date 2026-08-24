@@ -860,6 +860,7 @@ type MessageViewProps = {
   subagents?: OmpSubagentState[]
   jobs?: MessageViewJob[]
   runtime?: MessageViewRuntime | null
+  standaloneAgents?: boolean
   scrollRefCb?: (el: HTMLDivElement) => void
   sessionId?: string | null
 }
@@ -1192,6 +1193,11 @@ export function MessageView(props: MessageViewProps) {
       && message.content.filter(block => block.type === 'tool_result').every(block => !!block.tool_use_id && toolUseIds().has(block.tool_use_id))
   }
   const renderItems = createMemo(() => buildRenderItems(props.messages, isPureToolResultMsg))
+  const workAttachedToAnswer = createMemo(() => {
+    if ((props.work?.timeline.length || 0) === 0) return false
+    const latest = renderItems().at(-1)
+    return !!latest && latest.kind !== 'chain' && latest.msg.role === 'assistant'
+  })
 
   function renderWorkLog(messages: Message[]) {
     // buildRenderItems returns fresh wrapper objects as a turn grows. Native
@@ -1250,7 +1256,7 @@ export function MessageView(props: MessageViewProps) {
     const workLogMessages = inlineTraceBlocks.length > 0 ? [...trace, { ...msg, content: inlineTraceBlocks }] : trace
 
     return <div style={{ display: 'flex', 'flex-direction': 'column', 'align-items': msg.role === 'user' ? 'flex-end' : 'flex-start', 'margin-bottom': '10px' }}>
-      <div data-uuid={msg.uuid} data-role={msg.role} style={{
+      <div class={msg.role === 'assistant' ? 'asst-bubble' : undefined} data-uuid={msg.uuid} data-role={msg.role} style={{
         'max-width': '85%', padding: hasAttachments ? '6px' : '10px 14px',
         'border-radius': msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
         background: msg.role === 'user' ? 'rgba(74,186,106,0.15)' : '#1a1a2e',
@@ -1348,7 +1354,7 @@ export function MessageView(props: MessageViewProps) {
   }
 
   return (
-    <div style={{ position: 'relative', height: '100%' }}>
+    <div class={props.standaloneAgents ? 'agents-hub-view' : undefined} style={{ position: 'relative', height: '100%' }}>
     <div ref={(el) => { scrollRef = el; props.scrollRefCb?.(el) }} onScroll={onScroll} style={{ height: '100%', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', 'overscroll-behavior': 'contain', padding: '16px', 'padding-bottom': '80px' }}>
       <style>{markdownCSS}</style>
       <Show when={expandedTable()}>
@@ -1392,23 +1398,23 @@ export function MessageView(props: MessageViewProps) {
       <Show when={actionMenu()}>
         <div onClick={() => setActionMenu(null)} style={{ position: 'fixed', inset: '0', 'z-index': '90' }} />
       </Show>
-      <Show when={props.todo}>
-        {renderTodo(() => props.todo!, 'omp-todo', true)}
-      </Show>
-
       <For each={renderItems()}>{(item) => {
         // The live OMP mirror is the authoritative view of the current turn.
         // Do not show the same legacy transcript trace again in Details.
         const mirroredCurrentTurn = (props.work?.timeline.length || 0) > 0 && item === renderItems().at(-1)
-        if (item.kind === 'msg') return renderMsg(item.msg, [], mirroredCurrentTurn)
-        if (item.kind === 'turn') return renderMsg(item.msg, mirroredCurrentTurn ? [] : item.trace, mirroredCurrentTurn)
+        if (item.kind === 'msg') return mirroredCurrentTurn && item.msg.role === 'assistant'
+          ? <>{renderExecutionTimeline(() => props.work!, 'omp-parent-execution')}{renderMsg(item.msg, [], true)}</>
+          : renderMsg(item.msg)
+        if (item.kind === 'turn') return mirroredCurrentTurn && item.msg.role === 'assistant'
+          ? <>{renderExecutionTimeline(() => props.work!, 'omp-parent-execution')}{renderMsg(item.msg, [], true)}</>
+          : renderMsg(item.msg, item.trace)
         if (mirroredCurrentTurn) return null
         // Keep an unfinished or failed trace reachable even before a final
         // answer arrives; it stays collapsed so it does not dominate chat.
         const isLiveWork = props.working && item === renderItems().at(-1)
         return <div data-testid={isLiveWork ? 'live-work-turn' : undefined} style={{ margin: '4px 0 10px', 'max-width': '85%' }}>{renderWorkLog(item.messages)}</div>
       }}</For>
-      <Show when={(props.work?.timeline.length || 0) > 0}>
+      <Show when={(props.work?.timeline.length || 0) > 0 && !workAttachedToAnswer()}>
         {renderExecutionTimeline(() => props.work!, 'omp-parent-execution')}
       </Show>
 

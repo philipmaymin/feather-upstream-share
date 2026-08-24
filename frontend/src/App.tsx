@@ -180,7 +180,7 @@ export default function App() {
   const [creating, setCreating] = createSignal(false)
   const [resumingId, setResumingId] = createSignal<string | null>(null)
   const [text, setText] = createSignal('')
-  const [tab, setTab] = createSignal<'chat' | 'prompts' | 'updates' | 'files' | 'terminal'>('chat')
+  const [tab, setTab] = createSignal<'chat' | 'prompts' | 'todos' | 'agents' | 'updates' | 'files' | 'terminal'>('chat')
   const [updatesList, setUpdatesList] = createSignal<RoomUpdate[]>([])
   const [updatesLoading, setUpdatesLoading] = createSignal(false)
   const [updatesError, setUpdatesError] = createSignal<string | null>(null)
@@ -1612,6 +1612,8 @@ export default function App() {
   // traffic, not prompts, so include only messages with non-empty text blocks.
   const userPrompts = () => messages().filter(message => message.role === 'user' &&
     (message.content || []).some(block => block.type === 'text' && (block.text || '').trim()))
+  const activeTodo = () => ompMirror().parent.todo || todoSnapshot()
+  const activeSubagents = () => ompMirror().childOrder.map(id => ompMirror().children[id]).filter(Boolean)
   const promptText = (message: Message) => (message.content || [])
     .filter(block => block.type === 'text').map(block => block.text || '').join('\n').trim()
   const formatFeedTime = (timestamp: string | null | undefined) => {
@@ -2012,6 +2014,8 @@ export default function App() {
           <div style={{ display: 'flex', 'align-items': 'center', 'border-bottom': '1px solid #1e1e1e', 'padding-left': '16px', 'flex-shrink': '0', 'overflow-x': 'auto', 'scrollbar-width': 'none', '-webkit-overflow-scrolling': 'touch' }}>
             <button onClick={() => setTab('chat')} style={tabStyle('chat')}>Chat</button>
             <button onClick={() => setTab('prompts')} style={tabStyle('prompts')}>Prompts</button>
+            <button onClick={() => setTab('todos')} style={tabStyle('todos')}>Todos<Show when={activeTodo()}>{` ${activeTodo()!.completed}/${activeTodo()!.total}`}</Show></button>
+            <button onClick={() => setTab('agents')} style={tabStyle('agents')}>Agents<Show when={activeSubagents().length}>{` ${activeSubagents().length}`}</Show></button>
             <button onClick={() => setTab('updates')} style={tabStyle('updates')}>Updates</button>
             <button onClick={() => { setTab('files'); if (!browseDir()) openFileBrowser() }} style={tabStyle('files')}>Files{touchedFiles().length > 0 ? ` (${touchedFiles().length})` : ''}</button>
             <button onClick={() => setTab('terminal')} style={tabStyle('terminal')}>Terminal</button>
@@ -2056,12 +2060,11 @@ export default function App() {
                 intentHistory={toolIntentHistory()}
                 assistantStream={assistantStream()}
                 work={ompMirror().parent}
-                todo={ompMirror().parent.todo || todoSnapshot()}
                 notice={ompNotice()}
                 approval={ompApproval()}
-                subagents={ompMirror().childOrder.map(id => ompMirror().children[id]).filter(Boolean)}
-                jobs={ompJobs()}
-                runtime={ompRuntime()}
+                subagents={[]}
+                jobs={[]}
+                runtime={null}
                 scrollRefCb={(el) => { messageScrollRef = el }}
                 sessionId={loadedSessionId()}
               />
@@ -2194,6 +2197,42 @@ export default function App() {
                   )}
                 </For>
               </div>
+            </div>
+            <div data-testid="todos-panel" style={{ display: tab() === 'todos' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>
+              <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '14px 16px 28px' }}>
+                <div style={{ 'max-width': '760px', margin: '0 auto' }}>
+                  <Show when={activeTodo()} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '16px 4px' }}>No Todo list in this chat yet.</div>}>
+                    {(todo) => <>
+                      <div style={{ display: 'flex', 'align-items': 'baseline', 'justify-content': 'space-between', gap: '12px', 'margin-bottom': '14px' }}>
+                        <div>
+                          <div style={{ color: '#e5e5e5', 'font-size': '18px', 'font-weight': '700' }}>Todos</div>
+                          <Show when={todo().active}><div style={{ color: '#999', 'font-size': '12px', 'margin-top': '3px' }}>Current · {todo().active}</div></Show>
+                        </div>
+                        <span style={{ color: todo().completed === todo().total ? '#4aba6a' : '#999', 'font-size': '12px', 'font-weight': '700', 'font-family': "'SF Mono', Menlo, monospace" }}>{todo().completed}/{todo().total}</span>
+                      </div>
+                      <For each={todo().phases}>{(phase) => (
+                        <section style={{ 'margin-bottom': '12px', padding: '12px 14px', background: '#11151c', border: '1px solid #292936', 'border-radius': '10px' }}>
+                          <div style={{ color: '#888', 'font-size': '10px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.07em', 'margin-bottom': '7px' }}>{phase.name}</div>
+                          <For each={phase.tasks}>{(task) => (
+                            <div style={{ display: 'flex', gap: '9px', padding: '5px 0', color: task.status === 'completed' ? '#777' : task.status === 'in_progress' ? '#e5e5e5' : '#aaa', 'font-size': '13px', 'line-height': '1.4', 'text-decoration': task.status === 'abandoned' ? 'line-through' : 'none' }}>
+                              <span style={{ color: task.status === 'completed' ? '#4aba6a' : task.status === 'in_progress' ? '#73b8ff' : task.status === 'blocked' ? '#d8a13b' : '#666', width: '14px', 'flex-shrink': '0', 'font-weight': '700' }}>{task.status === 'completed' ? '✓' : task.status === 'in_progress' ? '●' : task.status === 'blocked' ? '!' : task.status === 'abandoned' ? '×' : '○'}</span>
+                              <span style={{ 'min-width': '0', 'word-break': 'break-word' }}>
+                                {task.content}
+                                <Show when={task.blocker}><span style={{ display: 'block', color: '#d8a13b', 'font-size': '11px', 'margin-top': '2px' }}>{task.blocker}</span></Show>
+                              </span>
+                            </div>
+                          )}</For>
+                        </section>
+                      )}</For>
+                    </>}
+                  </Show>
+                </div>
+              </div>
+            </div>
+            <div data-testid="agents-panel" style={{ display: tab() === 'agents' ? 'block' : 'none', height: '100%', overflow: 'hidden' }}>
+              <Show when={activeSubagents().length > 0 || ompJobs().length > 0 || ompRuntime()} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '30px 20px', 'text-align': 'center' }}>No delegated agents or background jobs in this chat yet.</div>}>
+                <MessageView messages={[]} loading={false} subagents={activeSubagents()} jobs={ompJobs()} runtime={ompRuntime()} standaloneAgents />
+              </Show>
             </div>
             <div data-testid="updates-panel" style={{ display: tab() === 'updates' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>
               <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '12px 16px 24px' }}>
