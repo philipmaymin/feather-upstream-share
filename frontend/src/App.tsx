@@ -624,7 +624,26 @@ export default function App() {
       try {
         const r = await fetch(appUrl('/api/version'))
         if (!r.ok) return
-        const { stagingJs, changes } = await r.json()
+        const { stagingJs, activeJs, changes } = await r.json()
+        // A resident mobile/PWA bundle can survive a deployment indefinitely.
+        // Reload once when the *active* immutable asset advances. Do not react
+        // to stagingJs here: candidates are built and tested before promotion.
+        if (activeJs && currentJsFile && activeJs !== currentJsFile) {
+          const reloadKey = `feather:asset-reload:${activeJs}`
+          try {
+            if (sessionStorage.getItem(reloadKey) !== '1') {
+              sessionStorage.setItem(reloadKey, '1')
+              location.reload()
+              return
+            }
+            console.warn(`Feather bundle ${currentJsFile} still differs from active ${activeJs}; suppressing reload loop`)
+          } catch {
+            // If storage is unavailable, preserve a usable client and leave the
+            // explicit Update Available action as the recovery path.
+          }
+        } else if (activeJs) {
+          try { sessionStorage.removeItem(`feather:asset-reload:${activeJs}`) } catch {}
+        }
         if (stagingJs && currentJsFile && stagingJs !== currentJsFile) {
           setUpdateAvailable(true)
           if (changes) setUpdateChanges(changes)
