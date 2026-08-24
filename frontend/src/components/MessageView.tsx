@@ -895,6 +895,7 @@ export function MessageView(props: MessageViewProps) {
       && message.content.some(block => block.type === 'tool_result')
       && message.content.filter(block => block.type === 'tool_result').every(block => !!block.tool_use_id && toolUseIds().has(block.tool_use_id))
   }
+  const renderItems = createMemo(() => buildRenderItems(props.messages, isPureToolResultMsg))
 
   function renderWorkLog(messages: Message[]) {
     // buildRenderItems returns fresh wrapper objects as a turn grows. Native
@@ -1096,12 +1097,13 @@ export function MessageView(props: MessageViewProps) {
         <div onClick={() => setActionMenu(null)} style={{ position: 'fixed', inset: '0', 'z-index': '90' }} />
       </Show>
 
-      <For each={buildRenderItems(props.messages, isPureToolResultMsg)}>{(item) => {
+      <For each={renderItems()}>{(item) => {
         if (item.kind === 'msg') return renderMsg(item.msg)
         if (item.kind === 'turn') return renderMsg(item.msg, item.trace)
         // Keep an unfinished or failed trace reachable even before a final
         // answer arrives; it stays collapsed so it does not dominate chat.
-        return <div style={{ margin: '4px 0 10px', 'max-width': '85%' }}>{renderWorkLog(item.messages)}</div>
+        const isLiveWork = props.working && item === renderItems().at(-1)
+        return <div data-testid={isLiveWork ? 'live-work-turn' : undefined} style={{ margin: '4px 0 10px', 'max-width': '85%' }}>{renderWorkLog(item.messages)}</div>
       }}</For>
 
       <Show when={props.approval}>

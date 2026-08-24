@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { ompSessionCwdFromHead, ompSessionIdFromHead, ompTurnBoundaryFromLine } from '../../lib/omp-session.js'
 
 const roots = []
@@ -55,6 +56,10 @@ describe('safe OMP resume', () => {
     const goodFeatherId = 'resume-good-feather-id'
     const goodDir = path.join(home, '.feather/omp-sessions', goodFeatherId)
     fs.mkdirSync(goodDir)
+    const tokenDir = path.join(home, '.feather/omp-sessions/.feather-bridge-tokens')
+    fs.mkdirSync(tokenDir, { recursive: true })
+    const staleTokenName = createHash('sha256').update(goodFeatherId).digest('hex')
+    fs.writeFileSync(path.join(tokenDir, staleTokenName), 'stale-token')
     const goodPath = path.join(goodDir, '2026-08-23_good.jsonl')
     fs.writeFileSync(goodPath, [
       JSON.stringify({ type: 'title', title: 'Mutable title before session' }),
@@ -104,6 +109,25 @@ exit 0
     assert.match(migratedLog, /--extension .*feather-bridge\.js/, stderr)
     assert.match(migratedLog, /--resume .*omp-exact-resume-id/, stderr)
     assert.match(migratedLog, /-c \/tmp\/project/, 'automatic migration must preserve the recorded cwd')
+    const discoveredBridge = path.join(home, '.omp/agent/extensions/feather-bridge.js')
+    assert.equal(fs.lstatSync(discoveredBridge).isSymbolicLink(), true)
+    assert.match(fs.realpathSync(discoveredBridge), /omp-extensions\/feather-bridge\.js$/)
+    const storedBridge = JSON.parse(fs.readFileSync(path.join(goodDir, '.feather-bridge.json'), 'utf8'))
+    assert.equal(storedBridge.sessionId, goodFeatherId)
+    assert.notEqual(storedBridge.token, 'stale-token')
+    const bridgeAlive = await fetch(`${base}/api/internal/sessions/${goodFeatherId}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Feather-Bridge-Token': storedBridge.token },
+      body: JSON.stringify({ events: [{ type: 'agent_start' }] }),
+    })
+    assert.equal(bridgeAlive.status, 204)
+    const logBeforeLiveFinal = fs.readFileSync(tmuxLog, 'utf8')
+    fs.appendFileSync(goodPath, JSON.stringify({
+      type: 'message',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'still live' }], stopReason: 'stop' },
+    }) + '\n')
+    await new Promise(resolve => setTimeout(resolve, 1800))
+    assert.equal(fs.readFileSync(tmuxLog, 'utf8'), logBeforeLiveFinal, 'a live bridge must not trigger another migration')
 
 
     const good = await fetch(`${base}/api/sessions/${goodFeatherId}/resume`, {

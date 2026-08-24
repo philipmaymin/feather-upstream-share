@@ -1,5 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import featherBridgeExtension from '../../omp-extensions/feather-bridge.js'
 
 const BRIDGE_URL = 'http://feather.test/api/internal/sessions/session-1/events'
@@ -118,6 +121,44 @@ async function settleDeliveryQueue() {
 }
 
 describe('Feather OMP bridge extension', () => {
+  it('loads per-session bridge config when OMP strips launch environment variables', async (t) => {
+    const previousEnv = {
+      url: process.env.FEATHER_BRIDGE_URL,
+      token: process.env.FEATHER_BRIDGE_TOKEN,
+      sessionId: process.env.FEATHER_SESSION_ID,
+    }
+    const previousArgv = [...process.argv]
+    const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-bridge-config-'))
+    fs.writeFileSync(path.join(sessionDir, '.feather-bridge.json'), JSON.stringify({
+      url: BRIDGE_URL, token: 'stored-secret', sessionId: 'session-1',
+    }))
+    delete process.env.FEATHER_BRIDGE_URL
+    delete process.env.FEATHER_BRIDGE_TOKEN
+    delete process.env.FEATHER_SESSION_ID
+    process.argv.push('--session-dir', sessionDir)
+    const requests = []
+    t.mock.method(globalThis, 'fetch', async (...args) => {
+      requests.push(parseRequest(...args))
+      return { ok: true, status: 200 }
+    })
+    t.after(() => {
+      restoreEnv('FEATHER_BRIDGE_URL', previousEnv.url)
+      restoreEnv('FEATHER_BRIDGE_TOKEN', previousEnv.token)
+      restoreEnv('FEATHER_SESSION_ID', previousEnv.sessionId)
+      process.argv.splice(0, process.argv.length, ...previousArgv)
+      fs.rmSync(sessionDir, { recursive: true, force: true })
+    })
+
+    const harness = createHarness()
+    featherBridgeExtension(harness.pi)
+    harness.emit('agent_start', { type: 'agent_start' })
+    await settleDeliveryQueue()
+
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0].url, BRIDGE_URL)
+    assert.equal(requests[0].options.headers['X-Feather-Bridge-Token'], 'stored-secret')
+  })
+
   it('sends throttled full-text snapshots without leaking thinking', async (t) => {
     const requests = []
     installRuntime(t, async (...args) => {

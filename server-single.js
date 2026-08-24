@@ -93,6 +93,8 @@ const OMP_SESSIONS = STATE_PATHS.harness.ompSessionsDir;
 const OMP_BRIDGE_EXTENSION = path.join(import.meta.dirname, 'omp-extensions', 'feather-bridge.js');
 const OMP_BRIDGE_TOKENS_DIR = path.join(OMP_SESSIONS, '.feather-bridge-tokens');
 const ompBridgeTokens = new Map();
+const ompBridgeLastSeen = new Map();
+const OMP_DISCOVERED_BRIDGE = path.join(HOME, '.omp/agent/extensions/feather-bridge.js');
 const OMP_BRIDGE_EVENT_TYPES = Object.freeze({
   assistant_snapshot: true,
   assistant_end: true,
@@ -586,13 +588,21 @@ function spawnTmuxOmp(name, ompArgs, dir, options = {}) {
   try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
   const sessionId = options.sessionId || name.replace(/^f-/, '');
   const bridgeToken = randomUUID();
+  const bridgeUrl = `http://127.0.0.1:${PORT}/api/internal/sessions/${sessionId}/events`;
   ompBridgeTokens.set(sessionId, bridgeToken);
+  ompBridgeLastSeen.delete(sessionId);
+  ensureOmpBridgeDiscovery();
   fs.mkdirSync(OMP_BRIDGE_TOKENS_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(ompBridgeTokenPath(sessionId), bridgeToken, { mode: 0o600 });
+  const sessionDir = path.join(OMP_SESSIONS, sessionId);
+  fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(sessionDir, '.feather-bridge.json'), JSON.stringify({
+    url: bridgeUrl, token: bridgeToken, sessionId,
+  }), { mode: 0o600 });
   const extensionArg = ` --extension ${shellQuote(OMP_BRIDGE_EXTENSION)}`;
   const launch = ompLaunchCommand(`${ompArgs}${extensionArg}`, OMP_MODEL, OMP_THINKING, options);
   const ompCmd = [
-    `export FEATHER_BRIDGE_URL=${shellQuote(`http://127.0.0.1:${PORT}/api/internal/sessions/${sessionId}/events`)}`,
+    `export FEATHER_BRIDGE_URL=${shellQuote(bridgeUrl)}`,
     `FEATHER_BRIDGE_TOKEN=${shellQuote(bridgeToken)}`,
     `FEATHER_SESSION_ID=${shellQuote(sessionId)}`,
     `; ${launch}`,
@@ -610,6 +620,20 @@ function shellQuote(value) {
 function ompBridgeTokenPath(sessionId) {
   const file = createHash('sha256').update(String(sessionId)).digest('hex');
   return path.join(OMP_BRIDGE_TOKENS_DIR, file);
+}
+
+function ensureOmpBridgeDiscovery() {
+  fs.mkdirSync(path.dirname(OMP_DISCOVERED_BRIDGE), { recursive: true, mode: 0o700 });
+  try {
+    const stat = fs.lstatSync(OMP_DISCOVERED_BRIDGE);
+    if (stat.isSymbolicLink()
+      && path.resolve(path.dirname(OMP_DISCOVERED_BRIDGE), fs.readlinkSync(OMP_DISCOVERED_BRIDGE)) === OMP_BRIDGE_EXTENSION) return;
+    console.warn(`[omp bridge] discovery path is occupied: ${OMP_DISCOVERED_BRIDGE}`);
+    return;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  fs.symlinkSync(OMP_BRIDGE_EXTENSION, OMP_DISCOVERED_BRIDGE);
 }
 
 // Codex doesn't accept a preset session id. We snapshot existing rollout files,
@@ -1543,10 +1567,9 @@ const fileOffsets = new Map();
 const watchedDirs = new Set();
 const pendingOmpBridgeMigrations = new Map();
 
-function ompBridgeConfigured(sessionId) {
-  if (ompBridgeTokens.has(sessionId)) return true;
-  try { return !!fs.readFileSync(ompBridgeTokenPath(sessionId), 'utf8').trim(); }
-  catch { return false; }
+function ompBridgeIsLive(sessionId, now = Date.now()) {
+  const lastSeen = ompBridgeLastSeen.get(sessionId);
+  return Number.isFinite(lastSeen) && now - lastSeen < 30_000;
 }
 
 function cancelOmpBridgeMigration(sessionId) {
@@ -1564,10 +1587,10 @@ function observeOmpTurnBoundary(sessionId, line) {
     return;
   }
   if (getAgentForSession(sessionId) !== 'omp') return;
-  if (ompBridgeConfigured(sessionId) || !tmuxIsActive(sessionId) || pendingOmpBridgeMigrations.has(sessionId)) return;
+  if (ompBridgeIsLive(sessionId) || !tmuxIsActive(sessionId) || pendingOmpBridgeMigrations.has(sessionId)) return;
   const timer = setTimeout(() => {
     pendingOmpBridgeMigrations.delete(sessionId);
-    if (ompBridgeConfigured(sessionId) || !tmuxIsActive(sessionId) || getAgentForSession(sessionId) !== 'omp') return;
+    if (ompBridgeIsLive(sessionId) || !tmuxIsActive(sessionId) || getAgentForSession(sessionId) !== 'omp') return;
     try {
       spawnOrResume(sessionId, getOmpSessionCwd(sessionId), true, 'omp');
       console.log(`[omp bridge] migrated completed session ${sessionId}`);
@@ -2008,6 +2031,7 @@ app.post('/api/internal/sessions/:id/events', (req, res) => {
   if (!Array.isArray(events) || events.length === 0 || events.length > 50) return res.status(400).json({ error: 'events must be a non-empty array (max 50)' });
   const normalized = events.map(normalizeOmpBridgeEvent);
   if (normalized.some(event => event === null)) return res.status(400).json({ error: 'invalid bridge event' });
+  ompBridgeLastSeen.set(id, Date.now());
   for (const event of normalized) broadcastNamedEvent(id, 'omp_event', event);
   res.status(204).end();
 });
@@ -3068,6 +3092,7 @@ app.post('/api/sessions/:id/delete', (req, res) => {
       return next;
     });
     ompBridgeTokens.delete(id);
+    ompBridgeLastSeen.delete(id);
     try { fs.unlinkSync(ompBridgeTokenPath(id)); } catch {}
     sseClients.delete(id);
     fileOffsets.delete(id);

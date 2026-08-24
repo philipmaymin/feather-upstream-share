@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 
 const SNAPSHOT_INTERVAL_MS = 50
 
@@ -19,11 +21,23 @@ function hasToolCall(message) {
     message.content.some((part) => part?.type === 'toolCall')
 }
 
-function bridgeConfig(env) {
+function bridgeConfig(env, argv = process.argv) {
   const url = env.FEATHER_BRIDGE_URL?.trim()
   const token = env.FEATHER_BRIDGE_TOKEN?.trim()
   const sessionId = env.FEATHER_SESSION_ID?.trim()
-  return url && token && sessionId ? { url, token, sessionId } : null
+  if (url && token && sessionId) return { url, token, sessionId }
+
+  const sessionDirIndex = argv.indexOf('--session-dir')
+  const sessionDir = sessionDirIndex >= 0 ? argv[sessionDirIndex + 1] : null
+  if (!sessionDir) return null
+  try {
+    const stored = JSON.parse(readFileSync(path.join(sessionDir, '.feather-bridge.json'), 'utf8'))
+    return typeof stored?.url === 'string' && typeof stored?.token === 'string' && typeof stored?.sessionId === 'string'
+      ? { url: stored.url, token: stored.token, sessionId: stored.sessionId }
+      : null
+  } catch {
+    return null
+  }
 }
 
 function todoDetails(message) {

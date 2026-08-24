@@ -547,6 +547,9 @@ test.describe('Live updates', () => {
     })
     const firstStatus = page.getByRole('status').filter({ hasText: 'Inspecting upload recovery.' })
     await expect(firstStatus).toBeVisible({ timeout: 10000 })
+    const liveWork = page.getByTestId('live-work-turn')
+    await expect(liveWork).toBeVisible()
+    await expect(liveWork.getByTestId('work-log-summary')).toContainText('Details')
 
     writeLine({
       type: 'assistant', uuid: `e2e-status-2-${Date.now()}`, timestamp: '2025-06-15T14:06:05Z',
@@ -556,8 +559,10 @@ test.describe('Live updates', () => {
         content: [{ type: 'tool_use', id: 'status-tool-2', name: 'bash', input: { command: 'npm test' }, intent: 'Testing the repaired upload.' }],
       },
     })
-    await expect(page.getByRole('status').filter({ hasText: 'Testing the repaired upload.' })).toBeVisible({ timeout: 10000 })
-    await expect(firstStatus).not.toBeVisible()
+    const currentStatus = page.getByRole('status').filter({ hasText: 'Testing the repaired upload.' })
+    await expect(currentStatus).toBeVisible({ timeout: 10000 })
+    await expect(currentStatus.locator('summary')).toContainText('Testing the repaired upload.')
+    await expect(currentStatus.locator('summary')).not.toContainText('Inspecting upload recovery.')
 
     writeLine({
       type: 'assistant', uuid: `e2e-status-final-${Date.now()}`, timestamp: '2025-06-15T14:06:10Z',
@@ -566,6 +571,9 @@ test.describe('Live updates', () => {
     })
     await expect(page.getByText('Status lifecycle complete.')).toBeVisible({ timeout: 10000 })
     await expect(page.getByRole('status').filter({ hasText: 'Testing the repaired upload.' })).not.toBeVisible()
+    await expect(liveWork).toHaveCount(0)
+    const finalBubble = page.locator('[data-role="assistant"]').filter({ hasText: 'Status lifecycle complete.' })
+    await expect(finalBubble.getByTestId('work-log-summary')).toBeVisible()
   })
 })
 
