@@ -288,6 +288,16 @@ test.describe('Message rendering', () => {
     await expect(detail).toContainText('markdown pipeline')
   })
 
+  test('Details precedes the final answer in chronological turn order', async ({ page }) => {
+    const bubble = page.locator('.asst-bubble').filter({ hasText: 'Feather uses marked with GFM support.' }).first()
+    const chronological = await bubble.evaluate(element => {
+      const details = element.querySelector('.work-log')
+      const answer = [...element.querySelectorAll('.markdown')].find(node => node.textContent?.includes('Feather uses marked with GFM support.'))
+      return !!(details && answer && (details.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING))
+    })
+    expect(chronological).toBe(true)
+  })
+
   test('tool_use block is preserved inside Details', async ({ page }) => {
     await page.getByTestId('work-log-summary').filter({ hasText: 'issue' }).click()
     const toolUse = page.locator('text=Read').first()

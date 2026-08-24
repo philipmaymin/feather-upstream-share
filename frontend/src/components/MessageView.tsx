@@ -624,7 +624,7 @@ const markdownCSS = `
 .markdown strong { font-weight: 600; }
 
 /* Execution details: quiet at rest, full fidelity on demand */
-.work-log { width: 100%; margin-top: 3px; }
+.work-log { width: 100%; margin: 0 0 4px; }
 .work-log > summary::-webkit-details-marker { display: none; }
 .work-log-summary { display: flex; align-items: center; gap: 5px; width: max-content; min-height: 28px; padding: 0 2px; border: none; background: transparent; color: #666; font-size: 11px; cursor: pointer; list-style: none; user-select: none; transition: color 120ms ease; }
 .work-log-summary:hover { color: #999; }
@@ -950,6 +950,7 @@ export function MessageView(props: MessageViewProps) {
           </a>
         )}</For>
         <div style={hasAttachments ? { padding: '4px 8px 4px' } : {}}>
+          <Show when={msg.role === 'assistant' && workLogMessages.length > 0}>{renderWorkLog(workLogMessages)}</Show>
           <For each={msg.content}>{(block) => {
             if (msg.role === 'assistant' && (block.type === 'thinking' || block.type === 'tool_result' || (block.type === 'tool_use' && !isQuestionBlock(block)))) return null
             if (block.type === 'text' && block.text) {
@@ -991,7 +992,6 @@ export function MessageView(props: MessageViewProps) {
             }
             return renderBlock(block, (src) => setLightbox(src), openExpandedTable)
           }}</For>
-          <Show when={msg.role === 'assistant' && workLogMessages.length > 0}>{renderWorkLog(workLogMessages)}</Show>
         </div>
       </div>
       <div style={{ display: 'flex', 'align-items': 'center', gap: '4px', 'margin-top': '4px', padding: '0 4px', 'justify-content': msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
