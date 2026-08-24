@@ -318,7 +318,16 @@ export function Terminal(props: { sessionId: string | null }) {
     let connectedOnce = false
     const openSocket = () => {
       if (generation !== connectionGeneration || term !== activeTerm) return
-      const socket = new WebSocket(`${BASE_WS}?session=${sessionId}`)
+      // Attach tmux at the browser's real dimensions from the first byte.
+      // Attaching at the old 120x30 default and resizing a moment later makes
+      // full-screen TUIs such as OMP repaint a long transcript into the PTY.
+      const params = new URLSearchParams({ session: sessionId })
+      const initialDims = fitAddon?.proposeDimensions()
+      if (initialDims) {
+        params.set('cols', String(initialDims.cols))
+        params.set('rows', String(initialDims.rows))
+      }
+      const socket = new WebSocket(`${BASE_WS}?${params}`)
       let socketOpened = false
       ws = socket
       socket.onmessage = (e) => {

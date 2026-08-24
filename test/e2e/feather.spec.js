@@ -67,6 +67,30 @@ test.beforeAll(() => {
     },
   })
   writeLine({
+    type: 'assistant', uuid: 'e2e-msg-005a', timestamp: '2025-06-15T14:00:20Z',
+    isSidechain: false, isMeta: false,
+    message: {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'I found the mismatch and am checking one last source.' },
+        { type: 'tool_use', id: 'tool_mixed', name: 'Read', input: { file_path: '/src/final-check.ts' } },
+      ],
+    },
+  })
+  writeLine({
+    type: 'assistant', uuid: 'e2e-msg-005b', timestamp: '2025-06-15T14:00:22Z',
+    isSidechain: false, isMeta: false,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'tool_result', tool_use_id: 'tool_mixed', content: 'export const verified = true', is_error: false }],
+    },
+  })
+  writeLine({
+    type: 'assistant', uuid: 'e2e-msg-005c', timestamp: '2025-06-15T14:00:25Z',
+    isSidechain: false, isMeta: false,
+    message: { role: 'assistant', content: [{ type: 'text', text: 'The implementation is now verified.' }] },
+  })
+  writeLine({
     type: 'user', uuid: 'e2e-msg-006', timestamp: '2025-06-15T14:01:00Z',
     isSidechain: false, isMeta: false,
     message: { role: 'user', content: 'Thanks, that makes sense!' },
@@ -286,6 +310,14 @@ test.describe('Message rendering', () => {
     const detail = page.getByTestId('work-log-detail').first()
     await expect(detail).toContainText('1 execution step')
     await expect(detail).toContainText('markdown pipeline')
+  })
+
+  test('assistant text beside a tool call stays exposed outside Details', async ({ page }) => {
+    const progress = page.getByText('I found the mismatch and am checking one last source.', { exact: true })
+    await expect(progress).toBeVisible()
+    const bubble = page.locator('[data-role="assistant"]').filter({ has: progress })
+    await expect(bubble.getByTestId('work-log-summary')).toContainText('Details')
+    await expect(page.getByText('The implementation is now verified.', { exact: true })).toBeVisible()
   })
 
   test('an open Details panel stays open while later execution updates arrive', async ({ page }) => {

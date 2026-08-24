@@ -131,13 +131,18 @@ test('mobile Return input and visible toolbar controls both reach the terminal',
   const terminalInput = []
   const terminalKeys = []
   let terminalSocket
+  let terminalUrl = ''
   let terminalConnections = 0
   await page.route(/\/api\/sessions\/[^/]+\/keys$/, async route => {
     const body = route.request().postDataJSON()
     terminalKeys.push(...body.keys)
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }) })
   })
-  await page.routeWebSocket(/\/api\/terminal\?session=/, socket => {
+  await page.routeWebSocket(url => {
+    if (!url.pathname.endsWith('/api/terminal')) return false
+    terminalUrl = url.href
+    return true
+  }, socket => {
     terminalSocket = socket
     terminalConnections++
     socket.onMessage(message => {
@@ -153,6 +158,10 @@ test('mobile Return input and visible toolbar controls both reach the terminal',
   await expect(page.getByText(TITLE, { exact: true }).first()).toBeVisible({ timeout: 10000 })
   await page.getByRole('button', { name: 'Terminal', exact: true }).click()
   await expect.poll(() => Boolean(terminalSocket)).toBe(true)
+  await expect.poll(() => terminalUrl).not.toBe('')
+  const initialSize = new URL(terminalUrl)
+  expect(Number(initialSize.searchParams.get('cols'))).toBeGreaterThan(20)
+  expect(Number(initialSize.searchParams.get('rows'))).toBeGreaterThan(2)
 
   const hiddenInput = page.locator('textarea[aria-label="Terminal input"]')
   await expect(hiddenInput).toBeAttached()

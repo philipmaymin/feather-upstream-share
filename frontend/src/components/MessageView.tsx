@@ -533,7 +533,10 @@ function isTraceAssistantMsg(m: Message): boolean {
   const hasTool = m.content.some(block => block.type === 'tool_use' || block.type === 'tool_result')
   const hasThinking = m.content.some(block => block.type === 'thinking')
   const hasText = m.content.some(block => block.type === 'text' && block.text?.trim())
-  return hasTool || (hasThinking && !hasText)
+  // Text is user-facing even when the same native OMP message also launches a
+  // tool. renderMsg keeps the tool/thinking blocks in Details while leaving
+  // that text exposed in the conversation.
+  return !hasText && (hasTool || hasThinking)
 }
 
 function canAttachTraceToMessage(m: Message): boolean {
@@ -763,6 +766,7 @@ export function MessageView(props: MessageViewProps) {
   }
 
   let scrollRef: HTMLDivElement | undefined
+  let assistantStreamMarkdownRef: HTMLDivElement | undefined
   const [pinned, setPinned] = createSignal(true)
   const [newMsgCount, setNewMsgCount] = createSignal(0)
   const [actionMenu, setActionMenu] = createSignal<string | null>(null)
@@ -839,6 +843,15 @@ export function MessageView(props: MessageViewProps) {
       setNewMsgCount(c => c + delta)
     }
     if (untrack(pinned) && streamChanged) requestAnimationFrame(pinSync)
+  })
+
+  createEffect(() => {
+    const streamText = props.assistantStream?.text || ''
+    if (!streamText) return
+    queueMicrotask(() => {
+      if (!assistantStreamMarkdownRef || props.assistantStream?.text !== streamText) return
+      enhanceMarkdown(assistantStreamMarkdownRef, (src) => setLightbox(src), openExpandedTable)
+    })
   })
 
   // Reset delta counter on session switch so a new session's load doesn't
@@ -1165,7 +1178,7 @@ export function MessageView(props: MessageViewProps) {
       </Show>
 
       <Show when={props.assistantStream?.text}>
-        <div data-testid="assistant-stream" aria-live="polite" style={{ display: 'flex', 'justify-content': 'flex-start', 'margin-bottom': '10px' }}><div style={{ 'max-width': '100%', padding: '10px 14px', 'border-radius': '12px', background: '#1a1a2e', border: '1px solid rgba(255,255,255,.06)', color: '#e5e5e5', 'font-size': '14px', 'line-height': '1.55', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{props.assistantStream!.text}<span aria-hidden="true" style={{ display: 'inline-block', width: '1px', height: '1em', background: '#aaa', 'margin-left': '2px', 'vertical-align': 'text-bottom', opacity: props.assistantStream!.ended ? '.35' : '.9' }} /></div></div>
+        <div data-testid="assistant-stream" aria-live="polite" style={{ display: 'flex', 'justify-content': 'flex-start', 'margin-bottom': '10px' }}><div style={{ position: 'relative', 'max-width': '100%', padding: '10px 14px', 'border-radius': '12px', background: '#1a1a2e', border: '1px solid rgba(255,255,255,.06)', color: '#e5e5e5', 'font-size': '14px', 'line-height': '1.55', 'word-break': 'break-word' }}><div class="markdown" innerHTML={renderMarkdown(props.assistantStream!.text)} ref={assistantStreamMarkdownRef} /><span aria-hidden="true" style={{ position: 'absolute', right: '7px', bottom: '7px', display: 'inline-block', width: '2px', height: '10px', background: '#aaa', opacity: props.assistantStream!.ended ? '.35' : '.9' }} /></div></div>
       </Show>
 
       {/* Typing indicator — always mounted, opacity-toggled so mount/unmount

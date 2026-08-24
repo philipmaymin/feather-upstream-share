@@ -73,7 +73,7 @@ test('renders and reconciles OMP-native live surfaces', async ({ page }) => {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Feather-Bridge-Token': 'e2e-native-token' },
     body: JSON.stringify({ events: [
-      { type: 'assistant_snapshot', messageId: 'stream-1', text: 'This answer is arriving token by token.' },
+      { type: 'assistant_snapshot', messageId: 'stream-1', text: '## Live answer\n\nThis answer is arriving **token by token**.\n\n- first point\n- second point' },
       { type: 'todo', phases: [{ name: 'Build', tasks: [{ content: 'Wire bridge', status: 'completed' }, { content: 'Verify native UI', status: 'in_progress' }] }], op: 'start', isError: false },
       { type: 'session_state', modelProvider: 'openai', modelId: 'gpt-5.6', modelApi: 'responses', thinkingLevel: 'high', serviceTiers: { openai: 'priority' }, contextTokens: 42000, contextWindow: 200000, contextPercent: 21 },
       { type: 'subagent_lifecycle', id: 'agent-1', agent: 'scout', status: 'started', index: 0, detached: true, description: 'Map OMP events' },
@@ -83,7 +83,10 @@ test('renders and reconciles OMP-native live surfaces', async ({ page }) => {
   })
   expect(response.status).toBe(204)
 
-  await expect(page.getByTestId('assistant-stream')).toContainText('arriving token by token')
+  await expect(page.getByTestId('assistant-stream')).toContainText('Live answer')
+  await expect(page.getByTestId('assistant-stream').getByRole('heading', { name: 'Live answer' })).toBeVisible()
+  await expect(page.getByTestId('assistant-stream').locator('strong')).toHaveText('token by token')
+  await expect(page.getByTestId('assistant-stream').locator('li')).toHaveCount(2)
   await expect(page.getByText(/Todo · 1\/2/)).toBeVisible()
   await expect(page.getByText('Verify native UI', { exact: true })).toBeVisible()
   await expect(page.getByTestId('omp-runtime')).toContainText('openai/gpt-5.6')

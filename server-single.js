@@ -3882,6 +3882,12 @@ sttWss.on('connection', (client) => {
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://localhost');
   const isShell = url.pathname === '/api/shell';
+  const terminalDimension = (value, fallback, min, max) => {
+    const parsed = Number.parseInt(value || '', 10);
+    return Number.isFinite(parsed) && parsed >= min && parsed <= max ? parsed : fallback;
+  };
+  const terminalCols = terminalDimension(url.searchParams.get('cols'), 120, 20, 500);
+  const terminalRows = terminalDimension(url.searchParams.get('rows'), 30, 5, 200);
 
   const cleanEnv = { ...process.env };
   delete cleanEnv.TMUX; delete cleanEnv.TMUX_PANE;
@@ -3902,7 +3908,7 @@ wss.on('connection', (ws, req) => {
   };
   if (isShell) {
     term = pty.spawn('bash', ['-l'], {
-      name: 'xterm-256color', cols: 120, rows: 30, env: cleanEnv, cwd: HOME,
+      name: 'xterm-256color', cols: terminalCols, rows: terminalRows, env: cleanEnv, cwd: HOME,
     });
   } else {
     const sessionId = url.searchParams.get('session');
@@ -3911,7 +3917,7 @@ wss.on('connection', (ws, req) => {
     terminalSessionName = existingTmuxName(sessionId);
     sendTerminalHyperlinks();
     term = pty.spawn('tmux', ['attach', '-t', terminalSessionName], {
-      name: 'xterm-256color', cols: 120, rows: 30, env: cleanEnv,
+      name: 'xterm-256color', cols: terminalCols, rows: terminalRows, env: cleanEnv,
     });
   }
 
