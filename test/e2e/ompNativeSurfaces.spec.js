@@ -54,6 +54,8 @@ test('mirrors parent and child execution across completion, replay, and responsi
   await expect(page.getByText('Ready for deterministic bridge events.')).toBeVisible()
   const health = await (await fetch(`${BASE}/api/health`)).json()
   await expect(page.locator('html')).toHaveAttribute('data-build-version', health.version)
+  await expect(page.getByTestId('build-version')).toBeVisible()
+  await expect(page.getByTestId('build-version')).toHaveAttribute('title', `Build ${health.version}`)
 
   const started = await postEvents([
     { type: 'agent_start' },

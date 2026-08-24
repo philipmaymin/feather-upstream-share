@@ -1947,7 +1947,8 @@ export default function App() {
       {/* Main */}
       <div style={{ flex: '1', display: 'flex', 'flex-direction': 'column', 'min-width': '0', height: '100%', position: 'relative' }}>
         {/* Header */}
-        <div style={{ padding: '8px 16px 0 100px', 'padding-top': 'max(8px, env(safe-area-inset-top))', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'align-items': 'center', gap: '8px', 'min-height': '48px', 'flex-shrink': '0' }}>
+        <div style={{ position: 'relative', padding: '8px 16px 0 100px', 'padding-top': 'max(8px, env(safe-area-inset-top))', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'align-items': 'center', gap: '8px', 'min-height': '48px', 'flex-shrink': '0' }}>
+          <span data-testid="build-version" title={`Build ${__BUILD_VERSION__}`} style={{ position: 'absolute', top: '2px', right: '10px', color: '#444', 'font-size': '8px', 'font-family': "'SF Mono', Menlo, monospace", 'line-height': '1', 'letter-spacing': '0.02em', 'white-space': 'nowrap' }}>{__BUILD_TIME__}</span>
           <Show when={headerSession()} fallback={<span style={{ color: '#888', 'font-size': '14px', 'font-weight': '600' }}>{currentId() ? 'Loading...' : 'Feather'}</span>}>
             {(s) => <>
               <Show when={s().isActive}><span style={{ width: '8px', height: '8px', 'border-radius': '50%', background: '#4aba6a', 'flex-shrink': '0' }} /></Show>
@@ -2014,7 +2015,6 @@ export default function App() {
             <button onClick={() => setTab('updates')} style={tabStyle('updates')}>Updates</button>
             <button onClick={() => { setTab('files'); if (!browseDir()) openFileBrowser() }} style={tabStyle('files')}>Files{touchedFiles().length > 0 ? ` (${touchedFiles().length})` : ''}</button>
             <button onClick={() => setTab('terminal')} style={tabStyle('terminal')}>Terminal</button>
-            <Show when={!isMobile}><span style={{ 'margin-left': 'auto', 'padding-right': '12px', 'font-size': '10px', color: '#444', 'flex-shrink': '0' }}>{__BUILD_TIME__}</span></Show>
           </div>
         </Show>
 
