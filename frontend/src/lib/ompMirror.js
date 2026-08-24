@@ -9,6 +9,8 @@ function emptyScope() {
     runStatus: 'idle',
     assistantText: '',
     assistantEnded: false,
+    continuationPending: false,
+    segment: 0,
   }
 }
 
@@ -158,38 +160,75 @@ function settleScope(scope, status, messageId) {
     } : item),
   }
 }
+function beginSegment(scope, messageId) {
+  const changedMessage = typeof messageId === 'string'
+    && scope.timeline.length > 0
+    && scope.activeMessageId !== messageId
+  if (!scope.continuationPending && !scope.assistantEnded && !changedMessage) return scope
+  return {
+    ...scope,
+    timeline: [],
+    activeMessageId: null,
+    runStatus: 'running',
+    assistantText: '',
+    assistantEnded: false,
+    continuationPending: false,
+    segment: scope.segment + 1,
+  }
+}
+
 
 function reduceScope(scope, event) {
   switch (event.type) {
     case 'agent_start':
-      return { ...scope, timeline: [], activeMessageId: null, runStatus: 'running', assistantText: '', assistantEnded: false }
+      return {
+        ...scope,
+        timeline: [],
+        activeMessageId: null,
+        runStatus: 'running',
+        assistantText: '',
+        assistantEnded: false,
+        continuationPending: false,
+        segment: scope.segment + 1,
+      }
     case 'agent_end':
-      return settleScope(scope, event.success === false ? 'error' : 'success')
+      return { ...settleScope(scope, event.success === false ? 'error' : 'success'), continuationPending: false }
     case 'todo':
       return event.phases ? { ...scope, todo: todoSnapshot(event.phases) } : scope
-    case 'assistant_snapshot':
-      return typeof event.text === 'string' ? {
-        ...scope,
+    case 'assistant_snapshot': {
+      if (typeof event.text !== 'string') return scope
+      const next = beginSegment(scope, event.messageId)
+      return {
+        ...next,
         assistantText: event.text,
         assistantEnded: false,
-        activeMessageId: typeof event.messageId === 'string' ? event.messageId : scope.activeMessageId,
+        activeMessageId: typeof event.messageId === 'string' ? event.messageId : next.activeMessageId,
         runStatus: 'running',
-      } : scope
+      }
+    }
     case 'work_snapshot':
-      return applyWorkSnapshot(scope, event)
-    case 'tool_execution_start':
-      return { ...upsertTool(scope, event, 'running'), runStatus: 'running' }
-    case 'tool_execution_update':
-      return { ...upsertTool(scope, event, event.isError ? 'error' : 'running'), runStatus: event.isError ? 'error' : 'running' }
+      return applyWorkSnapshot(beginSegment(scope, event.messageId), event)
+    case 'tool_execution_start': {
+      const next = beginSegment(scope)
+      return { ...upsertTool(next, event, 'running'), runStatus: 'running' }
+    }
+    case 'tool_execution_update': {
+      const next = beginSegment(scope)
+      return { ...upsertTool(next, event, event.isError ? 'error' : 'running'), runStatus: event.isError ? 'error' : 'running' }
+    }
     case 'tool_execution_end':
       return { ...upsertTool(scope, event, event.isError ? 'error' : 'success'), runStatus: event.isError ? 'error' : scope.runStatus }
     case 'assistant_end': {
       const settled = settleScope(scope, 'success', event.messageId)
-      return settled === scope ? scope : { ...settled, assistantEnded: true }
+      return settled === scope ? scope : { ...settled, assistantEnded: true, continuationPending: false }
     }
-    case 'assistant_cancel':
-      if (event.willContinue) return { ...scope, activeMessageId: null, runStatus: 'running' }
-      return { ...settleScope(scope, 'cancelled', event.messageId), assistantEnded: true }
+    case 'assistant_cancel': {
+      if (event.willContinue) {
+        const settled = settleScope(scope, 'success', event.messageId)
+        return settled === scope ? scope : { ...settled, assistantEnded: false, continuationPending: true }
+      }
+      return { ...settleScope(scope, 'cancelled', event.messageId), assistantEnded: true, continuationPending: false }
+    }
     default:
       return scope
   }
@@ -242,6 +281,8 @@ function upsertChildMetadata(state, event) {
     activeMessageId: restarting ? null : previous.activeMessageId,
     assistantText: restarting ? '' : previous.assistantText,
     assistantEnded: restarting ? false : previous.assistantEnded,
+    continuationPending: restarting ? false : previous.continuationPending,
+    segment: restarting ? previous.segment + 1 : previous.segment,
   }
   const settled = workStatus === 'success' || workStatus === 'error' || workStatus === 'cancelled'
     ? { ...next, ...settleScope(next, workStatus) }

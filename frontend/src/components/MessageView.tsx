@@ -1019,6 +1019,13 @@ export function MessageView(props: MessageViewProps) {
     const visibleTimeline = createMemo(() => inspector ? scope().timeline : scope().timeline.filter(item => !hideParentOrchestration(item)))
     const visibleScope = () => ({ ...scope(), timeline: visibleTimeline() })
     const summary = () => activeOmpStep(visibleScope())
+    let executionDetails: HTMLDetailsElement | undefined
+    let renderedSegment = scope().segment
+    createEffect(() => {
+      const segment = scope().segment
+      if (!inspector && executionDetails && segment !== renderedSegment) executionDetails.open = false
+      renderedSegment = segment
+    })
     if (inspector) {
       return (
         <section class="execution-log" data-testid={testId} aria-label="Agent execution timeline">
@@ -1036,7 +1043,7 @@ export function MessageView(props: MessageViewProps) {
     }
     return (
       <Show when={visibleTimeline().length > 0}>
-        <details class="execution-log" data-testid={testId}>
+        <details ref={executionDetails} class="execution-log" data-testid={testId} data-segment={scope().segment}>
           <summary class="execution-summary" data-testid={`${testId}-summary`}>
             <span class="execution-chevron">›</span>
             <span class="execution-title">Execution</span>
@@ -1050,6 +1057,9 @@ export function MessageView(props: MessageViewProps) {
         </details>
       </Show>
     )
+  }
+  function renderParentExecution(scope: () => OmpWorkScope) {
+    return <Show keyed when={scope().segment + 1}>{() => renderExecutionTimeline(scope, 'omp-parent-execution')}</Show>
   }
 
   let scrollRef: HTMLDivElement | undefined
@@ -1416,10 +1426,10 @@ export function MessageView(props: MessageViewProps) {
         // Do not show the same legacy transcript trace again in Details.
         const mirroredCurrentTurn = (props.work?.timeline.length || 0) > 0 && item === renderItems().at(-1)
         if (item.kind === 'msg') return mirroredCurrentTurn && item.msg.role === 'assistant'
-          ? <>{renderExecutionTimeline(() => props.work!, 'omp-parent-execution')}{renderMsg(item.msg, [], true)}</>
+          ? <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
           : renderMsg(item.msg)
         if (item.kind === 'turn') return mirroredCurrentTurn && item.msg.role === 'assistant'
-          ? <>{renderExecutionTimeline(() => props.work!, 'omp-parent-execution')}{renderMsg(item.msg, [], true)}</>
+          ? <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
           : renderMsg(item.msg, item.trace)
         if (mirroredCurrentTurn) return null
         // Keep an unfinished or failed trace reachable even before a final
@@ -1428,7 +1438,7 @@ export function MessageView(props: MessageViewProps) {
         return <div data-testid={isLiveWork ? 'live-work-turn' : undefined} style={{ margin: '4px 0 10px', 'max-width': '85%' }}>{renderWorkLog(item.messages)}</div>
       }}</For>
       <Show when={(props.work?.timeline.length || 0) > 0 && !workAttachedToAnswer()}>
-        {renderExecutionTimeline(() => props.work!, 'omp-parent-execution')}
+        {renderParentExecution(() => props.work!)}
       </Show>
 
 

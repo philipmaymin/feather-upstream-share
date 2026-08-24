@@ -31,16 +31,30 @@ describe('OMP mirror reducer', () => {
     })
   })
 
-  it('keeps normal tool-call segment boundaries running and distinguishes real cancellation', () => {
+  it('settles each assistant segment and recreates execution for current work', () => {
     const running = reduce([
       { type: 'agent_start' },
+      { type: 'todo', phases: [{ name: 'Keep', tasks: [{ content: 'Preserve Todo', status: 'in_progress' }] }] },
+      { type: 'work_snapshot', messageId: 'segment-1', blocks: [{ type: 'thinking', thinking: 'First segment' }] },
       { type: 'tool_execution_start', toolCallId: 'tool-1', toolName: 'read' },
-      { type: 'assistant_cancel', messageId: 'segment-1', willContinue: true },
     ])
-    assert.equal(running.parent.runStatus, 'running')
-    assert.equal(running.parent.timeline[0].status, 'running')
+    const settled = reduceOmpMirrorState(running, { type: 'assistant_cancel', messageId: 'segment-1', willContinue: true })
+    assert.equal(settled.parent.runStatus, 'success')
+    assert.equal(settled.parent.timeline.every(item => item.status === 'success'), true)
+    assert.equal(settled.parent.continuationPending, true)
 
-    const cancelled = reduceOmpMirrorState(running, { type: 'assistant_cancel' })
+    const continued = reduceOmpMirrorState(settled, { type: 'tool_execution_start', toolCallId: 'tool-2', toolName: 'bash' })
+    assert.equal(continued.parent.runStatus, 'running')
+    assert.deepEqual(continued.parent.timeline.map(item => item.key), ['tool:tool-2'])
+    assert.equal(continued.parent.todo.active, 'Preserve Todo')
+    assert.equal(continued.parent.segment, settled.parent.segment + 1)
+
+    const toolEnded = reduceOmpMirrorState(continued, { type: 'tool_execution_end', toolCallId: 'tool-2', toolName: 'bash', result: 'done' })
+    const reasoning = reduceOmpMirrorState(toolEnded, { type: 'work_snapshot', messageId: 'segment-2', blocks: [{ type: 'thinking', thinking: 'Current segment' }] })
+    assert.deepEqual(reasoning.parent.timeline.map(item => item.key), ['thinking:segment-2:0'])
+    assert.equal(reasoning.parent.segment, continued.parent.segment + 1)
+
+    const cancelled = reduceOmpMirrorState(reasoning, { type: 'assistant_cancel', messageId: 'segment-2' })
     assert.equal(cancelled.parent.runStatus, 'cancelled')
     assert.equal(cancelled.parent.timeline[0].status, 'cancelled')
   })

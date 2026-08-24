@@ -639,6 +639,7 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
 
     const ctrl = new AbortController()
     const terminalCtrl = new AbortController()
+    const continuationCtrl = new AbortController()
     try {
       const accepted = await post([{
         type: 'agent_start',
@@ -763,6 +764,25 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
       assert.ok(childEvents.some(event => event.type === 'todo'))
       assert.ok(childEvents.some(event => event.type === 'assistant_end'))
       ctrl.abort()
+      const continued = await post([{
+        type: 'assistant_cancel',
+        messageId: 'parent-message',
+        willContinue: true,
+      }, {
+        type: 'tool_execution_start',
+        toolCallId: 'current-tool',
+        toolName: 'read',
+        args: { path: '/tmp/current' },
+        intent: 'Reading current segment',
+      }])
+      assert.equal(continued.status, 204)
+      const continuationStream = await fetch(`${BASE}/api/sessions/${sessionId}/stream`, { signal: continuationCtrl.signal })
+      const continuationReplay = await readOmpSseEvents(continuationStream.body.getReader(), 12)
+      assert.equal(continuationReplay.events.some(event => event.toolCallId === 'parent-tool'), false)
+      assert.equal(continuationReplay.events.some(event => event.type === 'work_snapshot' && !event.subagentId), false)
+      assert.ok(continuationReplay.events.some(event => event.toolCallId === 'current-tool'))
+      continuationCtrl.abort()
+
 
       const ended = await post([{ type: 'assistant_end', messageId: 'parent-message' }])
       assert.equal(ended.status, 204)
@@ -776,6 +796,7 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
     } finally {
       ctrl.abort()
       terminalCtrl.abort()
+      continuationCtrl.abort()
       try { fs.unlinkSync(tokenPath) } catch {}
     }
   })

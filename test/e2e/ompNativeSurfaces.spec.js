@@ -65,6 +65,9 @@ test('mirrors parent and child execution across completion, replay, and responsi
     { type: 'work_snapshot', messageId: 'answer-1', blocks: [{ type: 'thinking', thinking: 'Planning the parent execution sequence.' }] },
     { type: 'tool_execution_start', toolCallId: 'parent-read', toolName: 'read', args: { path: '/tmp/parent-state' }, intent: 'Reading parent bridge state' },
     { type: 'tool_execution_update', toolCallId: 'parent-read', toolName: 'read', partialResult: 'Parent state is arriving.' },
+    { type: 'assistant_cancel', messageId: 'answer-1', willContinue: true },
+    { type: 'tool_execution_start', toolCallId: 'current-check', toolName: 'bash', args: { command: 'printf current' }, intent: 'Testing current execution segment' },
+    { type: 'tool_execution_update', toolCallId: 'current-check', toolName: 'bash', partialResult: 'Current segment is running.' },
     { type: 'tool_execution_start', toolCallId: 'spawn-child', toolName: 'task', args: { tasks: [{ agent: 'scout', task: 'Inspect nested bridge events' }] }, intent: 'Delegating bridge inspection' },
     { type: 'tool_execution_end', toolCallId: 'spawn-child', toolName: 'task', result: 'Started scout.', isError: false },
     { type: 'tool_execution_start', toolCallId: 'wait-child', toolName: 'hub', args: { op: 'wait' }, intent: 'Waiting for scout' },
@@ -97,19 +100,14 @@ test('mirrors parent and child execution across completion, replay, and responsi
 
   const parentExecution = page.getByTestId('omp-parent-execution')
   await expect(parentExecution).toBeVisible()
-  await expect(page.getByTestId('omp-parent-execution-summary')).toContainText('Reading parent bridge state')
+  await expect(page.getByTestId('omp-parent-execution-summary')).toContainText('Testing current execution segment')
   await expect(parentExecution.getByText('Child-only reasoning stays in the inspector.')).toHaveCount(0)
   await page.getByTestId('omp-parent-execution-summary').click()
   await expect(parentExecution.getByTestId('omp-tool-card')).toHaveCount(1)
-  await expect(parentExecution).toContainText('Reading parent bridge state')
+  await expect(parentExecution).toContainText('Testing current execution segment')
+  await expect(parentExecution).not.toContainText('Reading parent bridge state')
   await parentExecution.getByTestId('omp-tool-card').click()
-  await expect(parentExecution).toContainText('Parent state is arriving.')
-  await expect(page.getByTestId('assistant-stream')).toContainText('The parent is inspecting the bridge.')
-  expect(await page.evaluate(() => {
-    const execution = document.querySelector('[data-testid="omp-parent-execution"]')
-    const answer = document.querySelector('[data-testid="assistant-stream"]')
-    return !!execution && !!answer && !!(execution.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING)
-  })).toBe(true)
+  await expect(parentExecution).toContainText('Current segment is running.')
 
   await expect(page.getByTestId('omp-subagents')).toBeHidden()
   const agentsTab = page.getByRole('button', { name: /Agents 1/ })
@@ -131,7 +129,7 @@ test('mirrors parent and child execution across completion, replay, and responsi
   await page.getByRole('button', { name: 'Chat', exact: true }).click()
 
   const completed = await postEvents([
-    { type: 'tool_execution_end', toolCallId: 'parent-read', toolName: 'read', result: 'Parent state complete.', isError: false },
+    { type: 'tool_execution_end', toolCallId: 'current-check', toolName: 'bash', result: 'Current segment complete.', isError: false },
     { type: 'tool_execution_end', subagentId: 'child-1', toolCallId: 'child-grep', toolName: 'grep', result: 'Nested route verified.', isError: false },
     { type: 'assistant_snapshot', subagentId: 'child-1', messageId: 'child-answer-1', text: 'Child answer is complete.' },
     { type: 'assistant_end', subagentId: 'child-1', messageId: 'child-answer-1' },
@@ -139,10 +137,11 @@ test('mirrors parent and child execution across completion, replay, and responsi
     { type: 'assistant_end', messageId: 'answer-1' },
     { type: 'tool_execution_start', toolCallId: 'parent-read', toolName: 'read', intent: 'Reading parent bridge state' },
     { type: 'tool_execution_update', toolCallId: 'parent-read', toolName: 'read', partialResult: 'Replay must not regress completion.' },
+    { type: 'tool_execution_end', toolCallId: 'parent-read', toolName: 'read', result: 'Replay segment complete.', isError: false },
   ])
   expect(completed.status).toBe(204)
 
-  await expect(parentExecution).toHaveJSProperty('open', true)
+  await expect(parentExecution).toHaveJSProperty('open', false)
   await expect(parentExecution.getByTestId('omp-tool-card')).toHaveCount(1)
   await expect(parentExecution.getByTestId('omp-tool-card')).toHaveAttribute('data-status', 'success')
   await expect(parentExecution).toContainText('Success')
