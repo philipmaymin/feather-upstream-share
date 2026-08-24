@@ -289,7 +289,7 @@ test.describe('Message rendering', () => {
   })
 
   test('Details precedes the final answer in chronological turn order', async ({ page }) => {
-    const bubble = page.locator('.asst-bubble').filter({ hasText: 'Feather uses marked with GFM support.' }).first()
+    const bubble = page.locator('[data-role="assistant"]').filter({ hasText: 'Feather uses marked with GFM support.' }).first()
     const chronological = await bubble.evaluate(element => {
       const details = element.querySelector('.work-log')
       const answer = [...element.querySelectorAll('.markdown')].find(node => node.textContent?.includes('Feather uses marked with GFM support.'))
