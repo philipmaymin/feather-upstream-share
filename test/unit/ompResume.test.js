@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { ompSessionIdFromHead } from '../../lib/omp-session.js'
+import { ompSessionCwdFromHead, ompSessionIdFromHead, ompTurnBoundaryFromLine } from '../../lib/omp-session.js'
 
 const roots = []
 const children = []
@@ -19,7 +19,7 @@ afterEach(async () => {
   while (roots.length) fs.rmSync(roots.pop(), { recursive: true, force: true })
 })
 
-const sessionLine = (id) => JSON.stringify({ type: 'session', version: 3, id, timestamp: '2026-08-22T20:06:35.565Z', cwd: '/tmp/project' })
+const sessionLine = (id, cwd = '/tmp/project') => JSON.stringify({ type: 'session', version: 3, id, timestamp: '2026-08-22T20:06:35.565Z', cwd })
 
 async function waitForServer(base) {
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -35,6 +35,10 @@ describe('safe OMP resume', () => {
     assert.equal(ompSessionIdFromHead(head), 'omp-exact-id')
     assert.equal(ompSessionIdFromHead(`${JSON.stringify({ type: 'title' })}\n`), null)
     assert.equal(ompSessionIdFromHead(`{"truncated"\n${sessionLine('omp-after-malformed')}\n`), 'omp-after-malformed')
+    assert.equal(ompSessionCwdFromHead(head), '/tmp/project')
+    assert.equal(ompTurnBoundaryFromLine(JSON.stringify({ type: 'message', message: { role: 'user', content: 'next' } })), 'active')
+    assert.equal(ompTurnBoundaryFromLine(JSON.stringify({ type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall' }], stopReason: 'toolUse' } })), 'active')
+    assert.equal(ompTurnBoundaryFromLine(JSON.stringify({ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'done' }], stopReason: 'stop' } })), 'completed')
   })
 
   it('resumes the exact embedded OMP id and refuses unsafe continue fallback', async () => {
@@ -51,7 +55,8 @@ describe('safe OMP resume', () => {
     const goodFeatherId = 'resume-good-feather-id'
     const goodDir = path.join(home, '.feather/omp-sessions', goodFeatherId)
     fs.mkdirSync(goodDir)
-    fs.writeFileSync(path.join(goodDir, '2026-08-23_good.jsonl'), [
+    const goodPath = path.join(goodDir, '2026-08-23_good.jsonl')
+    fs.writeFileSync(goodPath, [
       JSON.stringify({ type: 'title', title: 'Mutable title before session' }),
       sessionLine('omp-exact-resume-id'),
       JSON.stringify({ type: 'message', message: { role: 'user', content: 'hello' } }),
@@ -86,6 +91,20 @@ exit 0
     let stderr = ''
     child.stderr.on('data', chunk => { stderr += chunk })
     await waitForServer(base)
+    fs.appendFileSync(goodPath, JSON.stringify({
+      type: 'message',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'finished' }], stopReason: 'stop' },
+    }) + '\n')
+    let migratedLog = ''
+    for (let attempt = 0; attempt < 100; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50))
+      try { migratedLog = fs.readFileSync(tmuxLog, 'utf8') } catch {}
+      if (migratedLog.includes('feather-bridge.js')) break
+    }
+    assert.match(migratedLog, /--extension .*feather-bridge\.js/, stderr)
+    assert.match(migratedLog, /--resume .*omp-exact-resume-id/, stderr)
+    assert.match(migratedLog, /-c \/tmp\/project/, 'automatic migration must preserve the recorded cwd')
+
 
     const good = await fetch(`${base}/api/sessions/${goodFeatherId}/resume`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',

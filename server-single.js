@@ -21,7 +21,7 @@ import { createJsonState, isJsonRecord } from './lib/json-state.js';
 import { encodeProjectPath, groupRoomSessions } from './lib/rooms.js';
 import { parseFrictionNotes } from './lib/friction.js';
 import { resolveOmpModel, resolveOmpThinking, ompLaunchCommand, ompTmuxArgs } from './lib/omp.js';
-import { ompSessionIdFromHead } from './lib/omp-session.js';
+import { ompSessionCwdFromHead, ompSessionIdFromHead, ompTurnBoundaryFromLine } from './lib/omp-session.js';
 import { inferLegacyTmuxOwner, legacyTmuxSessionName, tmuxSessionName } from './lib/tmux-session.js';
 import { extractOsc8HttpUrls } from './lib/terminal-hyperlinks.js';
 
@@ -377,9 +377,7 @@ function extractOmpTitle(buf) {
   return null;
 }
 
-// omp's internal snowflake session id lives in the session header line; needed
-// to resume the right conversation within a session dir.
-function getOmpSessionId(featherId) {
+function readOmpSessionHead(featherId) {
   const fpath = findOmpJsonlPath(featherId);
   if (!fpath) return null;
   try {
@@ -387,11 +385,21 @@ function getOmpSessionId(featherId) {
     try {
       const buf = Buffer.alloc(Math.min(64 * 1024, fs.fstatSync(fd).size));
       fs.readSync(fd, buf, 0, buf.length, 0);
-      return ompSessionIdFromHead(buf.toString('utf8'));
+      return buf.toString('utf8');
     } finally {
       fs.closeSync(fd);
     }
   } catch { return null; }
+}
+
+// omp's internal snowflake session id and original cwd live in the session
+// header. Resume must use that exact durable metadata, never a guessed session.
+function getOmpSessionId(featherId) {
+  return ompSessionIdFromHead(readOmpSessionHead(featherId));
+}
+
+function getOmpSessionCwd(featherId) {
+  return ompSessionCwdFromHead(readOmpSessionHead(featherId));
 }
 
 function extractCodexTitle(buf) {
@@ -679,7 +687,7 @@ function spawnOrResume(id, cwd, resume = false, agent = null) {
     if (resume) {
       const ompId = getOmpSessionId(id);
       if (!ompId) throw new Error(`Cannot resume OMP session ${id}: exact OMP session id not found`);
-      spawnTmuxOmp(name, `--resume ${ompId} --session-dir ${sessionDir}`, cwd || HOME);
+      spawnTmuxOmp(name, `--resume ${ompId} --session-dir ${sessionDir}`, cwd || getOmpSessionCwd(id) || HOME);
     } else {
       const meta = readMeta();
       meta[id] = { ...(meta[id] || {}), agent: 'omp', cwd: cwd || HOME };
@@ -1532,6 +1540,43 @@ if (!READ_ONLY_MODE) setInterval(() => {
 
 const fileOffsets = new Map();
 const watchedDirs = new Set();
+const pendingOmpBridgeMigrations = new Map();
+
+function ompBridgeConfigured(sessionId) {
+  if (ompBridgeTokens.has(sessionId)) return true;
+  try { return !!fs.readFileSync(ompBridgeTokenPath(sessionId), 'utf8').trim(); }
+  catch { return false; }
+}
+
+function cancelOmpBridgeMigration(sessionId) {
+  const timer = pendingOmpBridgeMigrations.get(sessionId);
+  if (!timer) return;
+  clearTimeout(timer);
+  pendingOmpBridgeMigrations.delete(sessionId);
+}
+
+function observeOmpTurnBoundary(sessionId, line) {
+  const boundary = ompTurnBoundaryFromLine(line);
+  if (!boundary) return;
+  if (boundary === 'active') {
+    cancelOmpBridgeMigration(sessionId);
+    return;
+  }
+  if (getAgentForSession(sessionId) !== 'omp') return;
+  if (ompBridgeConfigured(sessionId) || !tmuxIsActive(sessionId) || pendingOmpBridgeMigrations.has(sessionId)) return;
+  const timer = setTimeout(() => {
+    pendingOmpBridgeMigrations.delete(sessionId);
+    if (ompBridgeConfigured(sessionId) || !tmuxIsActive(sessionId) || getAgentForSession(sessionId) !== 'omp') return;
+    try {
+      spawnOrResume(sessionId, getOmpSessionCwd(sessionId), true, 'omp');
+      console.log(`[omp bridge] migrated completed session ${sessionId}`);
+    } catch (error) {
+      console.warn(`[omp bridge] migration failed for ${sessionId}:`, error.message);
+    }
+  }, 1500);
+  timer.unref();
+  pendingOmpBridgeMigrations.set(sessionId, timer);
+}
 
 function initFileOffsets() {
   const projDir = projectsDir();
@@ -1563,6 +1608,7 @@ function processFileChange(filePath, sessionIdOverride) {
     for (const line of complete.split('\n').filter(Boolean)) {
       offset += Buffer.byteLength(line + '\n');
       broadcast(sessionId, line, offset);
+      observeOmpTurnBoundary(sessionId, line);
     }
     fileOffsets.set(sessionId, currentOffset + Buffer.byteLength(complete));
   } catch {}
@@ -1643,6 +1689,29 @@ function watchOmpSessionDir(dirPath, featherId) {
   } catch {}
 }
 
+function initOmpWatchers() {
+  if (!fs.existsSync(OMP_SESSIONS)) return;
+  for (const dir of fs.readdirSync(OMP_SESSIONS)) {
+    if (dir.startsWith('.')) continue;
+    const dirPath = path.join(OMP_SESSIONS, dir);
+    try {
+      if (!fs.statSync(dirPath).isDirectory()) continue;
+      const files = fs.readdirSync(dirPath).filter(file => file.endsWith('.jsonl')).sort().reverse();
+      if (files.length > 0) fileOffsets.set(dir, fs.statSync(path.join(dirPath, files[0])).size);
+      watchOmpSessionDir(dirPath, dir);
+    } catch {}
+  }
+  // Sessions may be created by another Feather process or by OMP itself. Keep
+  // those discoverable sessions live without requiring a server restart.
+  try {
+    fs.watch(OMP_SESSIONS, (_event, filename) => {
+      if (!filename || filename.startsWith('.')) return;
+      const dirPath = path.join(OMP_SESSIONS, filename);
+      try { if (fs.statSync(dirPath).isDirectory()) watchOmpSessionDir(dirPath, filename); } catch {}
+    });
+  } catch {}
+}
+
 function initCodexWatchers() {
   // Watch the most recent ~100 codex sessions on startup. Limiting fanout
   // because fs.watch on every historical date dir is wasteful.
@@ -1660,6 +1729,7 @@ function initCodexWatchers() {
 initFileOffsets();
 watchProjectDir();
 initCodexWatchers();
+initOmpWatchers();
 
 // ── Express ─────────────────────────────────────────────────────────────────
 

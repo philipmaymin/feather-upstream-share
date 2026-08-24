@@ -60,6 +60,33 @@ test('attaches and detaches an existing chat without duplicate Room rows', async
   await expect(page.getByText(candidate.title, { exact: true })).toHaveCount(1)
 })
 
+test('Room card opens its main human chat instead of the Keep-working pulse', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  const pulse = {
+    id: 'pulse-chat', title: 'Keep working: #feather', updatedAt: '2026-08-24T01:00:00Z',
+    isActive: true, agent: 'omp', roomAssigned: true,
+  }
+  const main = {
+    id: 'main-human-chat', title: '#feather main', updatedAt: '2026-08-23T23:00:00Z',
+    isActive: false, agent: 'omp', roomAssigned: true,
+  }
+  await page.route('**/api/rooms', route => route.fulfill({ json: { rooms: [{
+    name: 'feather', cwd: '/home/user/rooms/feather', active: true,
+    latest: { role: 'assistant', text: 'Pulse finished work.' }, updatedAt: pulse.updatedAt,
+    updates: { count: 0, latestAt: null, latest: null },
+    friction: { count: 0, latestAt: null, latest: null },
+    pulse: { enabled: true, status: 'working', lastRunAt: pulse.updatedAt, nextRunAt: null, sessionId: pulse.id },
+    sessions: [pulse, main],
+  }] } }))
+
+  await page.goto(BASE)
+  await expect(page.getByText('#feather', { exact: true })).toBeVisible()
+  await page.locator('button:has-text("›")').click()
+  await expect(page.getByText('Main', { exact: true })).toBeVisible()
+  await page.getByText('#feather', { exact: true }).click()
+  await expect(page).toHaveURL(/#main-human-chat$/)
+})
+
 test('shows room updates newest-first and remembers that they were read', async ({ page }) => {
   const room = {
     name: 'briefings', cwd: '/srv/zak/home/rooms/briefings', active: false,
@@ -72,7 +99,6 @@ test('shows room updates newest-first and remembers that they were read', async 
     { id: 'first', ts: '2026-08-22T11:00:00Z', text: 'First outcome.' },
     { id: 'second', ts: '2026-08-22T12:00:00Z', text: 'Second outcome.' },
   ] } }))
-
   await page.goto(BASE)
   const button = page.getByTestId('updates-briefings')
   await expect(button).toContainText('2 new')
