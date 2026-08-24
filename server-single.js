@@ -3,7 +3,7 @@ import compression from 'compression';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
-import { createHash, randomUUID } from 'crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import { execFileSync, execFile, spawn } from 'child_process';
 import { WebSocketServer, WebSocket as WS } from 'ws';
 import pty from 'node-pty';
@@ -89,6 +89,28 @@ const CODEX_SESSIONS_ROOT = STATE_PATHS.harness.codexSessionsDir;
 // prompt. Keep enough headroom to find cwd, titles, and worker markers.
 const CODEX_HEAD_BYTES = 256 * 1024;
 const OMP_SESSIONS = STATE_PATHS.harness.ompSessionsDir;
+const OMP_BRIDGE_EXTENSION = path.join(import.meta.dirname, 'omp-extensions', 'feather-bridge.js');
+const OMP_BRIDGE_TOKENS_DIR = path.join(OMP_SESSIONS, '.feather-bridge-tokens');
+const ompBridgeTokens = new Map();
+const OMP_BRIDGE_EVENT_TYPES = Object.freeze({
+  assistant_snapshot: true,
+  assistant_end: true,
+  assistant_cancel: true,
+  agent_start: true,
+  agent_end: true,
+  auto_retry_start: true,
+  auto_retry_end: true,
+  auto_compaction_start: true,
+  auto_compaction_end: true,
+  credential_disabled: true,
+  todo: true,
+  tool_approval_requested: true,
+  tool_approval_resolved: true,
+  subagent_lifecycle: true,
+  subagent_progress: true,
+  async_jobs: true,
+  session_state: true,
+});
 if (!READ_ONLY_MODE && process.env.FEATHER_STATE_DIR) ensureStateLayout(STATE_PATHS);
 if (!READ_ONLY_MODE) {
   try { fs.mkdirSync(OMP_SESSIONS, { recursive: true }); } catch {}
@@ -553,11 +575,32 @@ function spawnTmuxCodex(name, codexArgs, dir) {
 // way upstream invokes it (oh-my-pi installs add themselves to ~/.bashrc).
 function spawnTmuxOmp(name, ompArgs, dir, options = {}) {
   try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
-  const ompCmd = ompLaunchCommand(ompArgs, OMP_MODEL, OMP_THINKING, options);
+  const sessionId = options.sessionId || name.replace(/^f-/, '');
+  const bridgeToken = randomUUID();
+  ompBridgeTokens.set(sessionId, bridgeToken);
+  fs.mkdirSync(OMP_BRIDGE_TOKENS_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ompBridgeTokenPath(sessionId), bridgeToken, { mode: 0o600 });
+  const extensionArg = ` --extension ${shellQuote(OMP_BRIDGE_EXTENSION)}`;
+  const launch = ompLaunchCommand(`${ompArgs}${extensionArg}`, OMP_MODEL, OMP_THINKING, options);
+  const ompCmd = [
+    `export FEATHER_BRIDGE_URL=${shellQuote(`http://127.0.0.1:${PORT}/api/internal/sessions/${sessionId}/events`)}`,
+    `FEATHER_BRIDGE_TOKEN=${shellQuote(bridgeToken)}`,
+    `FEATHER_SESSION_ID=${shellQuote(sessionId)}`,
+    `; ${launch}`,
+  ].join(' ');
   // Pass tmux arguments directly. The device-auth wrapper includes a quoted
   // status message; interpolating it into a second `bash -c` command corrupts
   // the nested quoting and makes the new pane exit immediately.
   execFileSync('tmux', ompTmuxArgs(name, dir, ompCmd), { stdio: 'ignore', encoding: 'utf8' });
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+function ompBridgeTokenPath(sessionId) {
+  const file = createHash('sha256').update(String(sessionId)).digest('hex');
+  return path.join(OMP_BRIDGE_TOKENS_DIR, file);
 }
 
 // Codex doesn't accept a preset session id. We snapshot existing rollout files,
@@ -1196,6 +1239,16 @@ if (!READ_ONLY_MODE) setInterval(() => {
 
 const sseClients = new Map();
 
+function writeSse(clients, res, chunk) {
+  try {
+    if (res.write(chunk)) return;
+    clients.delete(res);
+    res.end();
+  } catch {
+    clients.delete(res);
+  }
+}
+
 function broadcast(sessionId, line, offset) {
   const clients = sseClients.get(sessionId);
   if (!clients || clients.size === 0) return;
@@ -1204,9 +1257,14 @@ function broadcast(sessionId, line, offset) {
   const parsed = parseMessageForAgent(line, getAgentForSession(sessionId));
   if (!parsed) return;
   const chunk = `id: ${offset}\nevent: message\ndata: ${JSON.stringify(parsed)}\n\n`;
-  for (const res of clients) {
-    try { res.write(chunk); } catch { clients.delete(res); }
-  }
+  for (const res of clients) writeSse(clients, res, chunk);
+}
+
+function broadcastNamedEvent(sessionId, eventName, data) {
+  const clients = sseClients.get(sessionId);
+  if (!clients || clients.size === 0) return;
+  const chunk = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of clients) writeSse(clients, res, chunk);
 }
 
 // ── Activity + question polling (single tmux capture per session) ───────────
@@ -1606,7 +1664,7 @@ initCodexWatchers();
 // ── Express ─────────────────────────────────────────────────────────────────
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '512kb' }));
 
 // An allowlist keeps future GET handlers with side effects closed until they
 // are explicitly classified, while static and non-API reads remain available.
@@ -1675,6 +1733,213 @@ app.get('/api/health', (_req, res) => res.json({
     maxAudioBytes: MAX_AUDIO_BYTES,
   },
 }));
+
+function bridgeTokenValid(sessionId, value) {
+  if (typeof value !== 'string') return false;
+  let expected = ompBridgeTokens.get(sessionId);
+  if (!expected) {
+    try {
+      expected = fs.readFileSync(ompBridgeTokenPath(sessionId), 'utf8').trim();
+      if (expected) ompBridgeTokens.set(sessionId, expected);
+    } catch {
+      return false;
+    }
+  }
+  if (!expected) return false;
+  const givenHash = createHash('sha256').update(value).digest();
+  const expectedHash = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(givenHash, expectedHash);
+}
+
+function bridgeString(value, maxLength) {
+  return typeof value === 'string' && value.length <= maxLength ? value : undefined;
+}
+
+function bridgeNumber(value, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  return Number.isFinite(value) && value >= min && value <= max ? value : undefined;
+}
+
+function normalizeTodoEvent(event) {
+  if (!Array.isArray(event.phases) || event.phases.length > 30) return null;
+  const allowedStatuses = new Set(['pending', 'in_progress', 'completed', 'abandoned', 'blocked']);
+  const phases = [];
+  for (const phase of event.phases) {
+    const name = bridgeString(phase?.name, 120);
+    if (!name || !Array.isArray(phase.tasks) || phase.tasks.length > 200) return null;
+    const tasks = [];
+    for (const task of phase.tasks) {
+      const content = bridgeString(task?.content, 500);
+      if (!content || !allowedStatuses.has(task.status)) return null;
+      tasks.push({
+        content,
+        status: task.status,
+        ...(bridgeString(task.blocker, 300) !== undefined ? { blocker: task.blocker } : {}),
+      });
+    }
+    phases.push({ name, tasks });
+  }
+  return {
+    type: 'todo',
+    phases,
+    ...(bridgeString(event.op, 20) !== undefined ? { op: event.op } : {}),
+    isError: !!event.isError,
+  };
+}
+
+function normalizeAsyncJob(job) {
+  const id = bridgeString(job?.id, 120);
+  const type = bridgeString(job?.type, 20);
+  const status = bridgeString(job?.status, 20);
+  const startTime = bridgeNumber(job?.startTime, 0);
+  if (!id || !type || !status || startTime === undefined) return null;
+  return {
+    id,
+    type,
+    status,
+    startTime,
+    ...(type === 'task' && bridgeString(job.label, 160) !== undefined ? { label: job.label } : {}),
+  };
+}
+
+function normalizeOmpBridgeEvent(event) {
+  if (!event || typeof event !== 'object' || !OMP_BRIDGE_EVENT_TYPES[event.type]) return null;
+  const type = event.type;
+  if (type === 'assistant_snapshot') {
+    const messageId = bridgeString(event.messageId, 128);
+    const text = bridgeString(event.text, 100_000);
+    return messageId && text !== undefined ? { type, messageId, text } : null;
+  }
+  if (type === 'assistant_end' || type === 'assistant_cancel') {
+    const messageId = bridgeString(event.messageId, 128);
+    return messageId ? { type, messageId } : null;
+  }
+  if (type === 'agent_start') return { type };
+  if (type === 'agent_end') return { type, ...(typeof event.willContinue === 'boolean' ? { willContinue: event.willContinue } : {}) };
+  if (type === 'auto_retry_start') {
+    if (!Number.isSafeInteger(event.attempt) || !Number.isSafeInteger(event.maxAttempts) || !Number.isSafeInteger(event.delayMs)) return null;
+    return {
+      type,
+      attempt: event.attempt,
+      maxAttempts: event.maxAttempts,
+      delayMs: event.delayMs,
+      ...(bridgeString(event.errorMessage, 500) !== undefined ? { errorMessage: event.errorMessage } : {}),
+    };
+  }
+  if (type === 'auto_retry_end') {
+    if (typeof event.success !== 'boolean' || !Number.isSafeInteger(event.attempt)) return null;
+    return {
+      type,
+      success: event.success,
+      attempt: event.attempt,
+      ...(bridgeString(event.finalError, 500) !== undefined ? { finalError: event.finalError } : {}),
+    };
+  }
+  if (type === 'auto_compaction_start') {
+    const reason = bridgeString(event.reason, 32);
+    const action = bridgeString(event.action, 32);
+    return reason && action ? { type, reason, action } : null;
+  }
+  if (type === 'auto_compaction_end') {
+    const action = bridgeString(event.action, 32);
+    if (!action || typeof event.aborted !== 'boolean' || typeof event.willRetry !== 'boolean') return null;
+    return {
+      type,
+      action,
+      aborted: event.aborted,
+      willRetry: event.willRetry,
+      ...(typeof event.skipped === 'boolean' ? { skipped: event.skipped } : {}),
+      ...(bridgeString(event.errorMessage, 500) !== undefined ? { errorMessage: event.errorMessage } : {}),
+    };
+  }
+  if (type === 'credential_disabled') {
+    const provider = bridgeString(event.provider, 80);
+    return provider ? { type, provider } : null;
+  }
+  if (type === 'todo') return normalizeTodoEvent(event);
+  if (type === 'tool_approval_requested') {
+    const toolCallId = bridgeString(event.toolCallId, 128);
+    const toolName = bridgeString(event.toolName, 80);
+    const approvalMode = bridgeString(event.approvalMode, 40);
+    if (!toolCallId || !toolName || !approvalMode) return null;
+    return { type, toolCallId, toolName, approvalMode, ...(bridgeString(event.reason, 500) !== undefined ? { reason: event.reason } : {}) };
+  }
+  if (type === 'tool_approval_resolved') {
+    const toolCallId = bridgeString(event.toolCallId, 128);
+    const toolName = bridgeString(event.toolName, 80);
+    if (!toolCallId || !toolName || typeof event.approved !== 'boolean') return null;
+    return { type, toolCallId, toolName, approved: event.approved, ...(bridgeString(event.reason, 500) !== undefined ? { reason: event.reason } : {}) };
+  }
+  if (type === 'subagent_lifecycle' || type === 'subagent_progress') {
+    const id = bridgeString(event.id, 128);
+    const agent = bridgeString(event.agent, 80);
+    const status = bridgeString(event.status, 20);
+    const index = bridgeNumber(event.index, 0, 1000);
+    if (!id || !agent || !status || index === undefined) return null;
+    return {
+      type,
+      id,
+      agent,
+      status,
+      index,
+      detached: !!event.detached,
+      ...(bridgeString(event.description, 300) !== undefined ? { description: event.description } : {}),
+      ...(bridgeString(event.intent, 300) !== undefined ? { intent: event.intent } : {}),
+      ...(bridgeString(event.resolvedModel, 160) !== undefined ? { resolvedModel: event.resolvedModel } : {}),
+      ...(bridgeNumber(event.toolCount) !== undefined ? { toolCount: event.toolCount } : {}),
+      ...(bridgeNumber(event.requests) !== undefined ? { requests: event.requests } : {}),
+      ...(bridgeNumber(event.tokens) !== undefined ? { tokens: event.tokens } : {}),
+      ...(bridgeNumber(event.durationMs) !== undefined ? { durationMs: event.durationMs } : {}),
+      ...(bridgeNumber(event.contextTokens) !== undefined ? { contextTokens: event.contextTokens } : {}),
+      ...(bridgeNumber(event.contextWindow) !== undefined ? { contextWindow: event.contextWindow } : {}),
+    };
+  }
+  if (type === 'async_jobs') {
+    if (!Array.isArray(event.running) || !Array.isArray(event.recent) || event.running.length > 30 || event.recent.length > 20) return null;
+    const running = event.running.map(normalizeAsyncJob);
+    const recent = event.recent.map(normalizeAsyncJob);
+    if (running.some(job => job === null) || recent.some(job => job === null)) return null;
+    return {
+      type,
+      running,
+      recent,
+      delivery: {
+        queued: bridgeNumber(event.delivery?.queued, 0, 1000) || 0,
+        delivering: !!event.delivery?.delivering,
+      },
+    };
+  }
+  if (type === 'session_state') {
+    const serviceTiers = {};
+    if (event.serviceTiers && typeof event.serviceTiers === 'object' && !Array.isArray(event.serviceTiers)) {
+      for (const [family, tier] of Object.entries(event.serviceTiers).slice(0, 20)) {
+        if (bridgeString(family, 40) && (tier === null || bridgeString(tier, 40) !== undefined)) serviceTiers[family] = tier;
+      }
+    }
+    return {
+      type,
+      ...(bridgeString(event.modelProvider, 80) !== undefined ? { modelProvider: event.modelProvider } : {}),
+      ...(bridgeString(event.modelId, 160) !== undefined ? { modelId: event.modelId } : {}),
+      ...(bridgeString(event.modelApi, 80) !== undefined ? { modelApi: event.modelApi } : {}),
+      ...(bridgeString(event.thinkingLevel, 40) !== undefined ? { thinkingLevel: event.thinkingLevel } : {}),
+      serviceTiers,
+      ...(bridgeNumber(event.contextTokens) !== undefined ? { contextTokens: event.contextTokens } : {}),
+      ...(bridgeNumber(event.contextWindow) !== undefined ? { contextWindow: event.contextWindow } : {}),
+      ...(bridgeNumber(event.contextPercent, 0, 100) !== undefined ? { contextPercent: event.contextPercent } : {}),
+    };
+  }
+  return null;
+}
+
+app.post('/api/internal/sessions/:id/events', (req, res) => {
+  const { id } = req.params;
+  if (!bridgeTokenValid(id, req.get('X-Feather-Bridge-Token'))) return res.status(403).json({ error: 'invalid bridge token' });
+  const events = req.body?.events;
+  if (!Array.isArray(events) || events.length === 0 || events.length > 50) return res.status(400).json({ error: 'events must be a non-empty array (max 50)' });
+  const normalized = events.map(normalizeOmpBridgeEvent);
+  if (normalized.some(event => event === null)) return res.status(400).json({ error: 'invalid bridge event' });
+  for (const event of normalized) broadcastNamedEvent(id, 'omp_event', event);
+  res.status(204).end();
+});
 
 // Detect an optional agent's version via the interactive-rc shell so binaries
 // under ~/.npm-global/bin (codex, omp) resolve the same way they do when spawned
@@ -2637,6 +2902,25 @@ app.post('/api/sessions/:id/send', async (req, res) => {
   catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
+const TERMINAL_KEYS = new Set(['Enter', 'Escape', 'Up', 'Down', 'Left', 'Right', 'Home', 'End', 'Space', 'Tab']);
+
+function validatedTerminalKeys(value) {
+  return Array.isArray(value) && value.length > 0 && value.length <= 20 && value.every(key => TERMINAL_KEYS.has(key))
+    ? value
+    : null;
+}
+
+app.post('/api/sessions/:id/keys', (req, res) => {
+  const keys = validatedTerminalKeys(req.body?.keys);
+  if (!keys) return res.status(400).json({ error: 'invalid terminal keys' });
+  try {
+    execFileSync('tmux', ['send-keys', '-t', existingTmuxName(req.params.id), ...keys], { stdio: 'ignore' });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/sessions/:id/resume', async (req, res) => {
   try {
     const agent = getAgentForSession(req.params.id);
@@ -2701,6 +2985,8 @@ app.post('/api/sessions/:id/delete', (req, res) => {
       delete next[id];
       return next;
     });
+    ompBridgeTokens.delete(id);
+    try { fs.unlinkSync(ompBridgeTokenPath(id)); } catch {}
     sseClients.delete(id);
     fileOffsets.delete(id);
     sessionsSnapshotCache.invalidate();

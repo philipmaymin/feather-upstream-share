@@ -125,6 +125,25 @@ describe('parseOmpMessage: toolResult role', () => {
     assert.equal(b.tool_use_id, 'toolu_001')
     assert.ok(b.content.includes('total 42'))
     assert.equal(b.is_error, false)
+    assert.equal('details' in b, false)
+  })
+
+  it('preserves OMP tool name and structured Todo details', () => {
+    const phases = [{ name: 'Build', tasks: [{ content: 'Wire bridge', status: 'in_progress' }] }]
+    const msg = parseOmpMessage(omp({
+      message: {
+        role: 'toolResult',
+        toolCallId: 'todo_001',
+        toolName: 'todo',
+        content: [{ type: 'text', text: '1 task in progress' }],
+        details: { phases, op: 'init' },
+        isError: false,
+        timestamp: 1712345678000,
+      },
+    }))
+    assert.ok(msg)
+    assert.equal(msg.content[0].name, 'todo')
+    assert.deepEqual(msg.content[0].details, { phases, op: 'init' })
   })
 
   it('parses error toolResult with is_error flag', () => {

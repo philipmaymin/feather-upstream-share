@@ -6,6 +6,7 @@ import os from 'os'
 import net from 'net'
 import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
+import { createHash } from 'crypto'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..', '..')
@@ -553,6 +554,56 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
       ctrl.abort()
     }
   })
+  it('authenticates, normalizes, and broadcasts OMP bridge events', async () => {
+    const sessionId = `omp-bridge-${Date.now()}`
+    const token = 'test-bridge-secret'
+    const tokenDir = path.join(fixtureHome, '.feather', 'omp-sessions', '.feather-bridge-tokens')
+    fs.mkdirSync(tokenDir, { recursive: true })
+    const tokenName = createHash('sha256').update(sessionId).digest('hex')
+    fs.writeFileSync(path.join(tokenDir, tokenName), token, { mode: 0o600 })
+
+    const denied = await fetch(`${BASE}/api/internal/sessions/${sessionId}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Feather-Bridge-Token': 'wrong' },
+      body: JSON.stringify({ events: [{ type: 'assistant_snapshot', messageId: 'm1', text: 'Hello' }] }),
+    })
+    assert.equal(denied.status, 403)
+
+    const ctrl = new AbortController()
+    try {
+      const stream = await fetch(`${BASE}/api/sessions/${sessionId}/stream`, { signal: ctrl.signal })
+      const reader = stream.body.getReader()
+      const decoder = new TextDecoder()
+      await reader.read()
+
+      const accepted = await fetch(`${BASE}/api/internal/sessions/${sessionId}/events`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Feather-Bridge-Token': token },
+        body: JSON.stringify({ events: [{
+          type: 'assistant_snapshot',
+          messageId: 'm1',
+          text: 'Hello',
+          thinking: 'must not cross the boundary',
+        }] }),
+      })
+      assert.equal(accepted.status, 204)
+
+      const { value } = await reader.read()
+      const payload = decoder.decode(value)
+      assert.match(payload, /event: omp_event/)
+      const dataLine = payload.split('\n').find(line => line.startsWith('data: '))
+      assert.deepEqual(JSON.parse(dataLine.replace('data: ', '')), {
+        type: 'assistant_snapshot',
+        messageId: 'm1',
+        text: 'Hello',
+      })
+      assert.equal(payload.includes('must not cross'), false)
+    } finally {
+      ctrl.abort()
+      try { fs.unlinkSync(path.join(tokenDir, tokenName)) } catch {}
+    }
+  })
+
 })
 
 // ── Error handling ──────────────────────────────────────────────────────────

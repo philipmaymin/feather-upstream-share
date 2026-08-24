@@ -5,14 +5,15 @@ import { MessageView } from './components/MessageView'
 import { Terminal } from './components/Terminal'
 import { SidecarThread } from './components/Sidecar'
 import RoomsHome from './RoomsHome'
-import type { SessionMeta, Message, QuestionData, SidecarGroup, RoomUpdate } from './api'
-import { fetchSessions, fetchRooms, fetchRoomUpdates, fetchMessages, subscribeMessages, sendInput, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
+import type { SessionMeta, Message, QuestionData, SidecarGroup, RoomUpdate, OmpBridgeEvent, OmpAsyncJob } from './api'
+import { fetchSessions, fetchRooms, fetchRoomUpdates, fetchMessages, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
 import type { SearchResult } from './api'
 import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
 import { listPendingMessages, putPendingMessage, patchPendingMessage, deletePendingMessage } from './lib/messageOutbox.js'
 import { appUrl } from './lib/appPath.js'
-import { deriveToolIntentState, toolIntentTransition } from './lib/toolIntentStatus.js'
+import { deriveToolIntentState, isFinalAssistantMessage, toolIntentTransition } from './lib/toolIntentStatus.js'
+import { deriveTodoSnapshot, todoSnapshotFromDetails, todoSnapshotFromMessage } from './lib/ompTodo.js'
 
 interface QuickLink { label: string; url: string }
 type AgentId = 'claude' | 'codex' | 'omp'
@@ -34,6 +35,36 @@ interface StoredFileMedia extends StoredMediaBase { kind: 'file' | 'image'; stat
 interface StoredVoiceMedia extends StoredMediaBase { kind: 'audio'; status: VoiceStatus; transcript?: string; intent?: 'append' | 'send'; capturedText?: string }
 type StoredMedia = StoredFileMedia | StoredVoiceMedia
 interface PendingMessage { id: string; sessionId: string; text: string; createdAt: number; attempts: number; error?: string }
+interface AssistantStream { id: string; text: string; ended: boolean }
+interface TodoTask { content: string; status: string }
+interface TodoPhase { name: string; tasks: TodoTask[] }
+interface TodoSnapshot { phases: TodoPhase[]; completed: number; total: number; active: string | null }
+interface OmpNotice { kind: 'retry' | 'compaction' | 'credential'; text: string }
+interface OmpApproval { toolCallId: string; toolName: string; approvalMode: string; reason?: string }
+interface OmpSubagent {
+  id: string
+  agent: string
+  status: string
+  index: number
+  detached: boolean
+  description?: string
+  intent?: string
+  resolvedModel?: string
+  toolCount?: number
+  requests?: number
+  tokens?: number
+  durationMs?: number
+}
+interface OmpRuntimeState {
+  modelProvider?: string
+  modelId?: string
+  modelApi?: string
+  thinkingLevel?: string
+  serviceTiers?: Record<string, string | null>
+  contextTokens?: number
+  contextWindow?: number
+  contextPercent?: number
+}
 
 function fileStatusLabel(file: PendingFile) {
   if (file.status === 'uploading') return `Uploading · ${Math.min(MEDIA_ATTEMPTS, file.attempts + 1)}/${MEDIA_ATTEMPTS}`
@@ -239,6 +270,30 @@ export default function App() {
   const [working, setWorking] = createSignal(false)
   const [toolIntentStatus, setToolIntentStatus] = createSignal('')
   const [dragging, setDragging] = createSignal(false)
+  const [toolIntentHistory, setToolIntentHistory] = createSignal<string[]>([])
+  const [assistantStream, setAssistantStream] = createSignal<AssistantStream | null>(null)
+  const [todoSnapshot, setTodoSnapshot] = createSignal<TodoSnapshot | null>(null)
+  const [ompNotice, setOmpNotice] = createSignal<OmpNotice | null>(null)
+  const [ompApproval, setOmpApproval] = createSignal<OmpApproval | null>(null)
+  const [ompSubagents, setOmpSubagents] = createSignal<OmpSubagent[]>([])
+  const [ompJobs, setOmpJobs] = createSignal<OmpAsyncJob[]>([])
+  const [ompRuntime, setOmpRuntime] = createSignal<OmpRuntimeState | null>(null)
+  let assistantStreamStaleTimer: number | undefined
+  function clearAssistantStream() {
+    clearTimeout(assistantStreamStaleTimer)
+    assistantStreamStaleTimer = undefined
+    setAssistantStream(null)
+  }
+  function clearOmpLiveSurfaces() {
+    setTodoSnapshot(null)
+    setOmpNotice(null)
+    setOmpApproval(null)
+    setOmpSubagents([])
+    setOmpJobs([])
+    setOmpRuntime(null)
+  }
+
+
   const [menuOpen, setMenuOpen] = createSignal(false)
   const [historyIdx, setHistoryIdx] = createSignal(-1)
   const [sseStatus, setSSEStatus] = createSignal<'connected' | 'reconnecting'>('connected')
@@ -395,11 +450,15 @@ export default function App() {
       if (listed && !listed.isActive) {
         setWorking(false)
         setToolIntentStatus('')
+        setToolIntentHistory([])
+        clearAssistantStream()
       } else if (!listed) {
         findSessionMeta(active, visibleSessions).then(session => {
           if (currentId() === active && session && !session.isActive) {
             setWorking(false)
             setToolIntentStatus('')
+            setToolIntentHistory([])
+            clearAssistantStream()
           }
         })
       }
@@ -514,6 +573,8 @@ export default function App() {
       if (working()) {
         setWorking(false)
         setToolIntentStatus('')
+        setToolIntentHistory([])
+        clearAssistantStream()
       }
     }, 5 * 60 * 1000)
   }
@@ -600,7 +661,7 @@ export default function App() {
       window.removeEventListener('resize', setVh)
     })
   })
-  onCleanup(() => { if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer); if (pendingRetryTimer) clearTimeout(pendingRetryTimer); clearPendingMedia(); cancelSelectionWork(); document.removeEventListener('keydown', onGlobalKeyDown) })
+  onCleanup(() => { if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer); if (pendingRetryTimer) clearTimeout(pendingRetryTimer); clearAssistantStream(); clearPendingMedia(); cancelSelectionWork(); document.removeEventListener('keydown', onGlobalKeyDown) })
 
   // Autoresize textarea on programmatic text changes (draft restore on session
   // select, voice dictation, history navigation). The onInput handler covers
@@ -615,6 +676,117 @@ export default function App() {
       textareaRef.style.height = Math.min(textareaRef.scrollHeight, 120) + 'px'
     })
   })
+
+  function handleOmpEvent(event: OmpBridgeEvent) {
+    if (event.type === 'todo' && event.phases) {
+      setTodoSnapshot(todoSnapshotFromDetails({ phases: event.phases }))
+      return
+    }
+    if (event.type === 'tool_approval_requested' && event.toolCallId && event.toolName && event.approvalMode) {
+      setOmpApproval({
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        approvalMode: event.approvalMode,
+        reason: event.reason,
+      })
+      return
+    }
+    if (event.type === 'tool_approval_resolved') {
+      setOmpApproval(current => current?.toolCallId === event.toolCallId ? null : current)
+      return
+    }
+    if ((event.type === 'subagent_lifecycle' || event.type === 'subagent_progress') && event.id && event.agent && event.status && event.index !== undefined) {
+      setOmpSubagents(current => {
+        const previous = current.find(agent => agent.id === event.id)
+        const next: OmpSubagent = {
+          id: event.id!,
+          agent: event.agent!,
+          status: event.status!,
+          index: event.index!,
+          detached: !!event.detached,
+          description: event.description ?? previous?.description,
+          intent: event.intent ?? previous?.intent,
+          resolvedModel: event.resolvedModel ?? previous?.resolvedModel,
+          toolCount: event.toolCount ?? previous?.toolCount,
+          requests: event.requests ?? previous?.requests,
+          tokens: event.tokens ?? previous?.tokens,
+          durationMs: event.durationMs ?? previous?.durationMs,
+        }
+        return [next, ...current.filter(agent => agent.id !== next.id)].slice(0, 12)
+      })
+      return
+    }
+    if (event.type === 'async_jobs' && event.running && event.recent) {
+      const seen = new Set(event.running.map(job => job.id))
+      setOmpJobs([...event.running, ...event.recent.filter(job => !seen.has(job.id))].slice(0, 20))
+      return
+    }
+    if (event.type === 'session_state') {
+      setOmpRuntime({
+        modelProvider: event.modelProvider,
+        modelId: event.modelId,
+        modelApi: event.modelApi,
+        thinkingLevel: event.thinkingLevel,
+        serviceTiers: event.serviceTiers,
+        contextTokens: event.contextTokens,
+        contextWindow: event.contextWindow,
+        contextPercent: event.contextPercent,
+      })
+      return
+    }
+    if (event.type === 'assistant_snapshot' && event.messageId && typeof event.text === 'string') {
+      clearTimeout(assistantStreamStaleTimer)
+      assistantStreamStaleTimer = undefined
+      setAssistantStream({ id: event.messageId, text: event.text, ended: false })
+      setWorking(true)
+      return
+    }
+    if (event.type === 'assistant_end' && event.messageId) {
+      setAssistantStream(current => current?.id === event.messageId ? { ...current, ended: true } : current)
+      clearTimeout(assistantStreamStaleTimer)
+      assistantStreamStaleTimer = setTimeout(() => {
+        setAssistantStream(current => current?.id === event.messageId && current.ended ? null : current)
+        assistantStreamStaleTimer = undefined
+      }, 15_000)
+      return
+    }
+    if (event.type === 'assistant_cancel' && event.messageId) {
+      setAssistantStream(current => {
+        if (current?.id !== event.messageId) return current
+        clearTimeout(assistantStreamStaleTimer)
+        assistantStreamStaleTimer = undefined
+        return null
+      })
+      return
+    }
+    if (event.type === 'agent_start') {
+      setWorking(true)
+      return
+    }
+    if (event.type === 'agent_end') {
+      if (!event.willContinue) setWorking(false)
+      return
+    }
+    if (event.type === 'auto_retry_start') {
+      setOmpNotice({ kind: 'retry', text: `Retrying request · ${event.attempt || 1}/${event.maxAttempts || '?'}` })
+      return
+    }
+    if (event.type === 'auto_retry_end') {
+      setOmpNotice(event.success ? null : { kind: 'retry', text: event.finalError || 'Request retry failed' })
+      return
+    }
+    if (event.type === 'auto_compaction_start') {
+      setOmpNotice({ kind: 'compaction', text: 'Compacting context' })
+      return
+    }
+    if (event.type === 'auto_compaction_end') {
+      setOmpNotice(event.aborted ? { kind: 'compaction', text: event.errorMessage || 'Context compaction stopped' } : null)
+      return
+    }
+    if (event.type === 'credential_disabled') {
+      setOmpNotice({ kind: 'credential', text: `${event.provider || 'Provider'} credential disabled` })
+    }
+  }
 
   async function select(id: string) {
     const prev = currentId()
@@ -638,6 +810,9 @@ export default function App() {
     setMessages([])
     setHasMore(false)
     setToolIntentStatus('')
+    setToolIntentHistory([])
+    clearAssistantStream()
+    clearOmpLiveSurfaces()
     setActivity(null)
     setQuestion(null)
     setText(loadDraft(id))
@@ -686,6 +861,8 @@ export default function App() {
       const toolIntentState = deriveToolIntentState(msgs)
       const turnEnded = last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence'
       setToolIntentStatus(!isActive || turnEnded ? '' : toolIntentState.status)
+      setToolIntentHistory(!isActive || turnEnded ? [] : toolIntentState.history)
+      setTodoSnapshot(deriveTodoSnapshot(msgs))
       if (!isActive || turnEnded) setWorking(false)
       else if (last.role === 'user' || toolIntentState.working) setWorking(true)
       else setWorking(false) // assistant mid-stream but no new SSE yet; let SSE update it
@@ -699,6 +876,8 @@ export default function App() {
       }
     } else {
       setToolIntentStatus('')
+      setToolIntentHistory([])
+      setTodoSnapshot(null)
       setWorking(isActive)
     }
     appendPendingMessages(id)
@@ -719,12 +898,21 @@ export default function App() {
       clearTimeout(assistantDoneTimer)
       // If new content arrives while a question is showing, it was a false positive
       if (question() && msg.role === 'assistant' && !msg.stopReason) setQuestion(null)
-      const toolIntentUpdate = toolIntentTransition(toolIntentStatus(), msg)
+      const toolIntentUpdate = toolIntentTransition({
+        status: toolIntentStatus(),
+        history: toolIntentHistory(),
+        working: working(),
+      }, msg)
       setToolIntentStatus(toolIntentUpdate.status)
+      setToolIntentHistory(toolIntentUpdate.history)
+      const todo = todoSnapshotFromMessage(msg)
+      if (todo !== undefined) setTodoSnapshot(todo)
+      if (isFinalAssistantMessage(msg)) clearAssistantStream()
       // Use stop_reason to accurately track working state
       if (msg.stopReason === 'end_turn' || msg.stopReason === 'stop_sequence') {
         setWorking(false)
         setToolIntentStatus('')
+        setToolIntentHistory([])
         clearTimeout(workingTimer)
         // Refresh session list to pick up auto-generated title
         const cur = sessions().find(s => s.id === id)
@@ -744,6 +932,7 @@ export default function App() {
           if (isCurrentSelection(id, generation) && working()) {
             setWorking(false)
             setToolIntentStatus('')
+            setToolIntentHistory([])
             clearTimeout(workingTimer)
           }
         }, 5000)
@@ -783,9 +972,14 @@ export default function App() {
         refreshPendingMessages()
       }
     },
-    status => { if (isCurrentSelection(id, generation)) setSSEStatus(status) },
+    status => {
+      if (!isCurrentSelection(id, generation)) return
+      setSSEStatus(status)
+      if (status === 'reconnecting') clearAssistantStream()
+    },
     activity => { if (isCurrentSelection(id, generation)) setActivity(activity) },
-    nextQuestion => { if (isCurrentSelection(id, generation)) setQuestion(nextQuestion) })
+    nextQuestion => { if (isCurrentSelection(id, generation)) setQuestion(nextQuestion) },
+    event => { if (isCurrentSelection(id, generation) && loadedSessionId() === id) handleOmpEvent(event) })
     if (!isCurrentSelection(id, generation)) unsubscribe()
     else cleanupSSE = unsubscribe
     queueMicrotask(() => { if (isCurrentSelection(id, generation)) retryPendingMessages(id) })
@@ -891,6 +1085,8 @@ export default function App() {
     if (id === currentId()) {
       setWorking(false)
       setToolIntentStatus('')
+      setToolIntentHistory([])
+      clearAssistantStream()
     }
   }
 
@@ -924,6 +1120,9 @@ export default function App() {
     setMessages([])
     setWorking(false)
     setToolIntentStatus('')
+    setToolIntentHistory([])
+    clearAssistantStream()
+    clearOmpLiveSurfaces()
     setActivity(null)
     setQuestion(null)
     setSidebar(false)
@@ -1057,6 +1256,8 @@ export default function App() {
           })
           setWorking(true)
           setToolIntentStatus('')
+          setToolIntentHistory([])
+          clearAssistantStream()
           startWorkingTimeout()
         }
       } catch (error: any) {
@@ -1355,6 +1556,8 @@ export default function App() {
     if (!loading() && session && !session.isActive) {
       setWorking(false)
       setToolIntentStatus('')
+      setToolIntentHistory([])
+      clearAssistantStream()
     }
   })
 
@@ -1843,7 +2046,29 @@ export default function App() {
             />
           }>
             <div style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
-              <MessageView messages={messages()} loading={loading()} hasMore={hasMore()} loadingMore={loadingMore()} onLoadEarlier={loadEarlier} onAnswer={(t) => { if (composerReady()) sendInput(currentId()!, t) }} starred={new Set(starred()[currentId()!] || [])} onToggleStar={(uuid) => { if (loadedSessionId()) toggleStar(loadedSessionId()!, uuid) }} working={working()} statusText={toolIntentStatus()} scrollRefCb={(el) => { messageScrollRef = el }} sessionId={loadedSessionId()} />
+              <MessageView
+                messages={messages()}
+                loading={loading()}
+                hasMore={hasMore()}
+                loadingMore={loadingMore()}
+                onLoadEarlier={loadEarlier}
+                onAnswer={(answer) => { if (composerReady()) sendInput(currentId()!, answer) }}
+                onKeys={(keys) => { if (composerReady()) sendSessionKeys(currentId()!, keys).catch(console.error) }}
+                starred={new Set(starred()[currentId()!] || [])}
+                onToggleStar={(uuid) => { if (loadedSessionId()) toggleStar(loadedSessionId()!, uuid) }}
+                working={working()}
+                statusText={toolIntentStatus()}
+                intentHistory={toolIntentHistory()}
+                assistantStream={assistantStream()}
+                todo={todoSnapshot()}
+                notice={ompNotice()}
+                approval={ompApproval()}
+                subagents={ompSubagents()}
+                jobs={ompJobs()}
+                runtime={ompRuntime()}
+                scrollRefCb={(el) => { messageScrollRef = el }}
+                sessionId={loadedSessionId()}
+              />
             </div>
             <div style={{ display: tab() === 'files' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%' }}>
               {/* Mode toggle */}

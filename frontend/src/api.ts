@@ -178,6 +178,7 @@ export interface ContentBlock {
   tool_use_id?: string
   input?: any
   content?: any
+  details?: unknown
   is_error?: boolean
 }
 
@@ -235,6 +236,16 @@ export async function sendInput(id: string, text: string, messageId?: string): P
   if (data.ok !== true) throw Object.assign(new Error(data.error || `HTTP ${r.status}`), { status: r.status })
   return data
 }
+export async function sendSessionKeys(id: string, keys: string[]): Promise<void> {
+  const r = await fetch(`${BASE}/api/sessions/${id}/keys`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keys }),
+  })
+  const data = await responseJson<{ ok?: boolean; error?: string }>(r)
+  if (data.ok !== true) throw Object.assign(new Error(data.error || `HTTP ${r.status}`), { status: r.status })
+}
+
 
 export async function createSession(cwd?: string, agent?: 'claude' | 'codex' | 'omp'): Promise<string> {
   const id = crypto.randomUUID()
@@ -420,12 +431,71 @@ export function subscribeSidecar(id: string, onMessage: (message: SidecarMessage
   return () => { source?.close(); source = null }
 }
 
+export interface OmpTodoPhase {
+  name: string
+  tasks: Array<{ content: string; status: string; blocker?: string }>
+}
+
+export interface OmpAsyncJob {
+  id: string
+  type: string
+  status: string
+  startTime: number
+  label?: string
+}
+
+export interface OmpBridgeEvent {
+  type: string
+  messageId?: string
+  text?: string
+  reason?: string
+  attempt?: number
+  provider?: string
+  maxAttempts?: number
+  delayMs?: number
+  success?: boolean
+  finalError?: string
+  aborted?: boolean
+  errorMessage?: string
+  willContinue?: boolean
+  toolCallId?: string
+  toolName?: string
+  approvalMode?: string
+  approved?: boolean
+  phases?: OmpTodoPhase[]
+  isError?: boolean
+  id?: string
+  agent?: string
+  status?: string
+  index?: number
+  detached?: boolean
+  description?: string
+  intent?: string
+  resolvedModel?: string
+  toolCount?: number
+  requests?: number
+  tokens?: number
+  durationMs?: number
+  running?: OmpAsyncJob[]
+  recent?: OmpAsyncJob[]
+  delivery?: { queued: number; delivering: boolean }
+  modelProvider?: string
+  modelId?: string
+  modelApi?: string
+  thinkingLevel?: string
+  serviceTiers?: Record<string, string | null>
+  contextTokens?: number
+  contextWindow?: number
+  contextPercent?: number
+}
+
 export function subscribeMessages(
   id: string,
   onMessage: (msg: Message) => void,
   onStatus?: (status: 'connected' | 'reconnecting') => void,
   onActivity?: (activity: string | null) => void,
   onQuestion?: (question: QuestionData | null) => void,
+  onOmpEvent?: (event: OmpBridgeEvent) => void,
 ): () => void {
   let es: EventSource | null = null
   let closed = false
@@ -509,6 +579,10 @@ export function subscribeMessages(
     source.addEventListener('question', (e) => {
       if (!alive()) return
       try { onQuestion?.(JSON.parse(e.data).question) } catch {}
+    })
+    source.addEventListener('omp_event', (e) => {
+      if (!alive()) return
+      try { onOmpEvent?.(JSON.parse(e.data)) } catch {}
     })
     source.onerror = () => {
       if (closed || sourceGeneration !== generation || source !== es) return
