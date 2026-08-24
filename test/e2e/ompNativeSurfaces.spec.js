@@ -183,4 +183,22 @@ test('mirrors parent and child execution across completion, replay, and responsi
   await page.setViewportSize({ width: 1280, height: 800 })
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   await page.screenshot({ path: '/tmp/feather-omp-mirror-desktop.png', fullPage: false })
+  await page.getByRole('button', { name: 'Chat', exact: true }).click()
+  const markdownStarted = await postEvents([
+    { type: 'agent_start' },
+    { type: 'assistant_snapshot', messageId: 'markdown-stream', text: '# Live answer\n\nThe **Markdown** is arriving.' },
+  ])
+  expect(markdownStarted.status).toBe(204)
+  const markdownStream = page.getByTestId('assistant-stream')
+  await expect(markdownStream.getByRole('heading', { name: 'Live answer' })).toBeVisible()
+  await expect(markdownStream.locator('strong')).toHaveText('Markdown')
+  await expect(markdownStream).not.toContainText('**Markdown**')
+
+  const markdownUpdated = await postEvents([
+    { type: 'assistant_snapshot', messageId: 'markdown-stream', text: '# Live answer\n\nThe **Markdown** is arriving.\n\n- First item\n- Second item\n\n`inline code`' },
+  ])
+  expect(markdownUpdated.status).toBe(204)
+  await expect(markdownStream.locator('li')).toHaveCount(2)
+  await expect(markdownStream.locator('code')).toHaveText('inline code')
+  await page.screenshot({ path: '/tmp/feather-streaming-markdown.png', fullPage: false })
 })

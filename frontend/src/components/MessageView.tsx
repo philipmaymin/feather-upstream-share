@@ -76,6 +76,14 @@ function renderMarkdown(text: string): string {
   return safe
 }
 
+// Live snapshots are sanitized on every update and deliberately omit remote
+// images. This prevents an unfinished answer from making third-party requests
+// while still rendering headings, lists, links, tables, and code immediately.
+function renderLiveMarkdown(text: string): string {
+  const html = marked.parse(text.trimEnd()) as string
+  return DOMPurify.sanitize(html, { ADD_ATTR: ['class', 'target', 'rel'], FORBID_TAGS: ['img'] })
+}
+
 // ── Message export helpers ──────────────────────────────────────────────
 
 function getMsgEl(uuid: string, container: HTMLElement): HTMLElement | null {
@@ -1552,7 +1560,7 @@ export function MessageView(props: MessageViewProps) {
       <Show when={props.notice}><div role="status" style={{ margin: '0 0 10px', padding: '8px 11px', 'border-radius': '9px', border: '1px solid #d8a13b', background: 'rgba(216,161,59,.08)', color: '#d8a13b', 'font-size': '12px' }}>{props.notice!.text}</div></Show>
 
       <Show when={props.assistantStream?.text}>
-        <div data-testid="assistant-stream" aria-live="polite" style={{ display: 'flex', 'justify-content': 'flex-start', 'margin-bottom': '10px' }}><div style={{ position: 'relative', 'max-width': '100%', padding: '10px 14px', 'border-radius': '12px', background: '#1a1a2e', border: '1px solid rgba(255,255,255,.06)', color: '#e5e5e5', 'font-size': '14px', 'line-height': '1.55', 'word-break': 'break-word' }}><div class="markdown" innerHTML={renderMarkdown(props.assistantStream!.text)} ref={assistantStreamMarkdownRef} /><span aria-hidden="true" style={{ position: 'absolute', right: '7px', bottom: '7px', display: 'inline-block', width: '2px', height: '10px', background: '#aaa', opacity: props.assistantStream!.ended ? '.35' : '.9' }} /></div></div>
+        <div data-testid="assistant-stream" aria-live="polite" style={{ display: 'flex', 'justify-content': 'flex-start', 'margin-bottom': '10px' }}><div style={{ position: 'relative', 'max-width': '100%', padding: '10px 14px', 'border-radius': '12px', background: '#1a1a2e', border: '1px solid rgba(255,255,255,.06)', color: '#e5e5e5', 'font-size': '14px', 'line-height': '1.55', 'word-break': 'break-word' }}><div class="markdown" innerHTML={renderLiveMarkdown(props.assistantStream!.text)} ref={assistantStreamMarkdownRef} /><span aria-hidden="true" style={{ position: 'absolute', right: '7px', bottom: '7px', display: 'inline-block', width: '2px', height: '10px', background: '#aaa', opacity: props.assistantStream!.ended ? '.35' : '.9' }} /></div></div>
       </Show>
 
       {/* Typing indicator — always mounted, opacity-toggled so mount/unmount
