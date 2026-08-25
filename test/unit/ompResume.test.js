@@ -44,6 +44,8 @@ describe('safe OMP resume', () => {
 
   it('resumes the exact embedded OMP id and refuses unsafe continue fallback', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-omp-resume-'))
+    const port = 32_000 + (process.pid % 1000)
+    const base = `http://127.0.0.1:${port}`
     roots.push(root)
     const home = path.join(root, 'home')
     const stateDir = path.join(root, 'state')
@@ -72,9 +74,29 @@ describe('safe OMP resume', () => {
     fs.mkdirSync(badDir)
     fs.writeFileSync(path.join(badDir, '2026-08-23_bad.jsonl'), `${JSON.stringify({ type: 'title', title: 'No session record' })}\n`)
 
+    const foreignFeatherId = 'foreign-owner-feather-id'
+    const foreignDir = path.join(home, '.feather/omp-sessions', foreignFeatherId)
+    fs.mkdirSync(foreignDir)
+    const foreignPath = path.join(foreignDir, '2026-08-23_foreign.jsonl')
+    fs.writeFileSync(foreignPath, [
+      sessionLine('omp-foreign-owner-id'),
+      JSON.stringify({ type: 'message', message: { role: 'user', content: 'hello' } }),
+    ].join('\n') + '\n')
+    fs.writeFileSync(path.join(foreignDir, '.feather-bridge.json'), JSON.stringify({
+      url: `http://127.0.0.1:${port + 1}/api/internal/sessions/${foreignFeatherId}/events`,
+      token: 'foreign-owner-token',
+      sessionId: foreignFeatherId,
+    }))
+
     fs.writeFileSync(path.join(binDir, 'tmux'), `#!/bin/sh
 printf '%s\\n' "$*" >> "$TMUX_TEST_LOG"
 case "$1" in
+  has-session)
+    case "$*" in
+      *"=f-${goodFeatherId}"*|*"=f-${foreignFeatherId}"*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
   list-panes) printf 'omp\\n' ;;
   capture-pane) printf '>\\n' ;;
 esac
@@ -82,8 +104,6 @@ exit 0
 `)
     fs.chmodSync(path.join(binDir, 'tmux'), 0o755)
 
-    const port = 32_000 + (process.pid % 1000)
-    const base = `http://127.0.0.1:${port}`
     const child = spawn(process.execPath, ['server-single.js'], {
       cwd: path.resolve(import.meta.dirname, '../..'),
       env: {
@@ -96,6 +116,17 @@ exit 0
     let stderr = ''
     child.stderr.on('data', chunk => { stderr += chunk })
     await waitForServer(base)
+    const beforeForeignCompletion = fs.readFileSync(tmuxLog, 'utf8')
+    fs.appendFileSync(foreignPath, JSON.stringify({
+      type: 'message',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'finished elsewhere' }], stopReason: 'stop' },
+    }) + '\n')
+    await new Promise(resolve => setTimeout(resolve, 1800))
+    assert.equal(
+      fs.readFileSync(tmuxLog, 'utf8'),
+      beforeForeignCompletion,
+      'a non-owning Feather instance must not replace another instance’s live OMP process',
+    )
     const staleWorkBridge = await fetch(`${base}/api/internal/sessions/${goodFeatherId}/events`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Feather-Bridge-Token': 'stale-token' },
@@ -142,21 +173,30 @@ exit 0
     await new Promise(resolve => setTimeout(resolve, 1800))
     assert.equal(fs.readFileSync(tmuxLog, 'utf8'), logBeforeLiveFinal, 'a live bridge must not trigger another migration')
 
-
+    const logBeforeGoodResume = fs.readFileSync(tmuxLog, 'utf8')
     const good = await fetch(`${base}/api/sessions/${goodFeatherId}/resume`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
     })
     assert.equal(good.status, 200, stderr)
     const logAfterGood = fs.readFileSync(tmuxLog, 'utf8')
+    const resumeLogDelta = logAfterGood.slice(logBeforeGoodResume.length)
+    assert.match(resumeLogDelta, /has-session/, 'resume must still verify the exact tmux session')
+    assert.doesNotMatch(
+      resumeLogDelta,
+      /kill-session|new-session/,
+      'resume must be idempotent while the exact tmux session is already active',
+    )
     assert.match(logAfterGood, /--resume/)
     assert.match(logAfterGood, /omp-exact-resume-id/)
     assert.doesNotMatch(logAfterGood, /--continue/)
 
+    const logBeforeBadResume = fs.readFileSync(tmuxLog, 'utf8')
     const bad = await fetch(`${base}/api/sessions/${badFeatherId}/resume`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
     })
     assert.equal(bad.status, 500)
     assert.match((await bad.json()).error, /exact OMP session id not found/)
-    assert.equal(fs.readFileSync(tmuxLog, 'utf8'), logAfterGood, 'failed resume must not launch tmux')
+    const badResumeLogDelta = fs.readFileSync(tmuxLog, 'utf8').slice(logBeforeBadResume.length)
+    assert.doesNotMatch(badResumeLogDelta, /kill-session|new-session/, 'failed resume must not launch tmux')
   })
 })

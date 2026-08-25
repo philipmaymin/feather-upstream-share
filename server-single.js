@@ -1957,6 +1957,21 @@ function ompBridgeIsLive(sessionId, now = Date.now()) {
   return Number.isFinite(live?.seenAt) && live.version >= OMP_BRIDGE_VERSION && now - live.seenAt < 30_000;
 }
 
+function ompBridgeOwnedElsewhere(sessionId) {
+  try {
+    const metadata = JSON.parse(fs.readFileSync(
+      path.join(OMP_SESSIONS, sessionId, '.feather-bridge.json'),
+      'utf8',
+    ));
+    if (metadata?.sessionId !== sessionId || typeof metadata.url !== 'string') return false;
+    return new URL(metadata.url).origin !== `http://127.0.0.1:${PORT}`;
+  } catch {
+    // Missing metadata identifies a legacy pre-bridge session. Preserve the
+    // existing completed-turn migration path for those sessions.
+    return false;
+  }
+}
+
 function cancelOmpBridgeMigration(sessionId) {
   const timer = pendingOmpBridgeMigrations.get(sessionId);
   if (!timer) return;
@@ -1972,10 +1987,12 @@ function observeOmpTurnBoundary(sessionId, line) {
     return;
   }
   if (getAgentForSession(sessionId) !== 'omp') return;
-  if (ompBridgeIsLive(sessionId) || !tmuxIsActive(sessionId) || pendingOmpBridgeMigrations.has(sessionId)) return;
+  if (ompBridgeIsLive(sessionId) || ompBridgeOwnedElsewhere(sessionId)
+    || !tmuxIsActive(sessionId) || pendingOmpBridgeMigrations.has(sessionId)) return;
   const timer = setTimeout(() => {
     pendingOmpBridgeMigrations.delete(sessionId);
-    if (ompBridgeIsLive(sessionId) || !tmuxIsActive(sessionId) || getAgentForSession(sessionId) !== 'omp') return;
+    if (ompBridgeIsLive(sessionId) || ompBridgeOwnedElsewhere(sessionId)
+      || !tmuxIsActive(sessionId) || getAgentForSession(sessionId) !== 'omp') return;
     try {
       spawnOrResume(sessionId, getOmpSessionCwd(sessionId), true, 'omp');
       console.log(`[omp bridge] migrated completed session ${sessionId}`);
@@ -3603,11 +3620,13 @@ app.post('/api/sessions/:id/keys', (req, res) => {
 
 app.post('/api/sessions/:id/resume', async (req, res) => {
   try {
-    const agent = getAgentForSession(req.params.id);
-    spawnOrResume(req.params.id, req.body?.cwd, true, agent);
-    try { await waitForAgentReady(tmuxName(req.params.id), agent); } catch {}
-    sessionsSnapshotCache.invalidate();
-    roomSnapshotCache.invalidate();
+    if (!tmuxIsActive(req.params.id)) {
+      const agent = getAgentForSession(req.params.id);
+      spawnOrResume(req.params.id, req.body?.cwd, true, agent);
+      try { await waitForAgentReady(tmuxName(req.params.id), agent); } catch {}
+      sessionsSnapshotCache.invalidate();
+      roomSnapshotCache.invalidate();
+    }
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
