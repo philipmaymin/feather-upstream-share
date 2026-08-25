@@ -7,8 +7,11 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
+import shutil
+import stat
 from pathlib import Path
 import re
 import subprocess
@@ -56,6 +59,87 @@ def release_details(path: Path) -> tuple[Path, dict]:
         if not isinstance(manifest.get(field), str) or not manifest[field]:
             raise FleetError(f"release manifest is missing {field}: {release}")
     return release, manifest
+
+def release_identity(manifest: dict) -> tuple[str, str, str]:
+    return manifest["sourceCommit"], manifest["version"], manifest["treeHash"]
+
+
+def release_tree_hash(root: Path) -> str:
+    digest = hashlib.sha256()
+    for directory, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        for name in dirnames + filenames:
+            path = Path(directory) / name
+            relative = path.relative_to(root).as_posix()
+            if relative == ".refeather-release.json":
+                continue
+            info = path.lstat()
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISLNK(info.st_mode):
+                kind, payload = "link", os.readlink(path).encode()
+            elif stat.S_ISDIR(info.st_mode):
+                kind, payload = "dir", b""
+            elif stat.S_ISREG(info.st_mode):
+                kind = "file"
+                file_digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        file_digest.update(block)
+                payload = file_digest.hexdigest().encode()
+            else:
+                raise FleetError(f"unsupported release entry: {relative}")
+            digest.update(f"{kind}\0{mode:o}\0{relative}\0".encode())
+            digest.update(payload)
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def verify_release_content(release: Path, manifest: dict) -> None:
+    actual = release_tree_hash(release)
+    if actual != manifest["treeHash"]:
+        raise FleetError(f"release content hash mismatch: {release}")
+
+
+def current_matches_release(link: Path, manifest: dict) -> bool:
+    try:
+        _, current_manifest = release_details(current_target(link))
+    except FleetError:
+        return False
+    return release_identity(current_manifest) == release_identity(manifest)
+
+
+def publish_shared_release(release: Path, manifest: dict, shared_releases: Path) -> Path:
+    commit = manifest["sourceCommit"]
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise FleetError(f"invalid source commit in release manifest: {commit!r}")
+    shared_releases.mkdir(parents=True, exist_ok=True)
+    target = shared_releases / commit
+    if target.exists():
+        shared, shared_manifest = release_details(target)
+        if release_identity(shared_manifest) != release_identity(manifest):
+            raise FleetError(f"shared release identity conflict: {target}")
+        verify_release_content(shared, shared_manifest)
+        return shared
+    temporary = shared_releases / f".fleet-copy-{commit}-{os.getpid()}"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    try:
+        shutil.copytree(release, temporary, symlinks=True)
+        copied, copied_manifest = release_details(temporary)
+        if release_identity(copied_manifest) != release_identity(manifest):
+            raise FleetError(f"copied release identity mismatch: {temporary}")
+        verify_release_content(copied, copied_manifest)
+        os.replace(temporary, target)
+        directory_fd = os.open(shared_releases, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return target.resolve(strict=True)
 
 
 def fleet_config(path: Path) -> list[dict]:
@@ -147,8 +231,8 @@ def schedule(args: argparse.Namespace) -> int:
     canary_current = absolute_path(args.canary_current, "canary current link")
     config_path = absolute_path(args.fleet_config, "fleet config").resolve(strict=True)
     fleet_config(config_path)
-    if current_target(canary_current) != release:
-        raise FleetError(f"canary current link does not point to release: {canary_current}")
+    if not current_matches_release(canary_current, manifest):
+        raise FleetError(f"canary current link does not match release: {canary_current}")
     if args.delay_seconds < 0:
         raise FleetError("delay seconds cannot be negative")
     now = time.time()
@@ -158,6 +242,7 @@ def schedule(args: argparse.Namespace) -> int:
         "release": str(release),
         "sourceCommit": manifest["sourceCommit"],
         "version": manifest["version"],
+        "treeHash": manifest["treeHash"],
         "canaryCurrentLink": str(canary_current),
         "fleetConfig": str(config_path),
         "scheduledAt": utc_now(now),
@@ -170,6 +255,58 @@ def schedule(args: argparse.Namespace) -> int:
             previous = load_json(state_path, "fleet schedule")
             if previous.get("status") in {"pending", "running", "failed"}:
                 previous = {**previous, "status": "superseded", "supersededAt": utc_now(), "supersededBy": str(release)}
+                archive_state(state_path, previous, "superseded")
+        atomic_write(state_path, pending)
+    print(json.dumps(pending, sort_keys=True))
+    return 0
+
+def sync_canary(args: argparse.Namespace) -> int:
+    state_path = Path(args.state)
+    canary_current = absolute_path(args.canary_current, "canary current link")
+    config_path = absolute_path(args.fleet_config, "fleet config").resolve(strict=True)
+    shared_releases = absolute_path(args.shared_releases_dir, "shared releases directory")
+    fleet_config(config_path)
+    if args.delay_seconds < 0:
+        raise FleetError("delay seconds cannot be negative")
+    canary_release, manifest = release_details(current_target(canary_current))
+    verify_release_content(canary_release, manifest)
+    shared_release = publish_shared_release(canary_release, manifest, shared_releases)
+    promoted_at = min(time.time(), canary_current.lstat().st_mtime)
+    pending = {
+        "schema": 1,
+        "status": "pending",
+        "release": str(shared_release),
+        "sourceCommit": manifest["sourceCommit"],
+        "version": manifest["version"],
+        "treeHash": manifest["treeHash"],
+        "canaryCurrentLink": str(canary_current),
+        "fleetConfig": str(config_path),
+        "scheduledAt": utc_now(promoted_at),
+        "dueAt": promoted_at + args.delay_seconds,
+        "dueAtIso": utc_now(promoted_at + args.delay_seconds),
+        "attempts": 0,
+    }
+    with state_lock(state_path):
+        if state_path.exists():
+            previous = load_json(state_path, "fleet schedule")
+            previous_identity = (
+                previous.get("sourceCommit"),
+                previous.get("version"),
+                previous.get("treeHash"),
+            )
+            if previous_identity == release_identity(manifest):
+                if previous.get("release") != str(shared_release):
+                    previous = {**previous, "release": str(shared_release)}
+                    atomic_write(state_path, previous)
+                print(json.dumps(previous, sort_keys=True))
+                return 0
+            if previous.get("status") in {"pending", "running", "failed"}:
+                previous = {
+                    **previous,
+                    "status": "superseded",
+                    "supersededAt": utc_now(),
+                    "supersededBy": str(shared_release),
+                }
                 archive_state(state_path, previous, "superseded")
         atomic_write(state_path, pending)
     print(json.dumps(pending, sort_keys=True))
@@ -224,7 +361,7 @@ def run_pending(args: argparse.Namespace) -> int:
             return 0
         release, manifest = release_details(absolute_path(state.get("release"), "scheduled release"))
         canary_current = absolute_path(state.get("canaryCurrentLink"), "canary current link")
-        if current_target(canary_current) != release:
+        if not current_matches_release(canary_current, manifest):
             state = {**state, "status": "superseded", "supersededAt": utc_now(), "reason": "Philip canary advanced before fleet promotion"}
             atomic_write(state_path, state)
             archive_state(state_path, state, "superseded")
@@ -246,7 +383,7 @@ def run_pending(args: argparse.Namespace) -> int:
                 failure = str(error)
                 results.append({"name": instance["name"], "status": "failed", "error": failure})
                 break
-            if prior == release and health_version(instance["healthUrl"]) == manifest["version"]:
+            if current_matches_release(current, manifest) and health_version(instance["healthUrl"]) == manifest["version"]:
                 results.append({"name": instance["name"], "status": "already-current"})
                 completed.append((instance, prior))
                 continue
@@ -305,6 +442,13 @@ def parser() -> argparse.ArgumentParser:
     schedule_parser.add_argument("--state", required=True)
     schedule_parser.add_argument("--delay-seconds", type=int, default=DEFAULT_DELAY_SECONDS)
     schedule_parser.set_defaults(handler=schedule)
+    sync_parser = commands.add_parser("sync")
+    sync_parser.add_argument("--canary-current", required=True)
+    sync_parser.add_argument("--fleet-config", required=True)
+    sync_parser.add_argument("--shared-releases-dir", required=True)
+    sync_parser.add_argument("--state", required=True)
+    sync_parser.add_argument("--delay-seconds", type=int, default=DEFAULT_DELAY_SECONDS)
+    sync_parser.set_defaults(handler=sync_canary)
     run_parser = commands.add_parser("run")
     run_parser.add_argument("--state", required=True)
     run_parser.add_argument("--refeather")

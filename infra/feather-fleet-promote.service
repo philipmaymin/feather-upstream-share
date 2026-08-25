@@ -1,5 +1,5 @@
 [Unit]
-Description=Promote verified Feather canary release to secondary users
+Description=Synchronize Philip's Feather canary and promote due secondary users
 After=network-online.target
 Wants=network-online.target
 
@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=oneshot
 User=root
 Group=root
+ExecStart=/home/user/.local/share/feather/current/bin/refeather-fleet sync --canary-current /home/user/.local/share/feather/current --fleet-config /etc/feather/fleet.json --shared-releases-dir /opt/feather/releases --state /var/lib/feather/refeather/fleet-schedule.json
 ExecStart=/home/user/.local/share/feather/current/bin/refeather-fleet run --state /var/lib/feather/refeather/fleet-schedule.json
 TimeoutStartSec=20min
 Nice=10

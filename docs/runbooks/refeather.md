@@ -135,20 +135,23 @@ the migration receipt.
 
 ## 4. Delay secondary-user promotion
 
-Promote the immutable release to the designated canary first. After its health
-checks pass, schedule the same release for the secondary fleet:
+Promote the immutable release to the designated canary first. The fleet timer
+detects the canary link change, verifies the release content hash, copies that
+exact tree into the shared release store when necessary, supersedes any older
+pending release, and starts a new 86,400-second window from the canary link's
+promotion timestamp. To run that synchronization immediately:
 
 ```bash
-sudo /home/user/.local/share/feather/current/bin/refeather-fleet schedule \
-  --release "$release" \
+sudo /home/user/.local/share/feather/current/bin/refeather-fleet sync \
   --canary-current /home/user/.local/share/feather/current \
   --fleet-config /etc/feather/fleet.json \
+  --shared-releases-dir /opt/feather/releases \
   --state /var/lib/feather/refeather/fleet-schedule.json
 ```
 
-The default delay is 86,400 seconds. A later canary promotion supersedes the
-pending release and starts a new 24-hour window. The runner also refuses a due
-promotion if the canary link no longer points to the scheduled release.
+The due runner compares the canary and scheduled release identities by source
+commit, version, and tree hash, so byte-identical per-user and shared paths are
+equivalent. A genuinely newer canary always supersedes the pending release.
 
 `fleet.json` uses schema 1 and one explicit record per secondary instance:
 
@@ -167,12 +170,12 @@ promotion if the canary link no longer points to the scheduled release.
 
 Install `infra/feather-fleet-promote.service` and
 `infra/feather-fleet-promote.timer` under `/etc/systemd/system/`, then enable
-the timer. The one-minute timer only reads the durable schedule until it is
-due. At promotion time it invokes the guarded per-instance transaction,
-requires each exact health version, and rolls already-promoted peers back if a
-later peer fails. Failed schedules remain durable and retry on the next timer
-tick; completed and superseded records are copied into the adjacent history
-directory.
+the timer. Every minute the oneshot service synchronizes the canary identity,
+then checks whether the durable schedule is due. At promotion time it invokes
+the guarded per-instance transaction, requires each exact health version, and
+rolls already-promoted peers back if a later peer fails. Failed schedules
+remain durable and retry with bounded backoff; completed and superseded records
+are copied into the adjacent history directory.
 
 ## Recovery and rollback
 
