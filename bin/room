@@ -154,11 +154,13 @@ cmd_note() {
 cmd_update() {
   resolve_room
   [ -n "${1:-}" ] || die 'usage: room update "<what happened and why it matters>"'
-  local line
-  line=$(python3 -c 'import json,sys,uuid,datetime; print(json.dumps({"id":uuid.uuid4().hex,"ts":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),"text":sys.argv[1]}))' "$1") \
+  ensure_feather_url
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"text":sys.argv[1]}))' "$1") \
     || die "could not encode update"
-  [ -d "$ROOM_PATH" ] || die "no such room: $ROOM_NAME"
-  printf '%s\n' "$line" >>"$ROOM_PATH/updates.jsonl" || die "could not write update to #$ROOM_NAME"
+  curl -sf -X POST "$FEATHER_URL/api/rooms/$ROOM_NAME/updates" \
+    -H 'Content-Type: application/json' -d "$payload" >/dev/null \
+    || die "feather refused to post update to #$ROOM_NAME"
   echo "posted update to #$ROOM_NAME"
 }
 

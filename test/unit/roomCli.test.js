@@ -83,6 +83,7 @@ describe('room assignment CLI', () => {
       ])
       await run(cli, ['pause'], { cwd: roomDir, env })
       await run(cli, ['wake'], { cwd: roomDir, env })
+      await run(cli, ['update', 'Deployment ready'], { cwd: roomDir, env })
       for (let attempt = 0; attempt < 200 && requests.filter(request => request.url === '/api/rooms/friction/pulse').length < 2; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, 20))
       }
@@ -93,6 +94,10 @@ describe('room assignment CLI', () => {
         { url: '/api/rooms/health/pulse', body: { enabled: false } },
         { url: '/api/rooms/health/pulse', body: { enabled: true } },
       ])
+      assert.deepEqual(requests.filter(request => request.url === '/api/rooms/health/updates'), [
+        { url: '/api/rooms/health/updates', body: { text: 'Deployment ready' } },
+      ])
+      assert.equal(fs.existsSync(path.join(roomDir, 'updates.jsonl')), false)
       const frictionWakes = requests.filter(request => request.url === '/api/rooms/friction/pulse')
       assert.equal(frictionWakes.length, 2)
       assert.ok(frictionWakes.every(request => request.body.enabled === true))
