@@ -105,7 +105,7 @@ sudo -E bin/refeather promote \
   --pre-promote-check '/path/to/canary-gate'
 ```
 
-Systemd example, with every unit that shares the pointer:
+Systemd example, with every unit and health endpoint that shares the pointer:
 
 ```bash
 sudo -E bin/refeather promote \
@@ -113,21 +113,24 @@ sudo -E bin/refeather promote \
   --current-link "$REFEATHER_CURRENT_LINK" \
   --systemd-unit feather.service \
   --systemd-unit feather-philip.service \
-  --health-url "$REFEATHER_HEALTH_URL" \
+  --health-url http://127.0.0.1:4870/api/health \
+  --health-url http://127.0.0.1:4871/api/health \
   --pre-promote-check '/path/to/canary-gate'
 ```
 
 Promotion verifies the staged release content hash immediately before mutation,
 takes the host lock, writes `active.json` and an fsynced JSONL phase journal,
 stops the declared program or unit set, atomically replaces `current`, starts the
-same services, and requires `/api/health.version` to equal the staged manifest.
-Service operations have a finite timeout (`REFEATHER_SERVICE_TIMEOUT`, 15
-seconds by default; the older `REFEATHER_SUPERVISOR_TIMEOUT` remains honored).
-An ordinary failure is recovered only after the prior link, prior services,
-listener, and exact prior health version are all verified. The durable state
-records the manager and complete unit set, so `recover` cannot use the wrong
-backend after host loss. Record the completed state JSON and journal with the
-migration receipt.
+same services, and requires every declared `/api/health.version` to equal the
+staged manifest. Repeat `--health-url` when several services share the pointer;
+one failed or stale sibling fails the transaction. Service operations have a
+finite timeout (`REFEATHER_SERVICE_TIMEOUT`, 15 seconds by default; the older
+`REFEATHER_SUPERVISOR_TIMEOUT` remains honored). An ordinary failure is
+recovered only after the prior link, prior services, listeners, and exact prior
+health versions are all verified. The durable state records the manager,
+complete unit set, and health endpoints, so `recover` cannot use a partial or
+wrong backend after host loss. Record the completed state JSON and journal with
+the migration receipt.
 
 ## Recovery and rollback
 
@@ -151,7 +154,8 @@ sudo -E bin/refeather rollback \
   --current-link "$REFEATHER_CURRENT_LINK" \
   --systemd-unit feather.service \
   --systemd-unit feather-philip.service \
-  --health-url "$REFEATHER_HEALTH_URL"
+  --health-url http://127.0.0.1:4870/api/health \
+  --health-url http://127.0.0.1:4871/api/health
 ```
 
 Supervisor deployments use `--program` and `--supervisor-socket` instead.

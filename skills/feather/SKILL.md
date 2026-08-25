@@ -61,14 +61,16 @@ sudo bin/refeather promote --release "$release" --current-link /opt/feather/curr
 # Or systemd; name every unit sharing the release pointer
 sudo bin/refeather promote --release "$release" --current-link /opt/feather/current \
   --systemd-unit feather.service --systemd-unit feather-philip.service \
+  --health-url http://127.0.0.1:4870/api/health \
   --health-url http://127.0.0.1:4871/api/health
 ```
 
 Staging never restarts a service. Promotion refuses an unsafe source unless a
 complete archive receipt was supplied, owns the host deployment lock, switches
 the stable release link atomically, and verifies the exact built version.
-Supervisor and systemd transactions use the same journaled rollback; repeated
-`--systemd-unit` options stop and restart the complete shared-pointer unit set.
+Supervisor and systemd transactions use the same journaled rollback. Repeat
+`--systemd-unit` for the complete shared-pointer unit set and `--health-url` for
+every corresponding endpoint; one unhealthy sibling rolls the release back.
 Run `bin/refeather recover` after an interrupted promotion. Follow
 `docs/runbooks/refeather.md`; never rebase a personalized deployment checkout.
 

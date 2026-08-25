@@ -15,11 +15,11 @@ usage() {
 Usage:
   refeather stage [--source DIR] [--releases-dir DIR] [--archive-receipt FILE]
                   [--build-command CMD] [--check-port PORT]
-  refeather promote --release DIR --current-link LINK --health-url URL
+  refeather promote --release DIR --current-link LINK --health-url URL [--health-url URL ...]
                     (--program NAME --supervisor-socket URL |
                      --systemd-unit UNIT [--systemd-unit UNIT ...])
                     [--skip-capability-install]
-  refeather rollback --release DIR --current-link LINK --health-url URL
+  refeather rollback --release DIR --current-link LINK --health-url URL [--health-url URL ...]
                      (--program NAME --supervisor-socket URL |
                       --systemd-unit UNIT [--systemd-unit UNIT ...])
                      [--skip-capability-install]
@@ -324,11 +324,12 @@ atomic_current_link() {
 }
 
 write_tx_state() {
-  local phase="$1" systemd_units
+  local phase="$1" systemd_units health_urls
   TX_PHASE="$phase"
   systemd_units="$(IFS=,; printf '%s' "${TX_SYSTEMD_UNITS[*]:-}")"
+  health_urls="$(printf '%s\n' "${TX_HEALTH_URLS[@]}")"
   python3 - "$ACTIVE_STATE" "$TX_ID" "$TX_COMMAND" "$phase" "$TX_PRIOR" "$TX_CANDIDATE" "$TX_EXPECTED" \
-    "$TX_PROGRAM" "$TX_SOCKET" "$TX_HEALTH" "$TX_CURRENT" "$TX_JOURNAL" "$TX_SERVICE_MANAGER" "$systemd_units" <<'PY'
+    "$TX_PROGRAM" "$TX_SOCKET" "$TX_HEALTH" "$TX_CURRENT" "$TX_JOURNAL" "$TX_SERVICE_MANAGER" "$systemd_units" "$health_urls" <<'PY'
 import json, os, sys, tempfile, time
 path = sys.argv[1]
 keys = ("transaction", "command", "phase", "prior", "candidate", "expectedVersion", "program", "supervisorSocket", "healthUrl", "currentLink", "journal")
@@ -337,6 +338,8 @@ manager_index = 2 + len(keys)
 value["serviceManager"] = sys.argv[manager_index]
 units = sys.argv[manager_index + 1]
 value["systemdUnits"] = units.split(",") if units else []
+health_urls = sys.argv[manager_index + 2]
+value["healthUrls"] = health_urls.splitlines() if health_urls else []
 value["updatedAt"] = int(time.time())
 os.makedirs(os.path.dirname(path), exist_ok=True)
 fd, tmp = tempfile.mkstemp(prefix=".active-", dir=os.path.dirname(path), text=True)
@@ -390,7 +393,8 @@ service_action() {
 }
 
 health_version() {
-  "$TX_CURL" -fsS --max-time "${REFEATHER_HEALTH_TIMEOUT:-3}" "$TX_HEALTH" | python3 -c '
+  local url="$1"
+  "$TX_CURL" -fsS --max-time "${REFEATHER_HEALTH_TIMEOUT:-3}" -- "$url" | python3 -c '
 import json, sys
 value=json.load(sys.stdin)
 if value.get("status") != "ok":
@@ -400,13 +404,17 @@ print(value.get("version", ""))
 }
 
 wait_for_version() {
-  local expected="$1" attempts="${REFEATHER_HEALTH_ATTEMPTS:-20}" actual="" index
+  local expected="$1" attempts="${REFEATHER_HEALTH_ATTEMPTS:-20}" actual="" failures="" index url
   for ((index=1; index<=attempts; index++)); do
-    actual="$(health_version 2>/dev/null || true)"
-    [ "$actual" = "$expected" ] && return 0
+    failures=""
+    for url in "${TX_HEALTH_URLS[@]}"; do
+      actual="$(health_version "$url" 2>/dev/null || true)"
+      [ "$actual" = "$expected" ] || failures+="${failures:+; }$url=${actual:-unavailable}"
+    done
+    [ -z "$failures" ] && return 0
     sleep "${REFEATHER_HEALTH_DELAY:-0.25}"
   done
-  note "health version mismatch at $TX_HEALTH: expected $expected, last response $actual"
+  note "health version mismatch: expected $expected, last responses $failures"
   return 1
 }
 
@@ -451,7 +459,7 @@ load_switch_options() {
   TX_CURRENT="${REFEATHER_CURRENT_LINK:-}"
   TX_PROGRAM="${REFEATHER_SUPERVISOR_PROGRAM:-}"
   TX_SOCKET="${REFEATHER_SUPERVISOR_SOCKET:-}"
-  TX_HEALTH="${REFEATHER_HEALTH_URL:-}"
+  TX_HEALTH_URLS=()
   TX_SUPERVISORCTL="${REFEATHER_SUPERVISORCTL:-supervisorctl}"
   TX_SYSTEMCTL="${REFEATHER_SYSTEMCTL:-systemctl}"
   TX_SERVICE_TIMEOUT="${REFEATHER_SERVICE_TIMEOUT:-${REFEATHER_SUPERVISOR_TIMEOUT:-15s}}"
@@ -465,20 +473,26 @@ load_switch_options() {
   if [ -n "${REFEATHER_SYSTEMD_UNITS:-}" ]; then
     read -r -a TX_SYSTEMD_UNITS <<<"$REFEATHER_SYSTEMD_UNITS"
   fi
+  if [ -n "${REFEATHER_HEALTH_URLS:-}" ]; then
+    read -r -a TX_HEALTH_URLS <<<"$REFEATHER_HEALTH_URLS"
+  elif [ -n "${REFEATHER_HEALTH_URL:-}" ]; then
+    TX_HEALTH_URLS+=("$REFEATHER_HEALTH_URL")
+  fi
   while [ $# -gt 0 ]; do
     case "$1" in
       --release) TX_CANDIDATE="$2"; shift 2 ;; --current-link) TX_CURRENT="$2"; shift 2 ;;
       --program) TX_PROGRAM="$2"; shift 2 ;; --supervisor-socket) TX_SOCKET="$2"; shift 2 ;;
       --systemd-unit) TX_SYSTEMD_UNITS+=("$2"); shift 2 ;;
-      --health-url) TX_HEALTH="$2"; shift 2 ;;
+      --health-url) TX_HEALTH_URLS+=("$2"); shift 2 ;;
       --supervisorctl) TX_SUPERVISORCTL="$2"; shift 2 ;; --systemctl) TX_SYSTEMCTL="$2"; shift 2 ;;
       --journal-dir) TX_JOURNAL_DIR="$2"; shift 2 ;; --lock-file) TX_LOCK_FILE="$2"; shift 2 ;;
       --pre-promote-check) TX_PRECHECK="$2"; shift 2 ;; --skip-capability-install) TX_SKIP_CAPABILITIES=1; shift ;;
       *) die "unknown $TX_COMMAND option: $1" ;;
     esac
   done
-  [ -n "$TX_CANDIDATE" ] && [ -n "$TX_CURRENT" ] && [ -n "$TX_HEALTH" ] \
-    || die "$TX_COMMAND requires explicit --release, --current-link, and --health-url"
+  TX_HEALTH="${TX_HEALTH_URLS[0]:-}"
+  [ -n "$TX_CANDIDATE" ] && [ -n "$TX_CURRENT" ] && [ "${#TX_HEALTH_URLS[@]}" -gt 0 ] \
+    || die "$TX_COMMAND requires explicit --release, --current-link, and at least one --health-url"
   if [ "${#TX_SYSTEMD_UNITS[@]}" -gt 0 ]; then
     [ -z "$TX_PROGRAM" ] && [ -z "$TX_SOCKET" ] \
       || die "$TX_COMMAND cannot combine Supervisor and systemd service identities"
@@ -571,6 +585,10 @@ if not isinstance(manager, str) or not isinstance(units, list) or any(not isinst
     raise SystemExit("invalid service manager state")
 print(f"TX_SERVICE_MANAGER={shlex.quote(manager)}")
 print(f"TX_SYSTEMD_UNITS_SERIALIZED={shlex.quote(chr(10).join(units))}")
+health_urls = value.get("healthUrls") or ([value.get("healthUrl")] if value.get("healthUrl") else [])
+if not isinstance(health_urls, list) or any(not isinstance(url, str) or not url for url in health_urls):
+    raise SystemExit("invalid health URL state")
+print(f"TX_HEALTH_URLS_SERIALIZED={shlex.quote(chr(10).join(health_urls))}")
 PY
 )"
   TX_JOURNAL_DIR="$journal_dir"
@@ -583,6 +601,12 @@ PY
   if [ -n "$TX_SYSTEMD_UNITS_SERIALIZED" ]; then
     mapfile -t TX_SYSTEMD_UNITS <<<"$TX_SYSTEMD_UNITS_SERIALIZED"
   fi
+  TX_HEALTH_URLS=()
+  if [ -n "$TX_HEALTH_URLS_SERIALIZED" ]; then
+    mapfile -t TX_HEALTH_URLS <<<"$TX_HEALTH_URLS_SERIALIZED"
+  fi
+  [ "${#TX_HEALTH_URLS[@]}" -gt 0 ] || die "recovery state has no health URLs"
+  TX_HEALTH="${TX_HEALTH_URLS[0]}"
   TX_FINISHED=0 TX_STOP_ATTEMPTED=1 TX_POINTER_CHANGED=1
   case "$TX_SERVICE_MANAGER" in
     supervisor) need_command "$TX_SUPERVISORCTL" ;;

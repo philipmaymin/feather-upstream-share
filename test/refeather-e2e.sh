@@ -207,11 +207,13 @@ fake_curl="$TMP/fake-curl"
 cat >"$fake_curl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+url="${!#}"
 version=$(python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ["REFEATHER_TEST_CURRENT"], ".refeather-release.json")))["version"])')
 if [ "${REFEATHER_TEST_WAIT_HEALTH_VERSION:-}" = "$version" ]; then
   : >"$REFEATHER_TEST_WAIT_FILE"
   sleep 30
 fi
+if [ "${REFEATHER_TEST_BAD_HEALTH_URL:-}" = "$url" ] && [ "$version" = candidate-v1 ]; then version=wrong-version; fi
 printf '{"status":"ok","version":"%s","capabilities":{}}\n' "$version"
 SH
 chmod +x "$fake_curl"
@@ -227,7 +229,8 @@ systemd_switch_env=(env REFEATHER_SYSTEMCTL="$fake_systemctl" REFEATHER_CURL="$f
   REFEATHER_JOURNAL_DIR="$journal" REFEATHER_LOCK_FILE="$lock" REFEATHER_HEALTH_ATTEMPTS=2 REFEATHER_HEALTH_DELAY=0.01
   REFEATHER_SERVICE_TIMEOUT=0.1s REFEATHER_SERVICE_KILL_AFTER=0.1s)
 systemd_switch_args=(--current-link "$current" --systemd-unit feather.service --systemd-unit feather-philip.service
-  --systemctl "$fake_systemctl" --health-url http://127.0.0.1:4871/api/health --skip-capability-install)
+  --systemctl "$fake_systemctl" --health-url http://127.0.0.1:4870/api/health
+  --health-url http://127.0.0.1:4871/api/health --skip-capability-install)
 
 # A target changed after staging must be rejected before service mutation.
 chmod u+w "$release/build.marker"; printf 'tampered\n' >>"$release/build.marker"; chmod a-w "$release/build.marker"
@@ -302,6 +305,14 @@ fi
 [ "$(readlink -f "$current")" = "$old" ]
 grep -q 'prior release restored' "$TMP/systemd-start-failure.err"
 
+# Every declared health endpoint gates success; one failed sibling rolls back.
+if "${systemd_switch_env[@]}" REFEATHER_TEST_BAD_HEALTH_URL=http://127.0.0.1:4870/api/health \
+    "$ROOT/bin/refeather" promote --release "$release" "${systemd_switch_args[@]}" 2>"$TMP/systemd-health-failure.err"; then
+  echo "partial systemd health unexpectedly promoted" >&2; exit 1
+fi
+[ "$(readlink -f "$current")" = "$old" ]
+grep -q 'prior release restored' "$TMP/systemd-health-failure.err"
+
 # Interrupted systemd promotion persists its manager and full unit set so a
 # later recovery uses systemctl rather than falling back to Supervisor.
 systemd_wait_file="$TMP/systemd-health-blocked"
@@ -311,8 +322,8 @@ for _ in $(seq 1 100); do [ -e "$systemd_wait_file" ] && break; sleep 0.02; done
 [ -e "$systemd_wait_file" ] || { echo "systemd promotion never reached blocked health check" >&2; exit 1; }
 kill -KILL -- "-$systemd_pid" 2>/dev/null || true
 wait "$systemd_pid" 2>/dev/null || true
-[ "$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print(v["serviceManager"], *v["systemdUnits"])' "$journal/active.json")" = \
-  'systemd feather.service feather-philip.service' ]
+[ "$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print(v["serviceManager"], *v["systemdUnits"], "|", *v["healthUrls"])' "$journal/active.json")" = \
+  'systemd feather.service feather-philip.service | http://127.0.0.1:4870/api/health http://127.0.0.1:4871/api/health' ]
 [ "$(readlink -f "$current")" = "$release" ]
 "${systemd_switch_env[@]}" "$ROOT/bin/refeather" recover
 [ "$(readlink -f "$current")" = "$old" ]
