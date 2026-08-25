@@ -1,6 +1,9 @@
 ## 2026-08-25 - Session-affine local tools
 - **Room and sidecar commands target the Feather instance that launched the current OMP session.** The shared resolver now reads the session's bridge metadata before probing default ports, so a concurrent production/canary server cannot make `room pause`, `room wake`, or another local mutation fail as ambiguous or reach the wrong instance. Stale metadata falls back to the existing health-checked probe.
 - **Guarded promotion now supports systemd directly.** Repeated `--systemd-unit` options stop and restart every unit sharing a release pointer, and repeated `--health-url` gates require each sibling to report the exact release. The manager, full unit set, and endpoints persist in transaction state so failed starts, partial health, rollback, and crash recovery use systemctl rather than silently falling back to Supervisor.
+- **OMP Advisory runs are native and durable.** The Council skill and protocol extension run independent candidate seats plus a fresh judge, persist bounded event logs outside immutable releases, replay progress through SSE, and render a compact Advisory card directly below its invoking prompt.
+- **Chat keeps execution compact.** Parent OMP work is a one-line status in Chat; tapping it opens the complete chronological timeline in Agents alongside child-agent inspectors.
+- **Secondary users follow Philip after a 24-hour canary window.** A durable systemd-driven fleet schedule promotes the exact verified release to Tobin, Maya, Stella, and Allan, skips superseded canaries, verifies each listener, and rolls earlier peers back if a later peer fails.
 
 ## 2026-08-23 - Visible harnesses and controllable background work
 - **Terminal login links work on phones.** Plain taps now open HTTP(S) and OSC 8 links without a keyboard modifier, long OAuth URLs remain intact across wrapped terminal rows, and a Links drawer exposes every recent URL as a native browser link with a dedicated Copy action.

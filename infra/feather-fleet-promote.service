@@ -1,0 +1,12 @@
+[Unit]
+Description=Promote verified Feather canary release to secondary users
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/home/user/.local/share/feather/current/bin/refeather-fleet run --state /var/lib/feather/refeather/fleet-schedule.json
+TimeoutStartSec=20min
+Nice=10

@@ -26,6 +26,7 @@ import { ompSessionCwdFromHead, ompSessionIdFromHead, ompTurnBoundaryFromLine } 
 import { inferLegacyTmuxOwner, legacyTmuxSessionName, tmuxSessionName } from './lib/tmux-session.js';
 import { extractOsc8HttpUrls } from './lib/terminal-hyperlinks.js';
 import { prepareTmuxTerminal } from './lib/terminal-attach.js';
+import { createProtocolRunStore } from './lib/protocol-runs.js';
 
 // Load ~/.env if present
 try {
@@ -63,7 +64,7 @@ const ROOM_PULSE_MAX_CONCURRENT = Math.max(1, Number.isFinite(configuredPulseMax
   ? Math.floor(configuredPulseMax) : 3);
 const ROOM_PULSE_STARTED_AT = Date.now();
 const READ_ONLY_ERROR = Object.freeze({ error: 'read-only canary', code: 'FEATHER_READ_ONLY' });
-const SESSION_READ_ROUTE = /^\/api\/sessions\/[^/]+\/(messages|stream|export)$/;
+const SESSION_READ_ROUTE = /^\/api\/sessions\/[^/]+\/(messages|stream|export|protocol-runs)$/;
 
 const PORT = parseInt(process.env.PORT || '4870');
 const HOME = process.env.HOME || '/home/user';
@@ -92,10 +93,15 @@ const CODEX_SESSIONS_ROOT = STATE_PATHS.harness.codexSessionsDir;
 const CODEX_HEAD_BYTES = 256 * 1024;
 const OMP_SESSIONS = STATE_PATHS.harness.ompSessionsDir;
 const OMP_BRIDGE_EXTENSION = path.join(import.meta.dirname, 'omp-extensions', 'feather-bridge.js');
+const OMP_PROTOCOL_EXTENSION = path.join(import.meta.dirname, 'omp-tools', 'feather-protocol-tools.js');
+const OMP_COUNCIL_SKILL = path.join(import.meta.dirname, 'skills', 'council');
+const OMP_FEATHER_CONFIG = path.join(import.meta.dirname, 'omp-feather.yml');
 const OMP_BRIDGE_TOKENS_DIR = path.join(OMP_SESSIONS, '.feather-bridge-tokens');
 const ompBridgeTokens = new Map();
 const ompBridgeLastSeen = new Map();
 const OMP_DISCOVERED_BRIDGE = path.join(HOME, '.omp/agent/extensions/feather-bridge.js');
+const OMP_DISCOVERED_PROTOCOL = path.join(HOME, '.omp/agent/extensions/feather-protocol-tools.js');
+const OMP_DISCOVERED_COUNCIL = path.join(HOME, '.omp/agent/skills/council');
 // Older bridge payloads remain accepted for compatibility, but only v4 marks
 // the complete execution mirror live for migration purposes.
 const OMP_BRIDGE_VERSION = 4;
@@ -614,6 +620,7 @@ function spawnTmuxOmp(name, ompArgs, dir, options = {}) {
   ompBridgeTokens.set(sessionId, bridgeToken);
   ompBridgeLastSeen.delete(sessionId);
   ensureOmpBridgeDiscovery();
+  ensureOmpCouncilDiscovery();
   fs.mkdirSync(OMP_BRIDGE_TOKENS_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(ompBridgeTokenPath(sessionId), bridgeToken, { mode: 0o600 });
   const sessionDir = path.join(OMP_SESSIONS, sessionId);
@@ -622,7 +629,8 @@ function spawnTmuxOmp(name, ompArgs, dir, options = {}) {
     url: bridgeUrl, token: bridgeToken, sessionId,
   }), { mode: 0o600 });
   const extensionArg = ` --extension ${shellQuote(OMP_BRIDGE_EXTENSION)}`;
-  const launch = ompLaunchCommand(`${ompArgs}${extensionArg}`, OMP_MODEL, OMP_THINKING, options);
+  const configArg = ` --config ${shellQuote(OMP_FEATHER_CONFIG)}`;
+  const launch = ompLaunchCommand(`${ompArgs}${extensionArg}${configArg}`, OMP_MODEL, OMP_THINKING, options);
   const ompCmd = [
     `export FEATHER_BRIDGE_URL=${shellQuote(bridgeUrl)}`,
     `FEATHER_BRIDGE_TOKEN=${shellQuote(bridgeToken)}`,
@@ -644,18 +652,54 @@ function ompBridgeTokenPath(sessionId) {
   return path.join(OMP_BRIDGE_TOKENS_DIR, file);
 }
 
-function ensureOmpBridgeDiscovery() {
-  fs.mkdirSync(path.dirname(OMP_DISCOVERED_BRIDGE), { recursive: true, mode: 0o700 });
+function ensureManagedOmpSymlink(discoveredPath, targetPath, expectedSuffix, label) {
+  fs.mkdirSync(path.dirname(discoveredPath), { recursive: true, mode: 0o700 });
   try {
-    const stat = fs.lstatSync(OMP_DISCOVERED_BRIDGE);
-    if (stat.isSymbolicLink()
-      && path.resolve(path.dirname(OMP_DISCOVERED_BRIDGE), fs.readlinkSync(OMP_DISCOVERED_BRIDGE)) === OMP_BRIDGE_EXTENSION) return;
-    console.warn(`[omp bridge] discovery path is occupied: ${OMP_DISCOVERED_BRIDGE}`);
-    return;
+    const stat = fs.lstatSync(discoveredPath);
+    if (!stat.isSymbolicLink()) {
+      console.warn(`[omp ${label}] discovery path is occupied: ${discoveredPath}`);
+      return false;
+    }
+    const currentTarget = path.resolve(path.dirname(discoveredPath), fs.readlinkSync(discoveredPath));
+    if (currentTarget === targetPath) return true;
+    if (!currentTarget.endsWith(expectedSuffix)) {
+      console.warn(`[omp ${label}] refusing to replace unrelated symlink: ${discoveredPath}`);
+      return false;
+    }
+    const replacement = `${discoveredPath}.tmp-${process.pid}`;
+    try { fs.unlinkSync(replacement); } catch {}
+    fs.symlinkSync(targetPath, replacement);
+    fs.renameSync(replacement, discoveredPath);
+    return true;
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  fs.symlinkSync(OMP_BRIDGE_EXTENSION, OMP_DISCOVERED_BRIDGE);
+  fs.symlinkSync(targetPath, discoveredPath);
+  return true;
+}
+
+function ensureOmpBridgeDiscovery() {
+  return ensureManagedOmpSymlink(
+    OMP_DISCOVERED_BRIDGE,
+    OMP_BRIDGE_EXTENSION,
+    path.join('omp-extensions', 'feather-bridge.js'),
+    'bridge',
+  );
+}
+
+function ensureOmpCouncilDiscovery() {
+  ensureManagedOmpSymlink(
+    OMP_DISCOVERED_PROTOCOL,
+    OMP_PROTOCOL_EXTENSION,
+    path.join('omp-tools', 'feather-protocol-tools.js'),
+    'protocols',
+  );
+  ensureManagedOmpSymlink(
+    OMP_DISCOVERED_COUNCIL,
+    OMP_COUNCIL_SKILL,
+    path.join('skills', 'council'),
+    'council',
+  );
 }
 
 // Codex doesn't accept a preset session id. We snapshot existing rollout files,
@@ -1368,6 +1412,106 @@ function broadcastNamedEvent(sessionId, eventName, data) {
   if (!clients || clients.size === 0) return;
   const chunk = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of clients) writeSse(clients, res, chunk);
+}
+
+const protocolRuns = createProtocolRunStore({
+  root: path.join(LEGACY_STATE_ROOT, 'protocol-runs'),
+  onSnapshot: (sessionId, snapshot) => broadcastNamedEvent(sessionId, 'protocol_run', snapshot),
+  readOnly: READ_ONLY_MODE,
+});
+
+function replayProtocolRuns(sessionId, clients, res) {
+  for (const snapshot of protocolRuns.list(sessionId, 50)) {
+    const chunk = `event: protocol_run\ndata: ${JSON.stringify(snapshot)}\n\n`;
+    if (!writeSse(clients, res, chunk)) break;
+  }
+}
+
+function ompTranscriptLines(sessionId, cache) {
+  if (cache?.has(sessionId)) return cache.get(sessionId);
+  const file = findOmpJsonlPath(sessionId);
+  let lines = [];
+  try { lines = file ? fs.readFileSync(file, 'utf8').split('\n') : []; } catch {}
+  cache?.set(sessionId, lines);
+  return lines;
+}
+
+function ompOwnerExecutionIsTerminal(sessionId, ownerExecutionId, cache) {
+  const lines = ompTranscriptLines(sessionId, cache);
+  if (lines.length === 0) return false;
+  let found = false;
+  for (const line of lines) {
+    if (!line) continue;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      return false;
+    }
+    if (!found) {
+      found = entry?.type === 'message' && entry.id === ownerExecutionId && entry.message?.role === 'user';
+      continue;
+    }
+    if (entry?.type === 'message' && entry.message?.role === 'user') return true;
+    if (entry?.type === 'custom' && entry.customType === 'session_exit') return true;
+    if (ompTurnBoundaryFromLine(line) === 'completed') return true;
+  }
+  return false;
+}
+
+function ompUserText(message) {
+  if (typeof message?.content === 'string') return message.content;
+  if (!Array.isArray(message?.content)) return '';
+  return message.content
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n');
+}
+
+function ompAdvisoryOwnerForRun(run, cache) {
+  const lines = ompTranscriptLines(run.sessionId, cache);
+  if (lines.length === 0) return null;
+  const expected = `Run Advisory: ${run.question}`;
+  const createdAt = Date.parse(run.createdAt || '');
+  let owner = null;
+  for (const line of lines) {
+    if (!line) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { return null; }
+    if (entry?.type !== 'message' || entry.message?.role !== 'user' || ompUserText(entry.message) !== expected) continue;
+    if (Number.isFinite(createdAt) && Number.isFinite(Date.parse(entry.timestamp)) && Date.parse(entry.timestamp) + 5_000 < createdAt) continue;
+    if (typeof entry.id === 'string' && entry.id) owner = entry.id;
+  }
+  return owner;
+}
+
+async function bindUnclaimedProtocolOwner(sessionId, ownerExecutionId, cache) {
+  const run = protocolRuns.unclaimedStarting(sessionId)
+    .find(candidate => ompAdvisoryOwnerForRun(candidate, cache) === ownerExecutionId);
+  if (!run) return false;
+  try {
+    await protocolRuns.claim(sessionId, { ownerExecutionId, invocationMessageId: ownerExecutionId });
+    return true;
+  } catch (error) {
+    if (error.code === 'PROTOCOL_CLAIM_AMBIGUOUS') return false;
+    throw error;
+  }
+}
+
+async function reconcileProtocolRunOwners() {
+  const transcriptCache = new Map();
+  for (const initial of protocolRuns.active()) {
+    let run = initial;
+    if (!run.ownerExecutionId) {
+      const ownerExecutionId = ompAdvisoryOwnerForRun(run, transcriptCache);
+      if (!ownerExecutionId) continue;
+      if (!await bindUnclaimedProtocolOwner(run.sessionId, ownerExecutionId, transcriptCache)) continue;
+      run = protocolRuns.get(run.sessionId, run.runId);
+    }
+    if (ompOwnerExecutionIsTerminal(run.sessionId, run.ownerExecutionId, transcriptCache)) {
+      await protocolRuns.ownerTerminated(run.sessionId, run.ownerExecutionId);
+    }
+  }
 }
 
 const ompBridgeReplay = new Map();
@@ -2375,7 +2519,7 @@ function normalizeOmpBridgeEvent(event) {
   return null;
 }
 
-app.post('/api/internal/sessions/:id/events', (req, res) => {
+app.post('/api/internal/sessions/:id/events', async (req, res) => {
   const { id } = req.params;
   if (!bridgeTokenValid(id, req.get('X-Feather-Bridge-Token'))) return res.status(403).json({ error: 'invalid bridge token' });
   const events = req.body?.events;
@@ -2384,13 +2528,69 @@ app.post('/api/internal/sessions/:id/events', (req, res) => {
   if (normalized.some(event => event === null || Buffer.byteLength(JSON.stringify(event)) > OMP_BRIDGE_MAX_EVENT_BYTES)) {
     return res.status(400).json({ error: 'invalid bridge event' });
   }
+  const terminalOwners = new Set();
+  for (const event of events) {
+    const isParentTerminal = !event?.subagentId && (
+      ((event?.type === 'assistant_end' || event?.type === 'assistant_cancel') && !event.willContinue)
+      || (event?.type === 'agent_end' && !event.willContinue)
+    );
+    if (isParentTerminal && typeof event.ownerExecutionId === 'string') terminalOwners.add(event.ownerExecutionId);
+  }
   const bridgeVersion = Number.isSafeInteger(req.body?.version) ? req.body.version : 0;
   ompBridgeLastSeen.set(id, { seenAt: Date.now(), version: bridgeVersion });
   for (const event of normalized) {
     rememberOmpBridgeEvent(id, event);
     broadcastNamedEvent(id, 'omp_event', event);
   }
-  res.status(204).end();
+  try {
+    for (const ownerExecutionId of terminalOwners) {
+      await bindUnclaimedProtocolOwner(id, ownerExecutionId);
+      await protocolRuns.ownerTerminated(id, ownerExecutionId);
+    }
+    res.status(204).end();
+  } catch (error) {
+    res.status(protocolErrorStatus(error)).json({ error: error.message, code: error.code });
+  }
+});
+
+function protocolErrorStatus(error) {
+  return Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599
+    ? error.status
+    : 500;
+}
+
+function protocolBridgeRequestAllowed(req, allowedKeys) {
+  if (!bridgeTokenValid(req.params.id, req.get('X-Feather-Bridge-Token'))) return { status: 403, error: 'invalid bridge token' };
+  if (req.get('X-Feather-Subagent-ID') || req.body?.subagentId) return { status: 403, error: 'protocol tools are parent-only' };
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return { status: 400, error: 'request body must be an object' };
+  if (Buffer.byteLength(JSON.stringify(req.body)) > 128_000) return { status: 413, error: 'protocol request body exceeds 128000 bytes' };
+  const allowed = new Set(allowedKeys);
+  const unknown = Object.keys(req.body).find(key => !allowed.has(key));
+  if (unknown) return { status: 400, error: `request body contains unknown field ${unknown}` };
+  return null;
+}
+
+app.post('/api/internal/sessions/:id/protocol-runs/claim', async (req, res) => {
+  const denied = protocolBridgeRequestAllowed(req, ['ownerExecutionId', 'invocationMessageId', 'mode', 'input']);
+  if (denied) return res.status(denied.status).json({ error: denied.error });
+  try {
+    const envelope = await protocolRuns.claim(req.params.id, req.body);
+    res.json({ envelope });
+  } catch (error) {
+    res.status(protocolErrorStatus(error)).json({ error: error.message, code: error.code });
+  }
+});
+
+app.post('/api/internal/sessions/:id/protocol-runs/:runId/events', async (req, res) => {
+  const denied = protocolBridgeRequestAllowed(req, ['ownerExecutionId', 'event']);
+  if (denied) return res.status(denied.status).json({ error: denied.error });
+  if (req.body?.event?.runId !== req.params.runId) return res.status(409).json({ error: 'event runId does not match route runId' });
+  try {
+    const result = await protocolRuns.appendEvent(req.params.id, req.body.ownerExecutionId, req.body.event);
+    res.json({ ok: true, seq: result.seq, duplicate: result.duplicate });
+  } catch (error) {
+    res.status(protocolErrorStatus(error)).json({ error: error.message, code: error.code });
+  }
 });
 
 // Detect an optional agent's version via the interactive-rc shell so binaries
@@ -2933,6 +3133,7 @@ for (const state of USER_JSON_STATES.values()) state.read();
 ROOM_ASSIGN_STATE.read();
 ROOM_PULSES_STATE.read();
 MESSAGE_RECEIPTS_STATE.read();
+if (!READ_ONLY_MODE) await reconcileProtocolRunOwners();
 
 // Verify that a static directory is a coherent build: index.html points to a
 // JS bundle that actually exists in assets. Returns the matched JS filename.
@@ -3284,6 +3485,15 @@ app.post('/api/logout', (_req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/api/sessions/:id/protocol-runs', (req, res) => {
+  try {
+    const requestedLimit = req.query.limit === undefined ? 50 : Number(req.query.limit);
+    res.json({ runs: protocolRuns.list(req.params.id, requestedLimit) });
+  } catch (error) {
+    res.status(protocolErrorStatus(error)).json({ error: error.message, code: error.code });
+  }
+});
+
 app.get('/api/sessions/:id/messages', (req, res) => {
   const { messages, hasMore } = getMessages(req.params.id, parseInt(req.query.limit) || 100, parseInt(req.query.before) || 0);
   res.json({ messages, hasMore });
@@ -3333,6 +3543,7 @@ app.get('/api/sessions/:id/stream', (req, res) => {
   }
 
   replayOmpBridgeEvents(sid, clients, res);
+  replayProtocolRuns(sid, clients, res);
   const hb = setInterval(() => {
     if (!writeSse(clients, res, 'event: heartbeat\ndata: {}\n\n')) clearInterval(hb);
   }, 15000);
@@ -3439,9 +3650,10 @@ app.post('/api/sessions/:id/answer', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/sessions/:id/delete', (req, res) => {
+app.post('/api/sessions/:id/delete', async (req, res) => {
   try {
     const id = req.params.id;
+    await protocolRuns.deleteSession(id);
     killTmuxSessions(id);
     const fpath = findJsonlPath(id);
     if (fpath) fs.unlinkSync(fpath);

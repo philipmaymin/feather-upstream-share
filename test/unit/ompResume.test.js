@@ -113,11 +113,18 @@ exit 0
       if (migratedLog.includes('feather-bridge.js')) break
     }
     assert.match(migratedLog, /--extension .*feather-bridge\.js/, stderr)
+    assert.match(migratedLog, /--config .*omp-feather\.yml/, stderr)
     assert.match(migratedLog, /--resume .*omp-exact-resume-id/, stderr)
     assert.match(migratedLog, /-c \/tmp\/project/, 'automatic migration must preserve the recorded cwd')
     const discoveredBridge = path.join(home, '.omp/agent/extensions/feather-bridge.js')
     assert.equal(fs.lstatSync(discoveredBridge).isSymbolicLink(), true)
     assert.match(fs.realpathSync(discoveredBridge), /omp-extensions\/feather-bridge\.js$/)
+    const discoveredProtocols = path.join(home, '.omp/agent/extensions/feather-protocol-tools.js')
+    const discoveredCouncil = path.join(home, '.omp/agent/skills/council')
+    assert.equal(fs.lstatSync(discoveredProtocols).isSymbolicLink(), true)
+    assert.match(fs.realpathSync(discoveredProtocols), /omp-tools\/feather-protocol-tools\.js$/)
+    assert.equal(fs.lstatSync(discoveredCouncil).isSymbolicLink(), true)
+    assert.match(fs.realpathSync(discoveredCouncil), /skills\/council$/)
     const storedBridge = JSON.parse(fs.readFileSync(path.join(goodDir, '.feather-bridge.json'), 'utf8'))
     assert.equal(storedBridge.sessionId, goodFeatherId)
     assert.notEqual(storedBridge.token, 'stale-token')

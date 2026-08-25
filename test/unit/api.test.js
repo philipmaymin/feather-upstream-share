@@ -876,3 +876,134 @@ describe('GET /api/files/raw', () => {
     assert.equal(r.status, 404)
   })
 })
+
+// ── Council protocol runs ───────────────────────────────────────────────────
+
+describe('Council protocol-run APIs', () => {
+  const bridgeToken = 'council-test-bridge-token'
+  const ownerExecutionId = 'cafebabe'
+  const invocationMessageId = 'deadbeef'
+  const eventId = number => `20000000-0000-4000-8000-${String(number).padStart(12, '0')}`
+
+  async function postJson(url, body, token) {
+    return fetch(`${BASE}${url}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { 'X-Feather-Bridge-Token': token } : {}),
+      },
+      body: JSON.stringify(body),
+    })
+  }
+
+  before(() => {
+    const tokenDir = path.join(fixtureHome, '.feather', 'omp-sessions', '.feather-bridge-tokens')
+    fs.mkdirSync(tokenDir, { recursive: true, mode: 0o700 })
+    const tokenFile = createHash('sha256').update(TEST_SESSION_ID).digest('hex')
+    fs.writeFileSync(path.join(tokenDir, tokenFile), bridgeToken, { mode: 0o600 })
+  })
+
+  it('exposes read-only protocol history without a direct-launch endpoint', async () => {
+    let response = await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/protocol-runs`)
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { runs: [] })
+
+    response = await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/protocol-runs?limit=51`)
+    assert.equal(response.status, 400)
+
+    response = await postJson(`/api/sessions/${TEST_SESSION_ID}/protocol-runs`, { protocol: 'advisory', question: 'No direct form' })
+    assert.equal(response.status, 404)
+  })
+
+  it('enforces bridge authentication, parent-only claims, and exact event route identity', async () => {
+    const claimPath = `/api/internal/sessions/${TEST_SESSION_ID}/protocol-runs/claim`
+    let response = await postJson(claimPath, { ownerExecutionId, invocationMessageId, mode: 'create', input: { question: 'Choose a plan', candidateCount: 2 } })
+    assert.equal(response.status, 403)
+
+    response = await postJson(claimPath, { ownerExecutionId, invocationMessageId, mode: 'create', input: { question: 'Choose a plan', candidateCount: 2 } }, 'wrong-token')
+    assert.equal(response.status, 403)
+
+    response = await postJson(claimPath, { ownerExecutionId, invocationMessageId, mode: 'create', input: { question: 'Choose a plan', candidateCount: 2 }, subagentId: 'child-1' }, bridgeToken)
+    assert.equal(response.status, 403)
+
+    response = await postJson(claimPath, { ownerExecutionId }, bridgeToken)
+    assert.equal(response.status, 400)
+
+    response = await postJson(claimPath, { ownerExecutionId, invocationMessageId, mode: 'create', input: { question: 'Choose a plan', candidateCount: 2 } }, bridgeToken)
+    assert.equal(response.status, 200)
+    const { envelope } = await response.json()
+    assert.equal(envelope.ownerExecutionId, ownerExecutionId)
+    assert.deepEqual(envelope.input.roles, [
+      { seatId: 'candidate-1', role: 'Advocate' },
+      { seatId: 'candidate-2', role: 'Skeptic' },
+    ])
+
+    const started = {
+      schemaVersion: 1,
+      eventId: eventId(10),
+      runId: envelope.runId,
+      type: 'run_started',
+      payload: {
+        protocol: 'advisory',
+        invocationMessageId,
+        actionId: envelope.actionId,
+        ...envelope.input,
+      },
+    }
+    const eventsPath = `/api/internal/sessions/${TEST_SESSION_ID}/protocol-runs/${envelope.runId}/events`
+    response = await postJson(eventsPath, { ownerExecutionId, event: started })
+    assert.equal(response.status, 403)
+    response = await postJson(eventsPath, { ownerExecutionId, event: started, unexpected: true }, bridgeToken)
+    assert.equal(response.status, 400)
+    response = await postJson(`/api/internal/sessions/${TEST_SESSION_ID}/protocol-runs/${eventId(99)}/events`, { ownerExecutionId, event: started }, bridgeToken)
+    assert.equal(response.status, 409)
+
+    response = await postJson(eventsPath, { ownerExecutionId, event: started }, bridgeToken)
+    assert.equal(response.status, 200)
+    const accepted = await response.json()
+    assert.equal(accepted.seq, 1)
+    assert.equal(accepted.duplicate, false)
+
+    response = await postJson(eventsPath, { ownerExecutionId, event: started }, bridgeToken)
+    assert.equal(response.status, 200)
+    assert.equal((await response.json()).duplicate, true)
+
+    const conflicting = structuredClone(started)
+    conflicting.payload.question = 'Different question'
+    response = await postJson(eventsPath, { ownerExecutionId, event: conflicting }, bridgeToken)
+    assert.equal(response.status, 409)
+
+    response = await postJson(eventsPath, {
+      ownerExecutionId: eventId(77),
+      event: {
+        schemaVersion: 1,
+        eventId: eventId(11),
+        runId: envelope.runId,
+        type: 'stage_started',
+        attempt: 1,
+        stageId: 'candidates',
+        payload: {},
+      },
+    }, bridgeToken)
+    assert.equal(response.status, 403)
+  })
+
+  it('replays the latest snapshot as a named protocol_run SSE event', async () => {
+    const controller = new AbortController()
+    const response = await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/stream`, { signal: controller.signal })
+    assert.equal(response.status, 200)
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let payload = ''
+    for (let index = 0; index < 10 && !payload.includes('event: protocol_run'); index++) {
+      const chunk = await Promise.race([
+        reader.read(),
+        new Promise(resolve => setTimeout(() => resolve(null), 500)),
+      ])
+      if (chunk?.value) payload += decoder.decode(chunk.value)
+    }
+    controller.abort()
+    assert.match(payload, /event: protocol_run\ndata: /)
+    assert.match(payload, /"lastSeq":/)
+  })
+})

@@ -11,8 +11,7 @@ chat channel between you. You talk via the `sidecar` CLI; messages are recorded
 in `chat.jsonl` and injected straight into each other's tmux. The peer is an
 ordinary Feather session (shows up in the session list, resumable).
 
-It is **not** a generator-evaluator/GAN looper — that's a separate harness built
-*on top of* this primitive.
+Sidecar provides the durable peer channel only; workflow-specific iteration and judgment belong to the caller.
 
 ## Install
 

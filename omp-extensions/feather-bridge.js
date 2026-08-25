@@ -133,6 +133,7 @@ function assistantWork(message) {
   return blocks
 }
 
+
 function hasToolCall(message) {
   return message?.role === 'assistant' &&
     Array.isArray(message.content) &&
@@ -187,6 +188,16 @@ function latestTodoFromBranch(sessionManager) {
   return null
 }
 
+function latestUserEntryId(sessionManager) {
+  const branch = sessionManager?.getBranch?.()
+  if (!Array.isArray(branch)) return null
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index]
+    if (entry?.type === 'message' && entry.message?.role === 'user' && typeof entry.id === 'string') return entry.id
+  }
+  return null
+}
+
 function toolBridgeEvent(event, subagentId) {
   if (!event || !TOOL_EVENT_TYPES.has(event.type)) return null
   const toolCallId = typeof event.toolCallId === 'string' ? event.toolCallId.slice(0, 128) : ''
@@ -233,6 +244,7 @@ export default function featherBridgeExtension(pi) {
   const config = bridgeConfig(process.env)
   let enabled = !!config && !config.sessionDir
   let activeMessage = null
+  let parentOwnerExecutionId = null
   const childMessages = new Map()
   const pendingTimers = new Set()
   const unsubscribe = []
@@ -354,6 +366,7 @@ export default function featherBridgeExtension(pi) {
     }
     void deliver()
   }
+
   function postChanged(event, previous, setPrevious) {
     if (!event) return
     const serialized = JSON.stringify(event)
@@ -391,7 +404,7 @@ export default function featherBridgeExtension(pi) {
   }
 
 
-  function createMessageState(message, subagentId) {
+  function createMessageState(message, subagentId, ownerExecutionId) {
     const work = assistantWork(message)
     return {
       messageId: randomUUID(),
@@ -404,6 +417,7 @@ export default function featherBridgeExtension(pi) {
       willContinue: false,
       timer: null,
       subagentId,
+      ownerExecutionId,
     }
   }
 
@@ -436,6 +450,7 @@ export default function featherBridgeExtension(pi) {
         type: state.terminalType,
         messageId: state.messageId,
         ...(state.willContinue ? { willContinue: true } : {}),
+        ...(!state.subagentId && state.ownerExecutionId ? { ownerExecutionId: state.ownerExecutionId } : {}),
         ...owner,
       })
       if (state.subagentId) childMessages.delete(state.subagentId)
@@ -463,9 +478,10 @@ export default function featherBridgeExtension(pi) {
     pendingTimers.add(timer)
   }
 
-  pi.on('message_start', (event) => {
+  pi.on('message_start', (event, ctx) => {
     if (event.message?.role !== 'assistant') return
-    activeMessage = createMessageState(event.message)
+    parentOwnerExecutionId = latestUserEntryId(ctx.sessionManager)
+    activeMessage = createMessageState(event.message, undefined, parentOwnerExecutionId)
   })
 
   pi.on('message_update', (event, ctx) => {
@@ -579,15 +595,20 @@ export default function featherBridgeExtension(pi) {
       provider: event.provider,
     }),
     agent_start: (event) => ({ type: event.type }),
-    agent_end: (event) => ({
-      type: event.type,
-      ...(event.willContinue === undefined ? {} : { willContinue: event.willContinue }),
-    }),
   }
 
   for (const [eventName, toBridgeEvent] of Object.entries(lifecycleHandlers)) {
     pi.on(eventName, (event) => post([toBridgeEvent(event)]))
   }
+
+  pi.on('agent_end', (event, ctx) => {
+    parentOwnerExecutionId = latestUserEntryId(ctx.sessionManager) || parentOwnerExecutionId
+    post([{
+      type: event.type,
+      ...(event.willContinue === undefined ? {} : { willContinue: event.willContinue }),
+      ...(parentOwnerExecutionId ? { ownerExecutionId: parentOwnerExecutionId } : {}),
+    }])
+  })
 
   pi.on('tool_approval_requested', (event) => post([{
     type: event.type,

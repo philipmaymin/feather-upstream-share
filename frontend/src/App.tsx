@@ -6,8 +6,8 @@ import { MessageView } from './components/MessageView'
 import { Terminal } from './components/Terminal'
 import { SidecarThread } from './components/Sidecar'
 import RoomsHome from './RoomsHome'
-import type { SessionMeta, Message, QuestionData, SidecarGroup, RoomUpdate, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot } from './api'
-import { fetchSessions, fetchRooms, fetchRoomUpdates, fetchMessages, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
+import type { SessionMeta, Message, QuestionData, SidecarGroup, RoomUpdate, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot, ProtocolRunSnapshot } from './api'
+import { fetchSessions, fetchRooms, fetchRoomUpdates, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
 import type { SearchResult } from './api'
 import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
@@ -16,6 +16,7 @@ import { appUrl } from './lib/appPath.js'
 import { deriveToolIntentState, isFinalAssistantMessage, toolIntentTransition } from './lib/toolIntentStatus.js'
 import { deriveTodoSnapshot, todoSnapshotFromDetails, todoSnapshotFromMessage } from './lib/ompTodo.js'
 import { createOmpMirrorState, reduceOmpMirrorState } from './lib/ompMirror.js'
+import { createProtocolRunsState, orderedProtocolRuns, reduceProtocolRunSnapshot, replaceProtocolRuns } from './lib/protocolRuns.js'
 
 interface QuickLink { label: string; url: string }
 type AgentId = 'claude' | 'codex' | 'omp'
@@ -263,6 +264,11 @@ export default function App() {
   const [ompApproval, setOmpApproval] = createSignal<OmpApproval | null>(null)
   const [ompJobs, setOmpJobs] = createSignal<OmpAsyncJob[]>([])
   const [ompRuntime, setOmpRuntime] = createSignal<OmpRuntimeState | null>(null)
+  const [protocolRunsState, setProtocolRunsState] = createSignal(createProtocolRunsState())
+  const protocolRuns = createMemo(() => orderedProtocolRuns(protocolRunsState()))
+  function applyProtocolRun(run: ProtocolRunSnapshot) {
+    setProtocolRunsState(current => reduceProtocolRunSnapshot(current, run))
+  }
   let assistantStreamStaleTimer: number | undefined
   function clearAssistantStream() {
     clearTimeout(assistantStreamStaleTimer)
@@ -276,6 +282,9 @@ export default function App() {
     setOmpApproval(null)
     setOmpJobs([])
     setOmpRuntime(null)
+  }
+  function clearProtocolRunSurfaces() {
+    setProtocolRunsState(createProtocolRunsState())
   }
 
 
@@ -814,6 +823,7 @@ export default function App() {
     setToolIntentHistory([])
     clearAssistantStream()
     clearOmpLiveSurfaces()
+    clearProtocolRunSurfaces()
     setActivity(null)
     setQuestion(null)
     setText(loadDraft(id))
@@ -826,6 +836,7 @@ export default function App() {
     let s = sessions().find(s => s.id === id)
     setWorking(!!s?.isActive)
     const sessionMetaPromise = s ? Promise.resolve(s) : findSessionMeta(id)
+    const protocolRunsPromise = fetchProtocolRuns(id).catch(() => ({ runs: [] }))
     if (s) { lastSeenUpdatedAt.set(id, s.updatedAt); setLastSession(s) }
     else {
       setLastSession({ id, title: 'New session', updatedAt: new Date().toISOString(), isActive: true })
@@ -853,9 +864,10 @@ export default function App() {
     // Determine working state from loaded messages.
     // Only mark as working if the session is actually active (has a running tmux process).
     // Inactive/timed-out sessions should never show as working.
-    const sessionMeta = await sessionMetaPromise
+    const [sessionMeta, runResult] = await Promise.all([sessionMetaPromise, protocolRunsPromise])
     if (!isCurrentSelection(id, generation)) return
     const isActive = sessionMeta?.isActive ?? false
+    setProtocolRunsState(replaceProtocolRuns(runResult.runs))
     const msgs = result.messages
     if (msgs.length > 0) {
       const last = msgs[msgs.length - 1]
@@ -892,7 +904,7 @@ export default function App() {
       })
     }
     setSSEStatus('connected')
-    const unsubscribe = subscribeMessages(id, (msg) => {
+    const unsubscribe = subscribeMessages(id, { onMessage: (msg) => {
       if (!isCurrentSelection(id, generation) || loadedSessionId() !== id) return
       if (messages().some(existing => existing.uuid === msg.uuid)) return
       // Clear assistant-done debounce on any incoming message
@@ -973,14 +985,16 @@ export default function App() {
         refreshPendingMessages()
       }
     },
-    status => {
+      onStatus: status => {
       if (!isCurrentSelection(id, generation)) return
       setSSEStatus(status)
       if (status === 'reconnecting') clearAssistantStream()
     },
-    activity => { if (isCurrentSelection(id, generation)) setActivity(activity) },
-    nextQuestion => { if (isCurrentSelection(id, generation)) setQuestion(nextQuestion) },
-    event => { if (isCurrentSelection(id, generation) && loadedSessionId() === id) handleOmpEvent(event) })
+      onActivity: nextActivity => { if (isCurrentSelection(id, generation)) setActivity(nextActivity) },
+      onQuestion: nextQuestion => { if (isCurrentSelection(id, generation)) setQuestion(nextQuestion) },
+      onOmpEvent: event => { if (isCurrentSelection(id, generation) && loadedSessionId() === id) handleOmpEvent(event) },
+      onProtocolRun: run => { if (isCurrentSelection(id, generation) && loadedSessionId() === id) applyProtocolRun(run) },
+    })
     if (!isCurrentSelection(id, generation)) unsubscribe()
     else cleanupSSE = unsubscribe
     queueMicrotask(() => { if (isCurrentSelection(id, generation)) retryPendingMessages(id) })
@@ -1106,6 +1120,7 @@ export default function App() {
     setChatLoadError('')
     location.hash = ''
     setMessages([])
+    clearProtocolRunSurfaces()
     updateSessions(await fetchSessions())
   }
 
@@ -1124,6 +1139,7 @@ export default function App() {
     setToolIntentHistory([])
     clearAssistantStream()
     clearOmpLiveSurfaces()
+    clearProtocolRunSurfaces()
     setActivity(null)
     setQuestion(null)
     setSidebar(false)
@@ -2050,7 +2066,7 @@ export default function App() {
               codexAvailable={codexAvailable()}
             />
           }>
-            <div style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
+            <div data-testid="chat-panel" style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
               <MessageView
                 messages={messages()}
                 loading={loading()}
@@ -2071,6 +2087,8 @@ export default function App() {
                 subagents={[]}
                 jobs={[]}
                 runtime={null}
+                protocolRuns={protocolRuns()}
+                onOpenAgents={() => setTab('agents')}
                 scrollRefCb={(el) => { messageScrollRef = el }}
                 sessionId={loadedSessionId()}
               />
@@ -2236,8 +2254,8 @@ export default function App() {
               </div>
             </div>
             <div data-testid="agents-panel" style={{ display: tab() === 'agents' ? 'block' : 'none', height: '100%', overflow: 'hidden' }}>
-              <Show when={activeSubagents().length > 0 || ompJobs().length > 0 || ompRuntime()} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '30px 20px', 'text-align': 'center' }}>No delegated agents or background jobs in this chat yet.</div>}>
-                <MessageView messages={[]} loading={false} subagents={activeSubagents()} jobs={ompJobs()} runtime={ompRuntime()} standaloneAgents />
+              <Show when={activeSubagents().length > 0 || ompJobs().length > 0 || ompRuntime() || ompMirror().parent.timeline.length > 0} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '30px 20px', 'text-align': 'center' }}>No execution details, delegated agents, or background jobs in this chat yet.</div>}>
+                <MessageView messages={[]} loading={false} work={ompMirror().parent} subagents={activeSubagents()} jobs={ompJobs()} runtime={ompRuntime()} standaloneAgents />
               </Show>
             </div>
             <div data-testid="updates-panel" style={{ display: tab() === 'updates' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>

@@ -4,8 +4,11 @@ set -Eeuo pipefail
 
 SELF="$(readlink -f "$0")"
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd)"
-CAPABILITY_SKILLS=(feather sidecar looper)
-CAPABILITY_CLIS=(room sidecar refeather)
+CAPABILITY_SKILLS=(feather sidecar)
+CAPABILITY_CLIS=(room sidecar refeather refeather-fleet)
+CAPABILITY_OMP_SKILLS=(council)
+CAPABILITY_OMP_EXTENSIONS=(feather-protocol-tools.js)
+RETIRED_CAPABILITY_SKILLS=(looper)
 
 die() { echo "refeather: $*" >&2; exit 1; }
 note() { echo "refeather: $*" >&2; }
@@ -25,7 +28,8 @@ Usage:
                      [--skip-capability-install]
   refeather recover [--journal-dir DIR] [--lock-file FILE]
   refeather install-capabilities --release DIR [--target-root DIR]
-                    [--claude-skills-dir DIR] [--codex-skills-dir DIR] [--bin-dir DIR]
+                    [--claude-skills-dir DIR] [--codex-skills-dir DIR]
+                    [--omp-skills-dir DIR] [--omp-extensions-dir DIR] [--bin-dir DIR]
 
 Environment equivalents use the REFEATHER_ prefix. Promotion requires an
 explicit Supervisor program/socket or one or more systemd units, plus the exact
@@ -255,25 +259,43 @@ backup_conflicts() {
 }
 
 install_capabilities_impl() {
-  local release="$1" target_root="$2" claude_dir="$3" codex_dir="$4" bin_dir="$5" backup_dir="$6"
+  local release="$1" target_root="$2" claude_dir="$3" codex_dir="$4" omp_skills_dir="$5"
+  local omp_extensions_dir="$6" bin_dir="$7" backup_dir="$8"
   local skill name
   for skill in "${CAPABILITY_SKILLS[@]}"; do
     [ -f "$release/skills/$skill/SKILL.md" ] || die "release lacks skills/$skill/SKILL.md"
   done
+  for skill in "${CAPABILITY_OMP_SKILLS[@]}"; do
+    [ -f "$release/skills/$skill/SKILL.md" ] || die "release lacks skills/$skill/SKILL.md"
+  done
+  for name in "${CAPABILITY_OMP_EXTENSIONS[@]}"; do
+    [ -f "$release/omp-tools/$name" ] || die "release lacks omp-tools/$name"
+  done
   for name in "${CAPABILITY_CLIS[@]}"; do [ -x "$release/bin/$name" ] || die "release lacks executable bin/$name"; done
 
-  local destinations=() targets=() dest target
+  local destinations=() targets=() managed_suffixes=() dest target suffix resolved replacement
   for skill in "${CAPABILITY_SKILLS[@]}"; do
-    destinations+=("$claude_dir/$skill"); targets+=("$target_root/skills/$skill")
-    destinations+=("$codex_dir/$skill"); targets+=("$target_root/skills/$skill")
+    destinations+=("$claude_dir/$skill"); targets+=("$target_root/skills/$skill"); managed_suffixes+=("")
+    destinations+=("$codex_dir/$skill"); targets+=("$target_root/skills/$skill"); managed_suffixes+=("")
   done
-  for name in "${CAPABILITY_CLIS[@]}"; do destinations+=("$bin_dir/$name"); targets+=("$target_root/bin/$name"); done
+  for skill in "${CAPABILITY_OMP_SKILLS[@]}"; do
+    destinations+=("$omp_skills_dir/$skill"); targets+=("$target_root/skills/$skill"); managed_suffixes+=("/skills/$skill")
+  done
+  for name in "${CAPABILITY_OMP_EXTENSIONS[@]}"; do
+    destinations+=("$omp_extensions_dir/$name"); targets+=("$target_root/omp-tools/$name"); managed_suffixes+=("/omp-tools/$name")
+  done
+  for name in "${CAPABILITY_CLIS[@]}"; do
+    destinations+=("$bin_dir/$name"); targets+=("$target_root/bin/$name"); managed_suffixes+=("")
+  done
 
   local conflicts=()
   for ((index=0; index<${#destinations[@]}; index++)); do
-    dest="${destinations[$index]}"; target="${targets[$index]}"
+    dest="${destinations[$index]}"; target="${targets[$index]}"; suffix="${managed_suffixes[$index]}"
     if [ -L "$dest" ]; then
-      [ "$(readlink "$dest")" = "$target" ] || conflicts+=("$dest")
+      resolved="$(readlink -f "$dest" 2>/dev/null || true)"
+      [ "$(readlink "$dest")" = "$target" ] \
+        || { [ -n "$suffix" ] && [[ "$resolved" == *"$suffix" ]]; } \
+        || conflicts+=("$dest")
     elif [ -e "$dest" ]; then conflicts+=("$dest")
     fi
   done
@@ -282,24 +304,47 @@ install_capabilities_impl() {
     die "capability destination conflicts detected; inspect backup evidence and remove or relocate conflicts explicitly"
   fi
 
-  mkdir -p "$claude_dir" "$codex_dir" "$bin_dir"
+  local retired_dir retired
+  for retired_dir in "$claude_dir" "$codex_dir"; do
+    for retired in "${RETIRED_CAPABILITY_SKILLS[@]}"; do
+      dest="$retired_dir/$retired"
+      if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$target_root/skills/$retired" ]; then
+        rm "$dest"
+        note "removed retired managed skill: $dest"
+      fi
+    done
+  done
+
+  mkdir -p "$claude_dir" "$codex_dir" "$omp_skills_dir" "$omp_extensions_dir" "$bin_dir"
   for ((index=0; index<${#destinations[@]}; index++)); do
     dest="${destinations[$index]}"; target="${targets[$index]}"
-    [ -L "$dest" ] || ln -s "$target" "$dest"
+    if [ -L "$dest" ]; then
+      if [ "$(readlink "$dest")" != "$target" ]; then
+        replacement="${dest}.tmp-$$"
+        rm -f "$replacement"
+        ln -s "$target" "$replacement"
+        mv -Tf "$replacement" "$dest"
+      fi
+    else
+      ln -s "$target" "$dest"
+    fi
   done
-  note "installed Feather, Sidecar, and Looper for Claude and Codex; installed room, sidecar, and refeather CLIs"
+  note "installed Feather and Sidecar for Claude and Codex; installed Council and Feather protocol tools for OMP; installed Feather CLIs"
 }
 
 cmd_install_capabilities() {
   local release="${REFEATHER_RELEASE:-}" target_root="${REFEATHER_TARGET_ROOT:-}"
   local claude_dir="${REFEATHER_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
   local codex_dir="${REFEATHER_CODEX_SKILLS_DIR:-$HOME/.codex/skills}"
+  local omp_skills_dir="${REFEATHER_OMP_SKILLS_DIR:-$HOME/.omp/agent/skills}"
+  local omp_extensions_dir="${REFEATHER_OMP_EXTENSIONS_DIR:-$HOME/.omp/agent/extensions}"
   local bin_dir="${REFEATHER_BIN_DIR:-$HOME/.local/bin}"
   local backup_dir="${REFEATHER_CONFLICT_BACKUP_DIR:-$HOME/.feather/install-conflicts/$(date -u +%Y%m%dT%H%M%SZ)-$$}"
   while [ $# -gt 0 ]; do
     case "$1" in
       --release) release="$2"; shift 2 ;; --target-root) target_root="$2"; shift 2 ;;
       --claude-skills-dir) claude_dir="$2"; shift 2 ;; --codex-skills-dir) codex_dir="$2"; shift 2 ;;
+      --omp-skills-dir) omp_skills_dir="$2"; shift 2 ;; --omp-extensions-dir) omp_extensions_dir="$2"; shift 2 ;;
       --bin-dir) bin_dir="$2"; shift 2 ;; --backup-dir) backup_dir="$2"; shift 2 ;;
       *) die "unknown install-capabilities option: $1" ;;
     esac
@@ -307,7 +352,8 @@ cmd_install_capabilities() {
   [ -n "$release" ] || die "install-capabilities requires --release"
   release="$(realpath_existing "$release")"
   [ -n "$target_root" ] || target_root="$release"
-  install_capabilities_impl "$release" "$target_root" "$claude_dir" "$codex_dir" "$bin_dir" "$backup_dir"
+  install_capabilities_impl "$release" "$target_root" "$claude_dir" "$codex_dir" \
+    "$omp_skills_dir" "$omp_extensions_dir" "$bin_dir" "$backup_dir"
 }
 
 atomic_current_link() {
@@ -537,6 +583,8 @@ run_switch() {
     install_capabilities_impl "$TX_CANDIDATE" "$TX_CURRENT" \
       "${REFEATHER_CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}" \
       "${REFEATHER_CODEX_SKILLS_DIR:-$HOME/.codex/skills}" \
+      "${REFEATHER_OMP_SKILLS_DIR:-$HOME/.omp/agent/skills}" \
+      "${REFEATHER_OMP_EXTENSIONS_DIR:-$HOME/.omp/agent/extensions}" \
       "${REFEATHER_BIN_DIR:-$HOME/.local/bin}" \
       "${REFEATHER_CONFLICT_BACKUP_DIR:-$HOME/.feather/install-conflicts/$TX_ID}"
   fi

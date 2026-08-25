@@ -1,5 +1,5 @@
 import { For, Index, Show, createEffect, createMemo, createSignal, on, onCleanup, onMount, untrack } from 'solid-js'
-import type { Message, ContentBlock, OmpSubagentState, OmpTodoSnapshot, OmpTimelineItem, OmpWorkScope } from '../api'
+import type { Message, ContentBlock, OmpSubagentState, OmpTodoSnapshot, OmpTimelineItem, OmpWorkScope, ProtocolRunSnapshot } from '../api'
 import { toBlob } from 'html-to-image'
 import { Marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
@@ -23,6 +23,8 @@ import { localFilePath } from '../lib/localMedia.js'
 import { appUrl } from '../lib/appPath.js'
 import { extractImages } from '../lib/attachments.js'
 import { activeOmpStep } from '../lib/ompMirror.js'
+import { ProtocolRunCard } from './ProtocolRunCard'
+import { runsForInvocation } from '../lib/protocolRuns.js'
 
 hljs.registerLanguage('javascript', javascript)
 hljs.registerLanguage('js', javascript)
@@ -871,6 +873,8 @@ type MessageViewProps = {
   standaloneAgents?: boolean
   scrollRefCb?: (el: HTMLDivElement) => void
   sessionId?: string | null
+  protocolRuns?: ProtocolRunSnapshot[]
+  onOpenAgents?: () => void
 }
 
 export function MessageView(props: MessageViewProps) {
@@ -1067,7 +1071,29 @@ export function MessageView(props: MessageViewProps) {
     )
   }
   function renderParentExecution(scope: () => OmpWorkScope) {
-    return <Show keyed when={scope().segment + 1}>{() => renderExecutionTimeline(scope, 'omp-parent-execution')}</Show>
+    return (
+      <Show keyed when={scope().segment + 1}>
+        {() => props.standaloneAgents
+          ? renderExecutionTimeline(scope, 'omp-parent-execution', true)
+          : (
+            <Show when={scope().timeline.length > 0}>
+              <button
+                type="button"
+                data-testid="omp-parent-execution"
+                onClick={props.onOpenAgents}
+                aria-label="Open execution details in Agents"
+                style={{ width: '100%', height: '36px', margin: '0 0 10px', padding: '0 10px', border: '1px solid var(--border-subtle)', 'border-radius': '10px', background: 'var(--bg-surface)', color: 'var(--text-secondary)', cursor: props.onOpenAgents ? 'pointer' : 'default', display: 'flex', 'align-items': 'center', gap: '8px', 'text-align': 'left', overflow: 'hidden' }}
+              >
+                <span aria-hidden="true" style={{ color: executionStatusColor(scope().runStatus), 'font-size': '11px', 'flex-shrink': '0' }}>{executionStatusMark(scope().runStatus)}</span>
+                <span style={{ color: 'var(--text-primary)', 'font-size': '12px', 'font-weight': '650', 'flex-shrink': '0' }}>{scope().runStatus === 'running' ? 'Working' : 'Work'}</span>
+                <span data-testid="omp-parent-execution-summary" style={{ 'font-size': '11px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1', 'min-width': '0' }}>{activeOmpStep(scope()) || `${scope().timeline.length} steps`}</span>
+                <Show when={props.onOpenAgents}><span style={{ 'font-size': '10px', color: 'var(--text-muted)', 'flex-shrink': '0' }}>Agents ›</span></Show>
+              </button>
+            </Show>
+          )
+        }
+      </Show>
+    )
   }
 
   let scrollRef: HTMLDivElement | undefined
@@ -1229,6 +1255,13 @@ export function MessageView(props: MessageViewProps) {
     const latest = renderItems().at(-1)
     return !!latest && latest.kind !== 'chain' && latest.msg.role === 'assistant'
   })
+  const currentProtocolOwnsWork = createMemo(() => {
+    const latestUser = [...props.messages].reverse().find(message => message.role === 'user')
+    return !!latestUser && runsForInvocation(props.protocolRuns || [], latestUser.uuid).length > 0
+  })
+  const showWorkingIndicator = createMemo(() =>
+    !!props.working && !currentProtocolOwnsWork() && (props.work?.timeline.length || 0) === 0
+  )
 
   function renderWorkLog(messages: Message[]) {
     // buildRenderItems returns fresh wrapper objects as a turn grows. Native
@@ -1286,7 +1319,7 @@ export function MessageView(props: MessageViewProps) {
     ) : []
     const workLogMessages = inlineTraceBlocks.length > 0 ? [...trace, { ...msg, content: inlineTraceBlocks }] : trace
 
-    return <div style={{ display: 'flex', 'flex-direction': 'column', 'align-items': msg.role === 'user' ? 'flex-end' : 'flex-start', 'margin-bottom': '10px' }}>
+    return <div class="msg-row" style={{ display: 'flex', 'flex-direction': 'column', 'align-items': msg.role === 'user' ? 'flex-end' : 'flex-start', 'margin-bottom': '10px' }}>
       <div class={msg.role === 'assistant' ? 'asst-bubble' : undefined} data-uuid={msg.uuid} data-role={msg.role} style={{
         'max-width': '85%', padding: hasAttachments ? '6px' : '10px 14px',
         'border-radius': msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
@@ -1436,24 +1469,24 @@ export function MessageView(props: MessageViewProps) {
         const isLatestItem = () => itemIndex() === renderItems().length - 1
         const mirroredCurrentTurn = createMemo(() => (props.work?.timeline.length || 0) > 0 && isLatestItem())
         if (item.kind === 'msg') return <Show
-          when={mirroredCurrentTurn() && item.msg.role === 'assistant'}
-          fallback={renderMsg(item.msg)}
+          when={mirroredCurrentTurn() && item.msg.role === 'assistant' && !currentProtocolOwnsWork()}
+          fallback={<>{renderMsg(item.msg)}<Show when={item.msg.role === 'user'}><For each={runsForInvocation(props.protocolRuns || [], item.msg.uuid)}>{run => <ProtocolRunCard run={run} />}</For></Show></>}
         >
           <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
         </Show>
         if (item.kind === 'turn') return <Show
-          when={mirroredCurrentTurn() && item.msg.role === 'assistant'}
-          fallback={renderMsg(item.msg, item.trace)}
+          when={mirroredCurrentTurn() && item.msg.role === 'assistant' && !currentProtocolOwnsWork()}
+          fallback={<>{renderMsg(item.msg, item.trace)}<Show when={item.msg.role === 'user'}><For each={runsForInvocation(props.protocolRuns || [], item.msg.uuid)}>{run => <ProtocolRunCard run={run} />}</For></Show></>}
         >
           <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
         </Show>
         // Keep an unfinished or failed trace reachable even before a final
         // answer arrives; it stays collapsed so it does not dominate chat.
-        return <Show when={!mirroredCurrentTurn()}>
+        return <Show when={!mirroredCurrentTurn() && !currentProtocolOwnsWork()}>
           <div data-testid={props.working && isLatestItem() ? 'live-work-turn' : undefined} style={{ margin: '4px 0 10px', 'max-width': '85%' }}>{renderWorkLog(item.messages)}</div>
         </Show>
       }}</For>
-      <Show when={(props.work?.timeline.length || 0) > 0 && !workAttachedToAnswer()}>
+      <Show when={(props.work?.timeline.length || 0) > 0 && !workAttachedToAnswer() && !currentProtocolOwnsWork()}>
         {renderParentExecution(() => props.work!)}
       </Show>
 
@@ -1499,6 +1532,7 @@ export function MessageView(props: MessageViewProps) {
                 <li>
                   <button
                     type="button"
+                    id={`omp-subagent-${agent.id}`}
                     data-testid={`omp-subagent-${agent.id}`}
                     class="agent-card"
                     style={{ color: executionStatusColor(agent.status) }}
@@ -1574,8 +1608,8 @@ export function MessageView(props: MessageViewProps) {
       {/* Typing indicator — always mounted, opacity-toggled so mount/unmount
           doesn't shift layout and trigger a pin-scroll every time working flips. */}
       <Show when={!props.standaloneAgents}>
-      <div data-testid="working-indicator" style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px', opacity: props.working ? '1' : '0', visibility: props.working ? 'visible' : 'hidden', transition: 'opacity 0.12s', 'pointer-events': props.working ? 'auto' : 'none' }}>
-        <div role={props.statusText ? 'status' : undefined} aria-live={props.statusText ? 'polite' : undefined} aria-hidden={!props.working ? 'true' : undefined} style={{ padding: '10px 16px', 'border-radius': '16px 16px 16px 4px', background: '#1a1a2e', display: 'flex', gap: '4px', 'align-items': 'center', 'max-width': '92%' }}>
+      <div data-testid="working-indicator" style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px', opacity: showWorkingIndicator() ? '1' : '0', visibility: showWorkingIndicator() ? 'visible' : 'hidden', transition: 'opacity 0.12s', 'pointer-events': showWorkingIndicator() ? 'auto' : 'none' }}>
+        <div role={props.statusText ? 'status' : undefined} aria-live={props.statusText ? 'polite' : undefined} aria-hidden={!showWorkingIndicator() ? 'true' : undefined} style={{ padding: '10px 16px', 'border-radius': '16px 16px 16px 4px', background: '#1a1a2e', display: 'flex', gap: '4px', 'align-items': 'center', 'max-width': '92%' }}>
           <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out infinite' }} />
           <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.2s infinite' }} />
           <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.4s infinite' }} />

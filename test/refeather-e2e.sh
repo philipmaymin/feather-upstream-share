@@ -17,12 +17,13 @@ git init --bare -q "$origin"
 git init -q "$source_repo"
 git -C "$source_repo" config user.email test@example.com
 git -C "$source_repo" config user.name Test
-mkdir -p "$source_repo/skills" "$source_repo/bin"
-for skill in feather sidecar looper; do
+mkdir -p "$source_repo/skills" "$source_repo/omp-tools" "$source_repo/bin"
+for skill in feather sidecar council; do
   mkdir -p "$source_repo/skills/$skill"
   printf -- '---\nname: %s\n---\n' "$skill" >"$source_repo/skills/$skill/SKILL.md"
 done
-for cli in room sidecar refeather; do printf '#!/bin/sh\n' >"$source_repo/bin/$cli"; chmod +x "$source_repo/bin/$cli"; done
+printf 'export default function () {}\n' >"$source_repo/omp-tools/feather-protocol-tools.js"
+for cli in room sidecar refeather refeather-fleet; do printf '#!/bin/sh\n' >"$source_repo/bin/$cli"; chmod +x "$source_repo/bin/$cli"; done
 cat >"$source_repo/build-test.sh" <<'SH'
 #!/usr/bin/env bash
 set -e

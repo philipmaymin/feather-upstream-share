@@ -79,10 +79,11 @@ bin/refeather install-capabilities \
   --target-root "$REFEATHER_CURRENT_LINK"
 ```
 
-This installs Feather, Sidecar, and Looper into both `~/.claude/skills` and
-`~/.codex/skills`, and `room`, `sidecar`, plus `refeather` into `~/.local/bin`. Existing
-correct links are left alone. A file or foreign link is copied into a conflict
-evidence directory and causes a full preflight abort; nothing is overwritten.
+This installs Feather and Sidecar into `~/.claude/skills` and `~/.codex/skills`,
+Council plus Feather protocol tools into `~/.omp/agent`, and `room`, `sidecar`,
+`refeather`, plus `refeather-fleet` into `~/.local/bin`. Existing correct links
+are left alone. A file or foreign link is copied into a conflict evidence
+directory and causes a full preflight abort; nothing is overwritten.
 Promotion runs the same preflight by default before stopping the service.
 
 Inside an OMP session, the local CLIs use its health-checked bridge metadata to
@@ -131,6 +132,47 @@ health versions are all verified. The durable state records the manager,
 complete unit set, and health endpoints, so `recover` cannot use a partial or
 wrong backend after host loss. Record the completed state JSON and journal with
 the migration receipt.
+
+## 4. Delay secondary-user promotion
+
+Promote the immutable release to the designated canary first. After its health
+checks pass, schedule the same release for the secondary fleet:
+
+```bash
+sudo /home/user/.local/share/feather/current/bin/refeather-fleet schedule \
+  --release "$release" \
+  --canary-current /home/user/.local/share/feather/current \
+  --fleet-config /etc/feather/fleet.json \
+  --state /var/lib/feather/refeather/fleet-schedule.json
+```
+
+The default delay is 86,400 seconds. A later canary promotion supersedes the
+pending release and starts a new 24-hour window. The runner also refuses a due
+promotion if the canary link no longer points to the scheduled release.
+
+`fleet.json` uses schema 1 and one explicit record per secondary instance:
+
+```json
+{
+  "schema": 1,
+  "instances": [{
+    "name": "peer",
+    "home": "/home/peer",
+    "currentLink": "/home/peer/.local/share/feather/current",
+    "systemdUnit": "feather-peer.service",
+    "healthUrl": "http://127.0.0.1:4872/api/health"
+  }]
+}
+```
+
+Install `infra/feather-fleet-promote.service` and
+`infra/feather-fleet-promote.timer` under `/etc/systemd/system/`, then enable
+the timer. The one-minute timer only reads the durable schedule until it is
+due. At promotion time it invokes the guarded per-instance transaction,
+requires each exact health version, and rolls already-promoted peers back if a
+later peer fails. Failed schedules remain durable and retry on the next timer
+tick; completed and superseded records are copied into the adjacent history
+directory.
 
 ## Recovery and rollback
 

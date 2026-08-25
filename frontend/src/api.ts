@@ -204,6 +204,107 @@ export interface Message {
   internal?: boolean
 }
 
+export type ProtocolRunStatus =
+  | 'starting'
+  | 'start_failed'
+  | 'pending'
+  | 'running'
+  | 'cancelling'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
+
+export type ProtocolSeatStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'timed_out' | 'cancelled'
+export type ProtocolStageStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'
+
+export interface ProtocolRanking {
+  seatId: string
+  rationale: string
+}
+
+export interface ProtocolDisagreement {
+  summary: string
+  evidenceIds: string[]
+}
+
+export interface ProtocolVerdict {
+  ranking: ProtocolRanking[]
+  recommendation: string
+  disagreements: ProtocolDisagreement[]
+  confidence: 'low' | 'medium' | 'high'
+  citedEvidenceIds: string[]
+}
+
+export interface ProtocolSeatSnapshot {
+  seatId: string
+  stageId: 'candidates' | 'judge'
+  attempt: number
+  role: string
+  status: ProtocolSeatStatus
+  evidenceIds?: string[]
+  ompChildId?: string
+  reason?: string
+  startedAt?: string
+  finishedAt?: string
+}
+
+export interface ProtocolAttemptSnapshot {
+  attempt: number
+  status: ProtocolStageStatus
+  seats: ProtocolSeatSnapshot[]
+  reason?: string
+}
+
+export interface ProtocolStageSnapshot {
+  stageId: 'candidates' | 'judge'
+  status: ProtocolStageStatus
+  attempts: ProtocolAttemptSnapshot[]
+  reason?: string
+}
+
+export interface ProtocolEvidenceSnapshot {
+  evidenceId: string
+  kind: 'candidate_answer' | 'judge_verdict'
+  stageId: 'candidates' | 'judge'
+  seatId: string
+  attempt: number
+  content: string | ProtocolVerdict
+  artifactReferences?: string[]
+}
+
+export interface ProtocolRunSnapshot {
+  schemaVersion: 1
+  sessionId: string
+  runId: string
+  protocol: 'advisory'
+  status: ProtocolRunStatus
+  lastSeq: number
+  invocationMessageId: string
+  actionId: string
+  question: string
+  candidateCount: number
+  roles: Array<{ seatId: string; role: string }>
+  roleMode: 'diverse' | 'neutral'
+  timeoutMs: number
+  rubric?: string
+  sourceRunId?: string
+  ownerExecutionId?: string
+  createdAt: string
+  updatedAt?: string
+  startedAt?: string
+  finishedAt?: string
+  stages: ProtocolStageSnapshot[]
+  seats: ProtocolSeatSnapshot[]
+  evidence: ProtocolEvidenceSnapshot[]
+  verdict: ProtocolVerdict | null
+  verdictEvidenceId?: string | null
+  verdictRecordedAt?: string
+  cancelActionId?: string
+  reason?: string
+  error?: string
+}
+
 export async function fetchSessions(project?: string | null, query?: string, limit?: number): Promise<SessionMeta[]> {
   const params = new URLSearchParams()
   if (project) params.set('project', project)
@@ -233,6 +334,11 @@ export async function fetchMessages(id: string, before = 0, signal?: AbortSignal
   const r = await fetch(url, { signal })
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
   return await r.json()
+}
+
+export async function fetchProtocolRuns(id: string): Promise<{ runs: ProtocolRunSnapshot[] }> {
+  const response = await fetch(`${BASE}/api/sessions/${id}/protocol-runs`)
+  return responseJson<{ runs: ProtocolRunSnapshot[] }>(response)
 }
 
 export async function sendInput(id: string, text: string, messageId?: string): Promise<{ ok: boolean, sentAt: string }> {
@@ -566,14 +672,17 @@ export interface OmpBridgeEvent {
   contextPercent?: number
 }
 
-export function subscribeMessages(
-  id: string,
-  onMessage: (msg: Message) => void,
-  onStatus?: (status: 'connected' | 'reconnecting') => void,
-  onActivity?: (activity: string | null) => void,
-  onQuestion?: (question: QuestionData | null) => void,
-  onOmpEvent?: (event: OmpBridgeEvent) => void,
-): () => void {
+export interface SubscribeMessagesOptions {
+  onMessage: (message: Message) => void
+  onStatus?: (status: 'connected' | 'reconnecting') => void
+  onActivity?: (activity: string | null) => void
+  onQuestion?: (question: QuestionData | null) => void
+  onOmpEvent?: (event: OmpBridgeEvent) => void
+  onProtocolRun?: (run: ProtocolRunSnapshot) => void
+}
+
+export function subscribeMessages(id: string, options: SubscribeMessagesOptions): () => void {
+  const { onMessage, onStatus, onActivity, onQuestion, onOmpEvent, onProtocolRun } = options
   let es: EventSource | null = null
   let closed = false
   let retries = 0
@@ -587,18 +696,18 @@ export function subscribeMessages(
   const IDLE_TIMEOUT = 40_000
 
   function clearWatchdog() {
-    if (watchdog) clearTimeout(watchdog)
+    clearTimeout(watchdog)
     watchdog = null
   }
 
   function reconnect(source: EventSource, sourceGeneration: number, delay = 0) {
     if (closed || sourceGeneration !== generation || source !== es) return
-    generation++ // invalidate every handler on the dead source before close()
+    generation++
     clearWatchdog()
     try { source.close() } catch {}
     es = null
     onStatus?.('reconnecting')
-    if (retryTimer) clearTimeout(retryTimer)
+    clearTimeout(retryTimer)
     retryTimer = setTimeout(() => {
       retryTimer = null
       connect()
@@ -630,41 +739,44 @@ export function subscribeMessages(
       if (!alive()) return
       retries = 0
       onStatus?.('connected')
-      // On reconnect, check if last message has stopReason (Claude finished while disconnected)
       if (lastEventId) {
         fetch(`${BASE}/api/sessions/${id}/messages`)
-          .then(r => r.ok ? r.json() : null)
+          .then(response => response.ok ? response.json() : null)
           .then(data => {
             if (closed || sourceGeneration !== generation || source !== es) return
             if (!data?.messages?.length) return
             const last = data.messages[data.messages.length - 1]
-            if (last.stopReason) onMessage(last) // Re-emit so working state clears
+            if (last.stopReason) onMessage(last)
           })
           .catch(() => {})
       }
     })
     source.addEventListener('heartbeat', () => { alive() })
-    source.addEventListener('message', (e) => {
+    source.addEventListener('message', (event) => {
       if (!alive()) return
-      if (e.lastEventId) lastEventId = e.lastEventId
-      try { onMessage(JSON.parse(e.data)) } catch {}
+      if (event.lastEventId) lastEventId = event.lastEventId
+      try { onMessage(JSON.parse(event.data)) } catch {}
     })
-    source.addEventListener('activity', (e) => {
+    source.addEventListener('activity', (event) => {
       if (!alive()) return
-      try { onActivity?.(JSON.parse(e.data).activity) } catch {}
+      try { onActivity?.(JSON.parse(event.data).activity) } catch {}
     })
-    source.addEventListener('question', (e) => {
+    source.addEventListener('question', (event) => {
       if (!alive()) return
-      try { onQuestion?.(JSON.parse(e.data).question) } catch {}
+      try { onQuestion?.(JSON.parse(event.data).question) } catch {}
     })
-    source.addEventListener('omp_event', (e) => {
+    source.addEventListener('omp_event', (event) => {
       if (!alive()) return
-      try { onOmpEvent?.(JSON.parse(e.data)) } catch {}
+      try { onOmpEvent?.(JSON.parse(event.data)) } catch {}
+    })
+    source.addEventListener('protocol_run', (event) => {
+      if (!alive()) return
+      try { onProtocolRun?.(JSON.parse(event.data)) } catch {}
     })
     source.onerror = () => {
       if (closed || sourceGeneration !== generation || source !== es) return
       retries++
-      reconnect(source, sourceGeneration, Math.min(1000 * 2 ** Math.min(retries - 1, 5), 30000))
+      reconnect(source, sourceGeneration, Math.min(1000 * 2 ** Math.min(retries - 1, 5), 30_000))
     }
   }
 
@@ -673,7 +785,7 @@ export function subscribeMessages(
     closed = true
     generation++
     clearWatchdog()
-    if (retryTimer) clearTimeout(retryTimer)
+    clearTimeout(retryTimer)
     retryTimer = null
     es?.close()
     es = null

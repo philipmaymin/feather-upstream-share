@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Schedule and execute delayed promotion of one verified Feather release."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+DEFAULT_DELAY_SECONDS = 24 * 60 * 60
+UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@_.:-]{0,254}$")
+NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+class FleetError(RuntimeError):
+    pass
+
+
+def load_json(path: Path, label: str) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise FleetError(f"{label} not found: {path}") from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise FleetError(f"invalid {label}: {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise FleetError(f"{label} must be a JSON object: {path}")
+    return value
+
+
+def absolute_path(value: object, label: str) -> Path:
+    if not isinstance(value, str) or not value or not Path(value).is_absolute():
+        raise FleetError(f"{label} must be an absolute path")
+    return Path(value)
+
+
+def release_details(path: Path) -> tuple[Path, dict]:
+    try:
+        release = path.resolve(strict=True)
+    except OSError as error:
+        raise FleetError(f"release does not exist: {path}") from error
+    manifest = load_json(release / ".refeather-release.json", "release manifest")
+    if manifest.get("schema") != 2:
+        raise FleetError(f"unsupported release manifest schema: {release}")
+    for field in ("sourceCommit", "version", "treeHash"):
+        if not isinstance(manifest.get(field), str) or not manifest[field]:
+            raise FleetError(f"release manifest is missing {field}: {release}")
+    return release, manifest
+
+
+def fleet_config(path: Path) -> list[dict]:
+    value = load_json(path, "fleet config")
+    if value.get("schema") != 1 or not isinstance(value.get("instances"), list) or not value["instances"]:
+        raise FleetError("fleet config requires schema 1 and a non-empty instances array")
+    names: set[str] = set()
+    instances: list[dict] = []
+    for raw in value["instances"]:
+        if not isinstance(raw, dict):
+            raise FleetError("each fleet instance must be an object")
+        name = raw.get("name")
+        unit = raw.get("systemdUnit")
+        health_url = raw.get("healthUrl")
+        if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in names:
+            raise FleetError(f"invalid or duplicate fleet instance name: {name!r}")
+        if not isinstance(unit, str) or not UNIT_RE.fullmatch(unit):
+            raise FleetError(f"invalid systemd unit for {name}")
+        if not isinstance(health_url, str) or not re.fullmatch(r"https?://(?:127\.0\.0\.1|localhost)(?::\d+)?(?:/[^\s]*)?", health_url):
+            raise FleetError(f"healthUrl for {name} must be loopback HTTP(S)")
+        home = absolute_path(raw.get("home"), f"home for {name}")
+        current = absolute_path(raw.get("currentLink"), f"currentLink for {name}")
+        journal = absolute_path(raw.get("journalDir", f"/var/lib/feather/refeather-{name}"), f"journalDir for {name}")
+        lock = absolute_path(raw.get("lockFile", f"/var/lock/feather-refeather-{name}.lock"), f"lockFile for {name}")
+        names.add(name)
+        instances.append({
+            "name": name,
+            "home": str(home),
+            "currentLink": str(current),
+            "systemdUnit": unit,
+            "healthUrl": health_url,
+            "journalDir": str(journal),
+            "lockFile": str(lock),
+        })
+    return instances
+
+
+def atomic_write(path: Path, value: dict, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+def utc_now(epoch: float | None = None) -> str:
+    instant = dt.datetime.fromtimestamp(time.time() if epoch is None else epoch, tz=dt.timezone.utc)
+    return instant.isoformat().replace("+00:00", "Z")
+
+
+@contextlib.contextmanager
+def state_lock(state_path: Path):
+    lock_path = Path(f"{state_path}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def archive_state(state_path: Path, state: dict, outcome: str) -> None:
+    history = state_path.parent / f"{state_path.name}.history"
+    history.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    atomic_write(history / f"{stamp}-{outcome}.json", state)
+
+
+def current_target(link: Path) -> Path:
+    if not link.is_symlink():
+        raise FleetError(f"current link is not a symlink: {link}")
+    return link.resolve(strict=True)
+
+
+def schedule(args: argparse.Namespace) -> int:
+    state_path = Path(args.state)
+    release, manifest = release_details(Path(args.release))
+    canary_current = absolute_path(args.canary_current, "canary current link")
+    config_path = absolute_path(args.fleet_config, "fleet config").resolve(strict=True)
+    fleet_config(config_path)
+    if current_target(canary_current) != release:
+        raise FleetError(f"canary current link does not point to release: {canary_current}")
+    if args.delay_seconds < 0:
+        raise FleetError("delay seconds cannot be negative")
+    now = time.time()
+    pending = {
+        "schema": 1,
+        "status": "pending",
+        "release": str(release),
+        "sourceCommit": manifest["sourceCommit"],
+        "version": manifest["version"],
+        "canaryCurrentLink": str(canary_current),
+        "fleetConfig": str(config_path),
+        "scheduledAt": utc_now(now),
+        "dueAt": now + args.delay_seconds,
+        "dueAtIso": utc_now(now + args.delay_seconds),
+        "attempts": 0,
+    }
+    with state_lock(state_path):
+        if state_path.exists():
+            previous = load_json(state_path, "fleet schedule")
+            if previous.get("status") in {"pending", "running", "failed"}:
+                previous = {**previous, "status": "superseded", "supersededAt": utc_now(), "supersededBy": str(release)}
+                archive_state(state_path, previous, "superseded")
+        atomic_write(state_path, pending)
+    print(json.dumps(pending, sort_keys=True))
+    return 0
+
+
+def health_version(url: str) -> str | None:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            value = json.load(response)
+        return value.get("version") if value.get("status") == "ok" else None
+    except Exception:
+        return None
+
+
+def switch_command(refeather: Path, action: str, release: Path, instance: dict) -> list[str]:
+    return [
+        str(refeather), action,
+        "--release", str(release),
+        "--current-link", instance["currentLink"],
+        "--systemd-unit", instance["systemdUnit"],
+        "--health-url", instance["healthUrl"],
+        "--journal-dir", instance["journalDir"],
+        "--lock-file", instance["lockFile"],
+    ]
+
+
+def run_switch(command: list[str], home: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["HOME"] = home
+    return subprocess.run(command, env=environment, text=True, capture_output=True, timeout=240, check=False)
+
+
+def run_pending(args: argparse.Namespace) -> int:
+    state_path = Path(args.state)
+    refeather = Path(args.refeather or Path(__file__).with_name("refeather")).resolve(strict=True)
+    with state_lock(state_path):
+        if not state_path.exists():
+            print(json.dumps({"schema": 1, "status": "idle"}, sort_keys=True))
+            return 0
+        state = load_json(state_path, "fleet schedule")
+        if state.get("schema") != 1:
+            raise FleetError("unsupported fleet schedule schema")
+        if state.get("status") not in {"pending", "running", "failed"}:
+            print(json.dumps(state, sort_keys=True))
+            return 0
+        now = time.time()
+        due_at = state.get("dueAt")
+        retry_at = state.get("nextAttemptAt", 0)
+        if not isinstance(due_at, (int, float)) or not isinstance(retry_at, (int, float)) or max(due_at, retry_at) > now:
+            print(json.dumps(state, sort_keys=True))
+            return 0
+        release, manifest = release_details(absolute_path(state.get("release"), "scheduled release"))
+        canary_current = absolute_path(state.get("canaryCurrentLink"), "canary current link")
+        if current_target(canary_current) != release:
+            state = {**state, "status": "superseded", "supersededAt": utc_now(), "reason": "Philip canary advanced before fleet promotion"}
+            atomic_write(state_path, state)
+            archive_state(state_path, state, "superseded")
+            print(json.dumps(state, sort_keys=True))
+            return 0
+        instances = fleet_config(absolute_path(state.get("fleetConfig"), "fleet config"))
+        attempt = int(state.get("attempts", 0)) + 1
+        state = {**state, "status": "running", "attempts": attempt, "lastAttemptAt": utc_now()}
+        atomic_write(state_path, state)
+
+        completed: list[tuple[dict, Path]] = []
+        results: list[dict] = []
+        failure: str | None = None
+        for instance in instances:
+            current = Path(instance["currentLink"])
+            try:
+                prior = current_target(current)
+            except FleetError as error:
+                failure = str(error)
+                results.append({"name": instance["name"], "status": "failed", "error": failure})
+                break
+            if prior == release and health_version(instance["healthUrl"]) == manifest["version"]:
+                results.append({"name": instance["name"], "status": "already-current"})
+                completed.append((instance, prior))
+                continue
+            result = run_switch(switch_command(refeather, "promote", release, instance), instance["home"])
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or f"exit {result.returncode}")[-4000:]
+                failure = f"{instance['name']}: {detail.strip()}"
+                results.append({"name": instance["name"], "status": "failed", "error": failure})
+                break
+            completed.append((instance, prior))
+            results.append({"name": instance["name"], "status": "promoted"})
+
+        if failure is not None:
+            rollback_errors: list[str] = []
+            for instance, prior in reversed(completed):
+                if prior == release:
+                    continue
+                rollback = run_switch(switch_command(refeather, "rollback", prior, instance), instance["home"])
+                if rollback.returncode != 0:
+                    detail = (rollback.stderr or rollback.stdout or f"exit {rollback.returncode}")[-2000:]
+                    rollback_errors.append(f"{instance['name']}: {detail.strip()}")
+            retry_at = time.time() + min(15 * 60 * (2 ** (attempt - 1)), 6 * 60 * 60)
+            state = {
+                **state,
+                "status": "failed",
+                "lastError": failure,
+                "rollbackErrors": rollback_errors,
+                "instances": results,
+                "nextAttemptAt": retry_at,
+                "nextAttemptAtIso": utc_now(retry_at),
+            }
+            atomic_write(state_path, state)
+            print(json.dumps(state, sort_keys=True), file=sys.stderr)
+            return 1
+
+        state = {**state, "status": "completed", "completedAt": utc_now(), "instances": results}
+        atomic_write(state_path, state)
+        archive_state(state_path, state, "completed")
+        print(json.dumps(state, sort_keys=True))
+        return 0
+
+
+def status(args: argparse.Namespace) -> int:
+    state = load_json(Path(args.state), "fleet schedule")
+    print(json.dumps(state, indent=2, sort_keys=True))
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="refeather-fleet")
+    commands = root.add_subparsers(dest="command", required=True)
+    schedule_parser = commands.add_parser("schedule")
+    schedule_parser.add_argument("--release", required=True)
+    schedule_parser.add_argument("--canary-current", required=True)
+    schedule_parser.add_argument("--fleet-config", required=True)
+    schedule_parser.add_argument("--state", required=True)
+    schedule_parser.add_argument("--delay-seconds", type=int, default=DEFAULT_DELAY_SECONDS)
+    schedule_parser.set_defaults(handler=schedule)
+    run_parser = commands.add_parser("run")
+    run_parser.add_argument("--state", required=True)
+    run_parser.add_argument("--refeather")
+    run_parser.set_defaults(handler=run_pending)
+    status_parser = commands.add_parser("status")
+    status_parser.add_argument("--state", required=True)
+    status_parser.set_defaults(handler=status)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        return args.handler(args)
+    except (FleetError, OSError, subprocess.SubprocessError) as error:
+        print(f"refeather-fleet: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
