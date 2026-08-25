@@ -21,6 +21,53 @@ CURL_BIN="${FEATHER_CURL:-curl}"
 command -v "$CURL_BIN" >/dev/null 2>&1 || die "curl is required (or set FEATHER_CURL)"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 
+is_feather_url() {
+  local url="$1" body
+  body=$($CURL_BIN -fsS --max-time 1 "$url/api/health" 2>/dev/null || true)
+  printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+ok = value.get("status") == "ok" and isinstance(value.get("version"), str) and isinstance(value.get("capabilities"), dict)
+raise SystemExit(0 if ok else 1)
+'
+}
+
+session_feather_url() {
+  local metadata=""
+  if [[ "${PI_SESSION_FILE:-}" = */* ]]; then
+    metadata="${PI_SESSION_FILE%/*}/.feather-bridge.json"
+  elif [[ "${FEATHER_SESSION_ID:-}" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
+    metadata="$HOME/.feather/omp-sessions/$FEATHER_SESSION_ID/.feather-bridge.json"
+  fi
+  [ -f "$metadata" ] || return 1
+  python3 - "$metadata" <<'PY'
+import json, sys
+from urllib.parse import urlsplit, urlunsplit
+
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8")).get("url")
+    parsed = urlsplit(value)
+    marker = "/api/internal/sessions/"
+    marker_at = parsed.path.index(marker)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError
+    print(urlunsplit((parsed.scheme, parsed.netloc, parsed.path[:marker_at].rstrip("/"), "", "")), end="")
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+# An OMP session records the exact Feather instance that launched it. Prefer
+# that owner over port probing; concurrent production/canary servers can both
+# be healthy, and only the owner should receive session-scoped mutations.
+if owner=$(session_feather_url) && is_feather_url "$owner"; then
+  printf '%s' "$owner"
+  exit 0
+fi
+
 ports=()
 add_port() {
   local candidate="${1:-}" existing
@@ -40,16 +87,7 @@ add_port 3300
 matches=()
 for port in "${ports[@]}"; do
   url="http://127.0.0.1:$port"
-  body=$($CURL_BIN -fsS --max-time 1 "$url/api/health" 2>/dev/null || true)
-  if printf '%s' "$body" | python3 -c '
-import json, sys
-try:
-    value = json.load(sys.stdin)
-except Exception:
-    raise SystemExit(1)
-ok = value.get("status") == "ok" and isinstance(value.get("version"), str) and isinstance(value.get("capabilities"), dict)
-raise SystemExit(0 if ok else 1)
-'; then
+  if is_feather_url "$url"; then
     matches+=("$url")
   fi
 done

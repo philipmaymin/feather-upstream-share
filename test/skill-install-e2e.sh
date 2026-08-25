@@ -52,6 +52,14 @@ case ",${FEATHER_FAKE_PORTS:-}," in
 esac
 SH
 chmod +x "$fake_curl"
+unset PI_SESSION_FILE FEATHER_SESSION_ID
+
+session_dir="$TMP/omp-sessions/owner-id"
+mkdir -p "$session_dir"
+printf '%s\n' '{"url":"http://127.0.0.1:4871/api/internal/sessions/owner-id/events","token":"test","sessionId":"owner-id"}' >"$session_dir/.feather-bridge.json"
+touch "$session_dir/rollout.jsonl"
+[ "$(PI_SESSION_FILE="$session_dir/rollout.jsonl" FEATHER_CURL="$fake_curl" FEATHER_FAKE_PORTS=4871 "$ROOT/bin/feather-instance")" = 'http://127.0.0.1:4871' ]
+[ "$(PI_SESSION_FILE="$session_dir/rollout.jsonl" FEATHER_CURL="$fake_curl" FEATHER_FAKE_PORTS=4870 "$ROOT/bin/feather-instance")" = 'http://127.0.0.1:4870' ]
 
 [ "$(FEATHER_URL='https://zak.example/feather2/' FEATHER_CURL=/missing "$ROOT/bin/feather-instance")" = 'https://zak.example/feather2' ]
 [ "$(FEATHER_CURL="$fake_curl" FEATHER_FAKE_PORTS=4870 "$ROOT/bin/feather-instance")" = 'http://127.0.0.1:4870' ]

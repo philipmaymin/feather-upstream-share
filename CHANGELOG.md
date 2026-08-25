@@ -1,3 +1,6 @@
+## 2026-08-25 - Session-affine local tools
+- **Room and sidecar commands target the Feather instance that launched the current OMP session.** The shared resolver now reads the session's bridge metadata before probing default ports, so a concurrent production/canary server cannot make `room pause`, `room wake`, or another local mutation fail as ambiguous or reach the wrong instance. Stale metadata falls back to the existing health-checked probe.
+
 ## 2026-08-23 - Visible harnesses and controllable background work
 - **Terminal login links work on phones.** Plain taps now open HTTP(S) and OSC 8 links without a keyboard modifier, long OAuth URLs remain intact across wrapped terminal rows, and a Links drawer exposes every recent URL as a native browser link with a dedicated Copy action.
 - **Chat identity is now fail-closed.** Switching chats cancels and invalidates the previous history request and live stream; late responses are discarded, and the composer stays locked until the selected title and rendered transcript are the same chat. This prevents one chat's context from appearing under another title and prevents sends while a transcript is unresolved.
