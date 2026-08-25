@@ -52,15 +52,24 @@ Depends on how feather is running:
 
 ```bash
 release=$(bin/refeather stage --source path/to/clean/feather --releases-dir /opt/feather/releases)
+
+# Supervisor
 sudo bin/refeather promote --release "$release" --current-link /opt/feather/current \
   --program feather-zak --supervisor-socket unix:///run/supervisor.sock \
   --health-url http://127.0.0.1:8123/feather2/api/health
+
+# Or systemd; name every unit sharing the release pointer
+sudo bin/refeather promote --release "$release" --current-link /opt/feather/current \
+  --systemd-unit feather.service --systemd-unit feather-philip.service \
+  --health-url http://127.0.0.1:4871/api/health
 ```
 
 Staging never restarts a service. Promotion refuses an unsafe source unless a
 complete archive receipt was supplied, owns the host deployment lock, switches
-the stable release link atomically, and verifies the exact built version. Run
-`bin/refeather recover` after an interrupted promotion. Follow
+the stable release link atomically, and verifies the exact built version.
+Supervisor and systemd transactions use the same journaled rollback; repeated
+`--systemd-unit` options stop and restart the complete shared-pointer unit set.
+Run `bin/refeather recover` after an interrupted promotion. Follow
 `docs/runbooks/refeather.md`; never rebase a personalized deployment checkout.
 
 After deploy, both `/api/health` and the frontend tab bar should show the same fresh version timestamp.

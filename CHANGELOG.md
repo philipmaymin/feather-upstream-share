@@ -1,5 +1,6 @@
 ## 2026-08-25 - Session-affine local tools
 - **Room and sidecar commands target the Feather instance that launched the current OMP session.** The shared resolver now reads the session's bridge metadata before probing default ports, so a concurrent production/canary server cannot make `room pause`, `room wake`, or another local mutation fail as ambiguous or reach the wrong instance. Stale metadata falls back to the existing health-checked probe.
+- **Guarded promotion now supports systemd directly.** Repeated `--systemd-unit` options stop and restart every unit sharing a release pointer; the manager and full unit set are persisted in transaction state so failed starts, rollback, and crash recovery use systemctl rather than silently falling back to Supervisor.
 
 ## 2026-08-23 - Visible harnesses and controllable background work
 - **Terminal login links work on phones.** Plain taps now open HTTP(S) and OSC 8 links without a keyboard modifier, long OAuth URLs remain intact across wrapped terminal rows, and a Links drawer exposes every recent URL as a native browser link with a dedicated Copy action.

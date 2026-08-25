@@ -15,17 +15,21 @@ usage() {
 Usage:
   refeather stage [--source DIR] [--releases-dir DIR] [--archive-receipt FILE]
                   [--build-command CMD] [--check-port PORT]
-  refeather promote --release DIR --current-link LINK --program NAME
-                    --supervisor-socket URL --health-url URL [--skip-capability-install]
-  refeather rollback --release DIR --current-link LINK --program NAME
-                     --supervisor-socket URL --health-url URL [--skip-capability-install]
+  refeather promote --release DIR --current-link LINK --health-url URL
+                    (--program NAME --supervisor-socket URL |
+                     --systemd-unit UNIT [--systemd-unit UNIT ...])
+                    [--skip-capability-install]
+  refeather rollback --release DIR --current-link LINK --health-url URL
+                     (--program NAME --supervisor-socket URL |
+                      --systemd-unit UNIT [--systemd-unit UNIT ...])
+                     [--skip-capability-install]
   refeather recover [--journal-dir DIR] [--lock-file FILE]
   refeather install-capabilities --release DIR [--target-root DIR]
                     [--claude-skills-dir DIR] [--codex-skills-dir DIR] [--bin-dir DIR]
 
-Environment equivalents use the REFEATHER_ prefix. Promotion never guesses a
-Supervisor program/socket or health URL. FEATHER_URL is unrelated runtime
-client configuration; pass the exact mounted health URL to --health-url.
+Environment equivalents use the REFEATHER_ prefix. Promotion requires an
+explicit Supervisor program/socket or one or more systemd units, plus the exact
+mounted health URL. FEATHER_URL is unrelated runtime client configuration.
 EOF
 }
 
@@ -320,14 +324,19 @@ atomic_current_link() {
 }
 
 write_tx_state() {
-  local phase="$1"
+  local phase="$1" systemd_units
   TX_PHASE="$phase"
+  systemd_units="$(IFS=,; printf '%s' "${TX_SYSTEMD_UNITS[*]:-}")"
   python3 - "$ACTIVE_STATE" "$TX_ID" "$TX_COMMAND" "$phase" "$TX_PRIOR" "$TX_CANDIDATE" "$TX_EXPECTED" \
-    "$TX_PROGRAM" "$TX_SOCKET" "$TX_HEALTH" "$TX_CURRENT" "$TX_JOURNAL" <<'PY'
+    "$TX_PROGRAM" "$TX_SOCKET" "$TX_HEALTH" "$TX_CURRENT" "$TX_JOURNAL" "$TX_SERVICE_MANAGER" "$systemd_units" <<'PY'
 import json, os, sys, tempfile, time
 path = sys.argv[1]
 keys = ("transaction", "command", "phase", "prior", "candidate", "expectedVersion", "program", "supervisorSocket", "healthUrl", "currentLink", "journal")
-value = dict(zip(keys, sys.argv[2:]))
+value = dict(zip(keys, sys.argv[2:2 + len(keys)]))
+manager_index = 2 + len(keys)
+value["serviceManager"] = sys.argv[manager_index]
+units = sys.argv[manager_index + 1]
+value["systemdUnits"] = units.split(",") if units else []
 value["updatedAt"] = int(time.time())
 os.makedirs(os.path.dirname(path), exist_ok=True)
 fd, tmp = tempfile.mkstemp(prefix=".active-", dir=os.path.dirname(path), text=True)
@@ -365,9 +374,19 @@ finish_tx() {
   TX_FINISHED=1
 }
 
-supervisor_action() {
-  timeout --signal=TERM --kill-after="${REFEATHER_SUPERVISOR_KILL_AFTER:-2s}" \
-    "$TX_SUPERVISOR_TIMEOUT" "$TX_SUPERVISORCTL" -s "$TX_SOCKET" "$1" "$TX_PROGRAM"
+service_action() {
+  local action="$1"
+  case "$TX_SERVICE_MANAGER" in
+    supervisor)
+      timeout --signal=TERM --kill-after="$TX_SERVICE_KILL_AFTER" \
+        "$TX_SERVICE_TIMEOUT" "$TX_SUPERVISORCTL" -s "$TX_SOCKET" "$action" "$TX_PROGRAM"
+      ;;
+    systemd)
+      timeout --signal=TERM --kill-after="$TX_SERVICE_KILL_AFTER" \
+        "$TX_SERVICE_TIMEOUT" "$TX_SYSTEMCTL" "$action" "${TX_SYSTEMD_UNITS[@]}"
+      ;;
+    *) die "unsupported service manager in transaction: $TX_SERVICE_MANAGER" ;;
+  esac
 }
 
 health_version() {
@@ -418,10 +437,10 @@ switch_failed() {
 
 restore_prior_release() {
   local old_expected
-  supervisor_action stop >/dev/null 2>&1 || true
+  service_action stop >/dev/null 2>&1 || true
   atomic_current_link "$TX_CURRENT" "$TX_PRIOR" || return 1
   [ "$(readlink -f "$TX_CURRENT" 2>/dev/null || true)" = "$TX_PRIOR" ] || return 1
-  supervisor_action start >/dev/null 2>&1 || return 1
+  service_action start >/dev/null 2>&1 || return 1
   old_expected="$(prior_expected_version)"
   [ -n "$old_expected" ] || return 1
   wait_for_version "$old_expected" >/dev/null 2>&1 || return 1
@@ -434,25 +453,48 @@ load_switch_options() {
   TX_SOCKET="${REFEATHER_SUPERVISOR_SOCKET:-}"
   TX_HEALTH="${REFEATHER_HEALTH_URL:-}"
   TX_SUPERVISORCTL="${REFEATHER_SUPERVISORCTL:-supervisorctl}"
-  TX_SUPERVISOR_TIMEOUT="${REFEATHER_SUPERVISOR_TIMEOUT:-15s}"
+  TX_SYSTEMCTL="${REFEATHER_SYSTEMCTL:-systemctl}"
+  TX_SERVICE_TIMEOUT="${REFEATHER_SERVICE_TIMEOUT:-${REFEATHER_SUPERVISOR_TIMEOUT:-15s}}"
+  TX_SERVICE_KILL_AFTER="${REFEATHER_SERVICE_KILL_AFTER:-${REFEATHER_SUPERVISOR_KILL_AFTER:-2s}}"
   TX_CURL="${REFEATHER_CURL:-curl}"
   TX_JOURNAL_DIR="${REFEATHER_JOURNAL_DIR:-/var/lib/feather/refeather}"
   TX_LOCK_FILE="${REFEATHER_LOCK_FILE:-/var/lock/feather-refeather.lock}"
   TX_PRECHECK="${REFEATHER_PRE_PROMOTE_CHECK:-}"
   TX_SKIP_CAPABILITIES=0
+  TX_SYSTEMD_UNITS=()
+  if [ -n "${REFEATHER_SYSTEMD_UNITS:-}" ]; then
+    read -r -a TX_SYSTEMD_UNITS <<<"$REFEATHER_SYSTEMD_UNITS"
+  fi
   while [ $# -gt 0 ]; do
     case "$1" in
       --release) TX_CANDIDATE="$2"; shift 2 ;; --current-link) TX_CURRENT="$2"; shift 2 ;;
       --program) TX_PROGRAM="$2"; shift 2 ;; --supervisor-socket) TX_SOCKET="$2"; shift 2 ;;
-      --health-url) TX_HEALTH="$2"; shift 2 ;; --supervisorctl) TX_SUPERVISORCTL="$2"; shift 2 ;;
+      --systemd-unit) TX_SYSTEMD_UNITS+=("$2"); shift 2 ;;
+      --health-url) TX_HEALTH="$2"; shift 2 ;;
+      --supervisorctl) TX_SUPERVISORCTL="$2"; shift 2 ;; --systemctl) TX_SYSTEMCTL="$2"; shift 2 ;;
       --journal-dir) TX_JOURNAL_DIR="$2"; shift 2 ;; --lock-file) TX_LOCK_FILE="$2"; shift 2 ;;
       --pre-promote-check) TX_PRECHECK="$2"; shift 2 ;; --skip-capability-install) TX_SKIP_CAPABILITIES=1; shift ;;
       *) die "unknown $TX_COMMAND option: $1" ;;
     esac
   done
-  [ -n "$TX_CANDIDATE" ] && [ -n "$TX_CURRENT" ] && [ -n "$TX_PROGRAM" ] && [ -n "$TX_SOCKET" ] && [ -n "$TX_HEALTH" ] \
-    || die "$TX_COMMAND requires explicit --release, --current-link, --program, --supervisor-socket, and --health-url"
-  need_command "$TX_SUPERVISORCTL"; need_command "$TX_CURL"; need_command flock; need_command python3; need_command timeout
+  [ -n "$TX_CANDIDATE" ] && [ -n "$TX_CURRENT" ] && [ -n "$TX_HEALTH" ] \
+    || die "$TX_COMMAND requires explicit --release, --current-link, and --health-url"
+  if [ "${#TX_SYSTEMD_UNITS[@]}" -gt 0 ]; then
+    [ -z "$TX_PROGRAM" ] && [ -z "$TX_SOCKET" ] \
+      || die "$TX_COMMAND cannot combine Supervisor and systemd service identities"
+    TX_SERVICE_MANAGER=systemd
+    local unit
+    for unit in "${TX_SYSTEMD_UNITS[@]}"; do
+      [[ "$unit" =~ ^[A-Za-z0-9][A-Za-z0-9@_.:-]{0,254}$ ]] || die "invalid systemd unit: $unit"
+    done
+    need_command "$TX_SYSTEMCTL"
+  else
+    [ -n "$TX_PROGRAM" ] && [ -n "$TX_SOCKET" ] \
+      || die "$TX_COMMAND requires --program and --supervisor-socket, or one or more --systemd-unit options"
+    TX_SERVICE_MANAGER=supervisor
+    need_command "$TX_SUPERVISORCTL"
+  fi
+  need_command "$TX_CURL"; need_command flock; need_command python3; need_command timeout
   TX_CANDIDATE="$(realpath_existing "$TX_CANDIDATE")"
   [ -f "$TX_CANDIDATE/.refeather-release.json" ] || die "candidate has no release manifest"
   verify_release "$TX_CANDIDATE" || die "candidate release content verification failed"
@@ -490,13 +532,13 @@ run_switch() {
 
   write_tx_state stopping
   TX_STOP_ATTEMPTED=1
-  supervisor_action stop
+  service_action stop
   write_tx_state stopped
   atomic_current_link "$TX_CURRENT" "$TX_CANDIDATE"
   TX_POINTER_CHANGED=1
   write_tx_state pointer-switched
   write_tx_state starting
-  supervisor_action start
+  service_action start
   write_tx_state health-check
   wait_for_version "$TX_EXPECTED"
   write_tx_state promoted
@@ -523,12 +565,38 @@ mapping={
  "TX_CANDIDATE":"candidate", "TX_EXPECTED":"expectedVersion", "TX_PROGRAM":"program",
  "TX_SOCKET":"supervisorSocket", "TX_HEALTH":"healthUrl", "TX_CURRENT":"currentLink", "TX_JOURNAL":"journal"}
 for shell, key in mapping.items(): print(f"{shell}={shlex.quote(str(value.get(key, '')))}")
+manager = value.get("serviceManager") or "supervisor"
+units = value.get("systemdUnits") or []
+if not isinstance(manager, str) or not isinstance(units, list) or any(not isinstance(unit, str) for unit in units):
+    raise SystemExit("invalid service manager state")
+print(f"TX_SERVICE_MANAGER={shlex.quote(manager)}")
+print(f"TX_SYSTEMD_UNITS_SERIALIZED={shlex.quote(chr(10).join(units))}")
 PY
 )"
-  TX_JOURNAL_DIR="$journal_dir" TX_SUPERVISORCTL="${REFEATHER_SUPERVISORCTL:-supervisorctl}" TX_CURL="${REFEATHER_CURL:-curl}"
-  TX_SUPERVISOR_TIMEOUT="${REFEATHER_SUPERVISOR_TIMEOUT:-15s}"
+  TX_JOURNAL_DIR="$journal_dir"
+  TX_SUPERVISORCTL="${REFEATHER_SUPERVISORCTL:-supervisorctl}"
+  TX_SYSTEMCTL="${REFEATHER_SYSTEMCTL:-systemctl}"
+  TX_CURL="${REFEATHER_CURL:-curl}"
+  TX_SERVICE_TIMEOUT="${REFEATHER_SERVICE_TIMEOUT:-${REFEATHER_SUPERVISOR_TIMEOUT:-15s}}"
+  TX_SERVICE_KILL_AFTER="${REFEATHER_SERVICE_KILL_AFTER:-${REFEATHER_SUPERVISOR_KILL_AFTER:-2s}}"
+  TX_SYSTEMD_UNITS=()
+  if [ -n "$TX_SYSTEMD_UNITS_SERIALIZED" ]; then
+    mapfile -t TX_SYSTEMD_UNITS <<<"$TX_SYSTEMD_UNITS_SERIALIZED"
+  fi
   TX_FINISHED=0 TX_STOP_ATTEMPTED=1 TX_POINTER_CHANGED=1
-  need_command "$TX_SUPERVISORCTL"; need_command "$TX_CURL"; need_command timeout
+  case "$TX_SERVICE_MANAGER" in
+    supervisor) need_command "$TX_SUPERVISORCTL" ;;
+    systemd)
+      [ "${#TX_SYSTEMD_UNITS[@]}" -gt 0 ] || die "recovery state has no systemd units"
+      local unit
+      for unit in "${TX_SYSTEMD_UNITS[@]}"; do
+        [[ "$unit" =~ ^[A-Za-z0-9][A-Za-z0-9@_.:-]{0,254}$ ]] || die "invalid systemd unit in recovery state: $unit"
+      done
+      need_command "$TX_SYSTEMCTL"
+      ;;
+    *) die "unsupported service manager in recovery state: $TX_SERVICE_MANAGER" ;;
+  esac
+  need_command "$TX_CURL"; need_command timeout
   case "$TX_PHASE" in
     prepared|preflight)
       finish_tx recovered-noop

@@ -188,6 +188,21 @@ if [ "$action" = start ] && [ "${REFEATHER_TEST_HANG_START:-0}" = 1 ]; then slee
 SH
 chmod +x "$fake_supervisor"
 
+fake_systemctl="$TMP/fake-systemctl"
+cat >"$fake_systemctl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+action="$1"; shift
+printf '%s %s %s\n' "$action" "$*" "$REFEATHER_TEST_CURRENT" >>"$REFEATHER_TEST_SERVICE_LOG"
+if [ "$action" = start ] && [ -n "${REFEATHER_TEST_FAIL_START_VERSION:-}" ]; then
+  version=$(python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ["REFEATHER_TEST_CURRENT"], ".refeather-release.json")))["version"])')
+  [ "$version" != "$REFEATHER_TEST_FAIL_START_VERSION" ] || exit 7
+fi
+if [ "$action" = start ] && [ "${REFEATHER_TEST_FAIL_ALL_START:-0}" = 1 ]; then exit 8; fi
+if [ "$action" = start ] && [ "${REFEATHER_TEST_HANG_START:-0}" = 1 ]; then sleep 30; fi
+SH
+chmod +x "$fake_systemctl"
+
 fake_curl="$TMP/fake-curl"
 cat >"$fake_curl" <<'SH'
 #!/usr/bin/env bash
@@ -207,6 +222,12 @@ switch_env=(env REFEATHER_SUPERVISORCTL="$fake_supervisor" REFEATHER_CURL="$fake
   REFEATHER_SUPERVISOR_TIMEOUT=0.1s REFEATHER_SUPERVISOR_KILL_AFTER=0.1s)
 switch_args=(--current-link "$current" --program feather-zak --supervisor-socket unix:///tmp/zak-supervisor.sock
   --health-url http://127.0.0.1:8123/feather2/api/health --skip-capability-install)
+systemd_switch_env=(env REFEATHER_SYSTEMCTL="$fake_systemctl" REFEATHER_CURL="$fake_curl"
+  REFEATHER_TEST_CURRENT="$current" REFEATHER_TEST_SERVICE_LOG="$service_log"
+  REFEATHER_JOURNAL_DIR="$journal" REFEATHER_LOCK_FILE="$lock" REFEATHER_HEALTH_ATTEMPTS=2 REFEATHER_HEALTH_DELAY=0.01
+  REFEATHER_SERVICE_TIMEOUT=0.1s REFEATHER_SERVICE_KILL_AFTER=0.1s)
+systemd_switch_args=(--current-link "$current" --systemd-unit feather.service --systemd-unit feather-philip.service
+  --systemctl "$fake_systemctl" --health-url http://127.0.0.1:4871/api/health --skip-capability-install)
 
 # A target changed after staging must be rejected before service mutation.
 chmod u+w "$release/build.marker"; printf 'tampered\n' >>"$release/build.marker"; chmod a-w "$release/build.marker"
@@ -253,6 +274,49 @@ grep -q '^start feather-zak ' "$service_log"
 
 "${switch_env[@]}" "$ROOT/bin/refeather" rollback --release "$old" "${switch_args[@]}"
 [ "$(readlink -f "$current")" = "$old" ]
+
+# systemd promotion stops and starts every unit sharing the release pointer.
+: >"$service_log"
+"${systemd_switch_env[@]}" "$ROOT/bin/refeather" promote --release "$release" "${systemd_switch_args[@]}"
+[ "$(readlink -f "$current")" = "$release" ]
+grep -q '^stop feather.service feather-philip.service ' "$service_log"
+grep -q '^start feather.service feather-philip.service ' "$service_log"
+"${systemd_switch_env[@]}" "$ROOT/bin/refeather" rollback --release "$old" "${systemd_switch_args[@]}"
+[ "$(readlink -f "$current")" = "$old" ]
+
+# Mixed manager identities fail before any service or pointer mutation.
+: >"$service_log"
+if "${systemd_switch_env[@]}" "$ROOT/bin/refeather" promote --release "$release" "${systemd_switch_args[@]}" \
+    --program feather-zak --supervisor-socket unix:///tmp/zak-supervisor.sock 2>"$TMP/mixed-manager.err"; then
+  echo "mixed service managers unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'cannot combine Supervisor and systemd' "$TMP/mixed-manager.err"
+[ "$(readlink -f "$current")" = "$old" ]
+[ ! -s "$service_log" ]
+
+# A failed systemd start restores the prior link and restarts the same unit set.
+if "${systemd_switch_env[@]}" REFEATHER_TEST_FAIL_START_VERSION=candidate-v1 \
+    "$ROOT/bin/refeather" promote --release "$release" "${systemd_switch_args[@]}" 2>"$TMP/systemd-start-failure.err"; then
+  echo "failed systemd start unexpectedly promoted" >&2; exit 1
+fi
+[ "$(readlink -f "$current")" = "$old" ]
+grep -q 'prior release restored' "$TMP/systemd-start-failure.err"
+
+# Interrupted systemd promotion persists its manager and full unit set so a
+# later recovery uses systemctl rather than falling back to Supervisor.
+systemd_wait_file="$TMP/systemd-health-blocked"
+setsid "${systemd_switch_env[@]}" REFEATHER_TEST_WAIT_HEALTH_VERSION=candidate-v1 REFEATHER_TEST_WAIT_FILE="$systemd_wait_file" \
+  "$ROOT/bin/refeather" promote --release "$release" "${systemd_switch_args[@]}" >"$TMP/systemd-interrupted.out" 2>"$TMP/systemd-interrupted.err" & systemd_pid=$!
+for _ in $(seq 1 100); do [ -e "$systemd_wait_file" ] && break; sleep 0.02; done
+[ -e "$systemd_wait_file" ] || { echo "systemd promotion never reached blocked health check" >&2; exit 1; }
+kill -KILL -- "-$systemd_pid" 2>/dev/null || true
+wait "$systemd_pid" 2>/dev/null || true
+[ "$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print(v["serviceManager"], *v["systemdUnits"])' "$journal/active.json")" = \
+  'systemd feather.service feather-philip.service' ]
+[ "$(readlink -f "$current")" = "$release" ]
+"${systemd_switch_env[@]}" "$ROOT/bin/refeather" recover
+[ "$(readlink -f "$current")" = "$old" ]
+[ ! -e "$journal/active.json" ]
 
 if "${switch_env[@]}" REFEATHER_PRE_PROMOTE_CHECK=false "$ROOT/bin/refeather" promote --release "$release" "${switch_args[@]}" 2>"$TMP/precheck.err"; then
   echo "failed pre-promotion check unexpectedly promoted" >&2; exit 1
