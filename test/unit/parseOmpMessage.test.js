@@ -42,6 +42,17 @@ describe('parseOmpMessage: basic parsing', () => {
     assert.equal(msg.content[0].type, 'thinking')
     assert.equal(msg.content[1].type, 'text')
   })
+
+  it('preserves the OMP turn completion reason', () => {
+    const msg = parseOmpMessage(omp({
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Finished.' }],
+        stopReason: 'stop',
+      },
+    }))
+    assert.equal(msg.stopReason, 'stop')
+  })
 })
 
 // ── toolCall normalization ──────────────────────────────────────────────────
