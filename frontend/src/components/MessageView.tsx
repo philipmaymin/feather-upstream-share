@@ -3,6 +3,9 @@ import type { Message, ContentBlock, OmpSubagentState, OmpTodoSnapshot, OmpTimel
 import { toBlob } from 'html-to-image'
 import { Marked } from 'marked'
 import { markedHighlight } from 'marked-highlight'
+import markedKatex from 'marked-katex-extension'
+import katex from 'katex'
+import 'katex/dist/katex.min.css'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/core'
 import javascript from 'highlight.js/lib/languages/javascript'
@@ -49,6 +52,25 @@ hljs.registerLanguage('markdown', markdown)
 hljs.registerLanguage('md', markdown)
 
 // ── Markdown renderer with LRU cache ────────────────────────────────────────
+type MathCode = { source: string; display: boolean }
+
+function mathOnlyCode(text: string, displayOnly = false): MathCode | null {
+  const value = text.trim()
+  const display = value.match(/^\$\$\s*([\s\S]+?)\s*\$\$$/) || value.match(/^\\\[\s*([\s\S]+?)\s*\\\]$/)
+  if (display?.[1]?.trim()) return { source: display[1].trim(), display: true }
+  if (displayOnly) return null
+  const inline = value.match(/^\$(?!\$)([\s\S]+?)\$$/) || value.match(/^\\\(([\s\S]+?)\\\)$/)
+  return inline?.[1]?.trim() ? { source: inline[1].trim(), display: false } : null
+}
+
+function renderMathCode(math: MathCode): string | false {
+  try {
+    return katex.renderToString(math.source, { displayMode: math.display, throwOnError: false, trust: false })
+  } catch {
+    return false
+  }
+}
+
 
 const marked = new Marked(
   { gfm: true, breaks: true },
@@ -59,6 +81,22 @@ const marked = new Marked(
       return code
     },
   }),
+  markedKatex({ throwOnError: false }),
+  {
+    renderer: {
+      codespan({ text }) {
+        const math = mathOnlyCode(text)
+        return math ? renderMathCode(math) : false
+      },
+      code({ text, lang }) {
+        const language = lang?.trim().toLowerCase()
+        const math = ['math', 'latex', 'tex'].includes(language || '')
+          ? { source: text.trim(), display: true }
+          : mathOnlyCode(text, true)
+        return math?.source ? renderMathCode(math) : false
+      },
+    },
+  },
 )
 const mdCache = new Map<string, string>()
 const MD_CACHE_MAX = 2000
@@ -146,6 +184,19 @@ function printMsg(uuid: string, container: HTMLElement, css: string) {
   setTimeout(() => w.print(), 300)
 }
 
+// Code-block copy buttons are injected after Markdown rendering and handled
+// here through the scroll container so rerenders do not accumulate listeners.
+function handleCopyClick(e: MouseEvent) {
+  const btn = (e.target as HTMLElement).closest('.copy-btn') as HTMLElement | null
+  if (!btn) return
+  const code = btn.closest('pre')?.querySelector('code')
+  if (!code) return
+  navigator.clipboard.writeText(code.textContent || '').then(() => {
+    btn.textContent = 'Copied!'
+    setTimeout(() => { btn.textContent = 'Copy' }, 1500)
+  })
+}
+
 // Auto-collapse long code blocks (>25 lines)
 function collapseCodeBlocks(el: HTMLElement) {
   for (const pre of el.querySelectorAll('pre')) {
@@ -169,6 +220,17 @@ function collapseCodeBlocks(el: HTMLElement) {
       btn.textContent = collapsed ? `Show ${hiddenLines} more lines` : 'Collapse'
     }
     wrapper.appendChild(btn)
+  }
+}
+
+function injectCopyButtons(el: HTMLElement) {
+  for (const pre of el.querySelectorAll('pre')) {
+    if (pre.querySelector('.copy-btn')) continue
+    pre.style.position = 'relative'
+    const btn = document.createElement('button')
+    btn.className = 'copy-btn'
+    btn.textContent = 'Copy'
+    pre.appendChild(btn)
   }
 }
 
@@ -327,6 +389,7 @@ function enhanceTables(el: HTMLElement, onExpandTable?: (html: string) => void) 
 }
 
 function enhanceMarkdown(el: HTMLElement, onImageClick?: (src: string) => void, onExpandTable?: (html: string) => void) {
+  injectCopyButtons(el)
   fixLinks(el, onImageClick)
   fixImages(el, onImageClick)
   collapseCodeBlocks(el)
@@ -721,6 +784,17 @@ const markdownCSS = `
 div:hover > div > .star-btn, div:hover > div > .action-menu-btn { opacity: 0.6 !important; }
 .star-btn:hover, .action-menu-btn:hover { opacity: 1 !important; }
 
+/* Code-block copy button */
+.copy-btn {
+  position: absolute; top: 6px; right: 6px;
+  background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15);
+  color: var(--text-secondary); font-size: 11px; padding: 2px 8px; border-radius: 4px;
+  cursor: pointer; opacity: 0; transition: opacity 0.15s, background 0.15s;
+  font-family: -apple-system, system-ui, sans-serif; z-index: 2;
+}
+pre:hover .copy-btn { opacity: 1; }
+.copy-btn:hover { background: rgba(255,255,255,0.2); color: var(--text-primary); }
+
 /* Typing indicator bounce */
 @keyframes typing-bounce {
   0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
@@ -731,6 +805,8 @@ div:hover > div > .star-btn, div:hover > div > .action-menu-btn { opacity: 0.6 !
 .star-btn { -webkit-tap-highlight-color: transparent; }
 div:hover > div > .star-btn { opacity: 0.6 !important; }
 .star-btn:hover { opacity: 1 !important; }
+.msg-action { min-width: 28px; min-height: 28px; align-items: center; justify-content: center; border-radius: 5px !important; color: var(--text-secondary) !important; opacity: 1 !important; }
+.msg-action:hover, .msg-action:focus-visible { color: var(--text-primary) !important; background: rgba(255,255,255,0.07) !important; }
 
 /* Execution details: quiet at rest, full fidelity on demand */
 .work-log { width: 100%; margin: 0 0 4px; }
@@ -745,6 +821,12 @@ div:hover > div > .star-btn { opacity: 0.6 !important; }
 .work-log-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 .work-log-chevron { display: inline-block; transition: transform 120ms ease; }
 .work-log[open] .work-log-chevron { transform: rotate(90deg); }
+.live-work-disclosure { width: 100%; min-width: 0; }
+.live-work-disclosure .work-log { margin: 0; }
+.live-work-disclosure .work-log-summary { width: 100%; min-height: 34px; }
+.work-log-active { min-width: 0; flex: 0 1 auto; max-width: 75%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); font-size: 12px; }
+.work-log-live-dot { width: 7px; height: 7px; flex-shrink: 0; border-radius: 50%; background: var(--info); }
+.live-work-disclosure .work-log-detail { max-height: min(58vh, 520px); overflow: auto; margin-top: 2px; padding: 8px 10px; border: 0; border-top: 1px solid var(--border-subtle); border-radius: 0; background: transparent; }
 .work-log-detail {
   margin-top: 6px; padding: 10px 12px; border: 1px solid var(--border-subtle);
   border-radius: 9px; background: var(--bg-secondary); font-size: 13px; line-height: 1.5;
@@ -814,6 +896,28 @@ div:hover > div > .star-btn { opacity: 0.6 !important; }
   .agent-rail > li { flex-basis: 100%; max-width: none; }
   .agent-inspector { max-height: none; overflow: visible; margin-top: 10px; padding: 10px 0 0; border-top: 1px solid var(--border-medium); border-left: none; }
 }
+.work-details { width: 100%; max-width: 960px; margin: 0 auto 10px; color: var(--text-secondary); }
+.work-details > .execution-detail { max-height: min(58vh, 520px); overflow: auto; }
+.work-details > summary::-webkit-details-marker { display: none; }
+.work-details > .execution-summary { min-height: 34px; padding: 0 2px; border: 0; background: transparent; }
+.work-details[open] > .execution-summary { border-bottom: 1px solid var(--border-subtle); }
+.work-details[open] > .execution-summary .execution-chevron { transform: rotate(90deg); }
+.work-details > .execution-detail { padding: 5px 0 0; border: 0; }
+.work-details .execution-item { padding: 0 0 2px 14px; }
+.work-details .execution-item:not(:last-child)::before { left: 3px; top: 14px; bottom: -2px; background: var(--border-subtle); }
+.work-details .execution-node { left: 0; top: 12px; width: 7px; height: 7px; border: 0; }
+.work-details .execution-card { border: 0; border-radius: 6px; background: transparent; }
+.work-details .execution-item[data-status='running'] .execution-card { border: 0; background: rgba(96, 165, 250, 0.05); }
+.work-details .execution-tool > summary { min-height: 32px; padding: 0 6px; }
+.work-details .execution-payload { margin: 0 6px 4px; border: 1px solid var(--border-subtle); border-radius: 6px; background: var(--bg-base); }
+.work-details .omp-todo-surface { margin: 0 0 5px; padding: 0 6px; border: 0; border-radius: 6px; background: transparent; }
+.work-details .agent-surface { margin: 5px 0; padding: 6px; border: 0; border-radius: 6px; background: transparent; }
+.work-details .agent-card { padding: 6px 8px; border: 0; border-left: 2px solid currentColor; border-radius: 5px; background: transparent; }
+.work-details .agent-card[aria-expanded='true'] { border-color: var(--accent); background: rgba(255,255,255,0.025); }
+.work-details .execution-status { font-weight: 650; text-transform: none; letter-spacing: 0; }
+.work-details .execution-title { color: var(--text-muted); font-weight: 600; }
+.work-details .execution-active { flex: 0 1 auto; max-width: 75%; color: var(--text-primary); }
+.work-details .execution-status { margin-left: 2px; }
 /* highlight.js theme — uses CSS variables for theme switching */
 .hljs { color: var(--code-text); }
 .hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-link { color: var(--hljs-keyword); }
@@ -870,11 +974,9 @@ type MessageViewProps = {
   subagents?: OmpSubagentState[]
   jobs?: MessageViewJob[]
   runtime?: MessageViewRuntime | null
-  standaloneAgents?: boolean
   scrollRefCb?: (el: HTMLDivElement) => void
   sessionId?: string | null
   protocolRuns?: ProtocolRunSnapshot[]
-  onOpenAgents?: () => void
 }
 
 export function MessageView(props: MessageViewProps) {
@@ -969,11 +1071,14 @@ export function MessageView(props: MessageViewProps) {
     )
   }
 
-  function ExecutionEntry(entryProps: { item: OmpTimelineItem }) {
+  function ExecutionEntry(entryProps: { item: OmpTimelineItem; summaryIntent?: string }) {
     const thinking = createMemo(() => entryProps.item.kind === 'thinking' ? entryProps.item : null)
     const tool = createMemo(() => entryProps.item.kind === 'tool' ? entryProps.item : null)
     const presentation = createMemo(() => tool() ? timelineToolPresentation(tool()!) : null)
-    const intent = createMemo(() => tool()?.intent || presentation()?.summary || '')
+    const intent = createMemo(() => {
+      const value = tool()?.intent || presentation()?.summary || ''
+      return value === entryProps.summaryIntent ? '' : value
+    })
     const input = createMemo(() => executionValue(tool()?.args))
     const output = createMemo(() => executionValue(tool()?.result !== undefined ? tool()?.result : tool()?.partialResult))
     return (
@@ -1019,10 +1124,10 @@ export function MessageView(props: MessageViewProps) {
     return op === 'wait' || op === 'jobs' || op === 'inbox' || op === 'list'
   }
 
-  function renderTimelineItems(timeline: () => OmpTimelineItem[]) {
+  function renderTimelineItems(timeline: () => OmpTimelineItem[], summaryIntent?: () => string) {
     return (
       <ol class="execution-timeline">
-        <Index each={timeline()}>{(item) => <ExecutionEntry item={item()} />}</Index>
+        <Index each={timeline()}>{(item) => <ExecutionEntry item={item()} summaryIntent={summaryIntent?.()} />}</Index>
       </ol>
     )
   }
@@ -1070,28 +1175,123 @@ export function MessageView(props: MessageViewProps) {
       </Show>
     )
   }
-  function renderParentExecution(scope: () => OmpWorkScope) {
+  function renderWorkAuxiliarySurfaces() {
     return (
-      <Show keyed when={scope().segment + 1}>
-        {() => props.standaloneAgents
-          ? renderExecutionTimeline(scope, 'omp-parent-execution', true)
-          : (
-            <Show when={scope().timeline.length > 0}>
-              <button
-                type="button"
-                data-testid="omp-parent-execution"
-                onClick={props.onOpenAgents}
-                aria-label="Open execution details in Agents"
-                style={{ width: '100%', height: '36px', margin: '0 0 10px', padding: '0 10px', border: '1px solid var(--border-subtle)', 'border-radius': '10px', background: 'var(--bg-surface)', color: 'var(--text-secondary)', cursor: props.onOpenAgents ? 'pointer' : 'default', display: 'flex', 'align-items': 'center', gap: '8px', 'text-align': 'left', overflow: 'hidden' }}
-              >
-                <span aria-hidden="true" style={{ color: executionStatusColor(scope().runStatus), 'font-size': '11px', 'flex-shrink': '0' }}>{executionStatusMark(scope().runStatus)}</span>
-                <span style={{ color: 'var(--text-primary)', 'font-size': '12px', 'font-weight': '650', 'flex-shrink': '0' }}>{scope().runStatus === 'running' ? 'Working' : 'Work'}</span>
-                <span data-testid="omp-parent-execution-summary" style={{ 'font-size': '11px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1', 'min-width': '0' }}>{activeOmpStep(scope()) || `${scope().timeline.length} steps`}</span>
-                <Show when={props.onOpenAgents}><span style={{ 'font-size': '10px', color: 'var(--text-muted)', 'flex-shrink': '0' }}>Agents ›</span></Show>
-              </button>
+      <>
+
+      <Show when={(props.subagents?.length || 0) > 0}>
+        <section data-testid="omp-subagents" class="agent-surface" aria-label="Subagents">
+          <div class="agent-surface-heading">
+            <span>Agents</span>
+            <span style={{ color: 'var(--text-muted)', 'font-size': '10px', 'font-weight': '600' }}>
+              {(props.subagents || []).filter(agent => executionStatusLabel(agent.status) === 'Running').length} running
+            </span>
+          </div>
+          <div class={`agent-layout${selectedSubagent() ? ' is-open' : ''}`}>
+            <ul class="agent-rail">
+              <For each={props.subagents || []}>{(agent) => (
+                <li>
+                  <button
+                    type="button"
+                    id={`omp-subagent-${agent.id}`}
+                    data-testid={`omp-subagent-${agent.id}`}
+                    class="agent-card"
+                    style={{ color: executionStatusColor(agent.status) }}
+                    aria-expanded={selectedSubagentId() === agent.id}
+                    aria-controls={selectedSubagentId() === agent.id ? `omp-subagent-inspector-${agent.id}` : undefined}
+                    onClick={() => setSelectedSubagentId(current => current === agent.id ? null : agent.id)}
+                  >
+                    <span class="agent-card-head">
+                      <span class="agent-card-name">{agent.agent}</span>
+                      <span class="execution-status">{executionStatusMark(agent.status)} {executionStatusLabel(agent.status)}</span>
+                    </span>
+                  </button>
+                </li>
+              )}</For>
+            </ul>
+            <Show when={selectedSubagent()}>
+              {(agent) => (
+                <section id={`omp-subagent-inspector-${agent().id}`} data-testid="omp-subagent-inspector" class="agent-inspector" aria-label={`${agent().agent} inspector`}>
+                  <div class="agent-inspector-head">
+                    <div style={{ 'min-width': '0' }}>
+                      <div class="agent-inspector-title">
+                        {agent().agent}
+                        <Show when={agent().agentSource}><span style={{ color: 'var(--text-muted)', 'font-size': '10px', 'font-weight': '500' }}> · {agent().agentSource}</span></Show>
+                      </div>
+                      <div class="agent-inspector-assignment">{agent().assignment || agent().task || agent().description || 'Waiting for assignment'}</div>
+                    </div>
+                    <span class="execution-status" style={{ color: executionStatusColor(agent().status) }}>{executionStatusMark(agent().status)} {executionStatusLabel(agent().status)}</span>
+                  </div>
+                  <div class="agent-inspector-meta">
+                    <div>Model · {agent().resolvedModel || 'Resolving'}</div>
+                    <div>
+                      Elapsed · {formatDuration(agent().durationMs) || '—'}
+                      {' · '}Usage · {[
+                        agent().requests !== undefined ? `${agent().requests} requests` : '',
+                        agent().toolCount !== undefined ? `${agent().toolCount} steps` : '',
+                        agent().tokens !== undefined ? `${agent().tokens!.toLocaleString()} tokens` : '',
+                      ].filter(Boolean).join(' · ') || 'pending'}
+                    </div>
+                    <Show when={agent().sessionFile}><div>Session · {agent().sessionFile}</div></Show>
+                  </div>
+                  <Show when={agent().assistantText}>
+                    <section class="agent-answer" data-testid="omp-subagent-answer" aria-live={agent().assistantEnded ? 'off' : 'polite'}>
+                      <div class="agent-answer-label">Answer{agent().assistantEnded ? '' : ' · streaming'}</div>
+                      <div class="markdown" innerHTML={renderLiveMarkdown(agent().assistantText)} ref={(element) => queueMicrotask(() => enhanceMarkdown(element, setLightbox, openExpandedTable))} />
+                    </section>
+                  </Show>
+                  <Show when={agent().todo}>
+                    {renderTodo(() => agent().todo!, 'omp-subagent-todo')}
+                  </Show>
+                  <Show when={agent().timeline.length > 0} fallback={<div style={{ padding: '10px 0', color: 'var(--text-muted)', 'font-size': '11px' }}>Waiting for the first execution step.</div>}>
+                    {renderExecutionTimeline(() => agent(), 'omp-subagent-execution', true)}
+                  </Show>
+                </section>
+              )}
             </Show>
-          )
-        }
+          </div>
+        </section>
+      </Show>
+
+      <Show when={(props.jobs || []).some(job => job.status === 'running')}>
+        <details data-testid="omp-jobs" style={{ margin: '0 0 10px', padding: '0 11px', 'border-radius': '10px', border: '1px solid var(--border-subtle)', background: 'var(--bg-surface)' }}>
+          <summary style={{ padding: '7px 0', cursor: 'pointer', color: 'var(--text-muted)', 'font-size': '11px' }}>
+            Background jobs · {(props.jobs || []).filter(job => job.status === 'running').length} running
+          </summary>
+          <div style={{ padding: '0 0 7px' }}>
+            <For each={(props.jobs || []).filter(job => job.status === 'running')}>{(job) => (
+              <div style={{ display: 'flex', 'justify-content': 'space-between', gap: '8px', padding: '3px 0', color: 'var(--text-muted)', 'font-size': '10px' }}>
+                <span>{job.label || job.type}</span><span>{job.status}</span>
+              </div>
+            )}</For>
+          </div>
+        </details>
+      </Show>
+      </>
+    )
+  }
+  function renderParentExecution(scope: () => OmpWorkScope) {
+    const timeline = createMemo(() => scope().timeline.filter(item => !hideParentOrchestration(item)))
+    const visibleScope = () => ({ ...scope(), timeline: timeline() })
+    const summary = () => activeOmpStep(visibleScope()) || `${timeline().length} steps`
+    const hasWork = () => timeline().length > 0 || (props.todo?.total || 0) > 0 || (props.subagents?.length || 0) > 0 || (props.jobs || []).some(job => job.status === 'running')
+    return (
+      <Show when={hasWork()}>
+        <details class="work-details" data-testid="omp-parent-execution" data-segment={scope().segment}>
+          <summary class="execution-summary" data-testid="omp-parent-execution-summary">
+            <span class="execution-chevron">›</span>
+            <span class="execution-title">{scope().runStatus === 'running' ? 'Working' : 'Details'}</span>
+            <span class="execution-active">{summary()}</span>
+            <span class="execution-status" aria-label={executionStatusLabel(scope().runStatus)} title={executionStatusLabel(scope().runStatus)} style={{ color: executionStatusColor(scope().runStatus) }}>{executionStatusMark(scope().runStatus)}</span>
+          </summary>
+          <div class="execution-detail">
+            <Show when={(props.todo?.total || 0) > 0}>{renderTodo(() => props.todo!, 'omp-todo')}</Show>
+            <Show when={timeline().length > 0}>
+              <div data-testid="omp-parent-execution-timeline">{renderTimelineItems(timeline, summary)}</div>
+            </Show>
+            {renderWorkAuxiliarySurfaces()}
+          </div>
+        </details>
       </Show>
     )
   }
@@ -1250,8 +1450,15 @@ export function MessageView(props: MessageViewProps) {
       && message.content.filter(block => block.type === 'tool_result').every(block => !!block.tool_use_id && toolUseIds().has(block.tool_use_id))
   }
   const renderItems = createMemo(() => buildRenderItems(props.messages, isPureToolResultMsg))
+  const hasCurrentWork = createMemo(() => !!props.work && (
+    props.work.timeline.length > 0 ||
+    (props.todo?.total || 0) > 0 ||
+    (props.subagents?.length || 0) > 0 ||
+    (props.jobs || []).some(job => job.status === 'running')
+  ))
+  const liveLegacyWork = createMemo(() => props.working && !hasCurrentWork() && renderItems().at(-1)?.kind === 'chain')
   const workAttachedToAnswer = createMemo(() => {
-    if ((props.work?.timeline.length || 0) === 0) return false
+    if (!hasCurrentWork()) return false
     const latest = renderItems().at(-1)
     return !!latest && latest.kind !== 'chain' && latest.msg.role === 'assistant'
   })
@@ -1259,11 +1466,8 @@ export function MessageView(props: MessageViewProps) {
     const latestUser = [...props.messages].reverse().find(message => message.role === 'user')
     return !!latestUser && runsForInvocation(props.protocolRuns || [], latestUser.uuid).length > 0
   })
-  const showWorkingIndicator = createMemo(() =>
-    !!props.working && !currentProtocolOwnsWork() && (props.work?.timeline.length || 0) === 0
-  )
 
-  function renderWorkLog(messages: Message[]) {
+  function renderWorkLog(messages: Message[], live = false) {
     // buildRenderItems returns fresh wrapper objects as a turn grows. Native
     // <details> state would therefore reset whenever a later SSE update
     // replaced the DOM node. The first trace message is stable for the life of
@@ -1289,7 +1493,8 @@ export function MessageView(props: MessageViewProps) {
     }}>
       <summary class="work-log-summary" data-testid="work-log-summary">
         <span class="work-log-chevron">›</span>
-        <span style={{ 'font-weight': '600' }}>Details</span>
+        <span style={{ color: 'var(--text-muted)', 'font-weight': '600' }}>Details</span>
+        <Show when={live && props.statusText}><span class="work-log-active">{props.statusText}</span><span class="work-log-live-dot" aria-label="Running" /></Show>
         <Show when={errorCount > 0}>
           <span class="work-log-issue"><span class="work-log-issue-dot" />{errorCount} issue{errorCount === 1 ? '' : 's'}</span>
         </Show>
@@ -1418,8 +1623,8 @@ export function MessageView(props: MessageViewProps) {
   }
 
   return (
-    <div class={props.standaloneAgents ? 'agents-hub-view' : undefined} style={{ position: 'relative', height: '100%' }}>
-    <div ref={(el) => { scrollRef = el; props.scrollRefCb?.(el) }} onScroll={onScroll} style={{ height: '100%', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', 'overscroll-behavior': 'contain', padding: '16px', 'padding-bottom': '80px' }}>
+    <div style={{ position: 'relative', height: '100%' }}>
+    <div ref={(el) => { scrollRef = el; props.scrollRefCb?.(el) }} onScroll={onScroll} onClick={handleCopyClick} style={{ height: '100%', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', 'overscroll-behavior': 'contain', padding: '16px', 'padding-bottom': '80px' }}>
       <style>{markdownCSS}</style>
       <Show when={expandedTable()}>
         <div ref={tableModal} class="md-table-modal" role="dialog" aria-modal="true" aria-label="Expanded table" onKeyDown={handleTableModalKeydown}>
@@ -1467,15 +1672,15 @@ export function MessageView(props: MessageViewProps) {
         // Keep this decision reactive: transcript messages often render before
         // the replayed OMP timeline reaches the browser after a reload.
         const isLatestItem = () => itemIndex() === renderItems().length - 1
-        const mirroredCurrentTurn = createMemo(() => (props.work?.timeline.length || 0) > 0 && isLatestItem())
+        const mirroredCurrentTurn = createMemo(() => hasCurrentWork() && isLatestItem())
         if (item.kind === 'msg') return <Show
-          when={mirroredCurrentTurn() && item.msg.role === 'assistant' && !currentProtocolOwnsWork()}
+          when={mirroredCurrentTurn() && item.msg.role === 'assistant'}
           fallback={<>{renderMsg(item.msg)}<Show when={item.msg.role === 'user'}><For each={runsForInvocation(props.protocolRuns || [], item.msg.uuid)}>{run => <ProtocolRunCard run={run} />}</For></Show></>}
         >
           <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
         </Show>
         if (item.kind === 'turn') return <Show
-          when={mirroredCurrentTurn() && item.msg.role === 'assistant' && !currentProtocolOwnsWork()}
+          when={mirroredCurrentTurn() && item.msg.role === 'assistant'}
           fallback={<>{renderMsg(item.msg, item.trace)}<Show when={item.msg.role === 'user'}><For each={runsForInvocation(props.protocolRuns || [], item.msg.uuid)}>{run => <ProtocolRunCard run={run} />}</For></Show></>}
         >
           <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
@@ -1483,10 +1688,10 @@ export function MessageView(props: MessageViewProps) {
         // Keep an unfinished or failed trace reachable even before a final
         // answer arrives; it stays collapsed so it does not dominate chat.
         return <Show when={!mirroredCurrentTurn() && !currentProtocolOwnsWork()}>
-          <div data-testid={props.working && isLatestItem() ? 'live-work-turn' : undefined} style={{ margin: '4px 0 10px', 'max-width': '85%' }}>{renderWorkLog(item.messages)}</div>
+          <div class="live-work-disclosure" data-testid={props.working && isLatestItem() ? 'live-work-turn' : undefined} style={{ margin: '4px 0 10px' }}>{renderWorkLog(item.messages, !!props.working && isLatestItem())}</div>
         </Show>
       }}</For>
-      <Show when={(props.work?.timeline.length || 0) > 0 && !workAttachedToAnswer() && !currentProtocolOwnsWork()}>
+      <Show when={hasCurrentWork() && !workAttachedToAnswer()}>
         {renderParentExecution(() => props.work!)}
       </Show>
 
@@ -1503,101 +1708,7 @@ export function MessageView(props: MessageViewProps) {
         </div>
       </Show>
 
-      <Show when={props.runtime}>
-        <details data-testid="omp-runtime" style={{ margin: '0 0 10px', padding: '0 11px', 'border-radius': '10px', border: '1px solid #292936', background: '#11151c' }}>
-          <summary style={{ padding: '7px 0', cursor: 'pointer', color: '#888', 'font-size': '11px' }}>
-            {[props.runtime!.modelProvider, props.runtime!.modelId].filter(Boolean).join('/') || 'OMP session'}
-            <Show when={props.runtime!.thinkingLevel}><span> · {props.runtime!.thinkingLevel}</span></Show>
-            <Show when={props.runtime!.contextPercent !== undefined}><span> · {Math.round(props.runtime!.contextPercent!)}% context</span></Show>
-          </summary>
-          <div style={{ padding: '0 0 8px', color: '#777', 'font-size': '10px', 'line-height': '1.55' }}>
-            <Show when={props.runtime!.modelApi}><div>API · {props.runtime!.modelApi}</div></Show>
-            <Show when={props.runtime!.contextTokens !== undefined && props.runtime!.contextWindow !== undefined}><div>Context · {props.runtime!.contextTokens!.toLocaleString()} / {props.runtime!.contextWindow!.toLocaleString()} tokens</div></Show>
-            <Show when={Object.keys(props.runtime!.serviceTiers || {}).length}><div>Service · {Object.entries(props.runtime!.serviceTiers || {}).map(([family, tier]) => `${family}: ${tier || 'default'}`).join(' · ')}</div></Show>
-          </div>
-        </details>
-      </Show>
 
-      <Show when={(props.subagents?.length || 0) > 0}>
-        <section data-testid="omp-subagents" class="agent-surface" aria-label="Subagents">
-          <div class="agent-surface-heading">
-            <span>Agents</span>
-            <span style={{ color: 'var(--text-muted)', 'font-size': '10px', 'font-weight': '600' }}>
-              {(props.subagents || []).filter(agent => executionStatusLabel(agent.status) === 'Running').length} running
-            </span>
-          </div>
-          <div class={`agent-layout${selectedSubagent() ? ' is-open' : ''}`}>
-            <ul class="agent-rail">
-              <For each={props.subagents || []}>{(agent) => (
-                <li>
-                  <button
-                    type="button"
-                    id={`omp-subagent-${agent.id}`}
-                    data-testid={`omp-subagent-${agent.id}`}
-                    class="agent-card"
-                    style={{ color: executionStatusColor(agent.status) }}
-                    aria-expanded={selectedSubagentId() === agent.id}
-                    aria-controls={selectedSubagentId() === agent.id ? `omp-subagent-inspector-${agent.id}` : undefined}
-                    onClick={() => setSelectedSubagentId(current => current === agent.id ? null : agent.id)}
-                  >
-                    <span class="agent-card-head">
-                      <span class="agent-card-name">{agent.agent}</span>
-                      <span class="execution-status">{executionStatusMark(agent.status)} {executionStatusLabel(agent.status)}</span>
-                    </span>
-                  </button>
-                </li>
-              )}</For>
-            </ul>
-            <Show when={selectedSubagent()}>
-              {(agent) => (
-                <section id={`omp-subagent-inspector-${agent().id}`} data-testid="omp-subagent-inspector" class="agent-inspector" aria-label={`${agent().agent} inspector`}>
-                  <div class="agent-inspector-head">
-                    <div style={{ 'min-width': '0' }}>
-                      <div class="agent-inspector-title">
-                        {agent().agent}
-                        <Show when={agent().agentSource}><span style={{ color: 'var(--text-muted)', 'font-size': '10px', 'font-weight': '500' }}> · {agent().agentSource}</span></Show>
-                      </div>
-                      <div class="agent-inspector-assignment">{agent().assignment || agent().task || agent().description || 'Waiting for assignment'}</div>
-                    </div>
-                    <span class="execution-status" style={{ color: executionStatusColor(agent().status) }}>{executionStatusMark(agent().status)} {executionStatusLabel(agent().status)}</span>
-                  </div>
-                  <div class="agent-inspector-meta">
-                    <div>Model · {agent().resolvedModel || 'Resolving'}</div>
-                    <div>
-                      Elapsed · {formatDuration(agent().durationMs) || '—'}
-                      {' · '}Usage · {[
-                        agent().requests !== undefined ? `${agent().requests} requests` : '',
-                        agent().toolCount !== undefined ? `${agent().toolCount} steps` : '',
-                        agent().tokens !== undefined ? `${agent().tokens!.toLocaleString()} tokens` : '',
-                      ].filter(Boolean).join(' · ') || 'pending'}
-                    </div>
-                    <Show when={agent().sessionFile}><div>Session · {agent().sessionFile}</div></Show>
-                  </div>
-                  <Show when={agent().assistantText}>
-                    <section class="agent-answer" data-testid="omp-subagent-answer" aria-live={agent().assistantEnded ? 'off' : 'polite'}>
-                      <div class="agent-answer-label">Answer{agent().assistantEnded ? '' : ' · streaming'}</div>
-                      <div class="markdown" innerHTML={renderLiveMarkdown(agent().assistantText)} ref={(element) => queueMicrotask(() => enhanceMarkdown(element, setLightbox, openExpandedTable))} />
-                    </section>
-                  </Show>
-                  <Show when={agent().todo}>
-                    {renderTodo(() => agent().todo!, 'omp-subagent-todo', false)}
-                  </Show>
-                  <Show when={agent().timeline.length > 0} fallback={<div style={{ padding: '10px 0', color: 'var(--text-muted)', 'font-size': '11px' }}>Waiting for the first execution step.</div>}>
-                    {renderExecutionTimeline(() => agent(), 'omp-subagent-execution', true)}
-                  </Show>
-                </section>
-              )}
-            </Show>
-          </div>
-        </section>
-      </Show>
-
-      <Show when={(props.jobs?.length || 0) > 0}>
-        <details data-testid="omp-jobs" style={{ margin: '0 0 10px', padding: '0 11px', 'border-radius': '10px', border: '1px solid #292936', background: '#11151c' }}>
-          <summary style={{ padding: '7px 0', cursor: 'pointer', color: '#888', 'font-size': '11px' }}>Background jobs · {(props.jobs || []).filter(job => job.status === 'running').length} running</summary>
-          <div style={{ padding: '0 0 7px' }}><For each={props.jobs || []}>{(job) => <div style={{ display: 'flex', 'justify-content': 'space-between', gap: '8px', padding: '3px 0', color: '#777', 'font-size': '10px' }}><span>{job.label || job.type}</span><span>{job.status}</span></div>}</For></div>
-        </details>
-      </Show>
 
       <Show when={props.notice}><div role="status" style={{ margin: '0 0 10px', padding: '8px 11px', 'border-radius': '9px', border: '1px solid #d8a13b', background: 'rgba(216,161,59,.08)', color: '#d8a13b', 'font-size': '12px' }}>{props.notice!.text}</div></Show>
 
@@ -1605,21 +1716,24 @@ export function MessageView(props: MessageViewProps) {
         <div data-testid="assistant-stream" aria-live="polite" style={{ display: 'flex', 'justify-content': 'flex-start', 'margin-bottom': '10px' }}><div style={{ position: 'relative', 'max-width': '100%', padding: '10px 14px', 'border-radius': '12px', background: '#1a1a2e', border: '1px solid rgba(255,255,255,.06)', color: '#e5e5e5', 'font-size': '14px', 'line-height': '1.55', 'word-break': 'break-word' }}><div class="markdown" innerHTML={renderLiveMarkdown(props.assistantStream!.text)} ref={assistantStreamMarkdownRef} /><span aria-hidden="true" style={{ position: 'absolute', right: '7px', bottom: '7px', display: 'inline-block', width: '2px', height: '10px', background: '#aaa', opacity: props.assistantStream!.ended ? '.35' : '.9' }} /></div></div>
       </Show>
 
-      {/* Typing indicator — always mounted, opacity-toggled so mount/unmount
-          doesn't shift layout and trigger a pin-scroll every time working flips. */}
-      <Show when={!props.standaloneAgents}>
-      <div data-testid="working-indicator" style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px', opacity: showWorkingIndicator() ? '1' : '0', visibility: showWorkingIndicator() ? 'visible' : 'hidden', transition: 'opacity 0.12s', 'pointer-events': showWorkingIndicator() ? 'auto' : 'none' }}>
-        <div role={props.statusText ? 'status' : undefined} aria-live={props.statusText ? 'polite' : undefined} aria-hidden={!showWorkingIndicator() ? 'true' : undefined} style={{ padding: '10px 16px', 'border-radius': '16px 16px 16px 4px', background: '#1a1a2e', display: 'flex', gap: '4px', 'align-items': 'center', 'max-width': '92%' }}>
-          <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out infinite' }} />
-          <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.2s infinite' }} />
-          <span class="typing-dot" style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#888', 'animation': 'typing-bounce 1.2s ease-in-out 0.4s infinite' }} />
-          <Show when={props.statusText}>
-            <Show when={(props.intentHistory?.length || 0) > 1} fallback={<span style={{ 'margin-left': '6px', 'font-size': '12px', color: '#999', 'line-height': '1.35', 'word-break': 'break-word' }}>{props.statusText}</span>}>
-              <details style={{ 'margin-left': '6px' }}><summary style={{ cursor: 'pointer', 'font-size': '12px', color: '#999', 'line-height': '1.35', 'word-break': 'break-word' }}>{props.statusText}</summary><div style={{ 'margin-top': '6px', padding: '6px 8px', 'border-left': '1px solid #444', color: '#777', 'font-size': '10px', 'line-height': '1.45' }}><For each={(props.intentHistory || []).slice(0, -1)}>{(intent) => <div>{intent}</div>}</For></div></details>
+      <Show when={props.working && !currentProtocolOwnsWork() && !hasCurrentWork() && !liveLegacyWork()}>
+        <div style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px' }}>
+          <div role="status" data-testid="working-indicator" aria-live="polite" style={{ padding: '9px 12px', 'border-radius': '16px 16px 16px 4px', background: 'var(--bg-surface)', display: 'flex', gap: '6px', 'align-items': 'center', 'max-width': '92%' }}>
+            <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: 'var(--text-secondary)', 'animation': 'typing-bounce 1.2s ease-in-out infinite', 'flex-shrink': '0' }} />
+            <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: 'var(--text-secondary)', 'animation': 'typing-bounce 1.2s ease-in-out 0.2s infinite', 'flex-shrink': '0' }} />
+            <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: 'var(--text-secondary)', 'animation': 'typing-bounce 1.2s ease-in-out 0.4s infinite', 'flex-shrink': '0' }} />
+            <Show when={props.statusText}>
+              <Show when={(props.intentHistory?.length || 0) > 1} fallback={<span style={{ 'margin-left': '6px', 'font-size': '12px', color: 'var(--text-secondary)', 'line-height': '1.35', 'word-break': 'break-word' }}>{props.statusText}</span>}>
+                <details style={{ 'margin-left': '6px' }}>
+                  <summary style={{ cursor: 'pointer', 'font-size': '12px', color: 'var(--text-secondary)', 'line-height': '1.35', 'word-break': 'break-word' }}>{props.statusText}</summary>
+                  <div style={{ 'margin-top': '6px', padding: '6px 8px', 'border-left': '1px solid var(--border-medium)', color: 'var(--text-muted)', 'font-size': '10px', 'line-height': '1.45' }}>
+                    <For each={(props.intentHistory || []).slice(0, -1)}>{(intent) => <div>{intent}</div>}</For>
+                  </div>
+                </details>
+              </Show>
             </Show>
-          </Show>
+          </div>
         </div>
-      </div>
       </Show>
       </div>
     </div>

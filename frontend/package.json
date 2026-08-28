@@ -13,8 +13,10 @@
     "ghostty-web": "^0.4.0",
     "highlight.js": "^11.11.1",
     "html-to-image": "^1.11.13",
+    "katex": "^0.18.4",
     "marked": "^17.0.5",
     "marked-highlight": "^2.2.3",
+    "marked-katex-extension": "^5.1.12",
     "solid-js": "^1.9.0"
   },
   "devDependencies": {

@@ -303,22 +303,59 @@ function writeMeta(meta) {
   return META_STATE.write(meta);
 }
 
+const MESSAGE_TAIL_CHUNK_BYTES = 1024 * 1024;
+
+function readLatestMessages(fpath, agent, count) {
+  const wanted = Math.max(1, count);
+  const reverse = [];
+  const fd = fs.openSync(fpath, 'r');
+  let position = fs.fstatSync(fd).size;
+  let suffix = Buffer.alloc(0);
+  try {
+    while (position > 0 && reverse.length <= wanted) {
+      const length = Math.min(MESSAGE_TAIL_CHUNK_BYTES, position);
+      position -= length;
+      const chunk = Buffer.allocUnsafe(length);
+      fs.readSync(fd, chunk, 0, length, position);
+      const data = suffix.length ? Buffer.concat([chunk, suffix]) : chunk;
+      let end = data.length;
+      while (reverse.length <= wanted) {
+        const newline = data.lastIndexOf(10, end - 1);
+        if (newline < 0) break;
+        const line = data.subarray(newline + 1, end);
+        end = newline;
+        if (!line.length) continue;
+        const message = parseMessageForAgent(line.toString('utf8'), agent);
+        if (message) reverse.push(message);
+      }
+      suffix = Buffer.from(data.subarray(0, end));
+    }
+    if (position === 0 && reverse.length <= wanted && suffix.length) {
+      const message = parseMessageForAgent(suffix.toString('utf8'), agent);
+      if (message) reverse.push(message);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return {
+    messages: reverse.slice(0, wanted).reverse(),
+    hasEarlier: reverse.length > wanted,
+  };
+}
+
 function getMessages(sessionId, limit = 100, before = 0) {
   const agent = getAgentForSession(sessionId);
   const fpath = findJsonlPath(sessionId, agent);
-  if (!fpath) return { messages: [], hasMore: false };
-  let content;
-  try { content = fs.readFileSync(fpath, 'utf8'); } catch { return { messages: [], hasMore: false }; }
-  const lines = content.split('\n').filter(Boolean);
-  const msgs = [];
-  for (const line of lines) {
-    const m = parseMessageForAgent(line, agent);
-    if (m) msgs.push(m);
-  }
-  const end = Math.max(0, msgs.length - before);
-  const start = Math.max(0, end - limit);
-  const hasMore = start > 0;
-  return { messages: msgs.slice(start, end), hasMore };
+  if (!fpath || !fs.existsSync(fpath)) return { messages: [], hasMore: false };
+  const pageSize = Math.max(1, limit);
+  const offset = Math.max(0, before);
+  const tail = readLatestMessages(fpath, agent, pageSize + offset);
+  const end = Math.max(0, tail.messages.length - offset);
+  const start = Math.max(0, end - pageSize);
+  return {
+    messages: tail.messages.slice(start, end),
+    hasMore: tail.hasEarlier || start > 0,
+  };
 }
 
 // ── Per-user JSON helpers ──────────────────────────────────────────────────
@@ -1075,7 +1112,32 @@ function readFileHead(filePath, maxBytes) {
 function cachedCandidateInfo(candidate, meta) {
   const mtimeMs = candidate.mtime.getTime();
   let cached = sessionParseCache.get(candidate.fpath);
-  if (!cached || cached.agent !== candidate.agent || cached.mtimeMs !== mtimeMs || cached.size !== candidate.size) {
+  if (cached && cached.agent === candidate.agent && candidate.size >= cached.size) {
+    if (cached.mtimeMs !== mtimeMs || cached.size !== candidate.size) {
+      let activityMs = cached.activityMs;
+      const appendedBytes = candidate.size - cached.size;
+      if (appendedBytes > 0) {
+        if (appendedBytes <= 4 * 1024 * 1024) {
+          let fd;
+          try {
+            fd = fs.openSync(candidate.fpath, 'r');
+            const appended = Buffer.allocUnsafe(appendedBytes);
+            fs.readSync(fd, appended, 0, appendedBytes, cached.size);
+            activityMs = Math.max(activityMs || 0, lastMessageMs(appended.toString('utf8'), candidate.agent) || 0) || null;
+          } catch {
+            activityMs = null;
+          } finally {
+            if (fd !== undefined) fs.closeSync(fd);
+          }
+        } else {
+          activityMs = lastActivityMs(candidate.fpath, candidate.agent, mtimeMs);
+        }
+      }
+      const info = candidate.agent === 'claude' ? extractSessionInfo(candidate.fpath) : cached.info;
+      cached = { ...cached, mtimeMs, size: candidate.size, info, activityMs };
+      sessionParseCache.set(candidate.fpath, cached);
+    }
+  } else {
     let info;
     if (candidate.agent === 'codex') {
       const buffer = readFileHead(candidate.fpath, CODEX_HEAD_BYTES);

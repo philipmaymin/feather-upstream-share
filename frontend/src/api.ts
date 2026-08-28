@@ -327,13 +327,29 @@ export async function deletePath(path: string): Promise<void> {
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`)
 }
 
+const MESSAGE_PAGE_SIZE = 200
+const INITIAL_MESSAGE_LIMIT = 1000
+
+async function fetchMessagePage(id: string, before: number, signal?: AbortSignal): Promise<{ messages: Message[], hasMore: boolean }> {
+  const params = new URLSearchParams({ limit: String(MESSAGE_PAGE_SIZE) })
+  if (before > 0) params.set('before', String(before))
+  const response = await fetch(`${BASE}/api/sessions/${id}/messages?${params}`, { signal })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return await response.json()
+}
+
 export async function fetchMessages(id: string, before = 0, signal?: AbortSignal): Promise<{ messages: Message[], hasMore: boolean }> {
-  const url = before > 0
-    ? `${BASE}/api/sessions/${id}/messages?before=${before}`
-    : `${BASE}/api/sessions/${id}/messages`
-  const r = await fetch(url, { signal })
-  if (!r.ok) throw new Error(`HTTP ${r.status}`)
-  return await r.json()
+  if (before > 0) return fetchMessagePage(id, before, signal)
+  let result = await fetchMessagePage(id, 0, signal)
+  while (
+    result.hasMore &&
+    result.messages.length < INITIAL_MESSAGE_LIMIT &&
+    !result.messages.some(message => message.role === 'user' && (message.content || []).some(block => block.type === 'text' && block.text?.trim()))
+  ) {
+    const earlier = await fetchMessagePage(id, result.messages.length, signal)
+    result = { messages: [...earlier.messages, ...result.messages], hasMore: earlier.hasMore }
+  }
+  return result
 }
 
 export async function fetchProtocolRuns(id: string): Promise<{ runs: ProtocolRunSnapshot[] }> {

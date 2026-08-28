@@ -146,9 +146,12 @@ test('runs Advisory inline through candidates, Judge, verdict, and replay', asyn
   await expect(inlineCard).toContainText('Complete')
   await expect(inlineCard).toContainText('Make OMP the default harness')
 
-  await page.getByRole('button', { name: /Agents 3/ }).click()
-  await page.getByTestId('omp-subagent-council-child-1').click()
-  await expect(page.getByTestId('omp-subagent-inspector')).toContainText('Advocate candidate')
+  await expect(page.getByRole('button', { name: /Agents/ })).toHaveCount(0)
+  const details = page.getByTestId('chat-panel').getByTestId('omp-parent-execution')
+  await expect(details).toHaveJSProperty('open', false)
+  await details.getByTestId('omp-parent-execution-summary').click()
+  await details.getByTestId('omp-subagent-council-child-1').click()
+  await expect(details.getByTestId('omp-subagent-inspector')).toContainText('Advocate candidate')
 
   await page.reload()
   await expect(page.getByRole('button', { name: 'Council', exact: true })).toHaveCount(0)

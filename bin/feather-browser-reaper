@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import signal
+import time
+from pathlib import Path
+
+PROC = Path("/proc")
+STATE = Path(os.environ.get("FEATHER_BROWSER_REAPER_STATE", Path.home() / ".local/state/feather/browser-reaper.json"))
+MIN_AGE = int(os.environ.get("FEATHER_BROWSER_REAPER_MIN_AGE_SECONDS", 24 * 60 * 60))
+MIN_IDLE = int(os.environ.get("FEATHER_BROWSER_REAPER_IDLE_SECONDS", 60 * 60))
+INTERVAL = int(os.environ.get("FEATHER_BROWSER_REAPER_INTERVAL_SECONDS", 15 * 60))
+CLOCK_TICKS = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+MANAGED_MARKERS = (
+    "--headless",
+    "/tmp/playwright",
+    "/tmp/agent-browser",
+    "/tmp/feather-browser",
+    "/tmp/omp-browser",
+)
+
+
+def process(pid):
+    root = PROC / str(pid)
+    try:
+        command = (root / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        raw = (root / "stat").read_text()
+        fields = raw[raw.rfind(")") + 2 :].split()
+        return {
+            "pid": pid,
+            "ppid": int(fields[1]),
+            "cpu": int(fields[11]) + int(fields[12]),
+            "start": int(fields[19]),
+            "command": command,
+        }
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
+        return None
+
+
+def chrome(command):
+    executable = command.split(" ", 1)[0].rsplit("/", 1)[-1].lower()
+    return "chrome" in executable or "chromium" in executable
+
+
+def managed(command):
+    return chrome(command) and any(marker in command for marker in MANAGED_MARKERS)
+
+
+def snapshot():
+    rows = {}
+    for entry in PROC.iterdir():
+        if not entry.name.isdigit():
+            continue
+        row = process(int(entry.name))
+        if row:
+            rows[row["pid"]] = row
+    uptime_ticks = float((PROC / "uptime").read_text().split()[0]) * CLOCK_TICKS
+    roots = []
+    for row in rows.values():
+        if not managed(row["command"]):
+            continue
+        parent = rows.get(row["ppid"])
+        if parent and chrome(parent["command"]):
+            continue
+        row["age"] = max(0, (uptime_ticks - row["start"]) / CLOCK_TICKS)
+        roots.append(row)
+    return rows, roots
+
+
+def load_state():
+    try:
+        value = json.loads(STATE.read_text())
+        return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_state(value):
+    STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = STATE.with_name(f".{STATE.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, sort_keys=True))
+    os.chmod(temporary, 0o600)
+    temporary.replace(STATE)
+
+
+def descendants(pid, rows):
+    children = {}
+    for row in rows.values():
+        children.setdefault(row["ppid"], []).append(row["pid"])
+    found = []
+    stack = [pid]
+    while stack:
+        current = stack.pop()
+        found.append(current)
+        stack.extend(children.get(current, []))
+    return found
+
+
+def terminate_tree(pid, rows):
+    targets = descendants(pid, rows)
+    for target in reversed(targets):
+        try:
+            os.kill(target, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        alive = [target for target in targets if (PROC / str(target)).exists()]
+        if not alive:
+            return len(targets), 0
+        time.sleep(0.2)
+    alive = [target for target in targets if (PROC / str(target)).exists()]
+    for target in reversed(alive):
+        try:
+            os.kill(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return len(targets), len(alive)
+
+
+def run(dry_run=False, force_stale=False):
+    now = time.time()
+    previous = load_state()
+    rows, roots = snapshot()
+    current = {}
+    reaped = 0
+    for row in sorted(roots, key=lambda item: item["age"], reverse=True):
+        key = f'{row["pid"]}:{row["start"]}'
+        prior = previous.get(key) if isinstance(previous.get(key), dict) else None
+        idle_since = now
+        if prior:
+            elapsed = max(1, now - float(prior.get("seenAt", now)))
+            cpu_delta = max(0, row["cpu"] - int(prior.get("cpu", row["cpu"]))) / CLOCK_TICKS
+            idle_since = float(prior.get("idleSince", now)) if cpu_delta <= max(5, elapsed * 0.01) else now
+        current[key] = {"cpu": row["cpu"], "seenAt": now, "idleSince": idle_since}
+        old = row["age"] >= MIN_AGE
+        idle = now - idle_since >= MIN_IDLE
+        if not old or (not force_stale and not idle):
+            continue
+        label = row["command"][:180]
+        if dry_run:
+            print(f"candidate pid={row['pid']} age_h={row['age'] / 3600:.1f} idle_h={(now - idle_since) / 3600:.1f} {label}")
+            continue
+        total, forced = terminate_tree(row["pid"], rows)
+        reaped += 1
+        print(f"reaped pid={row['pid']} processes={total} forced={forced} age_h={row['age'] / 3600:.1f} {label}", flush=True)
+        current.pop(key, None)
+    save_state(current)
+    if dry_run and not any(row["age"] >= MIN_AGE for row in roots):
+        print("no stale managed browser roots")
+    return reaped
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Reap stale Feather-managed Chrome process trees")
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force-stale", action="store_true")
+    args = parser.parse_args()
+    if not args.loop:
+        run(dry_run=args.dry_run, force_stale=args.force_stale)
+        return
+    while True:
+        try:
+            run()
+        except Exception as error:
+            print(f"browser reaper error: {error}", flush=True)
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

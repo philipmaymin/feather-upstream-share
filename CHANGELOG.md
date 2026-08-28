@@ -1,3 +1,10 @@
+## 2026-08-28 - Readable chat, native math, and bounded browser cleanup
+- **LaTeX renders natively in chat.** Inline and display math now use KaTeX, including math-only backtick spans and fenced `math`, `latex`, or `tex` blocks.
+- **Execution stays in one compact Details surface.** Parent work, todos, delegated agents, and background jobs share the chronological disclosure beside the answer instead of fragmenting chat across separate Todos and Agents tabs.
+- **Long chats load and stay anchored efficiently.** Initial history stops once it reaches the current conversation boundary, older pages remain available on demand, active conversations keep their scroll anchor, and transcript activity refreshes parse only appended bytes.
+- **Sent media clears as soon as Feather has durably accepted it.** Upload and transcription state remains scoped to the originating chat, so navigating during an in-flight send cannot clear or attach media in the wrong conversation.
+- **Managed browser processes now have bounded cleanup.** The browser reaper removes only old, idle Feather-managed browser trees and ships with a dedicated systemd unit for continuous fleet-safe operation.
+
 ## 2026-08-25 - Session-affine local tools
 - **Room and sidecar commands target the Feather instance that launched the current OMP session.** The shared resolver now reads the session's bridge metadata before probing default ports, so a concurrent production/canary server cannot make `room pause`, `room wake`, or another local mutation fail as ambiguous or reach the wrong instance. Stale metadata falls back to the existing health-checked probe.
 - **Guarded promotion now supports systemd directly.** Repeated `--systemd-unit` options stop and restart every unit sharing a release pointer, and repeated `--health-url` gates require each sibling to report the exact release. The manager, full unit set, and endpoints persist in transaction state so failed starts, partial health, rollback, and crash recovery use systemctl rather than silently falling back to Supervisor.

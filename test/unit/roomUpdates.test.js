@@ -28,22 +28,16 @@ function makeRoom(root, name) {
 }
 
 describe('room updates CLI', () => {
-  it('appends a multi-paragraph briefing and lists entries chronologically', async () => {
+  it('lists a multi-paragraph briefing chronologically', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-room-updates-cli-'))
     roots.push(root)
     const { roomsDir, roomDir } = makeRoom(root, 'demo')
     const env = { ...process.env, HOME: root, ROOMS_DIR: roomsDir }
     const cli = path.resolve(import.meta.dirname, '../../bin/room')
-
-    await run(cli, ['update', 'First outcome.\nWhy it matters: the herd is gone.'], { cwd: roomDir, env })
-    await run(cli, ['update', 'Second outcome.'], { cwd: roomDir, env })
-
-    const lines = fs.readFileSync(path.join(roomDir, 'updates.jsonl'), 'utf8').trim().split('\n')
-    assert.equal(lines.length, 2)
-    const first = JSON.parse(lines[0])
-    assert.equal(first.text, 'First outcome.\nWhy it matters: the herd is gone.')
-    assert.match(first.id, /^[0-9a-f]{32}$/)
-    assert.match(first.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/)
+    fs.writeFileSync(path.join(roomDir, 'updates.jsonl'), [
+      JSON.stringify({ id: 'a'.repeat(32), ts: '2026-08-25T10:00:00Z', text: 'First outcome.\nWhy it matters: the herd is gone.' }),
+      JSON.stringify({ id: 'b'.repeat(32), ts: '2026-08-25T11:00:00Z', text: 'Second outcome.' }),
+    ].join('\n') + '\n')
 
     const listed = await run(cli, ['updates'], { cwd: roomDir, env })
     const firstAt = listed.stdout.indexOf('First outcome.')
@@ -74,7 +68,7 @@ describe('room updates API', () => {
     const stateDir = path.join(root, 'state')
     fs.mkdirSync(path.join(root, '.feather'), { recursive: true })
     fs.mkdirSync(stateDir, { recursive: true })
-    makeRoom(root, 'demo')
+    const { roomDir } = makeRoom(root, 'demo')
 
     const port = 31_000 + (process.pid % 1000)
     const base = `http://127.0.0.1:${port}`
@@ -95,19 +89,15 @@ describe('room updates API', () => {
       await new Promise((resolve) => setTimeout(resolve, 30))
     }
 
-    const posted = await fetch(`${base}/api/rooms/demo/updates`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: 'Shipped the updates feed.\nWhy it matters: you can walk in cold.' }),
-    })
-    assert.equal(posted.status, 200, stderr)
-    const postedBody = await posted.json()
-    assert.equal(postedBody.ok, true)
+    const cli = path.resolve(import.meta.dirname, '../../bin/room')
+    const env = { ...process.env, HOME: root, ROOMS_DIR: path.join(root, 'rooms'), FEATHER_URL: base }
+    await run(cli, ['update', 'Shipped the updates feed.\nWhy it matters: you can walk in cold.'], { cwd: roomDir, env })
+    const listed = await (await fetch(`${base}/api/rooms/demo/updates`)).json()
+    assert.equal(listed.updates.length, 1)
+    const postedBody = { update: listed.updates[0] }
     assert.match(postedBody.update.id, /[0-9a-f-]{36}/)
     assert.equal(postedBody.update.text, 'Shipped the updates feed.\nWhy it matters: you can walk in cold.')
 
-    const listed = await (await fetch(`${base}/api/rooms/demo/updates`)).json()
-    assert.equal(listed.updates.length, 1)
-    assert.equal(listed.updates[0].text, 'Shipped the updates feed.\nWhy it matters: you can walk in cold.')
 
     const snapshot = await (await fetch(`${base}/api/rooms`)).json()
     const demo = snapshot.rooms.find((room) => room.name === 'demo')

@@ -181,7 +181,7 @@ export default function App() {
   const [creating, setCreating] = createSignal(false)
   const [resumingId, setResumingId] = createSignal<string | null>(null)
   const [text, setText] = createSignal('')
-  const [tab, setTab] = createSignal<'chat' | 'prompts' | 'todos' | 'agents' | 'updates' | 'files' | 'terminal'>('chat')
+  const [tab, setTab] = createSignal<'chat' | 'files' | 'terminal' | 'prompts' | 'updates'>('chat')
   const [updatesList, setUpdatesList] = createSignal<RoomUpdate[]>([])
   const [updatesLoading, setUpdatesLoading] = createSignal(false)
   const [updatesError, setUpdatesError] = createSignal<string | null>(null)
@@ -247,12 +247,23 @@ export default function App() {
       }, autoDismissMs)
     }
   }
-  const [transcribing, setTranscribing] = createSignal(false)
   const uploadsInFlight = new Map<string, Promise<string>>()
   const voiceMemosInFlight = new Map<string, Promise<void>>()
   const pendingSendsInFlight = new Map<string, Promise<void>>()
   let pendingRetryTimer: ReturnType<typeof setTimeout> | undefined
-  const [uploading, setUploading] = createSignal(false)
+  const [uploadScopes, setUploadScopes] = createSignal<Set<string>>(new Set())
+  const uploading = () => {
+    const sessionId = currentId()
+    return !!sessionId && uploadScopes().has(sessionId)
+  }
+  function setUploadingFor(sessionId: string, active: boolean) {
+    setUploadScopes(current => {
+      const next = new Set(current)
+      if (active) next.add(sessionId)
+      else next.delete(sessionId)
+      return next
+    })
+  }
   const [working, setWorking] = createSignal(false)
   const [toolIntentStatus, setToolIntentStatus] = createSignal('')
   const [dragging, setDragging] = createSignal(false)
@@ -294,6 +305,17 @@ export default function App() {
   const [activity, setActivity] = createSignal<string | null>(null)
   const [question, setQuestion] = createSignal<QuestionData | null>(null)
   const [listening, setListening] = createSignal(false)
+  const [interimText, setInterimText] = createSignal('')
+  const [recordingTime, setRecordingTime] = createSignal(0)
+  const transcribing = () => voiceMemos().some(memo => memo.status === 'transcribing')
+  const [audioLevel, setAudioLevel] = createSignal(0)
+  const [spinGestureState, setSpinGestureState] = createSignal<SpinGestureState>('off')
+  const [motionSamples, setMotionSamples] = createSignal(0)
+  const [motionPeakDps, setMotionPeakDps] = createSignal(0)
+  const [motionDegrees, setMotionDegrees] = createSignal(0)
+  const [motionSeries, setMotionSeries] = createSignal<MotionChartPoint[]>([])
+  const [tossCalibration, setTossCalibration] = createSignal(false)
+  const [tossCalibrationStats, setTossCalibrationStats] = createSignal<TossCalibrationStats>({ maxPeakDps: 0, maxDegrees: 0, hits: 0 })
   const [hasMore, setHasMore] = createSignal(false)
   const [loadingMore, setLoadingMore] = createSignal(false)
   const [renaming, setRenaming] = createSignal(false)
@@ -631,7 +653,6 @@ export default function App() {
       setAuthUser(user)
       await initApp()
     }
-
     // Check for updates every 30 seconds
     async function checkForUpdate() {
       try {
@@ -1372,26 +1393,18 @@ export default function App() {
           await persistMediaPatch(memo.id, { transcript })
         }
         if (memo.intent === 'send') {
+          const target = memo.sessionId
           const onCurrent = memo.sessionId === currentId()
-          // One tap sends the whole composer. Voice previously sent only its
-          // transcript and left attached files behind for a surprising second tap.
+          // One Send sends everything: fold pending attachments into the same
+          // durable message as the transcript.
           const pending = onCurrent ? files() : []
           const parts: string[] = [[memo.capturedText, transcript].filter(Boolean).join(' ')].filter(Boolean)
           for (const file of pending) {
             const uploadPath = await uploadPendingFile(file)
             parts.push(file.isImage ? `[Attached image: ${uploadPath}]` : `[Attached file: ${uploadPath}] (${file.name})`)
           }
-          await sendSessionText(parts.join('\n'), memo.sessionId, memo.id)
-          for (const file of pending) {
-            URL.revokeObjectURL(file.dataUrl)
-            await deleteMediaRecord(file.id).catch(() => {})
-          }
-          if (onCurrent && pending.length) setFiles(previous => previous.filter(file => !pending.some(sent => sent.id === file.id)))
-          const draft = onCurrent ? text() : loadDraft(memo.sessionId)
-          if (draft === memo.capturedText) {
-            saveDraft(memo.sessionId, '')
-            if (onCurrent) setText('')
-          }
+          await sendSessionText(parts.join('\n'), target, memo.id)
+          acknowledgeComposedMessage(target, memo.capturedText, pending)
         } else {
           const previous = memo.sessionId === currentId() ? text().trim() : loadDraft(memo.sessionId).trim()
           const next = [previous, transcript].filter(Boolean).join(' ')
@@ -1457,22 +1470,51 @@ export default function App() {
       const id = crypto.randomUUID()
       const name = `voice-memo-${Date.now()}.${blob.type.includes('mp4') ? 'm4a' : 'webm'}`
       const sizeError = blob.size > MAX_AUDIO_BYTES ? 'Voice memo is larger than the 25 MB audio limit' : blob.size < 1000 ? 'Recording was too short to transcribe' : null
-      const record = { id, boxId: 'local', sessionId, kind: 'audio', name, mimeType: blob.type, blob, status: sizeError ? 'failed' : 'transcribing', attempts: 0, error: sizeError, intent: voiceSendAfterStop ? 'send' : 'append', capturedText: recordingTarget.capturedText, createdAt: Date.now() }
+      const sendAfterTranscription = voiceSendAfterStop
+      const capturedText = recordingTarget.capturedText
+      const boxId = 'local'
+      const record = { id, boxId, sessionId, kind: 'audio', name, mimeType: blob.type, blob, status: sizeError ? 'failed' : 'transcribing', attempts: 0, error: sizeError, intent: sendAfterTranscription ? 'send' : 'append', capturedText, createdAt: Date.now() }
+      let recoveryStored = true
       try { await putMediaRecord(record) }
-      catch (e: any) { setMediaNotice(`Voice recovery storage unavailable: ${e?.message || e}. Download the memo before closing this tab.`) }
+      catch (e: any) {
+        recoveryStored = false
+        setMediaNotice(`Voice recovery storage unavailable: ${e?.message || e}. Download the memo before closing this tab.`)
+      }
       const memo: VoiceMemo = { ...record, status: record.status as VoiceStatus, error: record.error || undefined, intent: record.intent as 'append' | 'send', boxId: 'local' }
       if (sessionId === currentId()) setVoiceMemos(prev => [...prev, memo])
       stopVoice()
       if (sizeError) return
-      setTranscribing(true)
-      try { await processVoiceMemo(memo) }
-      finally { setTranscribing(false) }
+      if (sendAfterTranscription && recoveryStored) clearComposerText(sessionId, capturedText)
+      await processVoiceMemo(memo)
     }
     recorder.onerror = (event: any) => {
       setMediaNotice(`Recording failed: ${event?.error?.message || 'unknown recorder error'}`)
+      // Stopping drives onstop, which durably saves any chunks the recorder did
+      // manage to produce instead of abandoning them in memory.
       if (recorder.state === 'recording') recorder.stop()
     }
     recorder.start(1000)
+  }
+
+  function clearComposerText(targetId: string, submittedText: string) {
+    const targetIsCurrent = targetId === currentId()
+    const currentDraft = targetIsCurrent ? text() : loadDraft(targetId)
+    if (currentDraft !== submittedText) return
+    saveDraft(targetId, '')
+    if (targetIsCurrent) setText('')
+  }
+
+  function acknowledgeComposedMessage(targetId: string, submittedText: string, pending: PendingFile[]) {
+    const targetIsCurrent = targetId === currentId()
+    clearComposerText(targetId, submittedText)
+    for (const file of pending) URL.revokeObjectURL(file.dataUrl)
+    if (targetIsCurrent) {
+      setFiles(current => current.filter(file => !pending.some(sent => sent.id === file.id)))
+      if (textareaRef) { textareaRef.style.height = 'auto'; textareaRef.blur() }
+    }
+    // The server has durably acknowledged the prompt. IndexedDB cleanup can
+    // finish behind the now-empty composer instead of blocking navigation.
+    void Promise.allSettled(pending.map(file => deleteMediaRecord(file.id)))
   }
 
   async function sendComposedMessage(rawText: string, pending: PendingFile[] = files()) {
@@ -1483,9 +1525,9 @@ export default function App() {
       showMediaNotice('Wait for this chat to finish loading before sending.')
       return
     }
-    const targetId = selectedId
+    const target = selectedId
     let safelyQueued = false
-    setUploading(true)
+    setUploadingFor(target, true)
     setMediaNotice('')
     try {
       const parts: string[] = val ? [val] : []
@@ -1493,31 +1535,24 @@ export default function App() {
         const uploadPath = await uploadPendingFile(file)
         parts.push(file.isImage ? `[Attached image: ${uploadPath}]` : `[Attached file: ${uploadPath}] (${file.name})`)
       }
-      await sendSessionText(parts.join('\n'), targetId, pending[0]?.id || crypto.randomUUID(), () => {
+      await sendSessionText(parts.join('\n'), target, pending[0]?.id || crypto.randomUUID(), () => {
         // Clicking Send transfers ownership from the composer to the durable
         // outbox. Clear only after that synchronous write succeeds.
         safelyQueued = true
-        if (targetId === currentId() && text() === rawText) {
+        if (target === currentId() && text() === rawText) {
           setText('')
-          saveDraft(targetId, '')
+          saveDraft(target, '')
           if (textareaRef) textareaRef.style.height = 'auto'
         }
       })
-      for (const file of pending) {
-        URL.revokeObjectURL(file.dataUrl)
-        await deleteMediaRecord(file.id).catch(() => {})
-      }
-      if (targetId === currentId()) {
-        setFiles(prev => prev.filter(file => !pending.some(sent => sent.id === file.id)))
-        if (textareaRef) textareaRef.style.height = 'auto'
-      }
+      acknowledgeComposedMessage(target, rawText, pending)
     } catch (e: any) {
-      if (targetId === currentId()) setMediaNotice(safelyQueued
+      if (target === currentId()) setMediaNotice(safelyQueued
         ? pending.length
           ? `Media and message retained — ${e?.message || e}. Feather will retry.`
           : `Message retained — ${e?.message || e}. Feather will retry.`
         : `Could not queue message — ${e?.message || e}. Your draft is still here.`)
-    } finally { setUploading(false) }
+    } finally { setUploadingFor(target, false) }
   }
 
   async function handleSend() {
@@ -1625,8 +1660,8 @@ export default function App() {
   })
 
   const tabStyle = (t: string) => ({
-    padding: '9px 14px', border: 'none', 'border-bottom': tab() === t ? '2px solid #4aba6a' : '2px solid transparent',
-    background: 'none', color: tab() === t ? '#e5e5e5' : '#666', 'font-size': '13px', 'font-weight': '600', cursor: 'pointer',
+    padding: '9px 14px', border: 'none', 'border-bottom': tab() === t ? '2px solid var(--success)' : '2px solid transparent',
+    background: 'none', color: tab() === t ? 'var(--text-primary)' : 'var(--text-secondary)', 'font-size': '13px', 'font-weight': '600', cursor: 'pointer',
     '-webkit-tap-highlight-color': 'transparent', 'flex-shrink': '0',
   })
 
@@ -2036,8 +2071,6 @@ export default function App() {
           <div style={{ display: 'flex', 'align-items': 'center', 'border-bottom': '1px solid #1e1e1e', 'padding-left': '16px', 'flex-shrink': '0', 'overflow-x': 'auto', 'scrollbar-width': 'none', '-webkit-overflow-scrolling': 'touch' }}>
             <button onClick={() => setTab('chat')} style={tabStyle('chat')}>Chat</button>
             <button onClick={() => setTab('prompts')} style={tabStyle('prompts')}>Prompts</button>
-            <button onClick={() => setTab('todos')} style={tabStyle('todos')}>Todos<Show when={activeTodo()}>{` ${activeTodo()!.completed}/${activeTodo()!.total}`}</Show></button>
-            <button onClick={() => setTab('agents')} style={tabStyle('agents')}>Agents<Show when={activeSubagents().length}>{` ${activeSubagents().length}`}</Show></button>
             <button onClick={() => setTab('updates')} style={tabStyle('updates')}>Updates</button>
             <button onClick={() => { setTab('files'); if (!browseDir()) openFileBrowser() }} style={tabStyle('files')}>Files{touchedFiles().length > 0 ? ` (${touchedFiles().length})` : ''}</button>
             <button onClick={() => setTab('terminal')} style={tabStyle('terminal')}>Terminal</button>
@@ -2082,13 +2115,13 @@ export default function App() {
                 intentHistory={toolIntentHistory()}
                 assistantStream={assistantStream()}
                 work={ompMirror().parent}
+                todo={activeTodo()}
                 notice={ompNotice()}
                 approval={ompApproval()}
-                subagents={[]}
-                jobs={[]}
-                runtime={null}
+                subagents={activeSubagents()}
+                jobs={ompJobs()}
+                runtime={ompRuntime()}
                 protocolRuns={protocolRuns()}
-                onOpenAgents={() => setTab('agents')}
                 scrollRefCb={(el) => { messageScrollRef = el }}
                 sessionId={loadedSessionId()}
               />
@@ -2222,42 +2255,7 @@ export default function App() {
                 </For>
               </div>
             </div>
-            <div data-testid="todos-panel" style={{ display: tab() === 'todos' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>
-              <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '14px 16px 28px' }}>
-                <div style={{ 'max-width': '760px', margin: '0 auto' }}>
-                  <Show when={activeTodo()} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '16px 4px' }}>No Todo list in this chat yet.</div>}>
-                    {(todo) => <>
-                      <div style={{ display: 'flex', 'align-items': 'baseline', 'justify-content': 'space-between', gap: '12px', 'margin-bottom': '14px' }}>
-                        <div>
-                          <div style={{ color: '#e5e5e5', 'font-size': '18px', 'font-weight': '700' }}>Todos</div>
-                          <Show when={todo().active}><div style={{ color: '#999', 'font-size': '12px', 'margin-top': '3px' }}>Current · {todo().active}</div></Show>
-                        </div>
-                        <span style={{ color: todo().completed === todo().total ? '#4aba6a' : '#999', 'font-size': '12px', 'font-weight': '700', 'font-family': "'SF Mono', Menlo, monospace" }}>{todo().completed}/{todo().total}</span>
-                      </div>
-                      <For each={todo().phases}>{(phase) => (
-                        <section style={{ 'margin-bottom': '12px', padding: '12px 14px', background: '#11151c', border: '1px solid #292936', 'border-radius': '10px' }}>
-                          <div style={{ color: '#888', 'font-size': '10px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.07em', 'margin-bottom': '7px' }}>{phase.name}</div>
-                          <For each={phase.tasks}>{(task) => (
-                            <div style={{ display: 'flex', gap: '9px', padding: '5px 0', color: task.status === 'completed' ? '#777' : task.status === 'in_progress' ? '#e5e5e5' : '#aaa', 'font-size': '13px', 'line-height': '1.4', 'text-decoration': task.status === 'abandoned' ? 'line-through' : 'none' }}>
-                              <span style={{ color: task.status === 'completed' ? '#4aba6a' : task.status === 'in_progress' ? '#73b8ff' : task.status === 'blocked' ? '#d8a13b' : '#666', width: '14px', 'flex-shrink': '0', 'font-weight': '700' }}>{task.status === 'completed' ? '✓' : task.status === 'in_progress' ? '●' : task.status === 'blocked' ? '!' : task.status === 'abandoned' ? '×' : '○'}</span>
-                              <span style={{ 'min-width': '0', 'word-break': 'break-word' }}>
-                                {task.content}
-                                <Show when={task.blocker}><span style={{ display: 'block', color: '#d8a13b', 'font-size': '11px', 'margin-top': '2px' }}>{task.blocker}</span></Show>
-                              </span>
-                            </div>
-                          )}</For>
-                        </section>
-                      )}</For>
-                    </>}
-                  </Show>
-                </div>
-              </div>
-            </div>
-            <div data-testid="agents-panel" style={{ display: tab() === 'agents' ? 'block' : 'none', height: '100%', overflow: 'hidden' }}>
-              <Show when={activeSubagents().length > 0 || ompJobs().length > 0 || ompRuntime() || ompMirror().parent.timeline.length > 0} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '30px 20px', 'text-align': 'center' }}>No execution details, delegated agents, or background jobs in this chat yet.</div>}>
-                <MessageView messages={[]} loading={false} work={ompMirror().parent} subagents={activeSubagents()} jobs={ompJobs()} runtime={ompRuntime()} standaloneAgents />
-              </Show>
-            </div>
+
             <div data-testid="updates-panel" style={{ display: tab() === 'updates' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>
               <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '12px 16px 24px' }}>
                 <Show when={updatesError()}><div style={{ color: '#d45555', 'font-size': '13px', padding: '8px 4px' }}>{updatesError()}</div></Show>

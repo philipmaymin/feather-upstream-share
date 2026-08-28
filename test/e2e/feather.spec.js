@@ -11,6 +11,7 @@ const CLAUDE_PROJECTS = path.join(HOME, '.claude/projects')
 
 const TEST_SESSION_ID = `e2e-feather-${Date.now()}`
 const HTML_ARTIFACT_PATH = path.join('/tmp', `${TEST_SESSION_ID}-artifact.html`)
+const TEXT_ARTIFACT_PATH = path.join('/tmp', `${TEST_SESSION_ID}-fixture.js`)
 let testSessionPath
 
 function writeLine(obj) {
@@ -25,6 +26,7 @@ test.beforeAll(() => {
 
   testSessionPath = path.join(CLAUDE_PROJECTS, dirs[0], `${TEST_SESSION_ID}.jsonl`)
   fs.writeFileSync(HTML_ARTIFACT_PATH, '<!doctype html><html><head><title>Feather artifact</title></head><body><h1>Rendered HTML artifact</h1><p>This is rendered markup, not source text.</p></body></html>')
+  fs.writeFileSync(TEXT_ARTIFACT_PATH, '// Synthetic session setup\nexport const fixture = true\n')
 
   writeLine({
     type: 'user', uuid: 'e2e-msg-001', timestamp: '2025-06-15T14:00:00Z',
@@ -37,8 +39,8 @@ test.beforeAll(() => {
     message: {
       role: 'assistant',
       content: [
-        { type: 'thinking', thinking: 'Let me explain the markdown pipeline step by step.' },
-        { type: 'text', text: `Feather uses **marked** with GFM support.\n\n## How it works\n\n1. Raw text goes through \`marked.parse()\`\n2. Output is sanitized with \`DOMPurify\`\n3. Result is cached in an LRU map\n\n\`\`\`js\nconst html = marked.parse(text)\nconst safe = DOMPurify.sanitize(html)\n\`\`\`\n\nThis keeps things **fast** and **secure**.\n\nLocal artifact: [Feather fixture](${path.join(HOME, 'feather-next/test/e2e/feather.spec.js')}:12)\n\nHTML artifact: [Rendered artifact](${HTML_ARTIFACT_PATH})` },
+        { type: 'thinking', thinking: '**Planning** the markdown pipeline.' },
+        { type: 'text', text: `Feather uses **marked** with GFM support.\n\n## How it works\n\n1. Raw text goes through \`marked.parse()\`\n2. Output is sanitized with \`DOMPurify\`\n3. Result is cached in an LRU map\n\n\`\`\`js\nconst html = marked.parse(text)\nconst safe = DOMPurify.sanitize(html)\n\`\`\`\n\nThis keeps things **fast** and **secure**.\n\nInline math: $2 \\times 4 = 8$.\n\n$$\n\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}\n$$\n\nBacktick math: \`$x^2$\`.\n\nFenced backtick math:\n\n\`\`\`\n$$\n\\int_0^1 x^2\,dx = \\frac{1}{3}\n$$\n\`\`\`\n\nOrdinary code stays literal: \`const formula = "$x^2$"\`.\n\nIt costs $5 and another item costs $10.\n\nLocal artifact: [Feather fixture](${TEXT_ARTIFACT_PATH}:12)\n\nHTML artifact: [Rendered artifact](${HTML_ARTIFACT_PATH})` },
       ],
     },
   })
@@ -100,6 +102,7 @@ test.beforeAll(() => {
 test.afterAll(() => {
   try { fs.unlinkSync(testSessionPath) } catch {}
   try { fs.unlinkSync(HTML_ARTIFACT_PATH) } catch {}
+  try { fs.unlinkSync(TEXT_ARTIFACT_PATH) } catch {}
 })
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -248,6 +251,16 @@ test.describe('Message rendering', () => {
     expect(count).toBeGreaterThanOrEqual(1)
   })
 
+  test('LaTeX renders bare and math-only backtick containers without changing ordinary code or currency', async ({ page }) => {
+    const answer = page.locator('.markdown').filter({ hasText: 'Feather uses marked with GFM support.' })
+    await expect(answer.locator('.katex')).toHaveCount(4)
+    await expect(answer.locator('.katex').first()).toBeVisible()
+    await expect(answer.locator('.katex-display')).toHaveCount(2)
+    await expect(answer.locator('code').filter({ hasText: 'const formula = \"$x^2$\"' })).toBeVisible()
+    await expect(answer.getByText('It costs $5 and another item costs $10.')).toBeVisible()
+    await page.screenshot({ path: '/tmp/feather-math-backticks.png', fullPage: false })
+  })
+
   test('markdown heading renders as <h2>', async ({ page }) => {
     const h2 = page.locator('.markdown h2')
     await expect(h2.first()).toBeVisible()
@@ -273,7 +286,7 @@ test.describe('Message rendering', () => {
 
   test('markdown links to local artifacts use the Files preview endpoint', async ({ page }) => {
     const link = page.getByRole('link', { name: 'Feather fixture' })
-    const expectedPath = path.join(HOME, 'feather-next/test/e2e/feather.spec.js')
+    const expectedPath = TEXT_ARTIFACT_PATH
     const expectedHref = `/api/files/raw?path=${encodeURIComponent(expectedPath)}`
     await expect(link).toHaveAttribute('href', expectedHref)
 
@@ -577,11 +590,12 @@ test.describe('Live updates', () => {
         content: [{ type: 'tool_use', id: 'status-tool-1', name: 'read', input: { file_path: '/tmp/upload' }, intent: 'Inspecting upload recovery.' }],
       },
     })
-    const firstStatus = page.getByRole('status').filter({ hasText: 'Inspecting upload recovery.' })
-    await expect(firstStatus).toBeVisible({ timeout: 10000 })
+
     const liveWork = page.getByTestId('live-work-turn')
     await expect(liveWork).toBeVisible()
     await expect(liveWork.getByTestId('work-log-summary')).toContainText('Details')
+    await expect(liveWork.getByTestId('work-log-summary')).toContainText('Inspecting upload recovery.')
+    await expect(page.getByTestId('working-indicator')).toHaveCount(0)
 
     writeLine({
       type: 'assistant', uuid: `e2e-status-2-${Date.now()}`, timestamp: '2025-06-15T14:06:05Z',
@@ -591,10 +605,9 @@ test.describe('Live updates', () => {
         content: [{ type: 'tool_use', id: 'status-tool-2', name: 'bash', input: { command: 'npm test' }, intent: 'Testing the repaired upload.' }],
       },
     })
-    const currentStatus = page.getByRole('status').filter({ hasText: 'Testing the repaired upload.' })
-    await expect(currentStatus).toBeVisible({ timeout: 10000 })
-    await expect(currentStatus.locator('summary')).toContainText('Testing the repaired upload.')
-    await expect(currentStatus.locator('summary')).not.toContainText('Inspecting upload recovery.')
+    const currentStatus = liveWork.getByTestId('work-log-summary')
+    await expect(currentStatus).toContainText('Testing the repaired upload.', { timeout: 10000 })
+    await expect(currentStatus).not.toContainText('Inspecting upload recovery.')
 
     writeLine({
       type: 'assistant', uuid: `e2e-status-final-${Date.now()}`, timestamp: '2025-06-15T14:06:10Z',
@@ -602,7 +615,7 @@ test.describe('Live updates', () => {
       message: { role: 'assistant', content: 'Status lifecycle complete.' },
     })
     await expect(page.getByText('Status lifecycle complete.')).toBeVisible({ timeout: 10000 })
-    await expect(page.getByRole('status').filter({ hasText: 'Testing the repaired upload.' })).not.toBeVisible()
+    await expect(currentStatus).not.toBeVisible()
     await expect(liveWork).toHaveCount(0)
     const finalBubble = page.locator('[data-role="assistant"]').filter({ hasText: 'Status lifecycle complete.' })
     await expect(finalBubble.getByTestId('work-log-summary')).toBeVisible()
