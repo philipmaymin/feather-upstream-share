@@ -167,7 +167,10 @@ function expectClosedUpgrade(url) {
 }
 
 function expectShellRoundTrip(url) {
-  const nonce = `feather-shell-${process.pid}-${Date.now()}`
+  const left = Date.now()
+  const right = process.pid
+  const nonce = `SHELL-${left + right}`
+  const input = `printf 'SHELL-%s\\n' $(( ${left} + ${right} ))\n`
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url)
     let output = ''
@@ -179,10 +182,10 @@ function expectShellRoundTrip(url) {
       if (ws.readyState === WebSocket.OPEN) ws.close()
       else if (ws.readyState === WebSocket.CONNECTING) ws.terminate()
       if (error) reject(error)
-      else resolve({ nonce, output })
+      else resolve({ nonce, input, output })
     }
     const timeout = setTimeout(() => finish(new Error(`shell output timed out: ${url}`)), 5000)
-    ws.once('open', () => ws.send(`printf '${nonce}\\n'\n`))
+    ws.once('open', () => ws.send(input))
     ws.on('message', data => {
       output += data.toString()
       if (output.includes(nonce)) finish()
@@ -312,7 +315,8 @@ describe('server-enforced read-only canary', () => {
     assert.equal(reload.status, 200)
     assert.deepEqual(await reload.json(), { ok: true, reload: true })
 
-    const { nonce, output: shellOutput } = await expectShellRoundTrip(`ws://127.0.0.1:${port}/api/shell`)
+    const { nonce, input: shellInput, output: shellOutput } = await expectShellRoundTrip(`ws://127.0.0.1:${port}/api/shell`)
+    assert.equal(shellInput.includes(nonce), false)
     assert.ok(shellOutput.includes(nonce), shellOutput)
     for (const route of ['/api/shell/', '/api/shell-near-match', '/api/terminal/', '/api/terminal-near-match']) {
       await expectClosedUpgrade(`ws://127.0.0.1:${port}${route}`)
