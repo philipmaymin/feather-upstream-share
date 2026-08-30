@@ -118,6 +118,7 @@ test('Fledge is a feed-first complete interface with internal chat navigation', 
   await expect(posts.first()).toContainText('Your move')
   await expect(posts.first()).toContainText('Choose the release channel')
   await expect(posts.first()).toContainText('Deployment decision')
+  await expect.poll(() => posts.first().locator('h2').evaluate(element => getComputedStyle(element).webkitLineClamp)).toBe('3')
   await expect(page.locator('a[href*="philip.feather.plus"]')).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Open menu' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Sessions' })).toHaveCount(0)
