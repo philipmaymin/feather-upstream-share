@@ -4390,6 +4390,13 @@ function launchRoomPulse(name) {
   }
 }
 
+function hasBlockingRoomActivity(room) {
+  return room.sessions.some(session =>
+    session.isActive
+      && !room.residents.some(resident =>
+        resident.role !== 'leader' && resident.sessionId === session.id));
+}
+
 function checkRoomPulses() {
   if (!ROOM_PULSES_ENABLED) return;
   const now = Date.now();
@@ -4416,7 +4423,7 @@ function checkRoomPulses() {
   const rooms = new Map(roomSnapshotCache.refresh().map(room => [room.name, room]));
   for (const { name } of due) {
     const room = rooms.get(name);
-    if (!room || room.active) {
+    if (!room || hasBlockingRoomActivity(room)) {
       ROOM_PULSES_STATE.update(current => ({
         ...current,
         [name]: pulseRecord(current[name], { enabled: true, status: 'waiting', nextRunAtMs: now + ROOM_PULSE_INTERVAL_MS }),
