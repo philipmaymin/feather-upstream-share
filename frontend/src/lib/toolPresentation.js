@@ -195,6 +195,10 @@ export function toolSummary(name, input) {
 }
 
 export function toolPresentation(rawName, input) {
+  const imagePath = toolImagePath(rawName, input)
+  if (imagePath) {
+    return { name: canonicalToolName(rawName), summary: imagePath.split(/[\\/]/).pop() || imagePath }
+  }
   const storedName = String(rawName || '').toLowerCase()
   if (storedName === 'exec' && input?.raw) {
     const nested = nestedToolCalls(input.raw)

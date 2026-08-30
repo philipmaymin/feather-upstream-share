@@ -36,11 +36,18 @@ describe('Codex tool presentation', () => {
     )
   })
 
-  it('exposes local view_image inputs for Feather previews', () => {
-    assert.equal(
-      toolImagePath('view_image', { path: '/home/user/feather/uploads/example.png', detail: 'original' }),
-      '/home/user/feather/uploads/example.png',
+  it('keeps local image basenames visible while preserving the preview path', () => {
+    const imagePath = '/home/user/feather/a-deliberately-long/path/that/exceeds/the/generic/summary/limit/by/a/wide/margin/tool-preview.svg'
+
+    assert.deepEqual(
+      toolPresentation('view_image', { path: imagePath, detail: 'original' }),
+      { name: 'View Image', summary: 'tool-preview.svg' },
     )
+    assert.deepEqual(
+      toolPresentation('viewImage', { path: String.raw`C:\Users\feather\deeply\nested\tool-preview.svg` }),
+      { name: 'View Image', summary: 'tool-preview.svg' },
+    )
+    assert.equal(toolImagePath('view_image', { path: imagePath, detail: 'original' }), imagePath)
     assert.equal(toolImagePath('read', { path: '/tmp/example.png' }), '')
   })
 

@@ -59,7 +59,7 @@ test('serves fingerprinted frontend assets as immutable', async ({ page }) => {
 })
 
 test('puts OMP, Claude Code, and Codex on the Rooms home and hides pulse worker internals', async ({ page }) => {
-  let createdAgent
+  let createdSession
   await page.route('**/api/rooms', route => route.fulfill({ json: ROOM_FIXTURE }))
   await page.route('**/api/agents', route => route.fulfill({ json: { agents: [
     { id: 'claude', label: 'Claude Code', available: true },
@@ -68,7 +68,7 @@ test('puts OMP, Claude Code, and Codex on the Rooms home and hides pulse worker 
   ] } }))
   await page.route('**/api/sessions', async route => {
     if (route.request().method() !== 'POST') return route.continue()
-    createdAgent = JSON.parse(route.request().postData() || '{}').agent
+    createdSession = JSON.parse(route.request().postData() || '{}')
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'unused', status: 'starting' }) })
   })
   await page.route('**/api/rooms/*/assign', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true, assignments: {} }) }))
@@ -82,18 +82,22 @@ test('puts OMP, Claude Code, and Codex on the Rooms home and hides pulse worker 
   await expect(page.getByText('pulse.md')).toHaveCount(0)
   await expect(page.getByText('Keep working: #instant-room')).toHaveCount(0)
   await page.locator('button:has-text("›")').click()
-  await expect(page.getByRole('button', { name: '+ New OMP chat' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '+ Start OMP Leader' })).toBeVisible()
   await page.getByText('Room options', { exact: true }).click()
   await expect(page.getByRole('button', { name: 'Claude Code', exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Codex', exact: true })).toBeVisible()
   const harness = page.getByLabel('Default harness for #instant-room')
   await expect(harness).toHaveValue('omp')
   await harness.selectOption('codex')
-  await expect(page.getByRole('button', { name: '+ New Codex chat' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '+ Start OMP Leader' })).toBeVisible()
   await harness.selectOption('omp')
 
-  await page.getByRole('button', { name: '+ New OMP chat' }).click()
-  await expect.poll(() => createdAgent).toBe('omp')
+  await page.getByRole('button', { name: '+ Start OMP Leader' }).click()
+  await expect.poll(() => createdSession).toMatchObject({
+    agent: 'omp',
+    roomName: 'instant-room',
+    roomRole: 'leader',
+  })
 })
 
 test('stops background work in every enabled room from one visible control', async ({ page }) => {
