@@ -1,0 +1,19 @@
+{
+  "id": "https://app.feather.plus/",
+  "name": "Fledge",
+  "short_name": "Fledge",
+  "description": "Your live stream of agent work, decisions, and artifacts",
+  "start_url": "https://app.feather.plus/",
+  "scope": "https://app.feather.plus/",
+  "display": "standalone",
+  "display_override": ["standalone"],
+  "orientation": "any",
+  "background_color": "#070b0a",
+  "theme_color": "#0b1210",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    { "src": "/fledge-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/fledge-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/fledge-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

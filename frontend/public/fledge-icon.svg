@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Fledge">
+  <defs>
+    <radialGradient id="bg" cx="28%" cy="20%" r="92%">
+      <stop offset="0" stop-color="#16261f"/>
+      <stop offset="0.55" stop-color="#0b1210"/>
+      <stop offset="1" stop-color="#050807"/>
+    </radialGradient>
+    <linearGradient id="plume" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#d9d4c4"/>
+      <stop offset="1" stop-color="#fffbea"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <path d="M118 405C111 298 172 133 379 82c-16 143-104 291-261 323Z" fill="#f2eedf"/>
+  <path d="M119 407c51-89 111-171 191-248" fill="none" stroke="#17211d" stroke-width="18" stroke-linecap="round"/>
+  <path d="M160 338 99 313M192 288l-73-39M227 242l-72-52M264 202l-63-60M303 166l-49-61M339 137l-28-52" fill="none" stroke="#17211d" stroke-width="14" stroke-linecap="round"/>
+  <path d="m149 360-39 72" fill="none" stroke="#d8ff57" stroke-width="18" stroke-linecap="round"/>
+  <circle cx="388" cy="102" r="16" fill="#d8ff57"/>
+</svg>

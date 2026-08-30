@@ -1,11 +1,11 @@
 declare const __BUILD_TIME__: string
 declare const __BUILD_VERSION__: string
 import { createSignal, createEffect, createMemo, onMount, onCleanup, Show, For } from 'solid-js'
-import { marked } from 'marked'
-import { MessageView } from './components/MessageView'
+import { MessageView, RichMarkdown } from './components/MessageView'
 import { Terminal } from './components/Terminal'
 import { SidecarThread } from './components/Sidecar'
 import RoomsHome from './RoomsHome'
+import FeedHome from './FeedHome'
 import type { SessionMeta, Message, QuestionData, SidecarGroup, RoomUpdate, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot, ProtocolRunSnapshot } from './api'
 import { fetchSessions, fetchRooms, fetchRoomUpdates, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
 import type { SearchResult } from './api'
@@ -161,12 +161,16 @@ function setFavicon(color: string) {
 
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
 
+const isFledgeHost = location.hostname === 'app.feather.plus' || new URLSearchParams(location.search).get('app') === 'fledge'
+type HomeView = 'feed' | 'rooms'
+
 export default function App() {
   const [authUser, setAuthUser] = createSignal<{ username: string; admin: boolean } | null>(null)
   const [authChecked, setAuthChecked] = createSignal(false)
   const [loginError, setLoginError] = createSignal('')
   const [loginLoading, setLoginLoading] = createSignal(false)
 
+  const [homeView, setHomeView] = createSignal<HomeView>(isFledgeHost ? 'feed' : 'rooms')
   const [sessions, setSessions] = createSignal<SessionMeta[]>([])
   const [currentId, setCurrentId] = createSignal<string | null>(null)
   const [messages, setMessages] = createSignal<Message[]>([])
@@ -187,17 +191,20 @@ export default function App() {
   const [updatesError, setUpdatesError] = createSignal<string | null>(null)
   const [updatesRoomName, setUpdatesRoomName] = createSignal<string | null>(null)
   const [filesMode, setFilesMode] = createSignal<'changed' | 'browse'>('browse')
-  const TEXT_EXTS = new Set(['.txt', '.md', '.js', '.ts', '.tsx', '.jsx', '.json', '.html', '.css', '.py', '.rb', '.go', '.rs', '.sh', '.yml', '.yaml', '.toml', '.cfg', '.conf', '.ini', '.env', '.sql', '.csv', '.xml', '.log', '.jsonl', '.svelte', '.vue', '.astro', '.mjs', '.cjs'])
-  const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico'])
-  function fileKind(p: string): 'text' | 'image' | 'pdf' | 'binary' {
+  const TEXT_EXTS: Record<string, true> = { '.txt': true, '.md': true, '.js': true, '.ts': true, '.tsx': true, '.jsx': true, '.json': true, '.css': true, '.py': true, '.rb': true, '.go': true, '.rs': true, '.sh': true, '.yml': true, '.yaml': true, '.toml': true, '.cfg': true, '.conf': true, '.ini': true, '.env': true, '.sql': true, '.csv': true, '.xml': true, '.log': true, '.jsonl': true, '.svelte': true, '.vue': true, '.astro': true, '.mjs': true, '.cjs': true }
+  const IMAGE_EXTS: Record<string, true> = { '.png': true, '.jpg': true, '.jpeg': true, '.gif': true, '.webp': true, '.svg': true, '.bmp': true, '.ico': true }
+  const VIDEO_EXTS: Record<string, true> = { '.mp4': true, '.m4v': true, '.mov': true, '.webm': true, '.ogv': true }
+  function fileKind(p: string): 'text' | 'image' | 'pdf' | 'video' | 'html' | 'binary' {
     const i = p.lastIndexOf('.')
     const ext = i >= 0 ? p.slice(i).toLowerCase() : ''
     if (ext === '.pdf') return 'pdf'
-    if (IMAGE_EXTS.has(ext)) return 'image'
-    if (TEXT_EXTS.has(ext) || ext === '') return 'text'
+    if (ext === '.html' || ext === '.htm') return 'html'
+    if (IMAGE_EXTS[ext]) return 'image'
+    if (VIDEO_EXTS[ext]) return 'video'
+    if (TEXT_EXTS[ext] || ext === '') return 'text'
     return 'binary'
   }
-  const [viewingFile, setViewingFile] = createSignal<{ path: string; kind: 'text' | 'image' | 'pdf' | 'binary'; content: string; blobUrl?: string; size?: number; error?: string } | null>(null)
+  const [viewingFile, setViewingFile] = createSignal<{ path: string; kind: 'text' | 'image' | 'pdf' | 'video' | 'html' | 'binary'; content: string; blobUrl?: string; size?: number; error?: string } | null>(null)
   function closeViewer() {
     const v = viewingFile()
     if (v?.blobUrl) URL.revokeObjectURL(v.blobUrl)
@@ -624,8 +631,17 @@ export default function App() {
     }).catch(() => {})
     fetch(appUrl('/api/quick-links')).then(r => r.ok ? r.json() : []).then(setLinks).catch(() => {})
     fetchStarred().then(setStarred).catch(() => {})
-    const hash = location.hash.slice(1)
-    if (hash) select(hash)
+    const hash = decodeURIComponent(location.hash.slice(1))
+    if (hash) {
+      if (isFledgeHost && !history.state?.fledgeSession) {
+        const chatUrl = location.href
+        history.replaceState({ fledgeHome: true }, '', `${location.pathname}${location.search}`)
+        history.pushState({ fledgeSession: hash }, '', chatUrl)
+      }
+      select(hash, false)
+    } else if (isFledgeHost) {
+      history.replaceState({ fledgeHome: true }, '', `${location.pathname}${location.search}`)
+    }
   }
 
   onMount(async () => {
@@ -642,6 +658,16 @@ export default function App() {
     window.visualViewport?.addEventListener('resize', setVh)
     window.addEventListener('resize', setVh)
     window.addEventListener('online', retryRecoverableWork)
+    const onFledgePopState = () => {
+      if (!isFledgeHost) return
+      const id = decodeURIComponent(location.hash.slice(1))
+      if (id) {
+        if (id !== currentId()) void select(id, false)
+      } else if (currentId()) {
+        clearSelectionForHome(false)
+      }
+    }
+    window.addEventListener('popstate', onFledgePopState)
 
     // The reverse proxy has already authenticated anyone who can load the app.
     // Warm Rooms alongside /api/me so the first render costs one round trip,
@@ -699,6 +725,7 @@ export default function App() {
       clearInterval(versionInterval)
       clearInterval(sessionsInterval)
       window.removeEventListener('online', retryRecoverableWork)
+      window.removeEventListener('popstate', onFledgePopState)
       window.visualViewport?.removeEventListener('resize', setVh)
       window.removeEventListener('resize', setVh)
     })
@@ -819,7 +846,7 @@ export default function App() {
     }
   }
 
-  async function select(id: string) {
+  async function select(id: string, updateHistory = true) {
     const prev = currentId()
     if (prev) {
       saveDraft(prev, text())
@@ -834,7 +861,18 @@ export default function App() {
     setCurrentId(id)
     setLoadedSessionId(null)
     setChatLoadError('')
-    location.hash = id
+    if (updateHistory) {
+      if (isFledgeHost) {
+        const currentHash = decodeURIComponent(location.hash.slice(1))
+        if (currentHash !== id) {
+          const url = new URL(location.href)
+          url.hash = encodeURIComponent(id)
+          history.pushState({ fledgeSession: id }, '', url)
+        }
+      } else {
+        location.hash = id
+      }
+    }
     setSidebar(false)
     setLoading(true)
     setLoadingMore(false)
@@ -1134,18 +1172,11 @@ export default function App() {
     if (!confirm('Delete this session?')) return
     setMenuOpen(false)
     await deleteSession(id)
-    dismissMediaNotice()
-    cancelSelectionWork()
-    setCurrentId(null)
-    setLoadedSessionId(null)
-    setChatLoadError('')
-    location.hash = ''
-    setMessages([])
-    clearProtocolRunSurfaces()
+    clearSelectionForHome(true)
     updateSessions(await fetchSessions())
   }
 
-  function goHome() {
+  function clearSelectionForHome(updateHistory: boolean) {
     dismissMediaNotice()
     const id = currentId()
     if (id) saveDraft(id, text())
@@ -1164,7 +1195,20 @@ export default function App() {
     setActivity(null)
     setQuestion(null)
     setSidebar(false)
-    location.hash = ''
+    if (!updateHistory) return
+    if (isFledgeHost) {
+      history.replaceState({ fledgeHome: true }, '', `${location.pathname}${location.search}`)
+    } else {
+      location.hash = ''
+    }
+  }
+
+  function goHome() {
+    if (isFledgeHost && currentId() && location.hash) {
+      history.back()
+      return
+    }
+    clearSelectionForHome(true)
   }
 
   async function doRename(id: string, title: string) {
@@ -1633,7 +1677,7 @@ export default function App() {
       const label = s.projectLabel || s.title.slice(0, 30)
       document.title = `${unreadPrefix}${dot} ${label}`
     } else {
-      document.title = `${unreadPrefix}Feather`
+      document.title = `${unreadPrefix}${isFledgeHost ? 'Fledge' : 'Feather'}`
     }
   })
 
@@ -1783,10 +1827,10 @@ export default function App() {
       style={{ display: 'flex', height: 'calc(var(--vh, 1vh) * 100)', width: '100%', 'font-family': "-apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif", position: 'relative', 'overscroll-behavior': 'none' }}>
 
       {/* Hamburger */}
-      <Show when={!sidebar()}>
+      <Show when={!sidebar() && !(isFledgeHost && !currentId() && homeView() === 'feed')}>
         <button onClick={() => setSidebar(true)} style={{ position: 'fixed', top: 'max(12px, env(safe-area-inset-top))', left: 'max(12px, env(safe-area-inset-left))', 'z-index': '50', background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', width: '36px', height: '36px', 'border-radius': '8px', 'font-size': '18px', cursor: 'pointer', display: 'flex', 'align-items': 'center', 'justify-content': 'center', '-webkit-tap-highlight-color': 'transparent' }}>&#9776;</button>
         <Show when={currentId()}>
-          <button onClick={goHome} title="Rooms home" style={{ position: 'fixed', top: 'max(12px, env(safe-area-inset-top))', left: 'calc(max(12px, env(safe-area-inset-left)) + 44px)', 'z-index': '50', background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', width: '36px', height: '36px', 'border-radius': '8px', 'font-size': '20px', cursor: 'pointer', display: 'flex', 'align-items': 'center', 'justify-content': 'center', '-webkit-tap-highlight-color': 'transparent' }}>&#8249;</button>
+          <button onClick={goHome} title={isFledgeHost ? 'Fledge home' : 'Rooms home'} style={{ position: 'fixed', top: 'max(12px, env(safe-area-inset-top))', left: 'calc(max(12px, env(safe-area-inset-left)) + 44px)', 'z-index': '50', background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', width: '36px', height: '36px', 'border-radius': '8px', 'font-size': '20px', cursor: 'pointer', display: 'flex', 'align-items': 'center', 'justify-content': 'center', '-webkit-tap-highlight-color': 'transparent' }}>&#8249;</button>
         </Show>
       </Show>
 
@@ -1796,7 +1840,7 @@ export default function App() {
       </Show>
 
       {/* Sidebar */}
-      <div style={{
+      <div aria-hidden={!sidebar()} inert={!sidebar()} style={{
         position: 'fixed', top: '0', left: '0', bottom: '0', width: '300px', 'max-width': '85vw',
         background: '#0d1117', 'z-index': '60',
         transform: sidebar() ? 'translateX(0)' : 'translateX(-100%)',
@@ -1806,7 +1850,7 @@ export default function App() {
       }}>
         <div style={{ display: 'flex', 'flex-direction': 'column', height: '100%' }}>
           <div style={{ padding: '12px 16px', display: 'flex', 'align-items': 'center', 'justify-content': 'space-between', 'border-bottom': '1px solid #1e1e1e' }}>
-            <span onClick={goHome} style={{ 'font-weight': '700', 'font-size': '16px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Feather</span>
+            <span onClick={goHome} style={{ 'font-weight': '700', 'font-size': '16px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>{isFledgeHost ? 'Fledge' : 'Feather'}</span>
             <div style={{ display: 'flex', 'align-items': 'center', gap: '8px' }}>
               <span style={{ 'font-size': '12px', color: '#4aba6a', 'font-weight': '500' }}>{authUser()?.username}</span>
               <button onClick={handleLogout} style={{ background: 'none', border: '1px solid #333', color: '#888', 'font-size': '11px', padding: '2px 8px', 'border-radius': '4px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Logout</button>
@@ -2005,10 +2049,11 @@ export default function App() {
 
       {/* Main */}
       <div style={{ flex: '1', display: 'flex', 'flex-direction': 'column', 'min-width': '0', height: '100%', position: 'relative' }}>
+        <Show when={currentId() || !isFledgeHost || homeView() === 'rooms'}>
         {/* Header */}
         <div style={{ position: 'relative', padding: '8px 16px 0 100px', 'padding-top': 'max(8px, env(safe-area-inset-top))', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'align-items': 'center', gap: '8px', 'min-height': '48px', 'flex-shrink': '0' }}>
           <span data-testid="build-version" title={`Build ${__BUILD_VERSION__}`} style={{ position: 'absolute', top: '2px', right: '10px', color: '#444', 'font-size': '8px', 'font-family': "'SF Mono', Menlo, monospace", 'line-height': '1', 'letter-spacing': '0.02em', 'white-space': 'nowrap' }}>{__BUILD_TIME__}</span>
-          <Show when={headerSession()} fallback={<span style={{ color: '#888', 'font-size': '14px', 'font-weight': '600' }}>{currentId() ? 'Loading...' : 'Feather'}</span>}>
+          <Show when={headerSession()} fallback={<span style={{ color: '#888', 'font-size': '14px', 'font-weight': '600' }}>{currentId() ? 'Loading...' : isFledgeHost ? 'Rooms' : 'Feather'}</span>}>
             {(s) => <>
               <Show when={s().isActive}><span style={{ width: '8px', height: '8px', 'border-radius': '50%', background: '#4aba6a', 'flex-shrink': '0' }} /></Show>
               <Show when={renaming()} fallback={
@@ -2065,6 +2110,7 @@ export default function App() {
             </>}
           </Show>
         </div>
+        </Show>
 
         {/* Tabs */}
         <Show when={currentId()}>
@@ -2091,13 +2137,34 @@ export default function App() {
         {/* Content */}
         <div style={{ flex: '1', overflow: 'hidden' }}>
           <Show when={currentId()} fallback={
-            <RoomsHome
-              onOpen={select}
-              onNewChat={(agent) => handleNew(false, agent)}
-              onSessionsChanged={() => fetchSessions().then(updateSessions).catch(() => {})}
-              creating={creating()}
-              codexAvailable={codexAvailable()}
-            />
+            <Show when={isFledgeHost && homeView() === 'feed'} fallback={
+              <div style={{ position: 'relative', height: '100%' }}>
+                <RoomsHome
+                  onOpen={select}
+                  onNewChat={(agent) => handleNew(false, agent)}
+                  onSessionsChanged={() => fetchSessions().then(updateSessions).catch(() => {})}
+                  creating={creating()}
+                  codexAvailable={codexAvailable()}
+                />
+                <Show when={isFledgeHost}>
+                  <button
+                    data-testid="fledge-feed-return"
+                    onClick={() => setHomeView('feed')}
+                    style={{ position: 'fixed', right: 'max(14px, env(safe-area-inset-right))', bottom: 'max(18px, env(safe-area-inset-bottom))', 'z-index': '55', border: '1px solid #d8ff5770', background: '#111a15', color: '#e9f6c5', padding: '10px 15px', 'border-radius': '999px', 'font-size': '12px', 'font-weight': '700', 'letter-spacing': '0.04em', cursor: 'pointer', 'box-shadow': '0 8px 30px rgba(0,0,0,.35)' }}
+                  >
+                    Return to feed
+                  </button>
+                </Show>
+              </div>
+            }>
+              <FeedHome
+                onOpen={select}
+                onMenu={() => setSidebar(true)}
+                onRooms={() => setHomeView('rooms')}
+                onNewChat={() => handleNew(false, 'omp')}
+                onOpenFile={openFile}
+              />
+            </Show>
           }>
             <div data-testid="chat-panel" style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
               <MessageView
@@ -2108,6 +2175,7 @@ export default function App() {
                 onLoadEarlier={loadEarlier}
                 onAnswer={(answer) => { if (composerReady()) sendInput(currentId()!, answer) }}
                 onKeys={(keys) => { if (composerReady()) sendSessionKeys(currentId()!, keys).catch(console.error) }}
+                onOpenFile={openFile}
                 starred={new Set(starred()[currentId()!] || [])}
                 onToggleStar={(uuid) => { if (loadedSessionId()) toggleStar(loadedSessionId()!, uuid) }}
                 working={working()}
@@ -2295,8 +2363,9 @@ export default function App() {
             const name = slash >= 0 ? v.path.slice(slash + 1) : v.path
             const dir = slash >= 0 ? v.path.slice(0, slash) : ''
             const rawUrl = appUrl(`/api/files/raw?path=${encodeURIComponent(v.path)}`)
-            const kindLabel = v.kind === 'pdf' ? 'PDF' : v.kind === 'image' ? 'IMAGE' : v.kind === 'binary' ? 'BINARY' : 'TEXT'
-            const kindColor = v.kind === 'pdf' ? '#e57373' : v.kind === 'image' ? '#81c784' : v.kind === 'binary' ? '#ba68c8' : '#73b8ff'
+            const htmlUrl = appUrl(`/api/files/html?path=${encodeURIComponent(v.path)}`)
+            const kindLabel = v.kind === 'pdf' ? 'PDF' : v.kind === 'image' ? 'IMAGE' : v.kind === 'video' ? 'VIDEO' : v.kind === 'html' ? 'INTERACTIVE' : v.kind === 'binary' ? 'BINARY' : 'TEXT'
+            const kindColor = v.kind === 'pdf' ? '#e57373' : v.kind === 'image' ? '#81c784' : v.kind === 'video' ? '#d8ff57' : v.kind === 'html' ? '#f0bd66' : v.kind === 'binary' ? '#ba68c8' : '#73b8ff'
             return (
               <div onClick={closeViewer} style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.6)', 'backdrop-filter': 'blur(4px)', 'z-index': '200', display: 'flex', 'align-items': 'stretch', 'justify-content': 'center', padding: 'max(20px, env(safe-area-inset-top)) 16px max(20px, env(safe-area-inset-bottom))' }}>
                 <div onClick={(e) => e.stopPropagation()} style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '12px', 'max-width': '900px', width: '100%', display: 'flex', 'flex-direction': 'column', overflow: 'hidden', 'box-shadow': '0 12px 40px rgba(0,0,0,0.5)' }}>
@@ -2326,6 +2395,18 @@ export default function App() {
                     <Show when={v.kind === 'pdf' && !v.error && v.blobUrl}>
                       <iframe src={v.blobUrl} style={{ display: 'block', width: '100%', height: '70vh', border: 'none', background: '#fff' }} title={name} />
                     </Show>
+                    <Show when={v.kind === 'video' && !v.error}>
+                      <video controls playsinline preload="metadata" src={rawUrl} style={{ display: 'block', width: '100%', 'max-height': '76vh', background: '#000' }} />
+                    </Show>
+                    <Show when={v.kind === 'html' && !v.error}>
+                      <iframe
+                        src={htmlUrl}
+                        sandbox="allow-scripts allow-downloads"
+                        referrerpolicy="no-referrer"
+                        style={{ display: 'block', width: '100%', height: '76vh', border: 'none', background: '#fff' }}
+                        title={name}
+                      />
+                    </Show>
                     <Show when={v.kind === 'binary' && !v.error}>
                       <div style={{ padding: '40px 20px', 'text-align': 'center', color: '#aaa' }}>
                         <div style={{ 'font-size': '48px', 'margin-bottom': '12px', opacity: '0.6' }}>📦</div>
@@ -2338,7 +2419,7 @@ export default function App() {
                       <div style={{ padding: '20px', color: '#666', 'font-size': '13px' }}>Loading…</div>
                     </Show>
                     <Show when={v.kind === 'text' && !v.error && v.content && isMd}>
-                      <div class="prose" style={{ padding: '4px 24px', color: '#d0d0d0', 'font-size': '14px', 'line-height': '1.55' }} innerHTML={marked.parse(v.content) as string} />
+                      <div style={{ padding: '4px 24px', color: '#d0d0d0', 'font-size': '14px', 'line-height': '1.55' }}><RichMarkdown text={v.content} onOpenFile={openFile} /></div>
                     </Show>
                     <Show when={v.kind === 'text' && !v.error && v.content && !isMd}>
                       <pre style={{ margin: '0', padding: '16px 20px', color: '#d0d0d0', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{v.content}</pre>

@@ -112,7 +112,7 @@ export async function fetchRooms(maxAgeMs = 0): Promise<RoomInfo[]> {
   finally { roomsRequest = null }
 }
 
-export interface RoomUpdate { id: string | null; ts: string | null; text: string }
+export interface RoomUpdate { id: string | null; ts: string | null; title?: string; text: string }
 
 export interface FrictionComplaint {
   id: string
@@ -303,6 +303,78 @@ export interface ProtocolRunSnapshot {
   cancelActionId?: string
   reason?: string
   error?: string
+}
+
+export type FeedMode = 'for-you' | 'latest' | 'needs-me'
+
+export type FeedReaction = 'like' | 'less'
+export type FeedDelivery = 'queued' | 'delivered' | 'failed'
+
+export interface FeedCommentReply {
+  text: string
+  timestamp: string
+}
+
+export interface FeedComment {
+  id: string
+  text: string
+  createdAt: string
+  delivery: 'queued' | 'delivered' | 'failed'
+  reply?: FeedCommentReply
+}
+
+export interface FeedPost {
+  id: string
+  kind: 'session' | 'room-update'
+  timestamp: string
+  sessionId: string | null
+  room: string | null
+  projectId: string | null
+  projectLabel: string | null
+  title: string
+  agent: 'claude' | 'codex' | 'omp' | null
+  status: 'waiting' | 'working' | 'errored' | 'finished'
+  question?: string
+  activity?: string
+  message?: Message
+  updateText?: string
+  score: number
+  why: string
+  reaction?: FeedReaction | null
+  reactionDelivery?: FeedDelivery | null
+  comments?: FeedComment[]
+}
+
+export interface FeedResponse {
+  generatedAt: string
+  nextBefore: string | null
+  counts: { waiting: number; working: number; errored: number; finished: number }
+  posts: FeedPost[]
+}
+
+export async function fetchFeed(mode: FeedMode, limit = 20, before?: string, signal?: AbortSignal): Promise<FeedResponse> {
+  const params = new URLSearchParams({ mode, limit: String(limit) })
+  if (before) params.set('before', before)
+  const response = await fetch(`${BASE}/api/feed?${params}`, { signal })
+  return responseJson<FeedResponse>(response)
+}
+
+export async function setFeedReaction(postId: string, reaction: FeedReaction | null): Promise<{ reaction: FeedReaction | null; reactionDelivery: FeedDelivery | null; changed: boolean; delivery: 'delivered' | 'failed' | 'not-needed' }> {
+  const response = await fetch(`${BASE}/api/feed/${encodeURIComponent(postId)}/reaction`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reaction }),
+  })
+  return responseJson(response)
+}
+
+export async function postFeedComment(postId: string, id: string, text: string): Promise<{ comment: FeedComment }> {
+  const response = await fetch(`${BASE}/api/feed/${encodeURIComponent(postId)}/comments`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, text }),
+  })
+  return responseJson(response)
 }
 
 export async function fetchSessions(project?: string | null, query?: string, limit?: number): Promise<SessionMeta[]> {

@@ -192,7 +192,7 @@ describe('server-enforced read-only canary', () => {
     assert.equal(health.capabilities.maxAudioBytes, 25 * 1024 * 1024)
 
     const readable = [
-      '/api/health', '/api/sessions',
+      '/api/health', '/api/feed', '/api/sessions',
       `/api/sessions/${fx.sessionId}/messages`, `/api/sessions/${fx.sessionId}/export`,
       `/api/files/raw?path=${encodeURIComponent(fx.readableFile)}`,
       `/api/files/list?dir=${encodeURIComponent(fx.home)}`,
@@ -211,8 +211,13 @@ describe('server-enforced read-only canary', () => {
     const mutations = [
       ['GET', '/api/future-side-effect'],
       ['GET', '/api/push/key'],
+      ['POST', '/api/push/subscribe', { endpoint: 'https://push.example.com/sub', keys: {} }],
+      ['DELETE', '/api/push/subscribe', { endpoint: 'https://push.example.com/sub' }],
+      ['POST', '/api/push/test', {}],
       ['POST', '/api/sessions', { id: 'new-session', cwd: fx.home }],
       ['POST', `/api/sessions/${fx.sessionId}/send`, { text: 'no' }],
+      ['PUT', '/api/feed/readonly-post/reaction', { reaction: 'like' }],
+      ['POST', '/api/feed/readonly-post/comments', { id: '20000000-0000-4000-8000-000000000099', text: 'no' }],
       ['POST', `/api/sessions/${fx.sessionId}/keys`, { keys: ['Enter'] }],
       ['POST', `/api/sessions/${fx.sessionId}/resume`, {}],
       ['POST', `/api/sessions/${fx.sessionId}/interrupt`, {}],

@@ -19,14 +19,15 @@ explicitly; Feather never silently substitutes or overwrites it.
 
 ## Compatibility matrix
 
-All current schemas are **v0 (unversioned)**. Adding a version envelope or
-changing a root type requires a new matrix row/version and a downgrade adapter
-before the new writer may be deployed.
+Existing documents remain **v0 (unversioned)** unless their row names a
+versioned envelope. Adding or changing an envelope/root type requires a new
+matrix row/version and a downgrade adapter before the new writer is deployed.
 
-| Document | Owner/root | Valid v0 root | Missing default | Mutation compatibility with `601c2dc` | Mode |
+| Document | Owner/root | Valid root/schema | Missing default | Mutation compatibility with `601c2dc` | Mode |
 |---|---|---|---|---|---|
 | `session-meta.json` | Instance state | Object keyed by session id | `{}` | Per-session updates spread existing records; deletion removes only the selected id | Existing mode, new `0644` |
 | `project-labels.json` | Instance state | Object keyed by project id | `{}` | Label updates preserve all other keys | Existing mode, new `0644` |
+| `feed-interactions.json` | Instance state | Schema 1 `{ "schema": 1, "posts": { ... } }` | `{ "schema": 1, "posts": {} }` | Per-post reaction/comment updates preserve unrelated posts; bounded snapshots retain the originating session; older releases ignore and retain the unknown file | `0600` |
 | `quick-links.json` | Instance state | Array | `[]` | Whole-array API remains unchanged; clients own the complete array | Existing mode, new `0644` |
 | `starred.json` | Instance state | Object | `{}` | Whole-object API remains unchanged; clients own the complete object | Existing mode, new `0644` |
 | `muted.json` | Instance state | Array of session ids | `[]` | Whole-array API remains unchanged | Existing mode, new `0644` |

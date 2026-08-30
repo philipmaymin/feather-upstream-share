@@ -67,6 +67,7 @@ const READ_ONLY_ERROR = Object.freeze({ error: 'read-only canary', code: 'FEATHE
 const SESSION_READ_ROUTE = /^\/api\/sessions\/[^/]+\/(messages|stream|export|protocol-runs)$/;
 
 const PORT = parseInt(process.env.PORT || '4870');
+const HOST = process.env.HOST || '127.0.0.1';
 const HOME = process.env.HOME || '/home/user';
 const LEGACY_STATE_ROOT = path.join(HOME, '.feather');
 const STATE_PATHS = resolveStatePaths({
@@ -305,16 +306,19 @@ function writeMeta(meta) {
 
 const MESSAGE_TAIL_CHUNK_BYTES = 1024 * 1024;
 
-function readLatestMessages(fpath, agent, count) {
+function readLatestMessages(fpath, agent, count, maxBytes = Infinity) {
   const wanted = Math.max(1, count);
+  const byteLimit = Number.isFinite(maxBytes) ? Math.max(1, maxBytes) : Infinity;
   const reverse = [];
   const fd = fs.openSync(fpath, 'r');
   let position = fs.fstatSync(fd).size;
+  let bytesRead = 0;
   let suffix = Buffer.alloc(0);
   try {
-    while (position > 0 && reverse.length <= wanted) {
-      const length = Math.min(MESSAGE_TAIL_CHUNK_BYTES, position);
+    while (position > 0 && reverse.length <= wanted && bytesRead < byteLimit) {
+      const length = Math.min(MESSAGE_TAIL_CHUNK_BYTES, position, byteLimit - bytesRead);
       position -= length;
+      bytesRead += length;
       const chunk = Buffer.allocUnsafe(length);
       fs.readSync(fd, chunk, 0, length, position);
       const data = suffix.length ? Buffer.concat([chunk, suffix]) : chunk;
@@ -339,17 +343,17 @@ function readLatestMessages(fpath, agent, count) {
   }
   return {
     messages: reverse.slice(0, wanted).reverse(),
-    hasEarlier: reverse.length > wanted,
+    hasEarlier: position > 0 || reverse.length > wanted,
   };
 }
 
-function getMessages(sessionId, limit = 100, before = 0) {
+function getMessages(sessionId, limit = 100, before = 0, maxBytes = Infinity) {
   const agent = getAgentForSession(sessionId);
   const fpath = findJsonlPath(sessionId, agent);
   if (!fpath || !fs.existsSync(fpath)) return { messages: [], hasMore: false };
   const pageSize = Math.max(1, limit);
   const offset = Math.max(0, before);
-  const tail = readLatestMessages(fpath, agent, pageSize + offset);
+  const tail = readLatestMessages(fpath, agent, pageSize + offset, maxBytes);
   const end = Math.max(0, tail.messages.length - offset);
   const start = Math.max(0, end - pageSize);
   return {
@@ -360,13 +364,46 @@ function getMessages(sessionId, limit = 100, before = 0) {
 
 // ── Per-user JSON helpers ──────────────────────────────────────────────────
 
+const PUSH_MAX_SUBSCRIPTIONS = 50;
+const PUSH_MAX_ENDPOINT_BYTES = 2048;
+const PUSH_MAX_KEY_BYTES = 256;
+const PUSH_MAX_STATE_BYTES = 256 * 1024;
+
+function validEncodedPushKey(value, bytes) {
+  return typeof value === 'string'
+    && /^[A-Za-z0-9_-]+$/.test(value)
+    && Buffer.from(value, 'base64url').length === bytes;
+}
+
+function validPushSubscription(sub) {
+  if (!isJsonRecord(sub)
+    || typeof sub.endpoint !== 'string'
+    || Buffer.byteLength(sub.endpoint, 'utf8') > PUSH_MAX_ENDPOINT_BYTES
+    || !webpush.validPushEndpoint(sub.endpoint)
+    || !isJsonRecord(sub.keys)
+    || !validEncodedPushKey(sub.keys.p256dh, 65)
+    || !validEncodedPushKey(sub.keys.auth, 16)
+    || Buffer.byteLength(sub.keys.p256dh, 'utf8') > PUSH_MAX_KEY_BYTES
+    || Buffer.byteLength(sub.keys.auth, 'utf8') > PUSH_MAX_KEY_BYTES
+    || !validFeedTimestamp(sub.at)) return false;
+  return true;
+}
+
+function isPushSubscriptionState(value) {
+  return Array.isArray(value)
+    && value.length <= PUSH_MAX_SUBSCRIPTIONS
+    && Buffer.byteLength(JSON.stringify(value), 'utf8') <= PUSH_MAX_STATE_BYTES
+    && value.every(validPushSubscription)
+    && new Set(value.map(sub => sub.endpoint)).size === value.length;
+}
+
 const USER_JSON_STATES = new Map([
   ['project-labels.json', createJsonState({ file: STATE_PATHS.instance.projectLabelsFile, root: featherDir(), document: 'project labels', defaultValue: {}, validate: isJsonRecord })],
   ['quick-links.json', createJsonState({ file: STATE_PATHS.instance.quickLinksFile, root: featherDir(), document: 'quick links', defaultValue: [], validate: Array.isArray })],
   ['starred.json', createJsonState({ file: STATE_PATHS.instance.starredFile, root: featherDir(), document: 'starred messages', defaultValue: {}, validate: isJsonRecord })],
   ['muted.json', createJsonState({ file: STATE_PATHS.instance.mutedFile, root: featherDir(), document: 'muted sessions', defaultValue: [], validate: Array.isArray })],
   ['push-keys.json', createJsonState({ file: STATE_PATHS.instance.pushKeysFile, root: featherDir(), document: 'push signing keys', defaultValue: {}, validate: isJsonRecord, mode: 0o600 })],
-  ['push-subscriptions.json', createJsonState({ file: STATE_PATHS.instance.pushSubscriptionsFile, root: featherDir(), document: 'push subscriptions', defaultValue: [], validate: Array.isArray })],
+  ['push-subscriptions.json', createJsonState({ file: STATE_PATHS.instance.pushSubscriptionsFile, root: featherDir(), document: 'push subscriptions', defaultValue: [], validate: isPushSubscriptionState })],
 ]);
 
 function readUserJson(filename, fallback) {
@@ -2232,7 +2269,7 @@ app.use(express.json({ limit: '512kb' }));
 // are explicitly classified, while static and non-API reads remain available.
 const READ_ONLY_API_ROUTES = [
   /^\/api\/health$/,
-  /^\/api\/(agents|rooms|version|projects|search|sessions|running|usage|digest|me)$/,
+  /^\/api\/(agents|feed|rooms|version|projects|search|sessions|running|usage|digest|me)$/,
   /^\/api\/rooms\/[^/]+\/(updates|friction)$/,
   SESSION_READ_ROUTE,
   /^\/api\/sidecar$/,
@@ -2836,13 +2873,24 @@ function lastRoomMessageSnippet(sessionId, agent) {
 // Human-facing room briefings are separate from terse agent working memory in
 // notes.md. The JSONL feed is append-only so its count is a stable unread marker.
 const ROOM_UPDATE_MAX_CHARS = 4000;
+const ROOM_UPDATE_TITLE_MAX_CHARS = 140;
+function roomUpdateTitle(text) {
+  const firstLine = String(text || '').split('\n').map(line => line.trim()).find(Boolean) || '';
+  return firstLine
+    .replace(/^#{1,6}\s+/, '')
+    .replace(/^[-*+]\s+/, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/[*_`~]/g, '')
+    .trim()
+    .slice(0, ROOM_UPDATE_TITLE_MAX_CHARS);
+}
 function roomUpdatesFile(name) { return path.join(ROOMS_HOME_DIR, name, 'updates.jsonl'); }
 
-function readRoomUpdates(name) {
-  let raw;
-  try { raw = fs.readFileSync(roomUpdatesFile(name), 'utf8'); } catch { return []; }
+function parseRoomUpdates(raw, dropPartialFirstLine = false) {
+  const lines = raw.split('\n');
+  if (dropPartialFirstLine) lines.shift();
   const updates = [];
-  for (const line of raw.split('\n')) {
+  for (const line of lines) {
     if (!line.trim()) continue;
     try {
       const entry = JSON.parse(line);
@@ -2851,11 +2899,37 @@ function readRoomUpdates(name) {
           id: typeof entry.id === 'string' ? entry.id : null,
           ts: typeof entry.ts === 'string' ? entry.ts : null,
           text: entry.text,
+          title: typeof entry.title === 'string' && entry.title.trim()
+            ? entry.title.trim().slice(0, ROOM_UPDATE_TITLE_MAX_CHARS)
+            : roomUpdateTitle(entry.text),
         });
       }
     } catch {}
   }
   return updates;
+}
+
+function readRoomUpdates(name) {
+  let raw;
+  try { raw = fs.readFileSync(roomUpdatesFile(name), 'utf8'); } catch { return []; }
+  return parseRoomUpdates(raw);
+}
+
+function readLatestRoomUpdates(name, limit) {
+  const maxBytes = 512 * 1024;
+  let fd;
+  try {
+    fd = fs.openSync(roomUpdatesFile(name), 'r');
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - maxBytes);
+    const buffer = Buffer.allocUnsafe(size - start);
+    fs.readSync(fd, buffer, 0, buffer.length, start);
+    return parseRoomUpdates(buffer.toString('utf8'), start > 0).slice(-limit);
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 function roomUpdatesSummary(name) {
@@ -2868,11 +2942,16 @@ function roomUpdatesSummary(name) {
   };
 }
 
-function appendRoomUpdate(name, text) {
+function appendRoomUpdate(name, text, title) {
   const clean = String(text == null ? '' : text).trim();
   if (!clean) throw httpError(400, 'update text is required');
   if (clean.length > ROOM_UPDATE_MAX_CHARS) throw httpError(413, `update exceeds ${ROOM_UPDATE_MAX_CHARS} characters`);
-  const entry = { id: randomUUID(), ts: new Date().toISOString(), text: clean };
+  const cleanTitle = String(title == null ? '' : title).trim() || roomUpdateTitle(clean);
+  if (!cleanTitle) throw httpError(400, 'update title is required');
+  if (cleanTitle.length > ROOM_UPDATE_TITLE_MAX_CHARS) {
+    throw httpError(413, `update title exceeds ${ROOM_UPDATE_TITLE_MAX_CHARS} characters`);
+  }
+  const entry = { id: randomUUID(), ts: new Date().toISOString(), title: cleanTitle, text: clean };
   fs.appendFileSync(roomUpdatesFile(name), JSON.stringify(entry) + '\n');
   return entry;
 }
@@ -3115,14 +3194,818 @@ app.post('/api/rooms/:name/updates', (req, res) => {
   try {
     const { name } = req.params;
     if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
-    const entry = appendRoomUpdate(name, req.body?.text);
+    const entry = appendRoomUpdate(name, req.body?.text, req.body?.title);
     roomSnapshotCache.update(rooms => rooms.map(room =>
       room.name === name ? { ...room, updates: roomUpdatesSummary(name) } : room));
     res.json({ ok: true, update: entry });
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
-const ROOM_PULSE_PROMPT = `Keep working on this room. Read AGENTS.md, notes.md, and the recent chats in this room. Then do the next useful thing fully autonomously. Do not ask the user to choose routine steps. Use tools and agents if useful. Append what you did and any open thread to notes.md. If you did something a person walking in cold would care about, also post a human-facing briefing: room update "<what happened and why it matters>". Write that update for a busy, sharp executive who has not seen this room in a day — plain language, lead with the outcome and why they should care, a few sentences over terseness; notes.md stays your terse working memory. If you hit a recurring annoyance, run: room complain "describe it plainly". If this room genuinely has no useful next action, run: room pause. Then stop.`;
+const FEED_DEFAULT_LIMIT = 20;
+const FEED_MAX_LIMIT = 50;
+const FEED_SESSION_MESSAGES = 80;
+const FEED_TRANSCRIPT_BYTES = 4 * 1024 * 1024;
+const FEED_MESSAGE_MAX_CHARS = 32 * 1024;
+const FEED_ROOM_LIMIT = 100;
+const FEED_UPDATES_PER_ROOM = 10;
+const FEED_SCORE_BAND = 20_000_000_000_000;
+const FEED_MODES = Object.freeze({ 'for-you': true, latest: true, 'needs-me': true });
+const FEED_REACTIONS = Object.freeze({ like: true, less: true });
+const FEED_DELIVERIES = Object.freeze({ queued: true, delivered: true, failed: true });
+const FEED_POST_KINDS = Object.freeze({ session: true, 'room-update': true });
+const FEED_POST_STATUSES = Object.freeze({ waiting: true, working: true, errored: true, finished: true });
+const FEED_INTERACTION_MAX_POSTS = 500;
+const FEED_INTERACTION_MAX_COMMENTS = 10;
+const FEED_COMMENT_MAX_BYTES = 4000;
+const FEED_REPLY_MAX_BYTES = 8 * 1024;
+const FEED_SNAPSHOT_MAX_BYTES = 64 * 1024;
+const FEED_POST_ID_MAX_CHARS = 512;
+const FEED_INTERACTION_STATE_MAX_BYTES = 64 * 1024 * 1024;
+const feedMessageCache = new Map();
+
+function validFeedTimestamp(value) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value));
+}
+
+function validFeedSnapshot(snapshot, postId, sessionId) {
+  if (!isJsonRecord(snapshot)
+    || snapshot.id !== postId
+    || !Object.hasOwn(FEED_POST_KINDS, snapshot.kind)
+    || !validFeedTimestamp(snapshot.timestamp)
+    || snapshot.sessionId !== sessionId
+    || (snapshot.room !== null && typeof snapshot.room !== 'string')
+    || (snapshot.projectId !== null && typeof snapshot.projectId !== 'string')
+    || (snapshot.projectLabel !== null && typeof snapshot.projectLabel !== 'string')
+    || typeof snapshot.title !== 'string'
+    || (snapshot.agent !== null && !SUPPORTED_AGENTS.has(snapshot.agent))
+    || !Object.hasOwn(FEED_POST_STATUSES, snapshot.status)
+    || !Number.isFinite(snapshot.score)
+    || typeof snapshot.why !== 'string') return false;
+  if (snapshot.question !== undefined && typeof snapshot.question !== 'string') return false;
+  if (snapshot.activity !== undefined && typeof snapshot.activity !== 'string') return false;
+  if (snapshot.kind === 'session') {
+    if (typeof snapshot.sessionId !== 'string'
+      || !isJsonRecord(snapshot.message)
+      || snapshot.message.role !== 'assistant'
+      || !validFeedTimestamp(snapshot.message.timestamp)
+      || !Array.isArray(snapshot.message.content)
+      || snapshot.message.content.length === 0
+      || !snapshot.message.content.every(block =>
+        isJsonRecord(block) && block.type === 'text' && typeof block.text === 'string' && !!block.text.trim())) return false;
+  }
+  if (snapshot.kind === 'room-update' && typeof snapshot.updateText !== 'string') return false;
+  return Buffer.byteLength(JSON.stringify(snapshot), 'utf8') <= FEED_SNAPSHOT_MAX_BYTES;
+}
+
+function validFeedComment(comment) {
+  if (!isJsonRecord(comment)
+    || typeof comment.id !== 'string'
+    || !UUID_RE.test(comment.id.toLowerCase())
+    || typeof comment.text !== 'string'
+    || !comment.text.trim()
+    || Buffer.byteLength(comment.text, 'utf8') > FEED_COMMENT_MAX_BYTES
+    || !validFeedTimestamp(comment.createdAt)
+    || !Object.hasOwn(FEED_DELIVERIES, comment.delivery)) return false;
+  return comment.reply === undefined
+    || (isJsonRecord(comment.reply)
+      && typeof comment.reply.text === 'string'
+      && !!comment.reply.text.trim()
+      && Buffer.byteLength(comment.reply.text, 'utf8') <= FEED_REPLY_MAX_BYTES
+      && validFeedTimestamp(comment.reply.timestamp));
+}
+
+function validFeedReactionDelivery(delivery, reaction, sessionId) {
+  if (reaction === null || sessionId === null) return delivery === null;
+  return isJsonRecord(delivery)
+    && delivery.reaction === reaction
+    && Object.hasOwn(FEED_DELIVERIES, delivery.status)
+    && typeof delivery.messageId === 'string'
+    && /^[a-zA-Z0-9_-]{8,128}$/.test(delivery.messageId)
+    && validFeedTimestamp(delivery.updatedAt);
+}
+
+function isFeedInteractionState(value) {
+  if (!isJsonRecord(value) || value.schema !== 1 || !isJsonRecord(value.posts)) return false;
+  const entries = Object.entries(value.posts);
+  if (entries.length > FEED_INTERACTION_MAX_POSTS
+    || Buffer.byteLength(JSON.stringify(value), 'utf8') > FEED_INTERACTION_STATE_MAX_BYTES) return false;
+  return entries.every(([postId, record]) => {
+    if (!/^feed_[a-f0-9]{32}$/.test(postId)
+      || !isJsonRecord(record)
+      || record.postId !== postId
+      || (record.sessionId !== null && (typeof record.sessionId !== 'string' || record.sessionId.length > 256))
+      || (record.reaction !== null && !Object.hasOwn(FEED_REACTIONS, record.reaction))
+      || !validFeedReactionDelivery(record.reactionDelivery, record.reaction, record.sessionId)
+      || !validFeedTimestamp(record.lastInteractionAt)
+      || !Array.isArray(record.comments)
+      || record.comments.length > FEED_INTERACTION_MAX_COMMENTS
+      || !validFeedSnapshot(record.snapshot, postId, record.sessionId)) return false;
+    const commentIds = new Set(record.comments.map(comment => comment?.id));
+    return commentIds.size === record.comments.length && record.comments.every(validFeedComment);
+  });
+}
+
+const FEED_INTERACTIONS_STATE = createJsonState({
+  file: STATE_PATHS.instance.feedInteractionsFile,
+  root: path.dirname(STATE_PATHS.instance.feedInteractionsFile),
+  document: 'feed interactions',
+  defaultValue: { schema: 1, posts: {} },
+  validate: isFeedInteractionState,
+  mode: 0o600,
+});
+function feedStableId(...parts) {
+  const hash = createHash('sha256');
+  for (const part of parts) {
+    const value = String(part);
+    hash.update(`${Buffer.byteLength(value, 'utf8')}:`).update(value);
+  }
+  return `feed_${hash.digest('hex').slice(0, 32)}`;
+}
+
+function feedMessageForSession(session) {
+  const cacheKey = `${session.agent}:${session.updatedAt}:${session[SESSION_SOURCE_MTIME] || ''}`;
+  const cached = feedMessageCache.get(session.id);
+  if (cached?.key === cacheKey) return cached.message;
+
+  const { messages } = getMessages(session.id, FEED_SESSION_MESSAGES, 0, FEED_TRANSCRIPT_BYTES);
+  const hasHumanMessage = messages.some(message =>
+    message.role === 'user'
+    && !message.internal
+    && message.content?.some(block => block?.type === 'text' && block.text?.trim()));
+  let result = null;
+  if (hasHumanMessage) {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      if (message.role !== 'assistant' || message.internal) continue;
+      const textBlocks = message.content?.filter(block =>
+        block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) || [];
+      if (textBlocks.length === 0) continue;
+
+      let remaining = FEED_MESSAGE_MAX_CHARS;
+      const content = [];
+      for (const block of textBlocks) {
+        if (remaining <= 0) break;
+        const text = block.text.slice(0, remaining);
+        content.push({ type: 'text', text });
+        remaining -= text.length;
+      }
+      const timestampMs = Date.parse(message.timestamp || '');
+      if (Number.isFinite(timestampMs)) {
+        result = {
+          ...message,
+          timestamp: new Date(timestampMs).toISOString(),
+          content,
+        };
+      }
+      break;
+    }
+  }
+  feedMessageCache.set(session.id, { key: cacheKey, message: result });
+  return result;
+}
+
+function feedLiveState(session) {
+  let question = null;
+  let activity = null;
+  if (session.isActive) {
+    try {
+      const { lines } = capturePaneLines(existingTmuxName(session.id));
+      activity = extractActivity(lines);
+      question = extractQuestion(lines, !!activity);
+    } catch {}
+  }
+  if (question) {
+    return {
+      status: 'waiting',
+      question: question.question?.trim() || 'Your input is required',
+      why: 'Waiting for your answer',
+    };
+  }
+  if (activity) return { status: 'working', activity, why: `Active now: ${activity}` };
+  if (session.outcome === 'errored') {
+    return { status: 'errored', why: 'The latest run ended with an error' };
+  }
+  return { status: 'finished', why: null };
+}
+
+function feedCompletionWhy(timestamp, generatedAt, kind) {
+  const age = generatedAt - Date.parse(timestamp);
+  const recent = age >= 0 && age <= 7 * 24 * 60 * 60 * 1000;
+  if (kind === 'room-update') return recent ? 'Recent Room update' : 'Earlier Room update';
+  return recent ? 'Recent assistant completion' : 'Earlier assistant completion';
+}
+
+function feedScore(status, timestamp) {
+  const priority = { waiting: 4, errored: 3, working: 2, finished: 1 }[status];
+  return priority * FEED_SCORE_BAND + Math.floor(Date.parse(timestamp) / 1000);
+}
+
+function feedRoomGroups(sessions) {
+  const names = listRoomDirs();
+  const roomNames = new Set(names);
+  const assignments = readRoomAssignments();
+  const recentIds = new Set(sessions.map(session => session.id));
+  const requiredIds = Object.keys(assignments)
+    .filter(sessionId => roomNames.has(assignments[sessionId]) && !recentIds.has(sessionId))
+    .sort()
+    .slice(0, FEED_ROOM_LIMIT);
+  const assignedHistory = requiredIds.length ? discoverSessions(0, null, requiredIds) : [];
+  const grouped = groupRoomSessions({
+    roomNames: names,
+    roomsRoot: ROOMS_HOME_DIR,
+    sessions: [...sessions, ...assignedHistory],
+    assignments,
+  });
+  return names.map(name => {
+    const roomSessions = grouped.get(name) || [];
+    let updateMtime = 0;
+    try { updateMtime = fs.statSync(roomUpdatesFile(name)).mtimeMs; } catch {}
+    return {
+      name,
+      sessions: roomSessions,
+      recency: Math.max(Date.parse(roomSessions[0]?.updatedAt || '') || 0, updateMtime),
+    };
+  })
+    .sort((a, b) => b.recency - a.recency || a.name.localeCompare(b.name))
+    .slice(0, FEED_ROOM_LIMIT);
+}
+
+function buildLiveFeedPosts(generatedAt) {
+  const sessions = [...sessionsSnapshotCache.get()];
+  const liveSessionIds = new Set(sessions.map(session => session.id));
+  for (const sessionId of feedMessageCache.keys()) {
+    if (!liveSessionIds.has(sessionId)) feedMessageCache.delete(sessionId);
+  }
+
+  const rooms = feedRoomGroups(sessions);
+  const roomBySession = new Map();
+  for (const room of rooms) {
+    for (const session of room.sessions) {
+      if (!roomBySession.has(session.id)) roomBySession.set(session.id, room.name);
+    }
+  }
+
+  const posts = [];
+  for (const session of sessions) {
+    const message = feedMessageForSession(session);
+    if (!message) continue;
+    const timestamp = message.timestamp;
+    const live = feedLiveState(session);
+    const status = live.status;
+    posts.push({
+      id: feedStableId('session', session.id, message.uuid || '', timestamp, JSON.stringify(message.content)),
+      kind: 'session',
+      timestamp,
+      sessionId: session.id,
+      room: roomBySession.get(session.id) || null,
+      projectId: session.projectId || null,
+      projectLabel: session.projectLabel || null,
+      title: session.title,
+      agent: SUPPORTED_AGENTS.has(session.agent) ? session.agent : null,
+      status,
+      ...(live.question ? { question: live.question } : {}),
+      ...(live.activity ? { activity: live.activity } : {}),
+      message,
+      score: feedScore(status, timestamp),
+      why: live.why || feedCompletionWhy(timestamp, generatedAt, 'session'),
+    });
+  }
+
+  for (const room of rooms) {
+    const linked = room.sessions[0] || null;
+    for (const update of readLatestRoomUpdates(room.name, FEED_UPDATES_PER_ROOM)) {
+      const timestampMs = Date.parse(update.ts || '');
+      const updateText = update.text.trim().slice(0, ROOM_UPDATE_MAX_CHARS);
+      if (!Number.isFinite(timestampMs) || !updateText) continue;
+      const timestamp = new Date(timestampMs).toISOString();
+      posts.push({
+        id: feedStableId('room-update', room.name, update.id || '', timestamp, updateText),
+        kind: 'room-update',
+        timestamp,
+        sessionId: linked?.id || null,
+        room: room.name,
+        projectId: linked?.projectId || null,
+        projectLabel: linked?.projectLabel || null,
+        title: update.title || `#${room.name} update`,
+        agent: null,
+        status: 'finished',
+        updateText,
+        score: feedScore('finished', timestamp),
+        why: feedCompletionWhy(timestamp, generatedAt, 'room-update'),
+      });
+    }
+  }
+  return posts;
+}
+
+const FEED_REACTION_SCORE = 7 * 24 * 60 * 60;
+
+function boundedFeedText(value, maxBytes) {
+  const text = String(value ?? '');
+  const bytes = Buffer.from(text);
+  if (bytes.length <= maxBytes) return text;
+  let truncated = bytes.subarray(0, maxBytes).toString('utf8');
+  if (truncated.endsWith('\uFFFD')) truncated = truncated.slice(0, -1);
+  return truncated;
+}
+
+function boundedFeedSnapshot(post) {
+  if (!post?.id || post.id.length > FEED_POST_ID_MAX_CHARS) throw httpError(413, 'feed post id is too large');
+  if (post.sessionId !== null && String(post.sessionId).length > 256) throw httpError(413, 'feed session id is too large');
+  const snapshot = {
+    id: post.id,
+    kind: post.kind,
+    timestamp: post.timestamp,
+    sessionId: post.sessionId,
+    room: post.room === null ? null : boundedFeedText(post.room, 512),
+    projectId: post.projectId === null ? null : boundedFeedText(post.projectId, 1024),
+    projectLabel: post.projectLabel === null ? null : boundedFeedText(post.projectLabel, 512),
+    title: boundedFeedText(post.title, 1024),
+    agent: post.agent,
+    status: post.status,
+    score: feedScore(post.status, post.timestamp),
+    why: boundedFeedText(post.why, 1024),
+  };
+  if (post.question) snapshot.question = boundedFeedText(post.question, 2048);
+  if (post.activity) snapshot.activity = boundedFeedText(post.activity, 2048);
+  if (post.kind === 'session') {
+    let remaining = FEED_MESSAGE_MAX_CHARS;
+    const content = [];
+    for (const block of post.message?.content || []) {
+      if (block?.type !== 'text' || !block.text?.trim() || remaining <= 0) continue;
+      const text = boundedFeedText(block.text, remaining);
+      content.push({ type: 'text', text });
+      remaining -= Buffer.byteLength(text, 'utf8');
+    }
+    snapshot.message = {
+      uuid: post.message?.uuid,
+      role: 'assistant',
+      timestamp: post.message?.timestamp || post.timestamp,
+
+      content,
+    };
+  } else {
+    snapshot.updateText = boundedFeedText(post.updateText, ROOM_UPDATE_MAX_CHARS * 4);
+  }
+  if (!validFeedSnapshot(snapshot, post.id, post.sessionId)) {
+    throw httpError(413, 'feed post snapshot is too large');
+  }
+  return snapshot;
+}
+function sessionTranscriptHasMarker(sessionId, marker) {
+  const { messages } = getMessages(sessionId, FEED_SESSION_MESSAGES * 2, 0, FEED_TRANSCRIPT_BYTES);
+  return messages.some(message => {
+    if (message.role !== 'user' || message.internal) return false;
+    const text = message.content?.filter(block => block?.type === 'text' && block.text)
+      .map(block => block.text).join('\n') || '';
+    return text.split('\n').some(line => line.trim() === marker);
+  });
+}
+
+function feedCommentReply(messages, commentId) {
+  const marker = `[FLEDGE_COMMENT:${commentId}]`;
+  let markerIndex = -1;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    const text = message.content?.filter(block => block?.type === 'text' && block.text)
+      .map(block => block.text).join('\n') || '';
+    if (message.role === 'user' && text.split('\n').some(line => line.trim() === marker)) markerIndex = index;
+    if (markerIndex < 0 || index <= markerIndex || message.role !== 'assistant' || message.internal) continue;
+    const reply = message.content?.filter(block => block?.type === 'text' && block.text?.trim())
+      .map(block => block.text.trim()).join('\n\n').trim() || '';
+    const timestampMs = Date.parse(message.timestamp || '');
+    if (reply && Number.isFinite(timestampMs)) {
+      return {
+        text: boundedFeedText(reply, FEED_REPLY_MAX_BYTES),
+        timestamp: new Date(timestampMs).toISOString(),
+      };
+    }
+  }
+  return null;
+}
+
+function refreshFeedCommentReplies(state) {
+  const unresolvedBySession = new Map();
+  for (const record of Object.values(state.posts)) {
+    if (!record.sessionId || !record.comments.some(comment => !comment.reply)) continue;
+    const records = unresolvedBySession.get(record.sessionId) || [];
+    records.push(record);
+    unresolvedBySession.set(record.sessionId, records);
+  }
+  if (unresolvedBySession.size === 0) return state;
+
+  let posts = state.posts;
+  let changed = false;
+  for (const [sessionId, records] of unresolvedBySession) {
+    const { messages } = getMessages(sessionId, FEED_SESSION_MESSAGES * 2, 0, FEED_TRANSCRIPT_BYTES);
+    for (const record of records) {
+      let comments = record.comments;
+      for (let index = 0; index < comments.length; index++) {
+        if (comments[index].reply) continue;
+        const reply = feedCommentReply(messages, comments[index].id);
+        if (!reply) continue;
+        if (comments === record.comments) comments = [...comments];
+        comments[index] = { ...comments[index], delivery: 'delivered', reply };
+      }
+      if (comments === record.comments) continue;
+      if (!changed) posts = { ...posts };
+      posts[record.postId] = { ...record, comments };
+      changed = true;
+    }
+  }
+  if (!changed) return state;
+  const next = { schema: 1, posts };
+  if (!READ_ONLY_MODE) FEED_INTERACTIONS_STATE.update(() => next);
+  return next;
+}
+
+function buildFeedPosts(generatedAt) {
+  const livePosts = buildLiveFeedPosts(generatedAt);
+  const postsById = new Map(livePosts.map(post => [post.id, post]));
+  const state = refreshFeedCommentReplies(FEED_INTERACTIONS_STATE.read());
+  for (const record of Object.values(state.posts)) {
+    // Only an exact current post keeps live operational status. Superseded
+    // dispatches are archival content, never duplicate waiting/work/error cards.
+    if (record.snapshot.kind === 'session'
+      && postsById.get(record.postId)?.sessionId === record.sessionId) continue;
+    const snapshot = {
+      ...record.snapshot,
+      status: 'finished',
+      score: feedScore('finished', record.snapshot.timestamp),
+      why: 'Archived interacted dispatch',
+    };
+    delete snapshot.question;
+    delete snapshot.activity;
+    postsById.set(record.postId, snapshot);
+  }
+  return [...postsById.values()].map(post => {
+    const record = state.posts[post.id];
+    const reaction = record?.reaction || null;
+    const reactionScore = reaction === 'like' ? FEED_REACTION_SCORE
+      : reaction === 'less' ? -FEED_REACTION_SCORE : 0;
+    const feedbackWhy = reaction === 'like' ? '; boosted because you liked this'
+      : reaction === 'less' ? '; lowered because you asked for less like this' : '';
+    return {
+      ...post,
+      reaction,
+      reactionDelivery: record?.reactionDelivery?.status || null,
+      comments: record?.comments || [],
+      score: feedScore(post.status, post.timestamp) + reactionScore,
+      why: `${post.why}${feedbackWhy}`,
+    };
+  });
+}
+
+function feedPostForInteraction(postId) {
+  if (!postId || postId.length > FEED_POST_ID_MAX_CHARS) throw httpError(400, 'invalid feed post id');
+  const stored = FEED_INTERACTIONS_STATE.read().posts;
+  if (Object.hasOwn(stored, postId)) return stored[postId].snapshot;
+  return buildLiveFeedPosts(Date.now()).find(post => post.id === postId) || null;
+}
+
+function interactionPostsWithCapacity(posts, postId) {
+  const next = { ...posts };
+  if (Object.hasOwn(next, postId) || Object.keys(next).length < FEED_INTERACTION_MAX_POSTS) return next;
+  const evictable = Object.values(next)
+    .filter(record => record.reaction === null && record.comments.length === 0)
+    .sort((a, b) => Date.parse(a.lastInteractionAt) - Date.parse(b.lastInteractionAt)
+      || a.postId.localeCompare(b.postId));
+  if (evictable.length === 0) throw httpError(507, 'feed interaction storage is full');
+  delete next[evictable[0].postId];
+  return next;
+}
+
+function feedDeliveryId(kind, ...parts) {
+  return `fledge-${kind}-${createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 32)}`;
+}
+
+function invalidateAfterFeedDelivery(sessionId) {
+  sessionsSnapshotCache.invalidate();
+  roomSnapshotCache.invalidate();
+  paneStableCount.set(sessionId, 0);
+}
+
+const FEED_CURSOR_PHASES = Object.freeze({ pinned: true, completions: true, timeline: true });
+
+function encodeFeedCursor(phase, post) {
+  return `f1_${Buffer.from(JSON.stringify({
+    v: 1,
+    p: phase,
+    t: post.timestamp,
+    i: post.id || '',
+    s: Number.isFinite(post.score) ? post.score : null,
+  })).toString('base64url')}`;
+}
+
+function parseFeedCursor(value) {
+  if (typeof value !== 'string' || !value || value.length > 2048) return null;
+  if (value.startsWith('f1_')) {
+    try {
+      const cursor = JSON.parse(Buffer.from(value.slice(3), 'base64url').toString('utf8'));
+      if (cursor?.v !== 1
+        || !Object.hasOwn(FEED_CURSOR_PHASES, cursor.p)
+        || !validFeedTimestamp(cursor.t)
+        || typeof cursor.i !== 'string'
+        || cursor.i.length > FEED_POST_ID_MAX_CHARS
+        || (cursor.s !== null && !Number.isFinite(cursor.s))) return null;
+      return {
+        phase: cursor.p,
+        timestamp: Date.parse(cursor.t),
+        id: cursor.i,
+        score: cursor.s,
+        legacy: false,
+      };
+    } catch {
+      return null;
+    }
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp)
+    ? { phase: 'completions', timestamp, id: '', score: null, legacy: true }
+    : null;
+}
+
+function feedAfterChronologicalCursor(post, cursor) {
+  if (!cursor) return true;
+  const timestamp = Date.parse(post.timestamp);
+  if (timestamp !== cursor.timestamp) return timestamp < cursor.timestamp;
+  return !cursor.legacy && post.id.localeCompare(cursor.id) > 0;
+}
+
+function feedAfterRankCursor(post, cursor) {
+  if (!cursor) return true;
+  if (cursor.score === null) return feedAfterChronologicalCursor(post, cursor);
+  if (post.score !== cursor.score) return post.score < cursor.score;
+  const timestamp = Date.parse(post.timestamp);
+  if (timestamp !== cursor.timestamp) return timestamp < cursor.timestamp;
+  return post.id.localeCompare(cursor.id) > 0;
+}
+
+function feedQuery(req) {
+  const requestedMode = typeof req.query.mode === 'string' ? req.query.mode : '';
+  const mode = Object.hasOwn(FEED_MODES, requestedMode) ? requestedMode : 'for-you';
+  const requestedLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : NaN;
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.min(FEED_MAX_LIMIT, Math.max(1, Math.trunc(requestedLimit)))
+    : FEED_DEFAULT_LIMIT;
+  const before = parseFeedCursor(typeof req.query.before === 'string' ? req.query.before : '');
+  return { mode, limit, before };
+}
+
+app.get('/api/feed', (req, res) => {
+  try {
+    const generatedAt = new Date().toISOString();
+    const generatedAtMs = Date.parse(generatedAt);
+    const { mode, limit, before } = feedQuery(req);
+    const allPosts = buildFeedPosts(generatedAtMs);
+    const counts = { waiting: 0, working: 0, errored: 0, finished: 0 };
+    for (const post of allPosts) counts[post.status] += 1;
+
+    const chronological = (a, b) =>
+      Date.parse(b.timestamp) - Date.parse(a.timestamp) || a.id.localeCompare(b.id);
+    const forYouRank = (a, b) => b.score - a.score
+      || Date.parse(b.timestamp) - Date.parse(a.timestamp)
+      || a.id.localeCompare(b.id);
+    let posts;
+    let nextBefore = null;
+    if (mode === 'for-you') {
+      const allFinished = allPosts.filter(post => post.status === 'finished').sort(chronological);
+      const inPinnedPhase = before === null || before.phase === 'pinned';
+      if (inPinnedPhase) {
+        let pinned = allPosts.filter(post => post.status !== 'finished').sort(forYouRank);
+        if (before?.phase === 'pinned') pinned = pinned.filter(post => feedAfterRankCursor(post, before));
+        const pinnedPosts = pinned.slice(0, limit);
+        posts = [...pinnedPosts];
+        if (pinned.length > pinnedPosts.length) {
+          nextBefore = encodeFeedCursor('pinned', pinnedPosts[pinnedPosts.length - 1]);
+        } else {
+          const chronologicalPage = allFinished.slice(0, limit - pinnedPosts.length);
+          posts.push(...[...chronologicalPage].sort(forYouRank));
+          if (allFinished.length > chronologicalPage.length) {
+            nextBefore = chronologicalPage.length
+              ? encodeFeedCursor('completions', chronologicalPage[chronologicalPage.length - 1])
+              : encodeFeedCursor('completions', { timestamp: generatedAt, id: '', score: null });
+          }
+        }
+      } else {
+        const finished = allFinished.filter(post => feedAfterChronologicalCursor(post, before));
+        const chronologicalPage = finished.slice(0, limit);
+        posts = [...chronologicalPage].sort(forYouRank);
+        if (finished.length > chronologicalPage.length) {
+          nextBefore = encodeFeedCursor('completions', chronologicalPage[chronologicalPage.length - 1]);
+        }
+      }
+    } else if (mode === 'latest') {
+      const eligible = allPosts
+        .filter(post => feedAfterChronologicalCursor(post, before))
+        .sort(chronological);
+      posts = eligible.slice(0, limit);
+      if (eligible.length > posts.length) nextBefore = encodeFeedCursor('timeline', posts[posts.length - 1]);
+    } else {
+      const eligible = allPosts
+        .filter(post => post.status === 'waiting' && feedAfterRankCursor(post, before))
+        .sort(forYouRank);
+      posts = eligible.slice(0, limit);
+      if (eligible.length > posts.length) nextBefore = encodeFeedCursor('timeline', posts[posts.length - 1]);
+    }
+    res.setHeader('Cache-Control', 'private, no-cache');
+    res.json({ generatedAt, nextBefore, counts, posts });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function updateFeedReactionDelivery(postId, status) {
+  let updated = null;
+  FEED_INTERACTIONS_STATE.update(current => {
+    const record = current.posts[postId];
+    if (!record?.reactionDelivery) return current;
+    updated = { ...record.reactionDelivery, status, updatedAt: new Date().toISOString() };
+    return {
+      schema: 1,
+      posts: { ...current.posts, [postId]: { ...record, reactionDelivery: updated } },
+    };
+  });
+  return updated;
+}
+
+app.put('/api/feed/:postId/reaction', async (req, res) => {
+  try {
+    const reaction = req.body?.reaction;
+    if (reaction !== null && !Object.hasOwn(FEED_REACTIONS, reaction)) {
+      throw httpError(400, 'reaction must be like, less, or null');
+    }
+    const post = feedPostForInteraction(req.params.postId);
+    if (!post) throw httpError(404, 'feed post not found');
+    const existing = FEED_INTERACTIONS_STATE.read().posts[post.id];
+    if (!existing && reaction === null) {
+      return res.json({ reaction: null, reactionDelivery: null, changed: false, delivery: 'not-needed' });
+    }
+
+    const changed = existing?.reaction !== reaction;
+    let record = existing;
+    if (changed) {
+      const now = new Date().toISOString();
+      FEED_INTERACTIONS_STATE.update(current => {
+        const posts = interactionPostsWithCapacity(current.posts, post.id);
+        const sessionId = existing?.sessionId ?? post.sessionId;
+        record = {
+          postId: post.id,
+          sessionId,
+          reaction,
+          reactionDelivery: reaction !== null && sessionId
+            ? {
+                reaction,
+                status: 'queued',
+                messageId: feedDeliveryId('reaction', post.id, reaction, now),
+                updatedAt: now,
+              }
+            : null,
+          lastInteractionAt: now,
+          snapshot: existing?.snapshot || boundedFeedSnapshot(post),
+          comments: existing?.comments || [],
+        };
+        posts[post.id] = record;
+        return { schema: 1, posts };
+      });
+    }
+
+    let delivery = 'not-needed';
+    const pending = reaction !== null
+      && record.sessionId
+      && record.reactionDelivery?.status !== 'delivered';
+    if (pending) {
+      const guidance = reaction === 'like'
+        ? 'Philip liked this Fledge dispatch. Treat it as preference evidence about topic, source, format, and timing. No reply is required.'
+        : 'Philip asked for less like this. Treat it as preference evidence; reduce similar topic/source/format unless it is operationally important. No reply is required.';
+      const marker = `[FLEDGE_REACTION:${post.id}:${reaction}:${record.reactionDelivery.messageId}]`;
+      const prompt = `${guidance}\n\n${marker}`;
+      updateFeedReactionDelivery(post.id, 'queued');
+      try {
+        if (!sessionTranscriptHasMarker(record.sessionId, marker)) {
+          await sendInputToSessionIdempotent(
+            record.sessionId,
+            prompt,
+            record.reactionDelivery.messageId,
+          );
+        }
+        invalidateAfterFeedDelivery(record.sessionId);
+        updateFeedReactionDelivery(post.id, 'delivered');
+        delivery = 'delivered';
+      } catch {
+        updateFeedReactionDelivery(post.id, 'failed');
+        delivery = 'failed';
+      }
+    }
+    const reactionDelivery = FEED_INTERACTIONS_STATE.read().posts[post.id]?.reactionDelivery?.status || null;
+    res.json({ reaction, reactionDelivery, changed, delivery });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+function updateFeedCommentDelivery(postId, commentId, delivery) {
+  let updated = null;
+  FEED_INTERACTIONS_STATE.update(current => {
+    const record = current.posts[postId];
+    if (!record) return current;
+    const comments = record.comments.map(comment => {
+      if (comment.id !== commentId) return comment;
+      updated = { ...comment, delivery };
+      return updated;
+    });
+    return {
+      schema: 1,
+      posts: { ...current.posts, [postId]: { ...record, comments } },
+    };
+  });
+  return updated;
+}
+
+app.post('/api/feed/:postId/comments', async (req, res) => {
+  try {
+    const commentId = typeof req.body?.id === 'string' ? req.body.id : '';
+    const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+    if (!UUID_RE.test(commentId.toLowerCase())) throw httpError(400, 'comment id must be a UUID');
+    if (!text) throw httpError(400, 'comment text is required');
+    if (Buffer.byteLength(text, 'utf8') > FEED_COMMENT_MAX_BYTES) {
+      throw httpError(413, `comment exceeds ${FEED_COMMENT_MAX_BYTES} bytes`);
+    }
+    const post = feedPostForInteraction(req.params.postId);
+    if (!post) throw httpError(404, 'feed post not found');
+
+    const state = FEED_INTERACTIONS_STATE.read();
+    const existingRecord = state.posts[post.id];
+    const existingComment = existingRecord?.comments.find(comment => comment.id === commentId);
+    if (existingComment && existingComment.text !== text) {
+      throw httpError(409, 'comment id already used with different text');
+    }
+    let comment = existingComment;
+    const created = !comment;
+    if (!comment) {
+      if ((existingRecord?.comments.length || 0) >= FEED_INTERACTION_MAX_COMMENTS) {
+        throw httpError(409, 'feed post comment limit reached');
+      }
+      comment = {
+        id: commentId,
+        text,
+        createdAt: new Date().toISOString(),
+        delivery: 'queued',
+      };
+      FEED_INTERACTIONS_STATE.update(current => {
+        const posts = interactionPostsWithCapacity(current.posts, post.id);
+        const record = posts[post.id] || {
+          postId: post.id,
+          sessionId: post.sessionId,
+          reaction: null,
+          reactionDelivery: null,
+          lastInteractionAt: comment.createdAt,
+          snapshot: boundedFeedSnapshot(post),
+          comments: [],
+        };
+        posts[post.id] = {
+          ...record,
+          lastInteractionAt: comment.createdAt,
+          comments: [...record.comments, comment],
+        };
+        return { schema: 1, posts };
+      });
+    }
+
+    if (comment.delivery !== 'delivered' && !comment.reply) {
+      if (!post.sessionId) {
+        comment = updateFeedCommentDelivery(post.id, commentId, 'failed') || comment;
+      } else {
+        const quoted = text.split('\n').map(line => `> ${line}`).join('\n');
+        const marker = `[FLEDGE_COMMENT:${commentId}]`;
+        const prompt = [
+          marker,
+          'Philip replied inline to this Fledge dispatch:',
+          quoted,
+          'Respond to Philip\'s comment. Your next meaningful human-facing answer will appear as the inline reply on that dispatch.',
+        ].join('\n\n');
+        try {
+          if (!sessionTranscriptHasMarker(post.sessionId, marker)) {
+            await sendInputToSessionIdempotent(
+              post.sessionId,
+              prompt,
+              feedDeliveryId('comment', post.id, commentId),
+            );
+          }
+          invalidateAfterFeedDelivery(post.sessionId);
+          comment = updateFeedCommentDelivery(post.id, commentId, 'delivered') || comment;
+        } catch {
+          comment = updateFeedCommentDelivery(post.id, commentId, 'failed') || comment;
+        }
+      }
+    }
+    res.status(created ? 201 : 200).json({ comment });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+const ROOM_PULSE_PROMPT = `Keep working on this room. Read AGENTS.md, notes.md, and the recent chats in this room. Then do the next useful thing fully autonomously. Do not ask the user to choose routine steps. Use tools and agents if useful. Append what you did and any open thread to notes.md. If you did something a person walking in cold would care about, also post a human-facing briefing with room update. Make every Room update timeline-ready: start with a specific Markdown H2 headline, then state the outcome, why it matters, current state or next action, and direct links to useful artifacts. Do not post raw internal logs or generic "update" headlines. Write for a busy, sharp executive who has not seen this room in a day; notes.md remains the terse working memory. If you hit a recurring annoyance, run: room complain "describe it plainly". If this room genuinely has no useful next action, run: room pause. Then stop.`;
 
 function launchRoomPulse(name) {
   try {
@@ -3216,6 +4099,8 @@ for (const state of USER_JSON_STATES.values()) state.read();
 ROOM_ASSIGN_STATE.read();
 ROOM_PULSES_STATE.read();
 MESSAGE_RECEIPTS_STATE.read();
+FEED_INTERACTIONS_STATE.read();
+readUserJson('push-subscriptions.json', []);
 if (!READ_ONLY_MODE) await reconcileProtocolRunOwners();
 
 // Verify that a static directory is a coherent build: index.html points to a
@@ -4104,23 +4989,32 @@ app.get('/api/push/key', (_req, res) => {
 });
 
 app.get('/api/push/subscribe', (_req, res) => {
-  res.json({ subscriptions: readUserJson('push-subscriptions.json', []) });
+  res.json({ count: readUserJson('push-subscriptions.json', []).length });
 });
 
 app.post('/api/push/subscribe', (req, res) => {
-  const sub = req.body;
-  if (!sub || typeof sub.endpoint !== 'string' || !sub.endpoint) {
-    return res.status(400).json({ error: 'expected { endpoint, keys }' });
+  const candidate = {
+    endpoint: req.body?.endpoint,
+    keys: req.body?.keys,
+    at: new Date().toISOString(),
+  };
+  if (!validPushSubscription(candidate)) {
+    return res.status(400).json({ error: 'invalid HTTPS push subscription' });
   }
-  const subs = readUserJson('push-subscriptions.json', []).filter(item => item.endpoint !== sub.endpoint);
-  subs.push({ endpoint: sub.endpoint, keys: sub.keys || {}, at: new Date().toISOString() });
+  const subs = readUserJson('push-subscriptions.json', []).filter(item => item.endpoint !== candidate.endpoint);
+  if (subs.length >= PUSH_MAX_SUBSCRIPTIONS) {
+    return res.status(409).json({ error: 'push subscription limit reached' });
+  }
+  subs.push(candidate);
   try { writeUserJson('push-subscriptions.json', subs); res.json({ ok: true, count: subs.length }); }
   catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.delete('/api/push/subscribe', (req, res) => {
   const endpoint = req.body?.endpoint;
-  if (typeof endpoint !== 'string') return res.status(400).json({ error: 'expected { endpoint }' });
+  if (typeof endpoint !== 'string' || !endpoint || Buffer.byteLength(endpoint, 'utf8') > PUSH_MAX_ENDPOINT_BYTES) {
+    return res.status(400).json({ error: 'expected bounded { endpoint }' });
+  }
   const subs = readUserJson('push-subscriptions.json', []).filter(item => item.endpoint !== endpoint);
   try { writeUserJson('push-subscriptions.json', subs); res.json({ ok: true, count: subs.length }); }
   catch (error) { res.status(500).json({ error: error.message }); }
@@ -4128,19 +5022,21 @@ app.delete('/api/push/subscribe', (req, res) => {
 
 async function pushToAll(payload) {
   const subs = readUserJson('push-subscriptions.json', []);
-  if (!subs.length) return [];
-  const results = await Promise.all(subs.map(sub => webpush.send(sub, payload, pushKeys())));
+  if (!subs.length) return { results: [], removed: 0 };
+  const keys = pushKeys();
+  const results = await Promise.all(subs.map(sub => webpush.send(sub, payload, keys)));
   const gone = new Set(results.filter(result => result.gone).map(result => result.endpoint));
   if (gone.size) {
     try { writeUserJson('push-subscriptions.json', subs.filter(sub => !gone.has(sub.endpoint))); } catch {}
   }
-  return results;
+  return { results, removed: gone.size };
 }
 
 app.post('/api/push/test', async (_req, res) => {
   try {
-    const results = await pushToAll({ title: 'Feather', body: 'Push notifications are working.', tag: 'feather-test' });
-    res.json({ sent: results.filter(result => result.ok).length, results });
+    const { results, removed } = await pushToAll({ title: 'Feather', body: 'Push notifications are working.', tag: 'feather-test' });
+    const sent = results.filter(result => result.ok).length;
+    res.json({ total: results.length, sent, failed: results.length - sent, removed });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
@@ -4408,8 +5304,8 @@ app.get('/api/files/raw', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Opt-in HTML artifact preview. A restrictive sandbox permits styling and
-// outbound links without giving the artifact access to Feather's origin.
+// Opt-in HTML artifact preview. Scripts run in an opaque-origin sandbox with
+// no forms, navigation, app storage privilege, or external network access.
 app.get('/api/files/html', (req, res) => {
   try {
     const filePath = expandTilde(req.query.path);
@@ -4426,7 +5322,7 @@ app.get('/api/files/html', (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Content-Disposition', 'inline');
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Security-Policy', "sandbox allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation; default-src 'none'; style-src 'unsafe-inline'; img-src data: https:; font-src data: https:; object-src 'none'; base-uri 'none'; form-action 'none'");
+    res.setHeader('Content-Security-Policy', "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' data: blob:; style-src 'unsafe-inline' data: blob:; img-src data: blob:; font-src data: blob:; media-src data: blob:; frame-src data: blob:; worker-src data: blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
     return res.sendFile(resolved);
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
@@ -4593,8 +5489,6 @@ wss.on('connection', (ws, req) => {
       term = pty.spawn('bash', ['-l'], {
         name: 'xterm-256color', cols: terminalCols, rows: terminalRows, env: cleanEnv, cwd: HOME,
       });
-    } else {
-      const sessionId = url.searchParams.get('session');
       if (!sessionId) { ws.close(1008, 'session required'); return; }
       if (!tmuxIsActive(sessionId)) { ws.close(1000, 'Session not active'); return; }
       terminalSessionName = existingTmuxName(sessionId);
@@ -4632,8 +5526,8 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Feather (single-user) on http://0.0.0.0:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`Feather (single-user) on http://${HOST}:${PORT}`);
   // Warm shared discovery first; Rooms then reuses it instead of scanning all
   // transcripts a second time before the first interactive request.
   setTimeout(() => {

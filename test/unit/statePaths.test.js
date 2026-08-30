@@ -25,7 +25,7 @@ afterEach(() => {
 })
 
 describe('state path classification', () => {
-  it('preserves every checkout-local path when FEATHER_STATE_DIR is unset', () => {
+  it('preserves legacy checkout-local paths while keeping feed feedback mutable', () => {
     const releaseDir = '/opt/feather/current'
     const homeDir = '/home/zak'
     const paths = resolveStatePaths({ releaseDir, homeDir })
@@ -37,6 +37,7 @@ describe('state path classification', () => {
     assert.equal(paths.instance.metaFile, `${releaseDir}/session-meta.json`)
     assert.equal(paths.instance.uploadsDir, `${releaseDir}/uploads`)
     assert.equal(paths.instance.projectLabelsFile, `${releaseDir}/project-labels.json`)
+    assert.equal(paths.instance.feedInteractionsFile, `${homeDir}/.feather/feed-interactions.json`)
     assert.equal(paths.instance.quickLinksFile, `${releaseDir}/quick-links.json`)
     assert.equal(paths.instance.starredFile, `${releaseDir}/starred.json`)
   })
@@ -51,6 +52,7 @@ describe('state path classification', () => {
     assert.equal(paths.instance.external, true)
     assert.equal(paths.instance.metaFile, '/srv/feather/state/session-meta.json')
     assert.equal(paths.instance.uploadsDir, '/srv/feather/state/uploads')
+    assert.equal(paths.instance.feedInteractionsFile, '/srv/feather/state/feed-interactions.json')
     assert.equal(paths.release.staticDir, '/opt/feather/releases/a/static')
     assert.equal(paths.coordination.sidecarsDir, '/home/zak/.feather/sidecars')
     assert.equal(paths.coordination.roomAssignmentsFile, '/home/zak/.feather/room-sessions.json')
@@ -200,4 +202,30 @@ describe('server state integration', () => {
       child.kill('SIGTERM')
     }
   }, { timeout: 10_000 })
+
+  it('rejects malformed feed interaction state during startup', async () => {
+    const base = tempDir('feather-feed-state-')
+    const stateDir = path.join(base, 'state')
+    const homeDir = path.join(base, 'home')
+    fs.mkdirSync(stateDir)
+    fs.mkdirSync(homeDir)
+    fs.writeFileSync(path.join(stateDir, 'feed-interactions.json'), JSON.stringify({ schema: 2, posts: {} }))
+    const child = spawn(process.execPath, ['server-single.js'], {
+      cwd: path.resolve(import.meta.dirname, '../..'),
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        FEATHER_STATE_DIR: stateDir,
+        PORT: String(49_500 + Math.floor(Math.random() * 400)),
+      },
+      stdio: 'ignore',
+    })
+    const exitCode = await Promise.race([
+      new Promise(resolve => child.once('exit', resolve)),
+      new Promise(resolve => setTimeout(() => resolve(null), 2_000)),
+    ])
+    if (exitCode === null) child.kill('SIGKILL')
+    assert.notEqual(exitCode, null, 'server accepted malformed feed interaction state')
+    assert.notEqual(exitCode, 0)
+  })
 })

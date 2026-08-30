@@ -6,12 +6,28 @@
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="Feather" />
-  <meta name="theme-color" content="#0a0e14" />
-  <link rel="manifest" href="./manifest.json" />
-  <link rel="apple-touch-icon" href="./icon-180.png" />
-  <link rel="icon" type="image/png" sizes="192x192" href="./icon-192.png" />
+  <meta id="apple-app-title" name="apple-mobile-web-app-title" content="Feather" />
+  <meta id="app-theme-color" name="theme-color" content="#0a0e14" />
+  <link id="app-manifest" rel="manifest" href="./manifest.json" />
+  <link id="apple-touch-icon" rel="apple-touch-icon" href="./icon-180.png" />
+  <link id="app-icon" rel="icon" type="image/png" sizes="192x192" href="./icon-192.png" />
   <title>Feather</title>
+  <script>
+    if (location.hostname === 'app.feather.plus') {
+      document.title = 'Fledge'
+      document.getElementById('apple-app-title').setAttribute('content', 'Fledge')
+      document.getElementById('app-theme-color').setAttribute('content', '#0b1210')
+      document.getElementById('app-manifest').setAttribute('href', './fledge-manifest.json')
+      document.getElementById('apple-touch-icon').setAttribute('href', './fledge-icon-180.png')
+      document.getElementById('app-icon').setAttribute('href', './fledge-icon-192.png')
+      document.documentElement.dataset.app = 'fledge'
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('/fledge-sw.js', { scope: '/' }).catch(function () {})
+        })
+      }
+    }
+  </script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { height: 100%; width: 100%; overflow: hidden; position: fixed; }

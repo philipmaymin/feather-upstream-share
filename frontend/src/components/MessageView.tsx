@@ -116,6 +116,41 @@ function renderMarkdown(text: string): string {
   return safe
 }
 
+function isRemoteImageReference(value: string | null): boolean {
+  if (!value) return false
+  const normalized = value.trim().replace(/[\u0000-\u0020]/g, '').replace(/\\/g, '/')
+  return /^(?:https?:)?\/\//i.test(normalized)
+}
+
+function remoteImageSourceSetReference(value: string | null): string | null {
+  return value?.match(/(?:^|,)\s*((?:https?:)?\/\/[^\s,]+)/i)?.[1] || null
+}
+
+function renderRichMarkdown(text: string, allowRemoteImages: boolean): string {
+  const html = renderMarkdown(text)
+  if (allowRemoteImages) return html
+
+  const template = document.createElement('template')
+  template.innerHTML = html
+  for (const image of template.content.querySelectorAll('img')) {
+    const source = image.getAttribute('src')
+    const remoteSource = isRemoteImageReference(source)
+      ? source!
+      : remoteImageSourceSetReference(image.getAttribute('srcset'))
+    if (!remoteSource) continue
+
+    const link = document.createElement('a')
+    link.href = remoteSource
+    link.target = '_blank'
+    link.rel = 'noopener noreferrer'
+    link.title = remoteSource
+    link.dataset.remoteImageSource = 'true'
+    link.textContent = image.alt ? `Load remote image: ${image.alt}` : `Load remote image: ${remoteSource}`
+    image.replaceWith(link)
+  }
+  return template.innerHTML
+}
+
 // Live snapshots are sanitized on every update and deliberately omit remote
 // images. This prevents an unfinished answer from making third-party requests
 // while still rendering headings, lists, links, tables, and code immediately.
@@ -148,7 +183,9 @@ async function copyHtml(uuid: string, container: HTMLElement): Promise<boolean> 
 }
 
 function filesystemPathFromHref(a: HTMLAnchorElement): string | null {
-  const candidate = localFilePath(a.getAttribute('href'))
+  const href = a.getAttribute('href')
+  if (href?.trim().startsWith('//')) return null
+  const candidate = localFilePath(href)
   return candidate?.replace(/:\d+(?::\d+)?$/, '') || null
 }
 
@@ -291,8 +328,13 @@ function localImageHref(src: string): string {
   return filePath ? localFileHref(filePath) : src
 }
 
-function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
+function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void, onOpenFile?: (path: string) => void) {
   for (const a of el.querySelectorAll('a')) {
+    if (a.dataset.remoteImageSource === 'true') {
+      a.target = '_blank'
+      a.rel = 'noopener noreferrer'
+      continue
+    }
     // Markdown already turns [label](/absolute/path) into an anchor, so the
     // text-node pass below never sees its path. Route those anchors through
     // the same authenticated preview endpoint as the Files tab.
@@ -302,6 +344,17 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
       a.classList.add('feather-path')
       a.dataset.path = localPath
       a.title = /\.html?$/i.test(localPath) ? 'Open HTML preview' : 'Open local file'
+      const ext = localPath.substring(localPath.lastIndexOf('.')).toLowerCase()
+      if (!IMAGE_EXTS.has(ext) && onOpenFile) {
+        a.removeAttribute('target')
+        a.removeAttribute('rel')
+        a.onclick = (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          onOpenFile(localPath)
+        }
+        continue
+      }
     }
     a.setAttribute('target', '_blank')
     a.setAttribute('rel', 'noopener')
@@ -332,7 +385,7 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
       if (IMAGE_EXTS.has(ext)) {
         const imgSrc = fileHref
         a.href = imgSrc
-        a.onclick = (e) => { e.preventDefault(); onImageClick?.(imgSrc) }
+        a.onclick = (event) => { event.preventDefault(); event.stopPropagation(); onImageClick?.(imgSrc) }
         frag.appendChild(a)
         // Auto-preview: insert inline image below the link
         const img = document.createElement('img')
@@ -343,12 +396,20 @@ function fixLinks(el: HTMLElement, onImageClick?: (src: string) => void) {
         img.style.marginTop = '4px'
         img.style.display = 'block'
         img.style.cursor = 'zoom-in'
-        img.onclick = () => onImageClick?.(imgSrc)
+        img.onclick = (event) => { event.stopPropagation(); onImageClick?.(imgSrc) }
         frag.appendChild(img)
       } else {
         a.href = fileHref
-        a.target = '_blank'
-        a.rel = 'noopener'
+        if (onOpenFile) {
+          a.onclick = (event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            onOpenFile(path)
+          }
+        } else {
+          a.target = '_blank'
+          a.rel = 'noopener'
+        }
         frag.appendChild(a)
       }
       last = idx + path.length
@@ -383,7 +444,7 @@ function fixImages(el: HTMLElement, onImageClick?: (src: string) => void) {
     if (!img.alt) img.alt = targetPath.split('/').pop() || 'image'
     if (!img.closest('a')) {
       img.style.cursor = 'zoom-in'
-      img.addEventListener('click', () => onImageClick?.(url))
+      img.addEventListener('click', (event) => { event.stopPropagation(); onImageClick?.(url) })
     }
     img.addEventListener('error', () => replaceImageWithPathLink(img, targetPath), { once: true })
     img.src = url
@@ -424,9 +485,9 @@ function enhanceTables(el: HTMLElement, onExpandTable?: (html: string) => void) 
   }
 }
 
-function enhanceMarkdown(el: HTMLElement, onImageClick?: (src: string) => void, onExpandTable?: (html: string) => void) {
+function enhanceMarkdown(el: HTMLElement, onImageClick?: (src: string) => void, onExpandTable?: (html: string) => void, onOpenFile?: (path: string) => void) {
   injectCopyButtons(el)
-  fixLinks(el, onImageClick)
+  fixLinks(el, onImageClick, onOpenFile)
   fixImages(el, onImageClick)
   collapseCodeBlocks(el)
   enhanceTables(el, onExpandTable)
@@ -534,11 +595,11 @@ function toolSummary(name: string, input: any): string {
 
 // Linkify file paths inside tool input pres and tool result output. Deferred to
 // the next microtask so text children are mounted before fixLinks walks them.
-const linkifyRef = (el: HTMLElement) => queueMicrotask(() => fixLinks(el))
+const linkifyRef = (el: HTMLElement, onImageClick?: (src: string) => void, onOpenFile?: (path: string) => void) => queueMicrotask(() => fixLinks(el, onImageClick, onOpenFile))
 
-function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, onExpandTable?: (html: string) => void, getResult?: (toolUseId: string) => ContentBlock | undefined) {
+function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, onExpandTable?: (html: string) => void, getResult?: (toolUseId: string) => ContentBlock | undefined, onOpenFile?: (path: string) => void) {
   if (block.type === 'text' && block.text) {
-    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => queueMicrotask(() => enhanceMarkdown(el, onImageClick, onExpandTable))} />
+    return <div class="markdown" innerHTML={renderMarkdown(block.text)} ref={(el) => queueMicrotask(() => enhanceMarkdown(el, onImageClick, onExpandTable, onOpenFile))} />
   }
   if (block.type === 'thinking' && block.thinking) {
     return (
@@ -576,24 +637,24 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
           {inp.old_string && <pre style={`${pre}color:#e07070`}>{inp.old_string}</pre>}
           {inp.new_string && <pre style={`${pre}color:#5cc878`}>{inp.new_string}</pre>}
         </>}
-        {name === 'Bash' && commandText(inp) && <pre style={`${pre}color:#e5a070`} ref={linkifyRef}>{commandText(inp)}</pre>}
-        {name === 'Patch' && patchText(inp) && <pre style={`${pre}color:#c4993a`} ref={linkifyRef}>{patchText(inp).slice(0, 2000)}{patchText(inp).length > 2000 ? '\n…' : ''}</pre>}
-        {name === 'Input' && <pre style={`${pre}color:#73b8ff`} ref={linkifyRef}>{stdinText(inp).replace(/\u0003/g, '^C') || '(empty stdin)'}{inp.session_id != null ? `\n\nsession: ${inp.session_id}` : ''}</pre>}
-        {name === 'Write' && inp.content && <pre style={`${pre}color:#5cc878`} ref={linkifyRef}>{(inp.content as string).slice(0, 500)}{(inp.content as string).length > 500 ? '...' : ''}</pre>}
+        {name === 'Bash' && commandText(inp) && <pre style={`${pre}color:#e5a070`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{commandText(inp)}</pre>}
+        {name === 'Patch' && patchText(inp) && <pre style={`${pre}color:#c4993a`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{patchText(inp).slice(0, 2000)}{patchText(inp).length > 2000 ? '\n…' : ''}</pre>}
+        {name === 'Input' && <pre style={`${pre}color:#73b8ff`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{stdinText(inp).replace(/\u0003/g, '^C') || '(empty stdin)'}{inp.session_id != null ? `\n\nsession: ${inp.session_id}` : ''}</pre>}
+        {name === 'Write' && inp.content && <pre style={`${pre}color:#5cc878`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{(inp.content as string).slice(0, 500)}{(inp.content as string).length > 500 ? '...' : ''}</pre>}
         {name === 'Agent' && <>
           {inp.subagent_type && <div style={{ padding: '2px 0', 'font-size': '10px', color: '#888' }}>Type: <span style={{ color: '#c4993a' }}>{inp.subagent_type}</span></div>}
-          {inp.prompt && <pre style={`${pre}color:#88c4ff`} ref={linkifyRef}>{(inp.prompt as string).slice(0, 800)}{(inp.prompt as string).length > 800 ? '...' : ''}</pre>}
+          {inp.prompt && <pre style={`${pre}color:#88c4ff`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{(inp.prompt as string).slice(0, 800)}{(inp.prompt as string).length > 800 ? '...' : ''}</pre>}
         </>}
         {name === 'Grep' && inp.pattern && <pre style={`${pre}color:#c4a0c0`}>/{inp.pattern}/{inp.path ? ` in ${inp.path}` : ''}</pre>}
-        {name === 'Read' && filePath && <pre style={`${pre}color:#88c4ff`} ref={linkifyRef}>{filePath}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
-        {genericInput && <pre style={`${pre}color:#aaa`} ref={linkifyRef}>{genericInput}</pre>}
+        {name === 'Read' && filePath && <pre style={`${pre}color:#88c4ff`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{filePath}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
+        {genericInput && <pre style={`${pre}color:#aaa`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{genericInput}</pre>}
       </details>
       {imagePath && (() => {
         const resolvedPath = imagePath.replace(/^~/, '/home/' + (typeof document !== 'undefined' ? document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user' : 'user'))
         const imgSrc = appUrl(`/api/files/raw?path=${encodeURIComponent(resolvedPath)}`)
         return <img src={imgSrc} onClick={() => onImageClick?.(imgSrc)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '6px', display: 'block', cursor: 'zoom-in' }} />
       })()}
-      {result && renderBlock(result, onImageClick, onExpandTable)}
+      {result && renderBlock(result, onImageClick, onExpandTable, undefined, onOpenFile)}
     </>
   }
   if (block.type === 'tool_result') {
@@ -610,7 +671,7 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
           {label}
           {isLong && !isErr && <span style={{ 'font-weight': '400', 'text-transform': 'none', 'margin-left': '6px', color: '#666' }}>{preview.split('\n')[0].slice(0, 60)}</span>}
         </summary>
-        {raw && <div style={{ padding: '2px 0', 'font-size': '10px', 'font-family': "'SF Mono', Menlo, monospace", color: isErr ? '#e07070' : '#999', 'white-space': 'pre-wrap', 'max-height': '200px', overflow: 'auto', 'word-break': 'break-all' }} ref={linkifyRef}>{raw.length > 3000 ? raw.slice(0, 3000) + '\n... (truncated)' : raw}</div>}
+        {raw && <div style={{ padding: '2px 0', 'font-size': '10px', 'font-family': "'SF Mono', Menlo, monospace", color: isErr ? '#e07070' : '#999', 'white-space': 'pre-wrap', 'max-height': '200px', overflow: 'auto', 'word-break': 'break-all' }} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{raw.length > 3000 ? raw.slice(0, 3000) + '\n... (truncated)' : raw}</div>}
       </details>
     )
   }
@@ -1002,6 +1063,54 @@ div:hover > div > .star-btn { opacity: 0.6 !important; }
 .hljs-property { color: var(--hljs-property); }
 `
 
+const RICH_MARKDOWN_STYLE_ID = 'feather-rich-markdown-styles'
+
+function ensureRichMarkdownStyles() {
+  if (document.getElementById(RICH_MARKDOWN_STYLE_ID)) return
+  const style = document.createElement('style')
+  style.id = RICH_MARKDOWN_STYLE_ID
+  style.textContent = markdownCSS
+  document.head.appendChild(style)
+}
+
+export function RichMarkdown(props: { text: string; onOpenFile?: (path: string) => void; allowRemoteImages?: boolean }) {
+  const [lightbox, setLightbox] = createSignal<string | null>(null)
+  const [expandedTable, setExpandedTable] = createSignal<string | null>(null)
+  let markdownElement: HTMLDivElement | undefined
+
+  createEffect(() => {
+    const text = props.text
+    const allowRemoteImages = props.allowRemoteImages !== false
+    queueMicrotask(() => {
+      if (!markdownElement || props.text !== text || (props.allowRemoteImages !== false) !== allowRemoteImages) return
+      enhanceMarkdown(markdownElement, setLightbox, setExpandedTable, props.onOpenFile)
+    })
+  })
+
+  return <>
+    <div
+      class="markdown"
+      onClick={handleCopyClick}
+      innerHTML={renderRichMarkdown(props.text, props.allowRemoteImages !== false)}
+      ref={(element) => { ensureRichMarkdownStyles(); markdownElement = element }}
+    />
+    <Show when={expandedTable()}>
+      <div class="md-table-modal" role="dialog" aria-modal="true" aria-label="Expanded table" onClick={(event) => event.stopPropagation()}>
+        <div class="md-table-modal-bar">
+          <span>Table</span>
+          <button aria-label="Close expanded table" onClick={() => setExpandedTable(null)} style={{ background: 'none', border: 'none', color: '#e5e5e5', 'font-size': '24px', cursor: 'pointer', padding: '2px 8px' }}>&times;</button>
+        </div>
+        <div class="md-table-modal-body" innerHTML={expandedTable()!} ref={(element) => queueMicrotask(() => { fixLinks(element, setLightbox, props.onOpenFile); fixImages(element, setLightbox) })} />
+      </div>
+    </Show>
+    <Show when={lightbox()}>
+      <div onClick={(event) => { event.stopPropagation(); setLightbox(null) }} style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.85)', 'z-index': '200', display: 'flex', 'align-items': 'center', 'justify-content': 'center', cursor: 'zoom-out' }}>
+        <img src={lightbox()!} style={{ 'max-width': '95vw', 'max-height': '95vh', 'object-fit': 'contain', 'border-radius': '8px' }} />
+      </div>
+    </Show>
+  </>
+}
+
 // ── Component ───────────────────────────────────────────────────────────────
 
 type MessageViewJob = { id: string; type: string; status: string; label?: string }
@@ -1041,6 +1150,7 @@ type MessageViewProps = {
   scrollRefCb?: (el: HTMLDivElement) => void
   sessionId?: string | null
   protocolRuns?: ProtocolRunSnapshot[]
+  onOpenFile?: (path: string) => void
 }
 
 export function MessageView(props: MessageViewProps) {
@@ -1159,20 +1269,20 @@ export function MessageView(props: MessageViewProps) {
             <Show when={input()}>
               <div class="execution-payload">
                 <div class="execution-payload-label">Input</div>
-                <pre ref={linkifyRef}>{input().slice(0, 3000)}{input().length > 3000 ? '\n… (truncated)' : ''}</pre>
+                <pre ref={(element) => linkifyRef(element, setLightbox, props.onOpenFile)}>{input().slice(0, 3000)}{input().length > 3000 ? '\n… (truncated)' : ''}</pre>
               </div>
             </Show>
             <Show when={output()}>
               <div class="execution-payload">
                 <div class="execution-payload-label">{tool()?.result !== undefined ? 'Result' : 'Latest output'}</div>
-                <pre ref={linkifyRef}>{output().slice(0, 3000)}{output().length > 3000 ? '\n… (truncated)' : ''}</pre>
+                <pre ref={(element) => linkifyRef(element, setLightbox, props.onOpenFile)}>{output().slice(0, 3000)}{output().length > 3000 ? '\n… (truncated)' : ''}</pre>
               </div>
             </Show>
           </details>
         }>
           <article class="execution-card execution-thinking" data-testid="omp-thinking-step">
             <div class="execution-thinking-label">Reasoning · {executionStatusMark(thinking()?.status || '')} {executionStatusLabel(thinking()?.status || '')}</div>
-            <div class="markdown" innerHTML={renderLiveMarkdown(thinking()?.text || '')} ref={(element) => queueMicrotask(() => enhanceMarkdown(element, setLightbox, openExpandedTable))} />
+            <div class="markdown" innerHTML={renderLiveMarkdown(thinking()?.text || '')} ref={(element) => queueMicrotask(() => enhanceMarkdown(element, setLightbox, openExpandedTable, props.onOpenFile))} />
           </article>
         </Show>
       </li>
@@ -1301,7 +1411,7 @@ export function MessageView(props: MessageViewProps) {
                   <Show when={agent().assistantText}>
                     <section class="agent-answer" data-testid="omp-subagent-answer" aria-live={agent().assistantEnded ? 'off' : 'polite'}>
                       <div class="agent-answer-label">Answer{agent().assistantEnded ? '' : ' · streaming'}</div>
-                      <div class="markdown" innerHTML={renderLiveMarkdown(agent().assistantText)} ref={(element) => queueMicrotask(() => enhanceMarkdown(element, setLightbox, openExpandedTable))} />
+                      <div class="markdown" innerHTML={renderLiveMarkdown(agent().assistantText)} ref={(element) => queueMicrotask(() => enhanceMarkdown(element, setLightbox, openExpandedTable, props.onOpenFile))} />
                     </section>
                   </Show>
                   <Show when={agent().todo}>
@@ -1452,7 +1562,7 @@ export function MessageView(props: MessageViewProps) {
     if (!streamText) return
     queueMicrotask(() => {
       if (!assistantStreamMarkdownRef || props.assistantStream?.text !== streamText) return
-      enhanceMarkdown(assistantStreamMarkdownRef, (src) => setLightbox(src), openExpandedTable)
+      enhanceMarkdown(assistantStreamMarkdownRef, (src) => setLightbox(src), openExpandedTable, props.onOpenFile)
     })
   })
 
@@ -1573,9 +1683,9 @@ export function MessageView(props: MessageViewProps) {
         <For each={messages}>{(message) => <For each={message.content}>{(block) => {
           if (block.type === 'tool_result' && block.tool_use_id && renderedToolUseIds.has(block.tool_use_id)) return null
           if (block.type === 'thinking' && block.thinking) {
-            return <div class="markdown work-log-reasoning" innerHTML={renderMarkdown(block.thinking)} ref={(element) => queueMicrotask(() => enhanceMarkdown(element, (src) => setLightbox(src), openExpandedTable))} />
+            return <div class="markdown work-log-reasoning" innerHTML={renderMarkdown(block.thinking)} ref={(element) => queueMicrotask(() => enhanceMarkdown(element, (src) => setLightbox(src), openExpandedTable, props.onOpenFile))} />
           }
-          return renderBlock(block, (src) => setLightbox(src), openExpandedTable, getResult)
+          return renderBlock(block, (src) => setLightbox(src), openExpandedTable, getResult, props.onOpenFile)
         }}</For>}</For>
       </div>
     </details>
@@ -1605,7 +1715,7 @@ export function MessageView(props: MessageViewProps) {
           <img src={localImageHref(src)} onClick={() => setLightbox(localImageHref(src))} onError={(event) => replaceImageWithPathLink(event.currentTarget, src)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': hasAttachments ? '12px' : '6px', 'margin-bottom': '4px', cursor: 'zoom-in', display: 'block' }} />
         )}</For>
         <For each={files}>{(f) => (
-          <a href={localFileHref(f.path)} target="_blank" rel="noopener" onClick={(e) => { if (f.name.toLowerCase().endsWith('.pdf')) { e.preventDefault(); setPdfViewer(localFileHref(f.path)) } }} style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
+          <a href={localFileHref(f.path)} target={props.onOpenFile ? undefined : '_blank'} rel={props.onOpenFile ? undefined : 'noopener'} onClick={(event) => { if (props.onOpenFile) { event.preventDefault(); event.stopPropagation(); props.onOpenFile(f.path); return } if (f.name.toLowerCase().endsWith('.pdf')) { event.preventDefault(); setPdfViewer(localFileHref(f.path)) } }} style={{ display: 'flex', 'align-items': 'center', gap: '6px', padding: '6px 10px', margin: '2px 0', background: 'rgba(255,255,255,0.05)', 'border-radius': '8px', 'text-decoration': 'none', color: '#73b8ff', 'font-size': '12px' }}>
             <span style={{ 'font-size': '16px' }}>{f.name.endsWith('.pdf') ? '\uD83D\uDCC4' : '\uD83D\uDCCE'}</span>
             <span style={{ overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{f.name}</span>
           </a>
@@ -1616,7 +1726,7 @@ export function MessageView(props: MessageViewProps) {
             if (msg.role === 'assistant' && (block.type === 'thinking' || block.type === 'tool_result' || (block.type === 'tool_use' && !isQuestionBlock(block)))) return null
             if (block.type === 'text' && block.text) {
               const display = hasAttachments ? cleanText : block.text
-              return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => queueMicrotask(() => enhanceMarkdown(el, (src) => setLightbox(src), openExpandedTable))} /> : null
+              return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => queueMicrotask(() => enhanceMarkdown(el, (src) => setLightbox(src), openExpandedTable, props.onOpenFile))} /> : null
             }
             if (isQuestionBlock(block)) {
               const rawQuestions = Array.isArray(block.input?.questions)
@@ -1651,7 +1761,7 @@ export function MessageView(props: MessageViewProps) {
                 </div>
               }}</For>
             }
-            return renderBlock(block, (src) => setLightbox(src), openExpandedTable)
+            return renderBlock(block, (src) => setLightbox(src), openExpandedTable, undefined, props.onOpenFile)
           }}</For>
         </div>
       </div>
@@ -1701,7 +1811,7 @@ export function MessageView(props: MessageViewProps) {
             <span>Table</span>
             <button ref={(element) => queueMicrotask(() => element.focus())} aria-label="Close expanded table" onClick={closeExpandedTable} style={{ background: 'none', border: 'none', color: '#e5e5e5', 'font-size': '24px', cursor: 'pointer', padding: '2px 8px' }}>&times;</button>
           </div>
-          <div class="md-table-modal-body" innerHTML={expandedTable()!} ref={(element) => queueMicrotask(() => { fixLinks(element, (src) => setLightbox(src)); fixImages(element, (src) => setLightbox(src)) })} />
+          <div class="md-table-modal-body" innerHTML={expandedTable()!} ref={(element) => queueMicrotask(() => { fixLinks(element, (src) => setLightbox(src), props.onOpenFile); fixImages(element, (src) => setLightbox(src)) })} />
         </div>
       </Show>
       <div ref={contentRef}>

@@ -19,6 +19,19 @@ let fixturePath
 let serverProcess
 let serverOutput = ''
 let toolFixture
+let htmlFixture
+let tmuxFixtureDir
+let fixtureState
+
+const FEED_IDS = {
+  waiting: `feed-waiting-${Date.now()}`,
+  working: `feed-working-${Date.now()}`,
+  errored: `feed-errored-${Date.now()}`,
+  finished: `feed-finished-${Date.now()}`,
+  normalized: `feed-normalized-${Date.now()}`,
+  empty: `feed-empty-${Date.now()}`,
+}
+const feedTimestamps = {}
 
 // ── Synthetic session for deterministic testing ─────────────────────────────
 
@@ -28,6 +41,23 @@ let testSessionPath
 
 function writeLine(obj) {
   fs.appendFileSync(testSessionPath, JSON.stringify(obj) + '\n')
+}
+
+function writeFeedSession(projectDir, id, records) {
+  fs.writeFileSync(path.join(projectDir, `${id}.jsonl`),
+    records.map(record => JSON.stringify(record)).join('\n') + '\n')
+}
+
+function claudeFeedMessage(id, timestamp, role, content, extra = {}) {
+  return {
+    type: role,
+    uuid: id,
+    timestamp,
+    isSidechain: false,
+    isMeta: false,
+    message: { role, content },
+    ...extra,
+  }
 }
 
 async function allocatePort() {
@@ -97,17 +127,145 @@ before(async () => {
     fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-api-test-'))
     fixtureHome = path.join(fixtureRoot, 'home')
     stateDir = path.join(fixtureRoot, 'state')
+    fixtureState = stateDir
     port = await allocatePort()
     BASE = `http://127.0.0.1:${port}`
     fs.mkdirSync(fixtureHome, { recursive: true })
     const fixtureBin = path.join(fixtureRoot, 'bin')
     fs.mkdirSync(fixtureBin)
-    fs.writeFileSync(path.join(fixtureBin, 'tmux'), '#!/bin/sh\nexit 1\n', { mode: 0o700 })
+    tmuxFixtureDir = path.join(fixtureRoot, 'tmux')
+    fs.mkdirSync(tmuxFixtureDir)
+    fs.writeFileSync(path.join(fixtureBin, 'tmux'), `#!/bin/sh
+state="\${FEATHER_TEST_TMUX_DIR}"
+case "$1" in
+  list-sessions)
+    [ -f "$state/sessions" ] && cat "$state/sessions"
+    ;;
+  has-session)
+    target="\${3#=}"
+    [ -f "$state/pane-$target" ]
+    ;;
+  capture-pane)
+    previous=""
+    target=""
+    for argument in "$@"; do
+      if [ "$previous" = "-t" ]; then target="$argument"; break; fi
+      previous="$argument"
+    done
+    [ -f "$state/pane-$target" ] || exit 1
+    cat "$state/pane-$target"
+    ;;
+  new-session)
+    [ -f "$state/fail-resume" ] && exit 1
+    previous=""
+    target=""
+    for argument in "$@"; do
+      if [ "$previous" = "-s" ]; then target="$argument"; break; fi
+      previous="$argument"
+    done
+    [ -n "$target" ] || exit 1
+    printf '❯\n' > "$state/pane-$target"
+    printf '%s\n' "$target" >> "$state/resumed"
+    ;;
+  list-panes)
+    printf 'claude\n'
+    ;;
+  load-buffer)
+    cp "$2" "$state/buffer"
+    ;;
+  paste-buffer)
+    previous=""
+    target=""
+    for argument in "$@"; do
+      if [ "$previous" = "-t" ]; then target="$argument"; break; fi
+      previous="$argument"
+    done
+    [ -n "$target" ] && [ ! -f "$state/pane-$target" ] && exit 1
+    [ -f "$state/buffer" ] && cat "$state/buffer" >> "$state/sent"
+    printf '\n' >> "$state/sent"
+    ;;
+  send-keys)
+    previous=""
+    target=""
+    for argument in "$@"; do
+      if [ "$previous" = "-t" ]; then target="$argument"; break; fi
+      previous="$argument"
+    done
+    [ -n "$target" ] && [ ! -f "$state/pane-$target" ] && exit 1
+    printf '%s\n' "$*" >> "$state/sent"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`, { mode: 0o700 })
     fixturePath = `${fixtureBin}${path.delimiter}${process.env.PATH || ''}`
   }
 
   const testProjectDir = path.join(fixtureHome, '.claude/projects/-api-test-project')
   fs.mkdirSync(testProjectDir, { recursive: true })
+
+  if (!EXTERNAL_SERVER) {
+    const now = Date.now()
+    Object.assign(feedTimestamps, {
+      finished: new Date(now - 10_000).toISOString(),
+      update: new Date(now - 20_000).toISOString(),
+      errored: new Date(now - 30_000).toISOString(),
+      working: new Date(now - 60_000).toISOString(),
+      normalized: new Date(now - 90_000).toISOString(),
+      waiting: new Date(now - 120_000).toISOString(),
+      excluded: new Date(now - 5_000).toISOString(),
+    })
+    const seedConversation = (id, timestamp, title, reply) => writeFeedSession(testProjectDir, id, [
+      claudeFeedMessage(`${id}-user`, new Date(Date.parse(timestamp) - 1_000).toISOString(), 'user', title),
+      claudeFeedMessage(`${id}-assistant`, timestamp, 'assistant', [{ type: 'text', text: reply }]),
+    ])
+    seedConversation(FEED_IDS.waiting, feedTimestamps.waiting, 'Waiting fixture', 'Waiting assistant response.')
+    seedConversation(FEED_IDS.working, feedTimestamps.working, 'Working fixture', 'Working assistant response.')
+    seedConversation(FEED_IDS.errored, feedTimestamps.errored, 'Errored fixture', 'API Error: synthetic failure')
+    seedConversation(FEED_IDS.finished, feedTimestamps.finished, 'Finished fixture', 'Finished assistant response.')
+    writeFeedSession(testProjectDir, FEED_IDS.normalized, [
+      claudeFeedMessage('feed-normalized-user', new Date(Date.parse(feedTimestamps.normalized) - 1_000).toISOString(), 'user', 'Normalized fixture'),
+      claudeFeedMessage('feed-normalized-visible', feedTimestamps.normalized, 'assistant', [{ type: 'text', text: 'Visible **normalized** answer.' }]),
+      claudeFeedMessage('feed-normalized-tool', feedTimestamps.excluded, 'assistant', [{ type: 'tool_use', id: 'feed-tool', name: 'Read', input: { path: '/tmp/input' } }]),
+      claudeFeedMessage('feed-normalized-result', feedTimestamps.excluded, 'assistant', [{ type: 'tool_result', tool_use_id: 'feed-tool', content: 'internal output' }]),
+      claudeFeedMessage('feed-normalized-internal', feedTimestamps.excluded, 'assistant', [{ type: 'text', text: 'Internal compact summary.' }], { isCompactSummary: true }),
+      claudeFeedMessage('feed-normalized-empty', feedTimestamps.excluded, 'assistant', '   '),
+    ])
+    writeFeedSession(testProjectDir, FEED_IDS.empty, [
+      claudeFeedMessage('feed-empty-user', new Date(Date.parse(feedTimestamps.normalized) - 2_000).toISOString(), 'user', 'Excluded fixture'),
+      claudeFeedMessage('feed-empty-tool', feedTimestamps.excluded, 'assistant', [{ type: 'tool_use', id: 'empty-tool', name: 'Read', input: {} }]),
+      claudeFeedMessage('feed-empty-result', feedTimestamps.excluded, 'assistant', [{ type: 'tool_result', tool_use_id: 'empty-tool', content: 'hidden' }]),
+      claudeFeedMessage('feed-empty-internal', feedTimestamps.excluded, 'assistant', [{ type: 'text', text: 'Hidden summary.' }], { isCompactSummary: true }),
+      claudeFeedMessage('feed-empty-assistant', feedTimestamps.excluded, 'assistant', ''),
+    ])
+
+    fs.mkdirSync(stateDir, { recursive: true })
+    fs.writeFileSync(path.join(stateDir, 'project-labels.json'), JSON.stringify({ '-api-test-project': 'API Test' }))
+    const featherHome = path.join(fixtureHome, '.feather')
+    fs.mkdirSync(featherHome, { recursive: true })
+    fs.writeFileSync(path.join(featherHome, 'room-sessions.json'), JSON.stringify({ [FEED_IDS.normalized]: 'alpha' }))
+    const roomDir = path.join(fixtureHome, 'rooms', 'alpha')
+    fs.mkdirSync(roomDir, { recursive: true })
+    fs.writeFileSync(path.join(roomDir, 'AGENTS.md'), '# Room: #alpha\n')
+    fs.writeFileSync(path.join(roomDir, 'updates.jsonl'), [{
+      id: 'feed-room-update',
+      ts: feedTimestamps.update,
+      text: 'Room update with a human-facing result.',
+    }, {
+      id: 'feed-room-update-tie',
+      ts: feedTimestamps.update,
+      text: 'Second update at the exact same time.',
+    }].map(update => JSON.stringify(update)).join('\n') + '\n')
+
+    const created = Math.floor(now / 1000)
+    fs.writeFileSync(path.join(tmuxFixtureDir, 'sessions'), [
+      `f-${FEED_IDS.waiting}|${created}`,
+      `f-${FEED_IDS.working}|${created}`,
+    ].join('\n') + '\n')
+    fs.writeFileSync(path.join(tmuxFixtureDir, `pane-f-${FEED_IDS.waiting}`), 'Deploy this result? (Y/n)\n')
+    fs.writeFileSync(path.join(tmuxFixtureDir, `pane-f-${FEED_IDS.working}`), '✻ Working…\n❯\n')
+  }
 
   if (!EXTERNAL_SERVER) {
     serverProcess = spawn(process.execPath, ['server-single.js'], {
@@ -117,6 +275,8 @@ before(async () => {
         HOME: fixtureHome,
         FEATHER_STATE_DIR: stateDir,
         FEATHER_DEEPGRAM_API_KEY: '',
+        FEATHER_TEST_TMUX_DIR: tmuxFixtureDir,
+        FEATHER_PUSH_POLL: '0',
         PORT: String(port),
         PATH: fixturePath,
       },
@@ -136,6 +296,8 @@ before(async () => {
   testSessionPath = path.join(testSessionDir, `${TEST_SESSION_ID}.jsonl`)
   toolFixture = path.join(fixtureHome, 'tool-preview.svg')
   fs.writeFileSync(toolFixture, '<svg xmlns="http://www.w3.org/2000/svg"></svg>')
+  htmlFixture = path.join(fixtureHome, 'interactive-preview.html')
+  fs.writeFileSync(htmlFixture, '<!doctype html><script>document.body.textContent = "interactive"</script>')
 
   // Seed with known messages
   writeLine({
@@ -163,6 +325,7 @@ before(async () => {
     },
   })
   writeLine({
+
     type: 'assistant', uuid: 'api-test-0004', timestamp: '2025-06-15T12:00:12Z',
     isSidechain: false, isMeta: false,
     message: {
@@ -179,6 +342,7 @@ after(async () => {
   // Clean up synthetic session
   try { fs.unlinkSync(testSessionPath) } catch {}
   try { fs.unlinkSync(toolFixture) } catch {}
+  try { fs.unlinkSync(htmlFixture) } catch {}
   if (serverProcess && serverProcess.exitCode === null && serverProcess.signalCode === null) {
     serverProcess.kill('SIGTERM')
     await Promise.race([
@@ -204,6 +368,49 @@ describe('GET /api/health', () => {
     assert.ok(body.uptime > 0)
     assert.equal(body.capabilities.maxUploadBytes, 50 * 1024 * 1024)
     assert.equal(body.capabilities.maxAudioBytes, 25 * 1024 * 1024)
+  })
+})
+describe('push subscription security', () => {
+  const keys = { p256dh: 'A'.repeat(87), auth: 'B'.repeat(22) }
+
+  it('returns only aggregate push test and subscription state', async () => {
+    let response = await fetch(`${BASE}/api/push/test`, { method: 'POST' })
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { total: 0, sent: 0, failed: 0, removed: 0 })
+    response = await fetch(`${BASE}/api/push/subscribe`)
+    assert.deepEqual(await response.json(), { count: 0 })
+  })
+
+  it('accepts only bounded public HTTPS subscriptions', async () => {
+    const subscribe = endpoint => fetch(`${BASE}/api/push/subscribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint, keys }),
+    })
+    for (const endpoint of [
+      'http://push.example.com/sub',
+      'https://127.0.0.1/sub',
+      'https://10.0.0.1/sub',
+      'https://169.254.1.1/sub',
+      'https://[::1]/sub',
+      `https://push.example.com/${'x'.repeat(2100)}`,
+    ]) {
+      assert.equal((await subscribe(endpoint)).status, 400, endpoint)
+    }
+    let response = await fetch(`${BASE}/api/push/subscribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        endpoint: 'https://push.example.com/sub',
+        keys: { p256dh: 'A'.repeat(257), auth: 'B'.repeat(22) },
+      }),
+    })
+    assert.equal(response.status, 400)
+
+    response = await subscribe('https://push.example.com/sub')
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { ok: true, count: 1 })
+    assert.deepEqual(await (await fetch(`${BASE}/api/push/subscribe`)).json(), { count: 1 })
   })
 })
 
@@ -373,6 +580,438 @@ describe('GET /api/sessions/:id/messages', () => {
     const { messages } = await (await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/messages`)).json()
     assert.equal(messages[0].timestamp, '2025-06-15T12:00:00Z')
     assert.equal(messages[1].timestamp, '2025-06-15T12:00:05Z')
+  })
+})
+
+// ── Feed ────────────────────────────────────────────────────────────────────
+
+describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
+  it('ranks waiting before errors, work, and completions in For You', async () => {
+    const response = await fetch(`${BASE}/api/feed?mode=for-you&limit=50`, {
+      headers: { 'Remote-User': 'Philip' },
+    })
+    assert.equal(response.status, 200)
+    const body = await response.json()
+    assert.ok(Number.isFinite(Date.parse(body.generatedAt)))
+    assert.ok(body.counts.waiting >= 1)
+    assert.ok(body.counts.working >= 1)
+    assert.ok(body.counts.errored >= 1)
+    assert.ok(body.counts.finished >= 1)
+
+    const positions = Object.fromEntries(['waiting', 'errored', 'working', 'finished'].map(status => {
+      const id = FEED_IDS[status]
+      return [status, body.posts.findIndex(post => post.sessionId === id)]
+    }))
+    for (const [status, position] of Object.entries(positions)) {
+      assert.ok(position >= 0, `missing ${status} fixture`)
+    }
+    assert.ok(positions.waiting < positions.errored)
+    assert.ok(positions.errored < positions.working)
+    assert.ok(positions.working < positions.finished)
+
+    const waiting = body.posts[positions.waiting]
+    assert.equal(waiting.status, 'waiting')
+    assert.match(waiting.question, /Deploy this result/)
+    assert.match(waiting.why, /Waiting for your answer/)
+    assert.doesNotMatch(waiting.why, /ETA|minute|hour/i)
+  })
+
+  it('orders Latest chronologically and filters Needs Me to waiting posts', async () => {
+    const latest = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    for (let index = 1; index < latest.posts.length; index++) {
+      assert.ok(Date.parse(latest.posts[index - 1].timestamp) >= Date.parse(latest.posts[index].timestamp))
+    }
+    assert.equal(latest.posts[0].sessionId, FEED_IDS.finished)
+
+    const needsMe = await (await fetch(`${BASE}/api/feed?mode=needs-me&limit=50`)).json()
+    assert.ok(needsMe.posts.length > 0)
+    assert.ok(needsMe.posts.every(post => post.status === 'waiting'))
+    assert.ok(needsMe.posts.some(post => post.sessionId === FEED_IDS.waiting))
+  })
+
+  it('uses normalized meaningful assistant messages and links Room updates', async () => {
+    const { posts } = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const normalized = posts.find(post => post.sessionId === FEED_IDS.normalized && post.kind === 'session')
+    assert.ok(normalized)
+    assert.equal(normalized.message.uuid, 'feed-normalized-visible')
+    assert.deepEqual(normalized.message.content, [{ type: 'text', text: 'Visible **normalized** answer.' }])
+    assert.equal(normalized.room, 'alpha')
+    assert.equal(normalized.projectId, '-api-test-project')
+    assert.equal(normalized.projectLabel, 'API Test')
+    assert.equal(posts.some(post => post.sessionId === FEED_IDS.empty), false)
+
+    const update = posts.find(post => post.updateText === 'Room update with a human-facing result.')
+    assert.ok(update)
+    assert.equal(update.kind, 'room-update')
+    assert.equal(update.sessionId, FEED_IDS.normalized)
+    assert.equal(update.room, 'alpha')
+    assert.equal(update.updateText, 'Room update with a human-facing result.')
+    assert.equal(update.title, 'Room update with a human-facing result.')
+    assert.equal(update.agent, null)
+    assert.equal(update.status, 'finished')
+    assert.match(update.id, /^feed_[a-f0-9]{32}$/)
+    assert.ok(posts.every(post => /^feed_[a-f0-9]{32}$/.test(post.id)))
+  })
+
+  it('paginates pinned For You posts without skipping or repeating completions', async () => {
+    const latest = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const expectedFinished = latest.posts
+      .filter(post => post.status === 'finished')
+      .map(post => post.id)
+
+    const first = await (await fetch(`${BASE}/api/feed?mode=for-you&limit=2`)).json()
+    assert.deepEqual(first.posts.map(post => post.status), ['waiting', 'errored'])
+    assert.match(first.nextBefore, /^f1_/)
+
+    const seen = new Set(first.posts.map(post => post.id))
+    const pinnedStatuses = first.posts.map(post => post.status)
+    let sawCompletion = false
+    let before = first.nextBefore
+    for (let pageNumber = 0; before && pageNumber < 10; pageNumber++) {
+      const page = await (await fetch(
+        `${BASE}/api/feed?mode=for-you&limit=2&before=${encodeURIComponent(before)}`,
+      )).json()
+      for (const post of page.posts) {
+        assert.equal(seen.has(post.id), false, `duplicate post ${post.id}`)
+        seen.add(post.id)
+        if (post.status === 'finished') {
+          sawCompletion = true
+        } else {
+          assert.equal(sawCompletion, false, 'a pinned post appeared after completions')
+          pinnedStatuses.push(post.status)
+        }
+      }
+      before = page.nextBefore
+    }
+    assert.equal(before, null)
+    assert.deepEqual(pinnedStatuses, ['waiting', 'errored', 'working'])
+    for (const id of expectedFinished) assert.ok(seen.has(id), `skipped completion ${id}`)
+  })
+
+  it('provides stable timestamp pagination and bounds malformed query values', async () => {
+    const first = await (await fetch(`${BASE}/api/feed?mode=latest&limit=2`)).json()
+    assert.equal(first.posts.length, 2)
+    assert.match(first.nextBefore, /^f1_/)
+    const second = await (await fetch(
+      `${BASE}/api/feed?mode=latest&limit=2&before=${encodeURIComponent(first.nextBefore)}`,
+    )).json()
+    assert.ok(second.posts.length > 0)
+    assert.equal(second.posts.some(post => first.posts.some(previous => previous.id === post.id)), false)
+    assert.ok(second.posts.some(post => post.timestamp === first.posts[1].timestamp),
+      'opaque cursor skipped a post sharing the boundary timestamp')
+
+    const repeated = await (await fetch(`${BASE}/api/feed?mode=latest&limit=2`)).json()
+    assert.deepEqual(repeated.posts.map(post => post.id), first.posts.map(post => post.id))
+    const oversized = await (await fetch(`${BASE}/api/feed?limit=999`)).json()
+    assert.ok(oversized.posts.length <= 50)
+    const negative = await (await fetch(`${BASE}/api/feed?limit=-99`)).json()
+    assert.equal(negative.posts.length, 1)
+    const malformed = await (await fetch(`${BASE}/api/feed?mode=not-a-mode&limit=nope&before=not-a-date`)).json()
+    assert.ok(malformed.posts.length <= 20)
+    assert.equal(malformed.posts[0].sessionId, FEED_IDS.waiting)
+  })
+  it('persists reactions and safely resumes an inactive session exactly once per change', async () => {
+    const initial = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const post = initial.posts.find(candidate => candidate.sessionId === FEED_IDS.finished)
+    assert.ok(post)
+    const endpoint = `${BASE}/api/feed/${encodeURIComponent(post.id)}/reaction`
+    const putReaction = reaction => fetch(endpoint, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Remote-User': 'Philip' },
+      body: JSON.stringify({ reaction }),
+    })
+
+    let response = await putReaction('like')
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { reaction: 'like', reactionDelivery: 'delivered', changed: true, delivery: 'delivered' })
+    assert.match(fs.readFileSync(path.join(tmuxFixtureDir, 'resumed'), 'utf8'), new RegExp(FEED_IDS.finished))
+    const interactionFile = path.join(fixtureState, 'feed-interactions.json')
+    const likeMessageId = JSON.parse(fs.readFileSync(interactionFile, 'utf8'))
+      .posts[post.id].reactionDelivery.messageId
+
+    const liked = (await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json())
+      .posts.find(candidate => candidate.id === post.id)
+    assert.equal(liked.reaction, 'like')
+    assert.equal(liked.reactionDelivery, 'delivered')
+    assert.equal(liked.score, post.score + (7 * 24 * 60 * 60))
+    assert.match(liked.why, /boosted because you liked this/)
+    const deliveriesBeforeRepeat = (fs.readFileSync(path.join(tmuxFixtureDir, 'sent'), 'utf8')
+      .match(/\[FLEDGE_REACTION:/g) || []).length
+
+    response = await putReaction('like')
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { reaction: 'like', reactionDelivery: 'delivered', changed: false, delivery: 'not-needed' })
+    const deliveriesAfterRepeat = (fs.readFileSync(path.join(tmuxFixtureDir, 'sent'), 'utf8')
+      .match(/\[FLEDGE_REACTION:/g) || []).length
+    assert.equal(deliveriesAfterRepeat, deliveriesBeforeRepeat)
+
+    response = await putReaction('less')
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { reaction: 'less', reactionDelivery: 'delivered', changed: true, delivery: 'delivered' })
+    const lowered = (await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json())
+      .posts.find(candidate => candidate.id === post.id)
+    assert.equal(lowered.score, post.score - (7 * 24 * 60 * 60))
+    assert.match(lowered.why, /lowered because you asked for less/)
+
+    const stored = JSON.parse(fs.readFileSync(interactionFile, 'utf8'))
+    assert.equal(stored.schema, 1)
+    assert.equal(stored.posts[post.id].reaction, 'less')
+    assert.equal(stored.posts[post.id].reactionDelivery.status, 'delivered')
+    assert.match(stored.posts[post.id].reactionDelivery.messageId, /^fledge-reaction-/)
+    const lessMessageId = stored.posts[post.id].reactionDelivery.messageId
+    const sentReactions = fs.readFileSync(path.join(tmuxFixtureDir, 'sent'), 'utf8')
+    assert.equal(sentReactions.split(`[FLEDGE_REACTION:${post.id}:like:${likeMessageId}]`).length - 1, 1)
+    assert.equal(sentReactions.split(`[FLEDGE_REACTION:${post.id}:less:${lessMessageId}]`).length - 1, 1)
+    assert.equal(stored.posts[post.id].snapshot.id, post.id)
+    assert.equal(fs.statSync(path.join(fixtureState, 'feed-interactions.json')).mode & 0o777, 0o600)
+
+    response = await putReaction(null)
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { reaction: null, reactionDelivery: null, changed: true, delivery: 'not-needed' })
+    const cleared = (await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json())
+      .posts.find(candidate => candidate.id === post.id)
+    assert.equal(cleared.reaction, null)
+    assert.equal(cleared.reactionDelivery, null)
+    assert.equal(cleared.score, post.score)
+  })
+  it('retries failed same-reaction delivery with its persisted idempotency key', async () => {
+    const feed = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const post = feed.posts.find(candidate => candidate.sessionId === FEED_IDS.normalized && candidate.kind === 'session')
+    const endpoint = `${BASE}/api/feed/${encodeURIComponent(post.id)}/reaction`
+    const putLike = () => fetch(endpoint, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reaction: 'like' }),
+    })
+
+    fs.writeFileSync(path.join(tmuxFixtureDir, 'fail-resume'), '1')
+    let response
+    try {
+      response = await putLike()
+    } finally {
+      fs.rmSync(path.join(tmuxFixtureDir, 'fail-resume'), { force: true })
+    }
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), {
+      reaction: 'like',
+      reactionDelivery: 'failed',
+      changed: true,
+      delivery: 'failed',
+    })
+    const interactionFile = path.join(fixtureState, 'feed-interactions.json')
+    let stored = JSON.parse(fs.readFileSync(interactionFile, 'utf8'))
+    const messageId = stored.posts[post.id].reactionDelivery.messageId
+    assert.equal(stored.posts[post.id].reactionDelivery.status, 'failed')
+
+    response = await putLike()
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), {
+      reaction: 'like',
+      reactionDelivery: 'delivered',
+      changed: false,
+      delivery: 'delivered',
+    })
+    stored = JSON.parse(fs.readFileSync(interactionFile, 'utf8'))
+    assert.equal(stored.posts[post.id].reactionDelivery.messageId, messageId)
+    assert.equal(stored.posts[post.id].reactionDelivery.status, 'delivered')
+  })
+
+
+  it('persists comments before delivery and exposes durable inline agent replies', async () => {
+    const initial = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const post = initial.posts.find(candidate => candidate.sessionId === FEED_IDS.finished)
+    const commentId = '20000000-0000-4000-8000-000000000001'
+    const endpoint = `${BASE}/api/feed/${encodeURIComponent(post.id)}/comments`
+    const postComment = (id, text) => fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Remote-User': 'Philip' },
+      body: JSON.stringify({ id, text }),
+    })
+
+    let response = await postComment(commentId, 'Can you explain the consequence?')
+    assert.equal(response.status, 201)
+    let body = await response.json()
+    assert.equal(body.comment.id, commentId)
+    assert.equal(body.comment.delivery, 'delivered')
+    const deliveredLog = fs.readFileSync(path.join(tmuxFixtureDir, 'sent'), 'utf8')
+    const commentPrompt = deliveredLog.slice(deliveredLog.lastIndexOf(`[FLEDGE_COMMENT:${commentId}]`))
+      .split('\nsend-keys -t ')[0]
+    assert.match(commentPrompt, new RegExp(`\\[FLEDGE_COMMENT:${commentId}\\]`))
+    assert.match(commentPrompt, /next meaningful human-facing answer will appear as the inline reply/)
+    assert.doesNotMatch(commentPrompt, /Finished fixture/)
+    assert.doesNotMatch(commentPrompt, new RegExp(FEED_IDS.finished))
+
+    const interactionFile = path.join(fixtureState, 'feed-interactions.json')
+    let stored = JSON.parse(fs.readFileSync(interactionFile, 'utf8'))
+    assert.equal(stored.posts[post.id].comments[0].delivery, 'delivered')
+    assert.equal(stored.posts[post.id].comments[0].text, 'Can you explain the consequence?')
+
+    const replyAt = new Date().toISOString()
+    const sessionFile = path.join(testSessionDir, `${FEED_IDS.finished}.jsonl`)
+    fs.appendFileSync(sessionFile, [
+      JSON.stringify(claudeFeedMessage('feed-comment-user', replyAt, 'user', `[FLEDGE_COMMENT:${commentId}]\nCan you explain the consequence?`)),
+      JSON.stringify(claudeFeedMessage('feed-comment-reply', new Date(Date.parse(replyAt) + 1).toISOString(), 'assistant', [
+        { type: 'text', text: 'The consequence is **durable and visible inline**.' },
+      ])),
+    ].join('\n') + '\n')
+
+    await fetch(`${BASE}/api/feed?mode=latest&limit=50`)
+    await new Promise(resolve => setTimeout(resolve, 150))
+    const refreshed = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const interacted = refreshed.posts.find(candidate => candidate.id === post.id)
+    assert.ok(interacted, 'interacted snapshot disappeared after a newer assistant answer')
+    assert.equal(interacted.comments.length, 1)
+    assert.deepEqual(interacted.comments[0].reply, {
+      text: 'The consequence is **durable and visible inline**.',
+      timestamp: new Date(Date.parse(replyAt) + 1).toISOString(),
+    })
+    assert.ok(refreshed.posts.some(candidate =>
+      candidate.sessionId === FEED_IDS.finished && candidate.id !== post.id))
+
+    response = await postComment(commentId, 'Can you explain the consequence?')
+    assert.equal(response.status, 200)
+    body = await response.json()
+    assert.ok(body.comment.reply)
+    stored = JSON.parse(fs.readFileSync(interactionFile, 'utf8'))
+    assert.equal(stored.posts[post.id].comments.length, 1)
+    assert.ok(stored.posts[post.id].comments[0].reply)
+    const commentDeliveries = (fs.readFileSync(path.join(tmuxFixtureDir, 'sent'), 'utf8')
+      .match(new RegExp(`\\[FLEDGE_COMMENT:${commentId}\\]`, 'g')) || []).length
+    assert.equal(commentDeliveries, 1)
+  })
+
+  it('keeps an interacted Room update bound to its stored originating session', async () => {
+    let feed = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const update = feed.posts.find(post => post.updateText === 'Room update with a human-facing result.')
+    const originSessionId = update.sessionId
+    const replacementSessionId = originSessionId === FEED_IDS.finished ? FEED_IDS.normalized : FEED_IDS.finished
+    const firstId = '20000000-0000-4000-8000-000000000010'
+    let response = await fetch(`${BASE}/api/feed/${encodeURIComponent(update.id)}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: firstId, text: 'Keep this bound to the originating chat.' }),
+    })
+    assert.equal(response.status, 201)
+    assert.equal((await response.json()).comment.delivery, 'delivered')
+
+    const assignmentsFile = path.join(fixtureHome, '.feather', 'room-sessions.json')
+    const assignments = JSON.parse(fs.readFileSync(assignmentsFile, 'utf8'))
+    assignments[replacementSessionId] = 'alpha'
+    fs.writeFileSync(assignmentsFile, JSON.stringify(assignments))
+    fs.appendFileSync(path.join(testSessionDir, `${replacementSessionId}.jsonl`),
+      JSON.stringify(claudeFeedMessage(
+        'feed-room-rebind-candidate',
+        new Date(Date.now() + 60_000).toISOString(),
+        'assistant',
+        [{ type: 'text', text: 'Newer Room session that must not steal the stored interaction.' }],
+      )) + '\n')
+    feed = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    assert.equal(feed.posts.find(post => post.id === update.id).sessionId, originSessionId)
+
+    const secondId = '20000000-0000-4000-8000-000000000011'
+    response = await fetch(`${BASE}/api/feed/${encodeURIComponent(update.id)}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: secondId, text: 'Deliver to the original chat.' }),
+    })
+    assert.equal(response.status, 201)
+    assert.equal((await response.json()).comment.delivery, 'delivered')
+    const sent = fs.readFileSync(path.join(tmuxFixtureDir, 'sent'), 'utf8')
+    const secondDelivery = sent.slice(sent.lastIndexOf(`[FLEDGE_COMMENT:${secondId}]`))
+    assert.match(secondDelivery, new RegExp(`send-keys -t f-${originSessionId} Enter`))
+    assert.doesNotMatch(secondDelivery, new RegExp(`send-keys -t f-${replacementSessionId} Enter`))
+  })
+
+  it('reports failed inactive-session delivery after durably queueing the comment', async () => {
+    const initial = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const post = initial.posts.find(candidate => candidate.sessionId === FEED_IDS.errored)
+    const commentId = '20000000-0000-4000-8000-000000000002'
+    fs.writeFileSync(path.join(tmuxFixtureDir, 'fail-resume'), '1')
+    let response
+    try {
+      response = await fetch(`${BASE}/api/feed/${encodeURIComponent(post.id)}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: commentId, text: 'Please recover this dispatch.' }),
+      })
+    } finally {
+      fs.rmSync(path.join(tmuxFixtureDir, 'fail-resume'), { force: true })
+    }
+    assert.equal(response.status, 201)
+    const { comment } = await response.json()
+    assert.equal(comment.delivery, 'failed')
+    const interactionFile = path.join(fixtureState, 'feed-interactions.json')
+    let stored = JSON.parse(fs.readFileSync(interactionFile, 'utf8'))
+    assert.equal(stored.posts[post.id].comments.find(candidate => candidate.id === commentId)?.delivery, 'failed')
+    stored.posts[post.id].snapshot.status = 'waiting'
+    stored.posts[post.id].snapshot.question = 'Stale question that was answered'
+    stored.posts[post.id].snapshot.why = 'Waiting for your answer'
+    fs.writeFileSync(interactionFile, JSON.stringify(stored))
+
+    const marker = `[FLEDGE_COMMENT:${commentId}]`
+    const answeredAt = new Date().toISOString()
+    fs.appendFileSync(path.join(testSessionDir, `${FEED_IDS.errored}.jsonl`), [
+      JSON.stringify(claudeFeedMessage('feed-failed-comment-user', answeredAt, 'user', `${marker}\nPlease recover this dispatch.`)),
+      JSON.stringify(claudeFeedMessage('feed-failed-comment-answer', new Date(Date.parse(answeredAt) + 1).toISOString(), 'assistant', [
+        { type: 'text', text: 'Recovered without leaving a stale question.' },
+      ])),
+    ].join('\n') + '\n')
+    const sendsBeforeReconcile = fs.existsSync(path.join(tmuxFixtureDir, 'sent'))
+      ? fs.readFileSync(path.join(tmuxFixtureDir, 'sent'), 'utf8').split(marker).length - 1
+      : 0
+    response = await fetch(`${BASE}/api/feed/${encodeURIComponent(post.id)}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: commentId, text: 'Please recover this dispatch.' }),
+    })
+    assert.equal(response.status, 200)
+    assert.equal((await response.json()).comment.delivery, 'delivered')
+    const sendsAfterReconcile = fs.readFileSync(path.join(tmuxFixtureDir, 'sent'), 'utf8').split(marker).length - 1
+    assert.equal(sendsAfterReconcile, sendsBeforeReconcile)
+
+    await fetch(`${BASE}/api/feed?mode=latest&limit=50`)
+    await new Promise(resolve => setTimeout(resolve, 150))
+    const refreshed = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const snapshot = refreshed.posts.find(candidate => candidate.id === post.id)
+    assert.equal(snapshot.status, 'finished')
+    assert.equal(snapshot.question, undefined)
+    assert.match(snapshot.why, /Archived interacted dispatch/)
+    const needsMe = await (await fetch(`${BASE}/api/feed?mode=needs-me&limit=50`)).json()
+    assert.equal(needsMe.posts.some(candidate => candidate.id === post.id), false)
+    assert.match(snapshot.message.content[0].text, /API Error/)
+  })
+
+  it('rejects stale posts, malformed feedback, and oversized comments', async () => {
+    let response = await fetch(`${BASE}/api/feed/not-a-current-post/reaction`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reaction: 'favorite' }),
+    })
+    assert.equal(response.status, 400)
+    response = await fetch(`${BASE}/api/feed/not-a-current-post/reaction`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reaction: 'like' }),
+    })
+    assert.equal(response.status, 404)
+    response = await fetch(`${BASE}/api/feed/not-a-current-post/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: '20000000-0000-4000-8000-000000000003', text: 'unknown' }),
+    })
+    assert.equal(response.status, 404)
+
+    const feed = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const post = feed.posts.find(candidate => candidate.sessionId === FEED_IDS.normalized)
+    response = await fetch(`${BASE}/api/feed/${encodeURIComponent(post.id)}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: '20000000-0000-4000-8000-000000000004',
+        text: 'x'.repeat(4001),
+      }),
+    })
+    assert.equal(response.status, 413)
   })
 })
 
@@ -874,6 +1513,22 @@ describe('GET /api/files/raw', () => {
   it('404s for missing files', async () => {
     const r = await fetch(`${BASE}/api/files/raw?path=/tmp/no-such-file-ever.png`)
     assert.equal(r.status, 404)
+  })
+})
+
+describe('GET /api/files/html', () => {
+  it('runs self-contained scripts in an opaque no-network sandbox', async () => {
+    const response = await fetch(`${BASE}/api/files/html?path=${encodeURIComponent(htmlFixture)}`)
+    assert.equal(response.status, 200)
+    assert.match(response.headers.get('content-type'), /^text\/html/)
+    const csp = response.headers.get('content-security-policy')
+    assert.ok(csp)
+    assert.match(csp, /(?:^|; )sandbox allow-scripts(?:;|$)/)
+    assert.match(csp, /script-src 'unsafe-inline' data: blob:/)
+    assert.match(csp, /connect-src 'none'/)
+    assert.match(csp, /form-action 'none'/)
+    assert.doesNotMatch(csp, /allow-same-origin|allow-forms|allow-popups|allow-top-navigation/)
+    assert.doesNotMatch(csp.match(/script-src ([^;]+)/)?.[1] || '', /https?:/)
   })
 })
 
