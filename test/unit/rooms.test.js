@@ -65,7 +65,7 @@ describe('portable Room membership', () => {
     assert.equal(detached.get('marriage')[1].roomAssigned, undefined)
   })
 
-  it('includes old assigned sessions and a freshly spawned transcriptless Leader', async () => {
+  it('includes old assigned sessions without letting a transcriptless Leader pin recency', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-rooms-portable-'))
     roots.push(root)
     const home = path.join(root, 'zak-home')
@@ -74,6 +74,7 @@ describe('portable Room membership', () => {
     const roomDir = path.join(home, 'rooms/marriage')
     const otherRoomDir = path.join(home, 'rooms/other')
     const freshRoomDir = path.join(home, 'rooms/fresh')
+    const notesRoomDir = path.join(home, 'rooms/notes-only')
     const ordinaryProject = path.join(projects, encodeProjectPath(path.join(home, 'ordinary')))
     const roomProject = path.join(projects, encodeProjectPath(roomDir))
     fs.mkdirSync(stateDir)
@@ -83,12 +84,15 @@ describe('portable Room membership', () => {
     fs.mkdirSync(roomDir, { recursive: true })
     fs.mkdirSync(otherRoomDir, { recursive: true })
     fs.mkdirSync(freshRoomDir, { recursive: true })
+    fs.mkdirSync(notesRoomDir, { recursive: true })
     fs.writeFileSync(path.join(roomDir, 'AGENTS.md'), '# Room: #marriage\n')
     fs.writeFileSync(path.join(roomDir, 'notes.md'), '# #marriage — notes\n')
     fs.writeFileSync(path.join(otherRoomDir, 'AGENTS.md'), '# Room: #other\n')
     fs.writeFileSync(path.join(otherRoomDir, 'notes.md'), '# #other — notes\n')
     fs.writeFileSync(path.join(freshRoomDir, 'AGENTS.md'), '# Room: #fresh\n')
     fs.writeFileSync(path.join(freshRoomDir, 'notes.md'), '# #fresh — notes\n')
+    fs.writeFileSync(path.join(notesRoomDir, 'AGENTS.md'), '# Room: #notes-only\n')
+    fs.writeFileSync(path.join(notesRoomDir, 'notes.md'), '# #notes-only — notes\n- 2026-08-20 Notes-only Room fallback\n')
     const invalidRoomDir = path.join(home, 'rooms/Bad Room')
     fs.mkdirSync(invalidRoomDir)
     fs.writeFileSync(path.join(invalidRoomDir, 'AGENTS.md'), '# invalid\n')
@@ -135,8 +139,17 @@ describe('portable Room membership', () => {
       timestamp: '2021-01-01T00:00:00Z',
     })
     fs.utimesSync(residentFile, new Date('2021-01-01T00:00:00Z'), new Date('2021-01-01T00:00:00Z'))
+    const freshChatId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+    const freshChatFile = path.join(ordinaryProject, `${freshChatId}.jsonl`)
+    writeClaudeSession(freshChatFile, {
+      id: freshChatId, cwd: path.join(home, 'ordinary'), title: 'Newer ordinary Fresh Room work',
+      timestamp: '2022-01-01T00:00:00Z',
+    })
+    fs.utimesSync(freshChatFile, new Date('2022-01-01T00:00:00Z'), new Date('2022-01-01T00:00:00Z'))
     const freshLeaderId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
-    fs.mkdirSync(path.join(home, '.feather/omp-sessions', freshLeaderId), { recursive: true })
+    const freshLeaderDir = path.join(home, '.feather/omp-sessions', freshLeaderId)
+    fs.mkdirSync(freshLeaderDir, { recursive: true })
+    fs.utimesSync(freshLeaderDir, new Date('2020-01-01T00:00:00Z'), new Date('2020-01-01T00:00:00Z'))
     fs.writeFileSync(path.join(stateDir, 'session-meta.json'), JSON.stringify({
       [freshLeaderId]: { agent: 'omp', cwd: freshRoomDir, title: '#fresh Leader' },
     }))
@@ -145,6 +158,7 @@ describe('portable Room membership', () => {
       [residentId]: 'marriage',
       [movedId]: 'other',
       [freshLeaderId]: 'fresh',
+      [freshChatId]: 'fresh',
     }))
     fs.writeFileSync(path.join(home, '.feather/room-mains.json'), JSON.stringify({ marriage: oldId, fresh: freshLeaderId }))
     fs.writeFileSync(path.join(home, '.feather/room-residents.json'), JSON.stringify({
@@ -181,6 +195,8 @@ describe('portable Room membership', () => {
       assert.equal(marriage.pulse.status, 'working')
       assert.equal(marriage.pulse.sessionId, cwdId)
       assert.equal(marriage.leaderSessionId, oldId)
+      assert.deepEqual(marriage.latest, { role: 'user', text: 'Marriage Caretaker' })
+      assert.equal(marriage.updatedAt, '2021-01-01T00:00:00.000Z')
       assert.deepEqual(marriage.sessions.map((session) => session.id), [residentId, oldId, cwdId])
       const historical = marriage.sessions.find((session) => session.id === oldId)
       assert.equal(historical.title, 'Historical marriage conversation')
@@ -192,12 +208,23 @@ describe('portable Room membership', () => {
       ])
       const fresh = rooms.find((room) => room.name === 'fresh')
       assert.equal(fresh.leaderSessionId, freshLeaderId)
-      assert.deepEqual(fresh.sessions.map((session) => session.id), [freshLeaderId])
-      assert.equal(fresh.sessions[0].title, '#fresh Leader')
-      assert.equal(fresh.sessions[0].roomAssigned, true)
+      assert.deepEqual(fresh.sessions.map((session) => session.id), [freshChatId, freshLeaderId])
+      assert.equal(fresh.sessions[0].title, 'Newer ordinary Fresh Room work')
+      assert.equal(fresh.sessions[1].title, '#fresh Leader')
+      assert.equal(fresh.sessions[1].roomAssigned, true)
+      assert.deepEqual(fresh.latest, { role: 'user', text: 'Newer ordinary Fresh Room work' })
+      assert.equal(fresh.updatedAt, '2022-01-01T00:00:00.000Z')
+      assert.ok(
+        rooms.findIndex((room) => room.name === 'fresh') < rooms.findIndex((room) => room.name === 'marriage'),
+        'an older synthetic Leader does not pin Room ordering',
+      )
       assert.deepEqual(fresh.residents.map((resident) => [resident.role, resident.sessionId]), [
         ['leader', freshLeaderId],
       ])
+      assert.deepEqual(
+        rooms.find((room) => room.name === 'notes-only').latest,
+        { role: 'notes', text: '- 2026-08-20 Notes-only Room fallback' },
+      )
 
       const blockedDetach = await fetch(`http://127.0.0.1:${port}/api/rooms/marriage/assign`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },

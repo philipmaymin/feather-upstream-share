@@ -40,6 +40,50 @@ describe('createSnapshotCache', () => {
     assert.deepEqual(cache.get(), { version: 2 })
   })
 
+  it('invalidates a dependent cache after its source refreshes successfully', () => {
+    let now = 1_000
+    let sessionVersion = 1
+    let sessionLoads = 0
+    let roomLoads = 0
+    const scheduled = []
+    let roomCache
+    const sessionsCache = createSnapshotCache(() => {
+      sessionLoads++
+      return { version: sessionVersion }
+    }, {
+      ttlMs: 1_000,
+      now: () => now,
+      schedule: (fn) => scheduled.push(fn),
+      onRefresh: () => roomCache?.invalidate(),
+    })
+    roomCache = createSnapshotCache(() => ({
+      sessionVersion: sessionsCache.get().version,
+      load: ++roomLoads,
+    }), {
+      ttlMs: 1_000,
+      now: () => now,
+      schedule: (fn) => scheduled.push(fn),
+    })
+
+    assert.deepEqual(roomCache.get(), { sessionVersion: 1, load: 1 })
+    sessionVersion = 2
+    now += 1_001
+
+    assert.deepEqual(roomCache.get(), { sessionVersion: 1, load: 1 })
+    scheduled.shift()()
+    assert.deepEqual(roomCache.get(), { sessionVersion: 1, load: 2 })
+    scheduled.shift()()
+
+    assert.deepEqual(roomCache.get(), { sessionVersion: 1, load: 2 })
+    assert.deepEqual(roomCache.get(), { sessionVersion: 1, load: 2 })
+    assert.equal(scheduled.length, 1, 'dependent stale reads coalesce without a refresh loop')
+    scheduled.shift()()
+
+    assert.deepEqual(roomCache.get(), { sessionVersion: 2, load: 3 })
+    assert.equal(sessionLoads, 2)
+    assert.equal(scheduled.length, 0)
+  })
+
   it('patches a warm snapshot without rerunning the loader', () => {
     let loads = 0
     const cache = createSnapshotCache(() => ({ version: ++loads, enabled: true }), { ttlMs: 10_000 })

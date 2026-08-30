@@ -1426,11 +1426,14 @@ function discoverSessions(limit = 50, projectFilter, requiredIds = []) {
 // Session discovery is shared by the sidebar and Rooms home, and scans every
 // supported agent transcript. Serve the common unfiltered index from a warm
 // snapshot so app startup can mount Rooms before deferred refresh work runs.
+let roomSnapshotCache = null;
 const sessionsSnapshotCache = createSnapshotCache(
   () => discoverSessions(300, null),
-  { ttlMs: 10_000 },
+  {
+    ttlMs: 10_000,
+    onRefresh: () => roomSnapshotCache?.invalidate(),
+  },
 );
-let roomSnapshotCache = null;
 
 // A Claude transcript can also be created outside Feather (or by a test
 // fixture). Patch that one item into the warm index instead of rescanning every
@@ -3422,7 +3425,7 @@ function buildRoomsSnapshot() {
         agent: meta.agent,
         cwd: meta.cwd || path.join(ROOMS_HOME_DIR, name),
         roomAssigned: true,
-      }, ...sessions];
+      }, ...sessions].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
     }
     const eligibleLeader = session => session.agent !== 'codex'
       && session.id !== pulse.sessionId
@@ -3450,7 +3453,7 @@ function buildRoomsSnapshot() {
         status: session ? (session.isActive ? 'working' : 'waiting') : 'offline',
       });
     }
-    const newest = leaderSession || sessions[0] || null;
+    const newest = sessions[0] || null;
     let latest = newest ? lastRoomMessageSnippet(newest.id, newest.agent || 'claude') : null;
     let updatedAt = newest?.updatedAt || null;
     if (!latest) {
