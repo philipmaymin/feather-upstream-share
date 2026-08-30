@@ -700,7 +700,13 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
       {imagePath && (() => {
         const resolvedPath = imagePath.replace(/^~/, '/home/' + (typeof document !== 'undefined' ? document.querySelector<HTMLElement>('[data-username]')?.dataset.username || 'user' : 'user'))
         const imgSrc = appUrl(`/api/files/raw?path=${encodeURIComponent(resolvedPath)}`)
-        return <img src={imgSrc} onClick={() => onImageClick?.(imgSrc)} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '6px', display: 'block', cursor: 'zoom-in' }} />
+        const imageName = imagePath.split(/[\\/]/).pop() || imagePath
+        return (
+          <button type="button" aria-label={`Open ${imageName} full screen`} onClick={() => onImageClick?.(imgSrc)}
+            style={{ background: 'none', border: 'none', padding: '0', margin: '0', display: 'block', cursor: 'zoom-in' }}>
+            <img src={imgSrc} alt={`Preview of ${imageName}`} style={{ 'max-width': '100%', 'max-height': '300px', 'border-radius': '8px', 'margin-top': '6px', display: 'block', cursor: 'zoom-in' }} />
+          </button>
+        )
       })()}
       {result && renderBlock(result, onImageClick, onExpandTable, undefined, onOpenFile)}
     </>
