@@ -4,6 +4,7 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { spawn } from 'child_process'
+import { createHash } from 'crypto'
 
 import { encodeProjectPath, groupRoomSessions } from '../../lib/rooms.js'
 
@@ -252,6 +253,228 @@ describe('portable Room membership', () => {
     } finally {
       child.kill('SIGTERM')
       if (child.exitCode === null) await new Promise((resolve) => child.once('exit', resolve))
+    }
+  })
+
+  it('deletes a complete OMP identity and reconciles ghosts only on explicit apply', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-rooms-delete-'))
+    roots.push(root)
+    const home = path.join(root, 'home')
+    const stateDir = path.join(root, 'state')
+    const featherDir = path.join(home, '.feather')
+    const ompRoot = path.join(featherDir, 'omp-sessions')
+    const binDir = path.join(root, 'bin')
+    fs.mkdirSync(stateDir, { recursive: true })
+    fs.mkdirSync(ompRoot, { recursive: true })
+    fs.mkdirSync(binDir)
+    fs.writeFileSync(path.join(binDir, 'tmux'), `#!/bin/sh
+case "$1" in
+  list-sessions) exit 0 ;;
+  has-session) exit 1 ;;
+  new-session|kill-session) exit 0 ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o700 })
+
+    const deletedId = '40000000-0000-4000-8000-000000000003'
+    const replacementLeaderId = '40000000-0000-4000-8000-000000000004'
+    const replacementResidentId = '40000000-0000-4000-8000-000000000005'
+    const replacementPulseId = '40000000-0000-4000-8000-000000000006'
+    const pendingLeaderId = '40000000-0000-4000-8000-000000000007'
+    const ghostId = '40000000-0000-4000-8000-000000000008'
+    const unknownId = '40000000-0000-4000-8000-000000000009'
+    const roomNames = ['alpha', 'beta', 'gamma', 'pending', 'ghost']
+    for (const name of roomNames) {
+      const roomDir = path.join(home, 'rooms', name)
+      fs.mkdirSync(roomDir, { recursive: true })
+      fs.writeFileSync(path.join(roomDir, 'AGENTS.md'), `# Room: #${name}\n`)
+    }
+
+    const writeOmpIdentity = (id, cwd, rollouts = 1) => {
+      const dir = path.join(ompRoot, id)
+      fs.mkdirSync(dir, { recursive: true })
+      for (let index = 0; index < rollouts; index++) {
+        fs.writeFileSync(path.join(dir, `2026-08-30T00-00-0${index}_rollout.jsonl`), [
+          JSON.stringify({ type: 'session', version: 3, id: `${id}-${index}`, timestamp: '2026-08-30T00:00:00Z', cwd }),
+          JSON.stringify({ type: 'message', message: { role: 'user', content: `rollout ${index}` } }),
+        ].join('\n') + '\n')
+      }
+      return dir
+    }
+    const deletedDir = writeOmpIdentity(deletedId, path.join(home, 'rooms/alpha'), 2)
+    writeOmpIdentity(replacementLeaderId, path.join(home, 'rooms/beta'))
+    writeOmpIdentity(replacementResidentId, path.join(home, 'rooms/beta'))
+    writeOmpIdentity(replacementPulseId, path.join(home, 'rooms/beta'))
+    fs.mkdirSync(path.join(ompRoot, pendingLeaderId))
+    const sentinel = path.join(ompRoot, 'unrelated.txt')
+    fs.writeFileSync(sentinel, 'preserve')
+
+    fs.writeFileSync(path.join(stateDir, 'session-meta.json'), JSON.stringify({
+      [deletedId]: { agent: 'omp', cwd: path.join(home, 'rooms/alpha') },
+      [replacementLeaderId]: { agent: 'omp', cwd: path.join(home, 'rooms/beta') },
+      [replacementResidentId]: { agent: 'omp', cwd: path.join(home, 'rooms/beta') },
+      [replacementPulseId]: { agent: 'omp', cwd: path.join(home, 'rooms/beta') },
+      [pendingLeaderId]: { agent: 'omp', cwd: path.join(home, 'rooms/pending'), title: '#pending Leader' },
+      untouched: { title: 'preserve' },
+    }))
+    const assignmentsFile = path.join(featherDir, 'room-sessions.json')
+    const leadersFile = path.join(featherDir, 'room-mains.json')
+    const residentsFile = path.join(featherDir, 'room-residents.json')
+    const pulsesFile = path.join(featherDir, 'room-pulses.json')
+    fs.writeFileSync(assignmentsFile, JSON.stringify({
+      [deletedId]: 'alpha',
+      [replacementLeaderId]: 'beta',
+      [replacementResidentId]: 'beta',
+      [replacementPulseId]: 'beta',
+      [pendingLeaderId]: 'pending',
+      [ghostId]: 'ghost',
+    }))
+    fs.writeFileSync(leadersFile, JSON.stringify({
+      alpha: deletedId, beta: replacementLeaderId, pending: pendingLeaderId, ghost: ghostId,
+    }))
+    fs.writeFileSync(residentsFile, JSON.stringify({
+      beta: {
+        caretaker: { sessionId: deletedId },
+        reviewer: { sessionId: replacementResidentId },
+      },
+    }))
+    const pulse = sessionId => ({
+      enabled: true, status: 'waiting', lastRunAt: null, nextRunAtMs: null, sessionId, error: null,
+    })
+    fs.writeFileSync(pulsesFile, JSON.stringify({
+      gamma: pulse(deletedId),
+      beta: pulse(replacementPulseId),
+    }))
+
+    const receiptsDir = path.join(stateDir, 'uploads')
+    fs.mkdirSync(receiptsDir)
+    const receiptsFile = path.join(receiptsDir, '.message-receipts.json')
+    const receipt = {
+      textHash: 'a'.repeat(64),
+      response: { ok: true, sentAt: '2026-08-30T00:00:00Z' },
+    }
+    fs.writeFileSync(receiptsFile, JSON.stringify({
+      [deletedId]: { 'delete-receipt': receipt },
+      untouched: { 'keep-receipt': receipt },
+    }))
+    const tokenDir = path.join(ompRoot, '.feather-bridge-tokens')
+    fs.mkdirSync(tokenDir)
+    const tokenPath = path.join(tokenDir, createHash('sha256').update(deletedId).digest('hex'))
+    fs.writeFileSync(tokenPath, 'fixture-token')
+
+    const sidecarDir = path.join(featherDir, 'sidecars')
+    fs.mkdirSync(path.join(sidecarDir, 'manual-group'), { recursive: true })
+    fs.writeFileSync(path.join(sidecarDir, 'groups.json'), JSON.stringify({
+      'manual-group': {
+        id: 'manual-group',
+        kind: 'sidecar',
+        members: [
+          { sessionId: deletedId, role: 'driver', spawned: false },
+          { sessionId: replacementResidentId, role: 'peer', spawned: true },
+        ],
+        status: 'active',
+        seq: 0,
+        createdAt: 1,
+      },
+    }))
+
+    const port = 26_000 + (process.pid % 10_000)
+    const child = spawn(process.execPath, ['server-single.js'], {
+      cwd: path.resolve(import.meta.dirname, '../..'),
+      env: {
+        ...process.env,
+        HOME: home,
+        FEATHER_STATE_DIR: stateDir,
+        PORT: String(port),
+        PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`,
+      },
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+    let stderr = ''
+    child.stderr.on('data', chunk => { stderr += chunk })
+    const base = `http://127.0.0.1:${port}`
+    try {
+      let ready = false
+      for (let attempt = 0; attempt < 80; attempt++) {
+        try {
+          const response = await fetch(`${base}/api/health`)
+          if (response.ok) { ready = true; break }
+        } catch {}
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      assert.equal(ready, true, stderr || 'server did not become ready')
+
+      const beforeDryRun = fs.readFileSync(assignmentsFile, 'utf8')
+      const dryRun = await fetch(`${base}/api/rooms/reconcile`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      })
+      assert.equal(dryRun.status, 200)
+      const dryBody = await dryRun.json()
+      assert.equal(dryBody.dryRun, true)
+      assert.ok(dryBody.ghosts.some(ghost => ghost.sessionId === ghostId && ghost.kind === 'assignment'))
+      assert.equal(dryBody.ghosts.some(ghost => ghost.sessionId === pendingLeaderId), false)
+      assert.equal(fs.readFileSync(assignmentsFile, 'utf8'), beforeDryRun)
+
+      const applied = await fetch(`${base}/api/rooms/reconcile`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apply: true }),
+      })
+      assert.equal(applied.status, 200)
+      assert.deepEqual((await applied.json()).removedSessionIds, [ghostId])
+      assert.equal(ghostId in JSON.parse(fs.readFileSync(assignmentsFile, 'utf8')), false)
+      assert.equal(JSON.parse(fs.readFileSync(leadersFile, 'utf8')).pending, pendingLeaderId)
+
+      const unknownAssignment = await fetch(`${base}/api/rooms/beta/assign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: unknownId }),
+      })
+      assert.equal(unknownAssignment.status, 404)
+      assert.match((await unknownAssignment.json()).error, /unknown session identity/)
+      assert.equal(unknownId in JSON.parse(fs.readFileSync(assignmentsFile, 'utf8')), false)
+
+      const deleted = await fetch(`${base}/api/sessions/${deletedId}/delete`, { method: 'POST' })
+      assert.equal(deleted.status, 200, JSON.stringify(await deleted.clone().json()))
+      assert.equal(fs.existsSync(deletedDir), false)
+      assert.equal(fs.readFileSync(sentinel, 'utf8'), 'preserve')
+      assert.equal(fs.existsSync(tokenPath), false)
+      assert.equal(deletedId in JSON.parse(fs.readFileSync(assignmentsFile, 'utf8')), false)
+      assert.equal('alpha' in JSON.parse(fs.readFileSync(leadersFile, 'utf8')), false)
+      assert.equal(JSON.parse(fs.readFileSync(leadersFile, 'utf8')).beta, replacementLeaderId)
+      assert.equal(JSON.parse(fs.readFileSync(leadersFile, 'utf8')).pending, pendingLeaderId)
+      const assignmentsAfterDelete = JSON.parse(fs.readFileSync(assignmentsFile, 'utf8'))
+      assert.equal(assignmentsAfterDelete[replacementLeaderId], 'beta')
+      assert.equal(assignmentsAfterDelete[pendingLeaderId], 'pending')
+      assert.deepEqual(JSON.parse(fs.readFileSync(residentsFile, 'utf8')), {
+        beta: { reviewer: { sessionId: replacementResidentId } },
+      })
+      assert.deepEqual(JSON.parse(fs.readFileSync(pulsesFile, 'utf8')), {
+        beta: pulse(replacementPulseId),
+      })
+      assert.equal(deletedId in JSON.parse(fs.readFileSync(path.join(stateDir, 'session-meta.json'), 'utf8')), false)
+      assert.equal(deletedId in JSON.parse(fs.readFileSync(receiptsFile, 'utf8')), false)
+      assert.equal('untouched' in JSON.parse(fs.readFileSync(receiptsFile, 'utf8')), true)
+      const groups = (await (await fetch(`${base}/api/sidecar`)).json()).groups
+      assert.equal(groups.some(group => group.members.some(member => member.sessionId === deletedId)), false)
+      assert.ok(groups.find(group => group.id === 'manual-group').members
+        .some(member => member.sessionId === replacementResidentId))
+
+      const recreated = await fetch(`${base}/api/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: deletedId,
+          cwd: path.join(home, 'rooms/alpha'),
+          agent: 'omp',
+          roomRole: 'leader',
+          roomName: 'alpha',
+        }),
+      })
+      assert.equal(recreated.status, 200, JSON.stringify(await recreated.clone().json()))
+      assert.equal(JSON.parse(fs.readFileSync(leadersFile, 'utf8')).alpha, deletedId)
+      assert.equal(fs.existsSync(path.join(ompRoot, deletedId)), true)
+    } finally {
+      child.kill('SIGTERM')
+      if (child.exitCode === null) await new Promise(resolve => child.once('exit', resolve))
     }
   })
 })

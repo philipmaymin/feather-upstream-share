@@ -238,10 +238,11 @@ function findClaudeJsonlPath(sessionId) {
 // Codex stores rollouts at ~/.codex/sessions/YYYY/MM/DD/rollout-*-<UUID>.jsonl.
 // idOrUuid may be the feather session id (mapped via session-meta.codexUuid)
 // or the raw codex UUID itself.
-function findCodexJsonlPath(idOrUuid) {
-  if (!fs.existsSync(CODEX_SESSIONS_ROOT)) return null;
+function findCodexJsonlPaths(idOrUuid) {
+  if (!fs.existsSync(CODEX_SESSIONS_ROOT)) return [];
   const meta = readMeta();
   const uuid = meta[idOrUuid]?.codexUuid || idOrUuid;
+  const matches = [];
   const stack = [CODEX_SESSIONS_ROOT];
   while (stack.length) {
     const dir = stack.pop();
@@ -250,10 +251,14 @@ function findCodexJsonlPath(idOrUuid) {
     for (const ent of entries) {
       const full = path.join(dir, ent.name);
       if (ent.isDirectory()) stack.push(full);
-      else if (ent.isFile() && ent.name.endsWith(`-${uuid}.jsonl`)) return full;
+      else if (ent.isFile() && ent.name.endsWith(`-${uuid}.jsonl`)) matches.push(full);
     }
   }
-  return null;
+  return matches;
+}
+
+function findCodexJsonlPath(idOrUuid) {
+  return findCodexJsonlPaths(idOrUuid)[0] || null;
 }
 
 function findJsonlPath(sessionId, agent) {
@@ -2958,6 +2963,190 @@ function validRoomLeaderDesignation(name, sessionId) {
     && !sessionIsRoomPulse({ title: session.title });
 }
 
+function containedOmpSessionDir(sessionId) {
+  const root = path.resolve(OMP_SESSIONS);
+  const candidate = path.resolve(root, sessionId);
+  if (path.dirname(candidate) !== root || path.basename(candidate) !== sessionId) return null;
+  if (!fs.existsSync(candidate)) return candidate;
+  try {
+    const entry = fs.lstatSync(candidate);
+    if (entry.isSymbolicLink() || !entry.isDirectory()) return null;
+    if (path.dirname(fs.realpathSync(candidate)) !== fs.realpathSync(root)) return null;
+    return candidate;
+  } catch {
+    return null;
+  }
+}
+
+function sessionIdentityStatus(sessionId) {
+  const meta = readMeta()[sessionId];
+  const agent = meta?.agent || getAgentForSession(sessionId);
+  const transcriptPath = findJsonlPath(sessionId, agent);
+  if (transcriptPath && fs.existsSync(transcriptPath)) {
+    return { known: true, pending: false, agent, transcriptPath };
+  }
+  const ompDir = agent === 'omp' ? containedOmpSessionDir(sessionId) : null;
+  const pending = UUID_RE.test(sessionId)
+    && (tmuxIsActive(sessionId)
+      || (['omp', 'claude', 'codex'].includes(meta?.agent)
+        && meta.agent === 'omp'
+        && ompDir
+        && fs.existsSync(ompDir)));
+  return { known: pending, pending, agent, transcriptPath: null };
+}
+
+function roomCoordinationSnapshot() {
+  return {
+    assignments: ROOM_ASSIGN_STATE.read(),
+    leaders: ROOM_LEADERS_STATE.read(),
+    residents: ROOM_RESIDENTS_STATE.read(),
+    pulses: ROOM_PULSES_STATE.read(),
+  };
+}
+
+function restoreSidecarMembers(removedMembers) {
+  for (const { groupId, member } of removedMembers) {
+    const group = sidecar.getGroup(groupId);
+    if (!group || group.members.some(candidate => candidate.role === member.role)) continue;
+    sidecar.addMember(groupId, member);
+  }
+}
+
+function restoreRoomCoordination(snapshot, removedMembers = [], sessionIds = []) {
+  const restoring = new Set(sessionIds);
+  ROOM_ASSIGN_STATE.update(current => {
+    const next = { ...current };
+    let changed = false;
+    for (const sessionId of restoring) {
+      if (!(sessionId in current) && sessionId in snapshot.assignments) {
+        next[sessionId] = snapshot.assignments[sessionId];
+        changed = true;
+      }
+    }
+    return changed ? next : current;
+  });
+  ROOM_LEADERS_STATE.update(current => {
+    const next = { ...current };
+    let changed = false;
+    for (const [roomName, sessionId] of Object.entries(snapshot.leaders)) {
+      if (!restoring.has(sessionId) || roomName in current || Object.values(current).includes(sessionId)) continue;
+      next[roomName] = sessionId;
+      changed = true;
+    }
+    return changed ? next : current;
+  });
+  ROOM_RESIDENTS_STATE.update(current => {
+    const next = { ...current };
+    const currentSessionIds = new Set(Object.values(current)
+      .flatMap(residents => Object.values(residents).map(resident => resident.sessionId)));
+    let changed = false;
+    for (const [roomName, residents] of Object.entries(snapshot.residents)) {
+      for (const [role, resident] of Object.entries(residents)) {
+        if (!restoring.has(resident.sessionId)
+          || current[roomName]?.[role]
+          || currentSessionIds.has(resident.sessionId)) continue;
+        next[roomName] = { ...(next[roomName] || {}), [role]: resident };
+        currentSessionIds.add(resident.sessionId);
+        changed = true;
+      }
+    }
+    return changed ? next : current;
+  });
+  ROOM_PULSES_STATE.update(current => {
+    const next = { ...current };
+    let changed = false;
+    for (const [roomName, pulse] of Object.entries(snapshot.pulses)) {
+      if (!restoring.has(pulse?.sessionId) || roomName in current) continue;
+      next[roomName] = pulse;
+      changed = true;
+    }
+    return changed ? next : current;
+  });
+  restoreSidecarMembers(removedMembers);
+}
+
+function removeSessionCoordinationReferences(sessionId, removedMembers = []) {
+  const rooms = new Set();
+  ROOM_ASSIGN_STATE.update(current => {
+    if (!(sessionId in current)) return current;
+    rooms.add(current[sessionId]);
+    const next = { ...current };
+    delete next[sessionId];
+    return next;
+  });
+  ROOM_LEADERS_STATE.update(current => {
+    const next = { ...current };
+    let changed = false;
+    for (const [roomName, leaderId] of Object.entries(current)) {
+      if (leaderId !== sessionId) continue;
+      rooms.add(roomName);
+      delete next[roomName];
+      changed = true;
+    }
+    return changed ? next : current;
+  });
+  ROOM_RESIDENTS_STATE.update(current => {
+    const next = { ...current };
+    let changed = false;
+    for (const [roomName, residents] of Object.entries(current)) {
+      const kept = Object.fromEntries(Object.entries(residents)
+        .filter(([, resident]) => resident.sessionId !== sessionId));
+      if (Object.keys(kept).length === Object.keys(residents).length) continue;
+      rooms.add(roomName);
+      changed = true;
+      if (Object.keys(kept).length) next[roomName] = kept;
+      else delete next[roomName];
+    }
+    return changed ? next : current;
+  });
+  ROOM_PULSES_STATE.update(current => {
+    const next = { ...current };
+    let changed = false;
+    for (const [roomName, pulse] of Object.entries(current)) {
+      if (pulse?.sessionId !== sessionId) continue;
+      rooms.add(roomName);
+      delete next[roomName];
+      changed = true;
+    }
+    return changed ? next : current;
+  });
+  for (const listed of sidecar.listGroups()) {
+    for (const member of listed.members || []) {
+      if (member.sessionId !== sessionId) continue;
+      const current = sidecar.getGroup(listed.id);
+      const owned = current?.members.find(candidate =>
+        candidate.role === member.role && candidate.sessionId === sessionId);
+      if (!owned) continue;
+      const removed = sidecar.removeMember(listed.id, member.role);
+      if (removed?.sessionId === sessionId) removedMembers.push({ groupId: listed.id, member: removed });
+    }
+  }
+  return { rooms: [...rooms], removedMembers };
+}
+
+function findRoomGhosts() {
+  const assignments = ROOM_ASSIGN_STATE.read();
+  const leaders = ROOM_LEADERS_STATE.read();
+  const residents = ROOM_RESIDENTS_STATE.read();
+  const pulses = ROOM_PULSES_STATE.read();
+  const references = [
+    ...Object.entries(assignments).map(([sessionId, roomName]) => ({ kind: 'assignment', roomName, sessionId })),
+    ...Object.entries(leaders).map(([roomName, sessionId]) => ({ kind: 'leader', roomName, sessionId })),
+    ...Object.entries(residents).flatMap(([roomName, roles]) =>
+      Object.entries(roles).map(([role, resident]) =>
+        ({ kind: 'resident', roomName, role, sessionId: resident.sessionId }))),
+    ...Object.entries(pulses).flatMap(([roomName, pulse]) =>
+      pulse?.sessionId ? [{ kind: 'pulse', roomName, sessionId: pulse.sessionId }] : []),
+  ];
+  const statuses = new Map();
+  return references.filter(reference => {
+    if (!statuses.has(reference.sessionId)) {
+      statuses.set(reference.sessionId, sessionIdentityStatus(reference.sessionId));
+    }
+    return !statuses.get(reference.sessionId).known;
+  });
+}
+
 function appointRoomLeader(name, sessionId, { assign = false, replaceStale = null } = {}) {
   if (assign) ROOM_ASSIGN_STATE.update(current => ({ ...current, [sessionId]: name }));
   ROOM_LEADERS_STATE.update(current => {
@@ -3473,12 +3662,39 @@ app.post('/api/rooms/:name/rename', (req, res) => {
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
+app.post('/api/rooms/reconcile', (req, res) => {
+  const ghosts = findRoomGhosts();
+  if (req.body?.apply !== true) return res.json({ dryRun: true, ghosts });
+  const snapshot = roomCoordinationSnapshot();
+  const removedMembers = [];
+  const removedSessionIds = [];
+  try {
+    for (const sessionId of [...new Set(ghosts.map(ghost => ghost.sessionId))]) {
+      if (sessionIdentityStatus(sessionId).known) continue;
+      removedSessionIds.push(sessionId);
+      removeSessionCoordinationReferences(sessionId, removedMembers);
+    }
+    roomSnapshotCache.refresh();
+    res.json({ dryRun: false, ghosts, removedSessionIds });
+  } catch (error) {
+    try { restoreRoomCoordination(snapshot, removedMembers, removedSessionIds); }
+    catch (rollbackError) {
+      error.message = `${error.message}; Room reconciliation rollback failed: ${rollbackError.message}`;
+    }
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+
 app.post('/api/rooms/:name/assign', (req, res) => {
   try {
     const { name } = req.params;
     const sessionId = String(req.body?.sessionId || '').trim();
     if (!sessionId) throw httpError(400, 'sessionId required');
     if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
+    if (!req.body?.remove && !sessionIdentityStatus(sessionId).known) {
+      throw httpError(404, 'unknown session identity');
+    }
     const targetRoom = req.body?.remove ? null : name;
     const leaderRoom = Object.entries(ROOM_LEADERS_STATE.read())
       .find(([, leaderSessionId]) => leaderSessionId === sessionId)?.[0] || null;
@@ -4847,8 +5063,19 @@ app.get('/api/sessions/:id/protocol-runs', (req, res) => {
 });
 
 app.get('/api/sessions/:id/messages', (req, res) => {
-  const { messages, hasMore } = getMessages(req.params.id, parseInt(req.query.limit) || 100, parseInt(req.query.before) || 0);
-  res.json({ messages, hasMore });
+  try {
+    const identity = sessionIdentityStatus(req.params.id);
+    if (!identity.known) {
+      return res.status(404).json({ error: 'session identity not found', code: 'SESSION_NOT_FOUND' });
+    }
+    if (identity.pending) {
+      return res.status(202).json({ messages: [], hasMore: false, pending: true, code: 'SESSION_PENDING' });
+    }
+    const { messages, hasMore } = getMessages(req.params.id, parseInt(req.query.limit) || 100, parseInt(req.query.before) || 0);
+    res.json({ messages, hasMore });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
 });
 
 app.get('/api/sessions/:id/stream', (req, res) => {
@@ -5045,30 +5272,137 @@ app.post('/api/sessions/:id/answer', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/sessions/:id/delete', async (req, res) => {
+function stageSessionFilesystemIdentity(id, agent) {
+  let transcriptPath = null;
+  if (agent === 'omp') {
+    const candidate = path.resolve(OMP_SESSIONS, id);
+    if (fs.existsSync(candidate)) {
+      transcriptPath = containedOmpSessionDir(id);
+      if (!transcriptPath) {
+        throw httpError(409, 'STOP: OMP session directory resolves outside the configured root');
+      }
+    }
+  } else if (agent === 'codex') {
+    const matches = findCodexJsonlPaths(id);
+    if (matches.length > 1) throw httpError(409, 'STOP: Codex session mapping is ambiguous');
+    transcriptPath = matches[0] || null;
+  } else {
+    transcriptPath = findClaudeJsonlPath(id);
+  }
+
+  const originals = [transcriptPath, fs.existsSync(ompBridgeTokenPath(id)) ? ompBridgeTokenPath(id) : null]
+    .filter(Boolean);
+  const staged = [];
   try {
-    const id = req.params.id;
+    for (const original of originals) {
+      const stagedPath = path.join(path.dirname(original), `.feather-delete-${path.basename(original)}-${randomUUID()}`);
+      fs.renameSync(original, stagedPath);
+      staged.push({ original, staged: stagedPath });
+    }
+    return staged;
+  } catch (error) {
+    for (const entry of staged.reverse()) {
+      try { fs.renameSync(entry.staged, entry.original); } catch {}
+    }
+    throw error;
+  }
+}
+
+function restoreStagedSessionIdentity(staged) {
+  for (const entry of [...staged].reverse()) {
+    if (fs.existsSync(entry.original)) continue;
+    if (!fs.existsSync(entry.staged)) {
+      throw new Error(`cannot restore deleted identity path ${entry.original}`);
+    }
+    fs.renameSync(entry.staged, entry.original);
+  }
+}
+
+function clearSessionRuntimeState(id, staged) {
+  ompBridgeTokens.delete(id);
+  resetOmpBridgeSessionState(id);
+  fileOffsets.delete(id);
+  titleQueue.delete(id);
+  lastActivity.delete(id);
+  lastQuestion.delete(id);
+  lastPaneHash.delete(id);
+  paneStableCount.delete(id);
+  feedMessageCache.delete(id);
+  for (const key of sessionParseCache.keys()) {
+    if (staged.some(entry => key === entry.original
+      || key === entry.staged
+      || key.startsWith(`${entry.original}${path.sep}`))) {
+      sessionParseCache.delete(key);
+    }
+  }
+  const ompDir = containedOmpSessionDir(id);
+  if (ompDir) watchedOmpDirs.delete(ompDir);
+  for (const files of watchedCodexDirs.values()) {
+    for (const [filename, featherId] of files) {
+      if (featherId === id) files.delete(filename);
+    }
+  }
+}
+
+app.post('/api/sessions/:id/delete', async (req, res) => {
+  const id = req.params.id;
+  let staged = [];
+  let coordinationSnapshot = null;
+  const coordinationRemovedMembers = [];
+  let metaBefore = null;
+  let receiptsBefore = null;
+  try {
+    const identity = sessionIdentityStatus(id);
+    if (!identity.known) throw httpError(404, 'session identity not found');
+    staged = stageSessionFilesystemIdentity(id, identity.agent);
     await protocolRuns.deleteSession(id);
-    killTmuxSessions(id);
-    const fpath = findJsonlPath(id);
-    if (fpath) fs.unlinkSync(fpath);
+
+    coordinationSnapshot = roomCoordinationSnapshot();
+    metaBefore = readMeta();
+    receiptsBefore = MESSAGE_RECEIPTS_STATE.read();
+    removeSessionCoordinationReferences(id, coordinationRemovedMembers);
     const meta = readMeta();
-    delete meta[id];
-    writeMeta(meta);
+    if (id in meta) {
+      delete meta[id];
+      writeMeta(meta);
+    }
     MESSAGE_RECEIPTS_STATE.update(receipts => {
       if (!(id in receipts)) return receipts;
       const next = { ...receipts };
       delete next[id];
       return next;
     });
-    ompBridgeTokens.delete(id);
-    try { fs.unlinkSync(ompBridgeTokenPath(id)); } catch {}
-    resetOmpBridgeSessionState(id);
-    fileOffsets.delete(id);
+    killTmuxSessions(id);
+    clearSessionRuntimeState(id, staged);
+    for (const entry of staged) fs.rmSync(entry.staged, { recursive: true, force: true });
     sessionsSnapshotCache.invalidate();
     roomSnapshotCache.invalidate();
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (error) {
+    const rollbackErrors = [];
+    if (metaBefore) {
+      try {
+        META_STATE.update(current => (id in current || !(id in metaBefore))
+          ? current
+          : { ...current, [id]: metaBefore[id] });
+      } catch (rollbackError) { rollbackErrors.push(rollbackError.message); }
+    }
+    if (receiptsBefore) {
+      try {
+        MESSAGE_RECEIPTS_STATE.update(current => (id in current || !(id in receiptsBefore))
+          ? current
+          : { ...current, [id]: receiptsBefore[id] });
+      } catch (rollbackError) { rollbackErrors.push(rollbackError.message); }
+    }
+    if (coordinationSnapshot) {
+      try { restoreRoomCoordination(coordinationSnapshot, coordinationRemovedMembers, [id]); }
+      catch (rollbackError) { rollbackErrors.push(rollbackError.message); }
+    }
+    try { restoreStagedSessionIdentity(staged); }
+    catch (rollbackError) { rollbackErrors.push(rollbackError.message); }
+    const suffix = rollbackErrors.length ? `; rollback failed: ${rollbackErrors.join('; ')}` : '';
+    res.status(error.status || 500).json({ error: `${error.message}${suffix}` });
+  }
 });
 
 app.post('/api/sessions/:id/rename', (req, res) => {

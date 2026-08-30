@@ -542,9 +542,25 @@ describe('GET /api/sessions', () => {
 // ── Messages ────────────────────────────────────────────────────────────────
 
 describe('GET /api/sessions/:id/messages', () => {
-  it('returns empty array for nonexistent session', async () => {
-    const { messages } = await (await fetch(`${BASE}/api/sessions/no-such-session-ever/messages`)).json()
-    assert.deepEqual(messages, [])
+  it('returns an explicit 404 for a nonexistent session identity', async () => {
+    const response = await fetch(`${BASE}/api/sessions/no-such-session-ever/messages`)
+    assert.equal(response.status, 404)
+    assert.deepEqual(await response.json(), { error: 'session identity not found', code: 'SESSION_NOT_FOUND' })
+  })
+
+  it('returns a typed pending response for a transcriptless bootstrap', { skip: EXTERNAL_SERVER }, async () => {
+    const id = '20000000-0000-4000-8000-000000000544'
+    const created = await fetch(`${BASE}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, cwd: fixtureHome, agent: 'omp' }),
+    })
+    assert.equal(created.status, 200)
+    const response = await fetch(`${BASE}/api/sessions/${id}/messages`)
+    assert.equal(response.status, 202)
+    assert.deepEqual(await response.json(), {
+      messages: [], hasMore: false, pending: true, code: 'SESSION_PENDING',
+    })
   })
 
   it('returns correct messages for test session', async () => {
@@ -584,6 +600,92 @@ describe('GET /api/sessions/:id/messages', () => {
     const { messages } = await (await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/messages`)).json()
     assert.equal(messages[0].timestamp, '2025-06-15T12:00:00Z')
     assert.equal(messages[1].timestamp, '2025-06-15T12:00:05Z')
+  })
+})
+
+describe('POST /api/sessions/:id/delete harness identity', { skip: EXTERNAL_SERVER }, () => {
+  it('deletes only the resolved Claude transcript', async () => {
+    const id = '20000000-0000-4000-8000-000000000545'
+    const transcript = path.join(testSessionDir, `${id}.jsonl`)
+    const unrelated = path.join(testSessionDir, `${id}.unrelated`)
+    writeFeedSession(testSessionDir, id, [
+      claudeFeedMessage(`${id}-user`, new Date().toISOString(), 'user', 'Delete this Claude session'),
+    ])
+    fs.writeFileSync(unrelated, 'preserve')
+
+    const response = await fetch(`${BASE}/api/sessions/${id}/delete`, { method: 'POST' })
+    assert.equal(response.status, 200)
+    assert.equal(fs.existsSync(transcript), false)
+    assert.equal(fs.readFileSync(unrelated, 'utf8'), 'preserve')
+  })
+
+  it('deletes one mapped Codex rollout and clears only its metadata', async () => {
+    const id = '20000000-0000-4000-8000-000000000546'
+    const codexUuid = '30000000-0000-4000-8000-000000000546'
+    const codexDir = path.join(fixtureHome, '.codex/sessions/2026/08/30')
+    fs.mkdirSync(codexDir, { recursive: true })
+    const transcript = path.join(codexDir, `rollout-2026-08-30T00-00-00-${codexUuid}.jsonl`)
+    const unrelated = path.join(codexDir, 'unrelated.jsonl')
+    fs.writeFileSync(transcript, '{"type":"session_meta","payload":{"cwd":"/tmp"}}\n')
+    fs.writeFileSync(unrelated, 'preserve')
+    const metaFile = path.join(fixtureState, 'session-meta.json')
+    const meta = fs.existsSync(metaFile) ? JSON.parse(fs.readFileSync(metaFile, 'utf8')) : {}
+    meta[id] = { agent: 'codex', codexUuid }
+    meta['unrelated-metadata'] = { title: 'preserve' }
+    fs.writeFileSync(metaFile, JSON.stringify(meta))
+
+    const response = await fetch(`${BASE}/api/sessions/${id}/delete`, { method: 'POST' })
+    assert.equal(response.status, 200)
+    assert.equal(fs.existsSync(transcript), false)
+    assert.equal(fs.readFileSync(unrelated, 'utf8'), 'preserve')
+    const after = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+    assert.equal(id in after, false)
+    assert.deepEqual(after['unrelated-metadata'], { title: 'preserve' })
+  })
+
+  it('stops before deleting an ambiguous Codex mapping', async () => {
+    const id = '20000000-0000-4000-8000-000000000547'
+    const codexUuid = '30000000-0000-4000-8000-000000000547'
+    const firstDir = path.join(fixtureHome, '.codex/sessions/2026/08/29')
+    const secondDir = path.join(fixtureHome, '.codex/sessions/2026/08/31')
+    fs.mkdirSync(firstDir, { recursive: true })
+    fs.mkdirSync(secondDir, { recursive: true })
+    const filename = `rollout-2026-08-30T00-00-00-${codexUuid}.jsonl`
+    const first = path.join(firstDir, filename)
+    const second = path.join(secondDir, filename)
+    fs.writeFileSync(first, '{}\n')
+    fs.writeFileSync(second, '{}\n')
+    const metaFile = path.join(fixtureState, 'session-meta.json')
+    const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+    meta[id] = { agent: 'codex', codexUuid }
+    fs.writeFileSync(metaFile, JSON.stringify(meta))
+
+    const response = await fetch(`${BASE}/api/sessions/${id}/delete`, { method: 'POST' })
+    assert.equal(response.status, 409)
+    assert.match((await response.json()).error, /STOP: Codex session mapping is ambiguous/)
+    assert.equal(fs.existsSync(first), true)
+    assert.equal(fs.existsSync(second), true)
+    assert.equal(id in JSON.parse(fs.readFileSync(metaFile, 'utf8')), true)
+  })
+
+  it('stops before following an OMP identity symlink outside its root', async () => {
+    const id = '20000000-0000-4000-8000-000000000548'
+    const outside = path.join(fixtureRoot, 'outside-omp-identity')
+    fs.mkdirSync(outside)
+    const outsideTranscript = path.join(outside, 'rollout.jsonl')
+    fs.writeFileSync(outsideTranscript, '{"type":"session","version":3,"id":"outside"}\n')
+    const ompRoot = path.join(fixtureHome, '.feather/omp-sessions')
+    fs.mkdirSync(ompRoot, { recursive: true })
+    fs.symlinkSync(outside, path.join(ompRoot, id))
+    const metaFile = path.join(fixtureState, 'session-meta.json')
+    const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+    meta[id] = { agent: 'omp', cwd: fixtureHome }
+    fs.writeFileSync(metaFile, JSON.stringify(meta))
+
+    const response = await fetch(`${BASE}/api/sessions/${id}/delete`, { method: 'POST' })
+    assert.equal(response.status, 409)
+    assert.match((await response.json()).error, /STOP: OMP session directory resolves outside/)
+    assert.equal(fs.readFileSync(outsideTranscript, 'utf8').includes('"outside"'), true)
   })
 })
 
