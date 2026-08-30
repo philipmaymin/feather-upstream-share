@@ -1,8 +1,10 @@
 import { createSignal, onMount, onCleanup, Show, For } from 'solid-js'
-import { fetchRooms, cachedRoomsSnapshot, fetchSessions, searchSessions, createRoom, renameRoom, createSession, assignSessionToRoom, setRoomPulse, fetchRoomUpdates, fetchRoomFriction } from './api'
-import type { RoomInfo, SessionMeta, RoomUpdate, FrictionComplaint } from './api'
+import { fetchRooms, cachedRoomsSnapshot, fetchSessions, searchSessions, createRoom, renameRoom, createSession, assignSessionToRoom, setRoomPulse, fetchRoomFriction } from './api'
+import type { RoomInfo, SessionMeta, FrictionComplaint } from './api'
+import { RoomWikiView } from './components/RoomWikiView'
 
 type AgentId = 'claude' | 'codex' | 'omp'
+const ROOM_HARNESSES_KEY = 'feather:roomHarnesses'
 
 // Full-screen rooms home (iMessage model, phone-first): one row per room
 // folder under ~/rooms/, latest message snippet, status dot. Tap a session
@@ -44,17 +46,6 @@ function pulseLabel(room: RoomInfo) {
   return `${worked ? `${worked} · ` : ''}checks again ${timeUntil(room.pulse.nextRunAt)}`
 }
 
-const SEEN_KEY = 'feather:roomUpdatesSeen'
-const ROOM_HARNESSES_KEY = 'feather:roomHarnesses'
-function loadSeen(): Record<string, number> {
-  try {
-    const value = JSON.parse(localStorage.getItem(SEEN_KEY) || '{}')
-    return value && typeof value === 'object' ? value : {}
-  } catch { return {} }
-}
-function saveSeen(map: Record<string, number>) {
-  try { localStorage.setItem(SEEN_KEY, JSON.stringify(map)) } catch {}
-}
 function loadRoomHarnesses(): Record<string, AgentId> {
   try {
     const value = JSON.parse(localStorage.getItem(ROOM_HARNESSES_KEY) || '{}')
@@ -75,15 +66,13 @@ function updateTimeLabel(iso: string | null) {
   return ago && ago !== 'now' ? `${when} · ${ago} ago` : `${when} · just now`
 }
 
-function primaryRoomSession(room: RoomInfo) {
-  return room.sessions.find(session =>
-    session.id !== room.pulse.sessionId && !session.title.startsWith('Keep working: #')
-  ) || null
+function leaderRoomSession(room: RoomInfo) {
+  return room.sessions.find(session => session.id === room.leaderSessionId) || null
 }
 
 export default function RoomsHome(props: {
   onOpen: (id: string) => void
-  onNewChat: (agent: AgentId) => void
+  onNewChat: (agent: AgentId, model?: string) => void
   onSessionsChanged?: () => void
   creating?: boolean
   codexAvailable?: boolean
@@ -99,26 +88,31 @@ export default function RoomsHome(props: {
   const [attachCandidates, setAttachCandidates] = createSignal<SessionMeta[]>([])
   const [attachError, setAttachError] = createSignal<string | null>(null)
   const [attachQuery, setAttachQuery] = createSignal('')
-  const [seen, setSeen] = createSignal<Record<string, number>>(loadSeen())
   const [roomHarnesses, setRoomHarnesses] = createSignal<Record<string, AgentId>>(loadRoomHarnesses())
-  const [updatesRoom, setUpdatesRoom] = createSignal<string | null>(null)
-  const [updatesList, setUpdatesList] = createSignal<RoomUpdate[]>([])
-  const [updatesLoading, setUpdatesLoading] = createSignal(false)
-  const [updatesError, setUpdatesError] = createSignal<string | null>(null)
-  let updatesRequest = 0
+  const [ompModel, setOmpModel] = createSignal(localStorage.getItem('feather:ompModelOverride') || '')
+  const [wikiRoom, setWikiRoom] = createSignal<string | null>(null)
   const [frictionRoom, setFrictionRoom] = createSignal<string | null>(null)
   const [frictionList, setFrictionList] = createSignal<FrictionComplaint[]>([])
   const [frictionLoading, setFrictionLoading] = createSignal(false)
   const [frictionError, setFrictionError] = createSignal<string | null>(null)
   let frictionRequest = 0
+  let roomsEpoch = 0
 
   async function refresh(useWarmSnapshot = false) {
-    try { setRooms(await fetchRooms(useWarmSnapshot ? 1000 : 0)); setError(null) }
-    catch (e: any) { setError(e.message) }
+    const epoch = ++roomsEpoch
+    try {
+      const next = await fetchRooms(useWarmSnapshot ? 1000 : 0)
+      if (epoch === roomsEpoch) {
+        setRooms(next)
+        setError(null)
+      }
+    } catch (cause) {
+      if (epoch === roomsEpoch) setError(cause instanceof Error ? cause.message : String(cause))
+    }
   }
 
   let timer: ReturnType<typeof setInterval>
-  onMount(() => { refresh(true); timer = setInterval(refresh, 10000) })
+  onMount(() => { refresh(true); timer = setInterval(() => { if (!wikiRoom()) refresh() }, 10000) })
   onCleanup(() => clearInterval(timer))
 
   async function newRoom() {
@@ -137,14 +131,24 @@ export default function RoomsHome(props: {
     setRoomHarnesses(next)
     saveRoomHarnesses(next)
   }
+  function updateOmpModel(model: string) {
+    setOmpModel(model)
+    if (model.trim()) localStorage.setItem('feather:ompModelOverride', model)
+    else localStorage.removeItem('feather:ompModelOverride')
+  }
 
-  async function newChat(room: RoomInfo, agent?: AgentId) {
+
+  async function newChat(room: RoomInfo, agent?: AgentId, asLeader = false) {
     setBusy(true)
     try {
-      const id = await createSession(room.cwd, agent || roomHarness(room.name))
-      // Belt and braces: cwd-derived grouping covers claude immediately, but
-      // codex/omp transcripts appear later — pin the membership explicitly.
-      await assignSessionToRoom(room.name, id).catch(() => {})
+      const selectedAgent = asLeader ? 'omp' : agent || roomHarness(room.name)
+      const id = await createSession(room.cwd, selectedAgent, {
+        ...(selectedAgent === 'omp' && ompModel().trim() ? { model: ompModel().trim() } : {}),
+        ...(asLeader ? { roomName: room.name, roomRole: 'leader' as const } : {}),
+      })
+      // Leader membership is assigned atomically so its first prompt carries
+      // the durable role. Other harnesses are grouped after launch.
+      if (!asLeader) await assignSessionToRoom(room.name, id).catch(() => {})
       props.onSessionsChanged?.()
       props.onOpen(id)
     } catch (e: any) { alert(e.message) }
@@ -186,7 +190,6 @@ export default function RoomsHome(props: {
     } catch (e: any) { alert(e.message) }
     finally { setBusy(false) }
   }
-
   async function loadAttachCandidates(query = '') {
     setAttachError(null)
     try {
@@ -228,6 +231,7 @@ export default function RoomsHome(props: {
     finally { setBusy(false) }
   }
 
+
   async function togglePulse(room: RoomInfo, event: MouseEvent) {
     event.stopPropagation()
     setBusy(true)
@@ -255,51 +259,27 @@ export default function RoomsHome(props: {
     finally { setBusy(false) }
   }
 
-  const unreadCount = (room: RoomInfo) => Math.max(0, room.updates.count - (seen()[room.name] || 0))
 
-  function markSeen(room: RoomInfo) {
-    const next = { ...seen(), [room.name]: room.updates.count }
-    setSeen(next)
-    saveSeen(next)
-  }
-
-  async function openUpdates(room: RoomInfo, event: MouseEvent) {
+  function openWiki(room: RoomInfo, event: MouseEvent) {
     event.stopPropagation()
     frictionRequest++
     setFrictionRoom(null)
-    if (updatesRoom() === room.name) {
-      updatesRequest++
-      setUpdatesRoom(null)
-      return
-    }
-    const request = ++updatesRequest
-    setUpdatesRoom(room.name)
-    setUpdatesList([])
-    setUpdatesError(null)
-    setUpdatesLoading(true)
-    try {
-      const updates = await fetchRoomUpdates(room.name)
-      if (request !== updatesRequest) return
-      setUpdatesList(updates)
-      markSeen(room)
-    } catch (error: any) {
-      if (request !== updatesRequest) return
-      setUpdatesError(error.message)
-    } finally {
-      if (request === updatesRequest) setUpdatesLoading(false)
-    }
+    const opening = wikiRoom() !== room.name
+    if (opening) roomsEpoch++ // discard an in-flight poll that would remount the reader
+    setWikiRoom(opening ? room.name : null)
+    if (!opening) refresh()
   }
 
   async function openFriction(room: RoomInfo, event: MouseEvent) {
     event.stopPropagation()
-    updatesRequest++
+    setWikiRoom(null)
     if (frictionRoom() === room.name) {
       frictionRequest++
       setFrictionRoom(null)
       return
     }
     const request = ++frictionRequest
-    setUpdatesRoom(null)
+    setWikiRoom(null)
     setFrictionRoom(room.name)
     setFrictionError(null)
     setFrictionLoading(true)
@@ -317,15 +297,20 @@ export default function RoomsHome(props: {
     }
   }
 
-  // Tap the card → open the newest human-facing chat, never the autonomous
-  // Keep-working pulse. If the Room has only pulse history, create its first
-  // OMP chat and make that the stable card destination on the next refresh.
+  // Each Room has one canonical user-facing conversation owned by its Leader.
+  // If it has not been established yet, opening the card creates it atomically.
   function openRoom(room: RoomInfo) {
-    const primary = primaryRoomSession(room)
-    if (primary) props.onOpen(primary.id)
-    else newChat(room, 'omp')
+    if (busy()) return
+    const leader = leaderRoomSession(room)
+    if (leader) props.onOpen(leader.id)
+    else newChat(room, 'omp', true)
   }
   const toggleExpand = (name: string) => setExpanded(expanded() === name ? null : name)
+
+  function otherRoomSessions(room: RoomInfo) {
+    const residentIds = new Set((room.residents || []).map(resident => resident.sessionId))
+    return room.sessions.filter(session => !residentIds.has(session.id))
+  }
 
   const agentColor = (a?: string) => a === 'codex' ? '#c084fc' : a === 'omp' ? '#e0a050' : '#73b8ff'
   const agentBg = (a?: string) => a === 'codex' ? '#2a1e3a' : a === 'omp' ? '#3a2a1e' : '#1e2a3a'
@@ -335,9 +320,6 @@ export default function RoomsHome(props: {
       style={{ display: 'flex', 'align-items': 'center', gap: '8px', padding: '9px 16px 9px 28px', 'border-top': '1px solid #16161f', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
       <span style={{ width: '7px', height: '7px', 'border-radius': '50%', background: s.isActive ? '#4aba6a' : '#333', 'flex-shrink': '0' }} />
       <span style={{ 'font-size': '9px', padding: '1px 5px', 'border-radius': '3px', background: agentBg(s.agent), color: agentColor(s.agent), 'flex-shrink': '0', 'font-weight': '600' }}>{s.agent || 'claude'}</span>
-      <Show when={primaryRoomSession(room)?.id === s.id}>
-        <span style={{ 'font-size': '9px', color: '#69c77f', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>Main</span>
-      </Show>
       <span style={{ flex: '1', 'font-size': '13px', color: '#ccc', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{s.title}</span>
       <Show when={(rooms()?.length || 0) > 1}>
         <button aria-label={`Move ${s.title} to another room`} disabled={busy()}
@@ -365,7 +347,7 @@ export default function RoomsHome(props: {
         <div data-testid="new-chat-launcher" style={{ background: '#0d1117', border: '1px solid #262b33', 'border-radius': '12px', padding: '12px', 'margin-bottom': '10px' }}>
           <div style={{ display: 'flex', 'align-items': 'center', gap: '8px', 'flex-wrap': 'wrap' }}>
             <span style={{ color: '#9aa4b2', 'font-size': '12px', 'font-weight': '700', 'margin-right': '2px' }}>New chat</span>
-            <button onClick={() => props.onNewChat('omp')} disabled={busy() || props.creating}
+            <button onClick={() => props.onNewChat('omp', ompModel().trim() || undefined)} disabled={busy() || props.creating}
               style={{ background: '#e0a050', border: 'none', color: '#111', 'font-size': '12px', 'font-weight': '800', padding: '7px 12px', 'border-radius': '8px', cursor: 'pointer' }}>+ OMP</button>
             <button onClick={() => props.onNewChat('claude')} disabled={busy() || props.creating}
               style={{ background: '#15202a', border: '1px solid #344657', color: '#73b8ff', 'font-size': '12px', 'font-weight': '700', padding: '6px 11px', 'border-radius': '8px', cursor: 'pointer' }}>+ Claude Code</button>
@@ -374,6 +356,19 @@ export default function RoomsHome(props: {
                 style={{ background: '#251b31', border: '1px solid #49345e', color: '#c084fc', 'font-size': '12px', 'font-weight': '700', padding: '6px 11px', 'border-radius': '8px', cursor: 'pointer' }}>+ Codex</button>
             </Show>
           </div>
+          <label style={{ display: 'flex', 'align-items': 'center', gap: '8px', 'margin-top': '10px', color: '#78828f', 'font-size': '11px' }}>
+            <span style={{ 'flex-shrink': '0' }}>OMP model</span>
+            <input
+              data-testid="omp-model-override"
+              aria-label="OMP model override"
+              value={ompModel()}
+              onInput={(event) => updateOmpModel(event.currentTarget.value)}
+              placeholder="Deployment default"
+              spellcheck={false}
+              autocapitalize="none"
+              style={{ flex: '1', 'min-width': '0', background: '#090d12', border: '1px solid #292f38', color: '#c9d1db', 'font-size': '11px', 'font-family': 'monospace', padding: '6px 8px', 'border-radius': '7px', outline: 'none' }}
+            />
+          </label>
           <div data-testid="background-work-status" style={{ display: 'flex', 'align-items': 'center', gap: '8px', 'margin-top': '11px', 'padding-top': '10px', 'border-top': '1px solid #1c2128', color: '#78828f', 'font-size': '11px' }}>
             <span style={{ width: '7px', height: '7px', 'border-radius': '50%', background: (rooms() || []).some(room => room.pulse.enabled) ? '#e0a050' : '#4f5965' }} />
             <span>Background work: <strong style={{ color: '#aeb6c0', 'font-weight': '600' }}>{(rooms() || []).some(room => room.pulse.enabled) ? `${(rooms() || []).filter(room => room.pulse.enabled).length} room${(rooms() || []).filter(room => room.pulse.enabled).length === 1 ? '' : 's'} enabled` : 'all paused'}</strong></span>
@@ -383,7 +378,6 @@ export default function RoomsHome(props: {
             </Show>
           </div>
         </div>
-
         <Show when={error()}>
           <div style={{ color: '#d45555', 'font-size': '13px', padding: '8px 4px' }}>{error()}</div>
         </Show>
@@ -395,13 +389,13 @@ export default function RoomsHome(props: {
             </div>
           }>
             <For each={rooms()!}>{(room) => (
-              <div style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '12px', 'margin-bottom': '10px', overflow: 'hidden' }}>
+              <div data-testid={`room-card-${room.name}`} style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '12px', 'margin-bottom': '10px', overflow: 'hidden' }}>
                 <div onClick={() => openRoom(room)} style={{ padding: '12px 16px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                   <div style={{ display: 'flex', 'align-items': 'center', gap: '10px' }}>
                     <span style={{ width: '10px', height: '10px', 'border-radius': '50%', background: room.active ? '#4aba6a' : '#333', 'flex-shrink': '0' }} />
                     <span style={{ 'font-size': '16px', 'font-weight': '700', color: '#e5e5e5' }}>#{room.name}</span>
-                    <Show when={room.sessions.length > 1}>
-                      <span style={{ 'font-size': '11px', color: '#666' }}>{room.sessions.length} chats</span>
+                    <Show when={leaderRoomSession(room)} fallback={<span style={{ 'font-size': '11px', color: '#806f55' }}>No Leader</span>}>
+                      {(leader) => <span style={{ 'font-size': '11px', color: '#69c77f' }}>Leader · {leader().agent || 'omp'} · {room.residents?.length || 1} resident{(room.residents?.length || 1) === 1 ? '' : 's'}</span>}
                     </Show>
                     <span style={{ 'margin-left': 'auto', 'font-size': '11px', color: '#555', 'font-family': 'monospace' }}>{timeAgo(room.updatedAt)}</span>
                     <button onClick={(e) => { e.stopPropagation(); toggleExpand(room.name) }}
@@ -417,13 +411,10 @@ export default function RoomsHome(props: {
                       {room.pulse.enabled ? 'Stop background' : 'Start background'}
                     </button>
                     <span style={{ color: room.pulse.status === 'error' ? '#d48166' : '#666', 'font-size': '11px' }}>{pulseLabel(room)}</span>
-                    <button data-testid={`updates-${room.name}`} onClick={(event) => openUpdates(room, event)}
-                      aria-label={`Updates for #${room.name}`}
-                      style={{ 'margin-left': 'auto', display: 'flex', 'align-items': 'center', gap: '6px', background: updatesRoom() === room.name ? '#1a1f2e' : 'transparent', border: '1px solid #2a3346', color: '#9aa4b2', 'font-size': '11px', 'font-weight': '600', padding: '3px 9px', 'border-radius': '999px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
-                      Updates
-                      <Show when={unreadCount(room) > 0} fallback={<span style={{ color: '#555', 'font-weight': '500' }}>{room.updates.count}</span>}>
-                        <span style={{ background: '#c0392b', color: '#fff', 'border-radius': '999px', padding: '0 6px', 'font-size': '10px', 'line-height': '16px' }}>{unreadCount(room)} new</span>
-                      </Show>
+                    <button data-testid={`wiki-${room.name}`} onClick={(event) => openWiki(room, event)}
+                      aria-label={`Wiki for #${room.name}`}
+                      style={{ 'margin-left': 'auto', display: 'flex', 'align-items': 'center', gap: '6px', background: wikiRoom() === room.name ? '#1a1f2e' : 'transparent', border: '1px solid #2a3346', color: '#9aa4b2', 'font-size': '11px', 'font-weight': '600', padding: '3px 9px', 'border-radius': '999px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                      Wiki
                     </button>
                     <button data-testid={`friction-${room.name}`} onClick={(event) => openFriction(room, event)}
                       aria-label={`Friction from #${room.name}`}
@@ -432,23 +423,9 @@ export default function RoomsHome(props: {
                     </button>
                   </div>
                 </div>
-                <Show when={updatesRoom() === room.name}>
-                  <div data-testid={`updates-panel-${room.name}`} style={{ 'border-top': '1px solid #16161f', padding: '8px 16px 12px', background: '#0a0d13' }}>
-                    <Show when={updatesError()}>
-                      <div style={{ color: '#d45555', 'font-size': '12px', padding: '4px 0' }}>{updatesError()}</div>
-                    </Show>
-                    <Show when={updatesLoading()}>
-                      <div style={{ color: '#666', 'font-size': '12px', padding: '4px 0' }}>Loading updates…</div>
-                    </Show>
-                    <Show when={!updatesLoading() && !updatesError() && updatesList().length === 0}>
-                      <div style={{ color: '#666', 'font-size': '12px', padding: '4px 0' }}>No updates yet. Agents post here with <code style={{ color: '#e0a050' }}>room update</code> when something worth knowing happens.</div>
-                    </Show>
-                    <For each={[...updatesList()].reverse()}>{(update) => (
-                      <div data-testid="room-update" style={{ padding: '9px 0', 'border-bottom': '1px solid #14141c' }}>
-                        <div style={{ 'font-size': '10px', color: '#5a6472', 'font-family': 'monospace', 'margin-bottom': '3px' }}>{updateTimeLabel(update.ts)}</div>
-                        <div style={{ 'font-size': '13px', color: '#d0d4da', 'line-height': '1.5', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{update.text}</div>
-                      </div>
-                    )}</For>
+                <Show when={wikiRoom() === room.name}>
+                  <div data-testid={`wiki-panel-${room.name}`} style={{ height: '60vh', 'border-top': '1px solid #16161f', background: '#0a0d13' }}>
+                    <RoomWikiView room={room.name} />
                   </div>
                 </Show>
                 <Show when={frictionRoom() === room.name}>
@@ -474,7 +451,18 @@ export default function RoomsHome(props: {
                   </div>
                 </Show>
                 <Show when={expanded() === room.name}>
-                  <For each={room.sessions}>{(s) => sessionRow(room, s)}</For>
+                  <div data-testid={`residents-${room.name}`} style={{ 'border-top': '1px solid #16161f', padding: '7px 16px 9px 28px' }}>
+                    <div style={{ color: '#596373', 'font-size': '9px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.06em', 'margin-bottom': '5px' }}>Residents</div>
+                    <For each={room.residents || []}>{(resident) => (
+                      <div data-testid={`resident-${room.name}-${resident.role}`} style={{ display: 'flex', 'align-items': 'center', gap: '8px', padding: '5px 0' }}>
+                        <span style={{ width: '7px', height: '7px', 'border-radius': '50%', background: resident.status === 'working' ? '#4aba6a' : resident.status === 'waiting' ? '#596373' : '#5c3333', 'flex-shrink': '0' }} />
+                        <span style={{ color: resident.role === 'leader' ? '#69c77f' : '#b6bfcc', 'font-size': '12px', 'font-weight': '650', 'text-transform': 'capitalize' }}>{resident.role}</span>
+                        <span style={{ color: agentColor(resident.agent), 'font-size': '9px', 'font-weight': '600' }}>{resident.agent}</span>
+                        <span style={{ color: '#555f6d', 'font-size': '10px', 'margin-left': 'auto' }}>{resident.status}</span>
+                      </div>
+                    )}</For>
+                  </div>
+                  <For each={otherRoomSessions(room)}>{(session) => sessionRow(room, session)}</For>
                   <div style={{ display: 'flex', 'flex-wrap': 'wrap', gap: '8px', padding: '10px 16px 12px 28px', 'border-top': '1px solid #16161f', position: 'relative' }}>
                     <button onClick={() => newChat(room)} disabled={busy()}
                       style={{ background: roomHarness(room.name) === 'omp' ? '#3a2a1e' : '#15202a', border: `1px solid ${roomHarness(room.name) === 'omp' ? '#68481f' : '#344657'}`, color: roomHarness(room.name) === 'omp' ? '#e0a050' : agentColor(roomHarness(room.name)), 'font-size': '12px', 'font-weight': '700', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>+ New {agentLabel(roomHarness(room.name))} chat</button>

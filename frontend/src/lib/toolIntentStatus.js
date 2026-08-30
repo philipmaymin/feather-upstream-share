@@ -37,3 +37,4 @@ export function deriveToolIntentState(messages) {
   for (const message of messages || []) state = toolIntentTransition(state, message)
   return state
 }
+

@@ -23,7 +23,7 @@ for skill in feather sidecar council; do
   printf -- '---\nname: %s\n---\n' "$skill" >"$source_repo/skills/$skill/SKILL.md"
 done
 printf 'export default function () {}\n' >"$source_repo/omp-tools/feather-protocol-tools.js"
-for cli in room sidecar refeather refeather-fleet; do printf '#!/bin/sh\n' >"$source_repo/bin/$cli"; chmod +x "$source_repo/bin/$cli"; done
+for cli in room sidecar refeather refeather-fleet feather-instance; do printf '#!/bin/sh\n' >"$source_repo/bin/$cli"; chmod +x "$source_repo/bin/$cli"; done
 cat >"$source_repo/build-test.sh" <<'SH'
 #!/usr/bin/env bash
 set -e
@@ -203,7 +203,6 @@ if [ "$action" = start ] && [ "${REFEATHER_TEST_FAIL_ALL_START:-0}" = 1 ]; then 
 if [ "$action" = start ] && [ "${REFEATHER_TEST_HANG_START:-0}" = 1 ]; then sleep 30; fi
 SH
 chmod +x "$fake_systemctl"
-
 fake_curl="$TMP/fake-curl"
 cat >"$fake_curl" <<'SH'
 #!/usr/bin/env bash
@@ -329,7 +328,6 @@ wait "$systemd_pid" 2>/dev/null || true
 "${systemd_switch_env[@]}" "$ROOT/bin/refeather" recover
 [ "$(readlink -f "$current")" = "$old" ]
 [ ! -e "$journal/active.json" ]
-
 if "${switch_env[@]}" REFEATHER_PRE_PROMOTE_CHECK=false "$ROOT/bin/refeather" promote --release "$release" "${switch_args[@]}" 2>"$TMP/precheck.err"; then
   echo "failed pre-promotion check unexpectedly promoted" >&2; exit 1
 fi

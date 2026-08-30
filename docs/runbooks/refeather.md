@@ -81,19 +81,30 @@ bin/refeather install-capabilities \
 
 This installs Feather and Sidecar into `~/.claude/skills` and `~/.codex/skills`,
 Council plus Feather protocol tools into `~/.omp/agent`, and `room`, `sidecar`,
-`refeather`, plus `refeather-fleet` into `~/.local/bin`. Existing correct links
-are left alone. A file or foreign link is copied into a conflict evidence
-directory and causes a full preflight abort; nothing is overwritten.
-Promotion runs the same preflight by default before stopping the service.
+`refeather`, `refeather-fleet`, plus `feather-instance` into `~/.local/bin`.
+Existing correct links are left alone; managed OMP links to an older immutable
+release are atomically normalized to the stable target. A file or foreign link
+is copied into a conflict evidence directory and causes a full preflight abort;
+nothing is overwritten. Remove or relocate only the exact conflicts named by
+that failed preflight, retaining its evidence. Promotion runs the same preflight
+before stopping the service.
 
 Inside an OMP session, the local CLIs use its health-checked bridge metadata to
 target the Feather instance that launched it. Outside a session, fallback probes
 `FEATHER_PORT` (or legacy `PORT` when `FEATHER_PORT` is unset), 4870, and 3300,
-and refuses zero or multiple Feather-shaped responses.
+and refuses zero or multiple Feather-shaped responses. Discovery is client
+routing, never deploy targeting; promotion always requires the exact service
+identity, stable release link, and mounted health URL.
 
 ## 3. Promote as the sole writer
 
-Run any canary/backup gate through `--pre-promote-check` before quiescing.
+Run any canary/backup gate through `--pre-promote-check` before quiescing. The
+gate must record its canary PID, install a termination trap, and verify that both
+the process and listener are gone before promotion. Closing SSH or a hub session
+does not clean up a detached read-only canary. After interruption, match the
+recorded PID to its command line before terminating it; never kill an unverified
+PID.
+
 Supervisor example:
 
 ```bash
@@ -135,10 +146,11 @@ the migration receipt.
 
 ## 4. Delay secondary-user promotion
 
-Promote the immutable release to the designated canary first. The fleet timer
-detects the canary link change, verifies the release content hash, copies that
-exact tree into the shared release store when necessary, supersedes any older
-pending release, and starts a new 86,400-second window from the canary link's
+Philip's instance at `/home/user/.local/share/feather/current` is the designated
+canary. Promote and verify that immutable release there first. The fleet timer
+detects the canary link change, verifies its content hash, copies that exact tree
+into `/opt/feather/releases` when necessary, supersedes any older pending
+release, and starts a fresh 86,400-second (24-hour) window from the canary
 promotion timestamp. To run that synchronization immediately:
 
 ```bash

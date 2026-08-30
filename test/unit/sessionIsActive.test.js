@@ -34,7 +34,6 @@ describe('sessionIsActive', () => {
   it('temporarily recognizes tmux sessions from older 8-character releases', () => {
     assert.equal(sessionIsActive(new Set([prefix]), id, now - 60_000, now), true)
   })
-
   it('is NOT active when tmux is alive but the last write is older than ACTIVE_MS', () => {
     // This is the exact bug: a lingering tmux pane with no recent activity.
     const active = new Set([prefix])

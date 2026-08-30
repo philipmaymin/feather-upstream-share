@@ -28,16 +28,22 @@ function makeRoom(root, name) {
 }
 
 describe('room updates CLI', () => {
-  it('lists a multi-paragraph briefing chronologically', async () => {
+  it('appends a multi-paragraph briefing and lists entries chronologically', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-room-updates-cli-'))
     roots.push(root)
     const { roomsDir, roomDir } = makeRoom(root, 'demo')
     const env = { ...process.env, HOME: root, ROOMS_DIR: roomsDir }
     const cli = path.resolve(import.meta.dirname, '../../bin/room')
-    fs.writeFileSync(path.join(roomDir, 'updates.jsonl'), [
-      JSON.stringify({ id: 'a'.repeat(32), ts: '2026-08-25T10:00:00Z', text: 'First outcome.\nWhy it matters: the herd is gone.' }),
-      JSON.stringify({ id: 'b'.repeat(32), ts: '2026-08-25T11:00:00Z', text: 'Second outcome.' }),
-    ].join('\n') + '\n')
+
+    await run(cli, ['update', 'First outcome.\nWhy it matters: the herd is gone.'], { cwd: roomDir, env })
+    await run(cli, ['update', 'Second outcome.'], { cwd: roomDir, env })
+
+    const lines = fs.readFileSync(path.join(roomDir, 'updates.jsonl'), 'utf8').trim().split('\n')
+    assert.equal(lines.length, 2)
+    const first = JSON.parse(lines[0])
+    assert.equal(first.text, 'First outcome.\nWhy it matters: the herd is gone.')
+    assert.match(first.id, /^[0-9a-f]{32}$/)
+    assert.match(first.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/)
 
     const listed = await run(cli, ['updates'], { cwd: roomDir, env })
     const firstAt = listed.stdout.indexOf('First outcome.')
@@ -84,6 +90,7 @@ describe('room updates API', () => {
     let stderr = ''
     child.stderr.on('data', (chunk) => { stderr += chunk })
 
+
     for (let attempt = 0; attempt < 100; attempt++) {
       try { if ((await fetch(`${base}/api/health`)).ok) break } catch {}
       await new Promise((resolve) => setTimeout(resolve, 30))
@@ -95,7 +102,7 @@ describe('room updates API', () => {
     const listed = await (await fetch(`${base}/api/rooms/demo/updates`)).json()
     assert.equal(listed.updates.length, 1)
     const postedBody = { update: listed.updates[0] }
-    assert.match(postedBody.update.id, /[0-9a-f-]{36}/)
+    assert.match(postedBody.update.id, /^[0-9a-f]{32}$/)
     assert.equal(postedBody.update.text, 'Shipped the updates feed.\nWhy it matters: you can walk in cold.')
 
 
@@ -105,6 +112,7 @@ describe('room updates API', () => {
     assert.equal(demo.updates.count, 1)
     assert.equal(demo.updates.latestAt, postedBody.update.ts)
     assert.match(demo.updates.latest, /Shipped the updates feed\. Why it matters/)
+
 
     assert.equal((await fetch(`${base}/api/rooms/demo/updates`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: '   ' }),

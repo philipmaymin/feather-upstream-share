@@ -10,9 +10,9 @@
 # Usage:
 #   room new <name>                    scaffold a room folder
 #   room list                          list rooms
-#   room note "<text>"                 append a timestamped note to notes.md
-#   room update "<text>"               post a human-facing briefing
-#   room updates                       list this room's updates feed
+#   room note TEXT|--stdin|--file PATH   append durable working memory
+#   room update TEXT|--stdin|--file PATH append legacy evidence
+#   room updates                         list legacy evidence
 #   room complain "<text>"             add an annoyance to #friction
 #   room pause                          stop automatic checks for this room
 #   room wake                           resume automatic checks for this room
@@ -42,6 +42,39 @@ ensure_feather_url() {
   FEATHER_URL="$($script_dir/feather-instance)" || die "could not resolve Feather; set FEATHER_URL"
 }
 
+try_feather_url() {
+  [ -n "$FEATHER_URL" ] && return 0
+  local script_dir
+  script_dir="$(CDPATH= cd -- "$(dirname -- "$(readlink -f "$0")")" && pwd)"
+  FEATHER_URL="$($script_dir/feather-instance 2>/dev/null)" || { FEATHER_URL=""; return 1; }
+}
+
+read_room_text() {
+  local command="$1"
+  shift
+  ROOM_TEXT=""
+  case "${1:-}" in
+    --stdin)
+      [ "$#" -eq 1 ] || die "room $command: cannot combine --stdin with positional text"
+      IFS= read -r -d '' ROOM_TEXT || true
+      ;;
+    --file)
+      [ "$#" -eq 2 ] || die "room $command: --file requires exactly one path and no positional text"
+      [ -f "$2" ] || die "room $command: input file not found: $2"
+      IFS= read -r -d '' ROOM_TEXT <"$2" || true
+      ;;
+    --)
+      shift
+      [ "$#" -eq 1 ] || die "usage: room $command TEXT | --stdin | --file PATH"
+      ROOM_TEXT="$1"
+      ;;
+    *)
+      [ "$#" -eq 1 ] || die "usage: room $command TEXT | --stdin | --file PATH"
+      ROOM_TEXT="${1:-}"
+      ;;
+  esac
+  [ -n "$ROOM_TEXT" ] || die "room $command: text must not be empty"
+}
 # ── Room resolution ─────────────────────────────────────────────────────────
 resolve_room() {
   if [ -n "${ROOM_NAME:-}" ]; then return; fi
@@ -146,21 +179,31 @@ cmd_list() {
 
 cmd_note() {
   resolve_room
-  [ -n "${1:-}" ] || die 'usage: room note "<text>"'
-  printf -- '- %s %s\n' "$(date -u +%Y-%m-%d\ %H:%M)" "$1" >>"$ROOM_PATH/notes.md"
+  read_room_text note "$@"
+  printf -- '- %s %s\n' "$(date -u +%Y-%m-%d\ %H:%M)" "$ROOM_TEXT" >>"$ROOM_PATH/notes.md"
   echo "noted in #$ROOM_NAME"
 }
 
 cmd_update() {
   resolve_room
-  [ -n "${1:-}" ] || die 'usage: room update "<what happened and why it matters>"'
-  ensure_feather_url
+  read_room_text update "$@"
   local payload
-  payload=$(python3 -c 'import json,sys; print(json.dumps({"text":sys.argv[1]}))' "$1") \
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"text":sys.argv[1]}))' "$ROOM_TEXT") \
     || die "could not encode update"
-  curl -sf -X POST "$FEATHER_URL/api/rooms/$ROOM_NAME/updates" \
-    -H 'Content-Type: application/json' -d "$payload" >/dev/null \
-    || die "feather refused to post update to #$ROOM_NAME"
+  if try_feather_url; then
+    curl -sf -X POST "$FEATHER_URL/api/rooms/$ROOM_NAME/updates" \
+      -H 'Content-Type: application/json' -d "$payload" >/dev/null \
+      || die "feather refused to post update to #$ROOM_NAME"
+    echo "posted update to #$ROOM_NAME"
+    return
+  fi
+  # No owning Feather can be resolved (for example, offline caretaker tools).
+  # Retain one append-only legacy evidence entry rather than losing the briefing.
+  local line
+  line=$(python3 -c 'import json,sys,uuid,datetime; print(json.dumps({"id":uuid.uuid4().hex,"ts":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),"text":sys.argv[1]}))' "$ROOM_TEXT") \
+    || die "could not encode update"
+  [ -d "$ROOM_PATH" ] || die "no such room: $ROOM_NAME"
+  printf '%s\n' "$line" >>"$ROOM_PATH/updates.jsonl" || die "could not write update to #$ROOM_NAME"
   echo "posted update to #$ROOM_NAME"
 }
 

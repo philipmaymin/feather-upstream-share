@@ -5,7 +5,7 @@ set -Eeuo pipefail
 SELF="$(readlink -f "$0")"
 REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd)"
 CAPABILITY_SKILLS=(feather sidecar)
-CAPABILITY_CLIS=(room sidecar refeather refeather-fleet)
+CAPABILITY_CLIS=(room sidecar refeather refeather-fleet feather-instance)
 CAPABILITY_OMP_SKILLS=(council)
 CAPABILITY_OMP_EXTENSIONS=(feather-protocol-tools.js)
 RETIRED_CAPABILITY_SKILLS=(looper)

@@ -271,6 +271,7 @@ describe('Feather OMP bridge extension', () => {
     assert.equal(JSON.stringify(workEvents).includes('/private'), false)
   })
 
+
   it('ends text-only messages and cancels messages containing any tool call', async (t) => {
     const requests = []
     installRuntime(t, async (...args) => {
@@ -343,6 +344,7 @@ describe('Feather OMP bridge extension', () => {
 
     assert.equal(requests.length, 2)
     assert.deepEqual(requests[1].body.events, [
+
       { type: 'assistant_snapshot', messageId: requests[1].body.events[0].messageId, text: 'Latest snapshot' },
       { type: 'assistant_end', messageId: requests[1].body.events[0].messageId },
     ])

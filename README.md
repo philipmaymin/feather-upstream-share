@@ -4,9 +4,30 @@
 
 Open any Claude Code session on your phone. Read the conversation. Send messages. Watch the terminal. Resume old sessions or spawn new ones — instantly.
 
+<p align="center"><img src="docs/screenshots/session.png" alt="A Claude Code session rendered like a texting app, on mobile" width="320" /></p>
+
+## Sidecars — multi-agent, built in
+
+Spin up a **second agent** with its own context, paired to your current session, and chat with it both ways. It's a Feather session like any other — persistent, resumable, visible in the UI — so you can read the conversation, jump in, or let two agents work it out.
+
+![Two agents collaborating in the Sidecar tab](docs/screenshots/sidecar.png)
+
+- **`/sidecar <task>`** — spawn a peer thread (Claude *or* Codex) and talk to it through the `sidecar` CLI. Messages are brokered by Feather and injected into each agent's tmux; a per-session lock prevents two senders from garbling a pane. → [`skills/sidecar`](skills/sidecar/SKILL.md)
+
+Agents talk over a tiny CLI — messages are recorded to a file and injected into the peer's session:
+
+```bash
+# from inside any agent session:
+sidecar post --to peer "Please review the current approach."
+sidecar read        # print the whole thread
+# the peer's reply is injected straight back into your session.
+```
+
+The peer works in an independent context while sharing a visible, durable thread with the primary session.
+
 ## Make it yours
 
-The entire app is 6 files. Point Claude (or any AI agent) at this repo and tell it what you want:
+The whole thing is a handful of files — one backend (`server-single.js` + focused `lib/` modules), one app shell, a renderer, and a terminal. Point Claude (or any AI agent) at this repo and tell it what you want:
 
 - *"Add a cost tracker that shows tokens and dollars per session"*
 - *"Add push notifications when an agent needs my attention"*
@@ -18,7 +39,7 @@ The entire app is 6 files. Point Claude (or any AI agent) at this repo and tell 
 - *"Show a green typing indicator when Claude is responding"*
 - *"Add keyboard shortcuts — j/k to navigate sessions, Enter to open"*
 
-No abstractions to learn. No plugin API to read. One server file, one app shell, one message renderer. You describe it, the agent builds it.
+No abstractions to learn. No plugin API to read. One backend, one app shell, one renderer. You describe it, the agent builds it.
 
 ## Fork and share
 
@@ -71,34 +92,55 @@ while the durable JSONL transcript remains the historical source of truth.
 ## Rooms — durable workspaces
 
 A Room is a folder under `~/rooms/` that gives related Feather chats a shared
-working directory and durable notes. The Rooms home groups Claude, Codex, and
-oh-my-pi sessions by working directory, and lets you create or explicitly assign
-chats without maintaining a separate Projects tree.
+working directory and durable knowledge. Each contains `AGENTS.md`, a matching
+`CLAUDE.md` symlink, `notes.md` for working evidence, and curated `wiki/` pages.
+Rooms do not impose a generic agent persona: start or resume the Claude, Codex,
+or OMP sessions that fit the work.
 
-Each room contains an `AGENTS.md`, a matching `CLAUDE.md` symlink, and a
-`notes.md` working memory. From a room chat, `room note "..."` appends a durable
-decision or open thread.
+Each Room has one durable **Leader**: the single user-facing conversation that
+answers directly or synthesizes contributions from the Room. Tapping the Room
+always opens that Leader. A missing, archived, or otherwise stale Leader is
+repaired to a compatible durable session rather than silently routing the user
+to whichever chat spoke most recently.
 
-By default, Feather checks each inactive Room every 15 minutes and launches one
-non-interactive OMP session to do the next useful thing. The Room card shows when
-it last worked and when it will check again. Pause or resume that behavior from
-the card, or from inside the Room with `room pause` and `room wake`.
+Rooms may also keep permanent **residents** with named roles and harness/model
+choices. The resident roster survives process restarts and is synchronized into
+the Room's durable Sidecar group. Leader-to-resident and resident-to-Leader
+messages use that visible thread, so agent-to-agent delivery has one canonical,
+human-readable record rather than a hidden parallel channel.
+
+By default, the caretaker checks each inactive Room every 15 minutes. It records
+evidence for what it actually inspected, repairs stale leadership, and distills
+durable meaning from `notes.md`, Room events, updates, and session history into
+the Wiki. Pause or resume caretaker work from the Room or with `room pause` and
+`room wake`.
+
+The standalone Room **Updates** tab and unread badge are retired; their content
+is folded into the curated Wiki. `updates.jsonl`, the Room updates API, and
+`room update`/`room updates` remain supported because Fledge consumes
+timeline-ready Room dispatches. Agents should keep raw working evidence in
+`notes.md` and let the caretaker maintain the human-facing synthesis.
 
 Agents can run `room complain "..."` to append recurring annoyances to
-`#friction`. `#meta` is the separate place for reusable lessons across Rooms.
+`#friction`; `#meta` remains separate for lessons shared across Rooms. Optional
+delegation commands include `room council`, `room lookup`,
+`room second-opinion`, and `room spawn`.
 
-The optional `room` CLI also supports lookups, sealed councils, second opinions,
-spawned sessions, and handoffs.
+On `app.feather.plus`, Fledge remains the landing surface and keeps feed
+reactions and comments in `feed-interactions.json`. Other hosts remain
+Rooms-first.
 
-Feather's former Auto surface is retired. Existing `~/auto-*` directories are
-left untouched.
+For finite autonomous work in Codex, the recommended path is `$goal-prep`
+followed by `/goal`: prepare a bounded, verifiable goal, then let the Codex goal
+session run it.
 
 ## Agent capabilities
 
 Install Feather and Sidecar for Claude and Codex, Council plus Feather protocol
-tools for OMP, and the `room`, `sidecar`, `refeather`, and `refeather-fleet`
-CLIs through the guarded installer. Point the links at the stable `current`
-release so promotion updates server and agent capabilities together:
+tools for OMP, and the `room`, `sidecar`, `refeather`, `refeather-fleet`, and
+`feather-instance` CLIs through the guarded installer. Point all managed links
+at the stable `current` release so one promotion updates server and agent
+capabilities together:
 
 ```bash
 bin/refeather install-capabilities \
@@ -106,9 +148,13 @@ bin/refeather install-capabilities \
   --target-root /opt/feather/current
 ```
 
-The installer is idempotent and never overwrites a file or foreign symlink;
+The installer is idempotent. It never overwrites a file or foreign symlink;
 conflicts are copied to a timestamped evidence directory and installation
-stops with cleanup guidance.
+stops with cleanup guidance. Ensure `~/.local/bin` is on the environment used
+to spawn Claude, Codex, and OMP sessions.
+
+- [`/sidecar`](skills/sidecar/SKILL.md) — spawn a paired peer agent thread and chat both ways.
+- [`/feather`](skills/feather/SKILL.md) — manage the running Feather server (status, logs, quick links, deploy).
 
 ## Quick start
 
@@ -144,6 +190,7 @@ The configured state root owns only these instance assets:
 | `sharing.json` | Peer grants and credentials (secret, enforced `0600`) |
 | `session-meta.json` | Per-session names, archive state, and sharing metadata |
 | `project-labels.json` | Project display labels |
+| `feed-interactions.json` | Fledge reactions, comments, and bounded source snapshots |
 | `quick-links.json` | Saved navigation links |
 | `starred.json` | Starred sessions |
 | `muted.json` | Muted notification sessions |
@@ -152,11 +199,12 @@ The configured state root owns only these instance assets:
 | `uploads/` | Uploaded attachments |
 
 Everything else keeps its existing owner: release assets (`static/`,
-`version.json`, and the bridge extension) stay in the checkout; sidecars, Room
-assignments, access logs, and OMP state stay under `~/.feather`; Claude and Codex
-session stores stay under their harness homes; Rooms stay under `~/rooms`; and
-tmux/process/temp state remains runtime-managed. A new writable path must be
-classified into one of those groups before it is added.
+`version.json`, and the bridge extension) stay in the checkout; Room
+assignments, durable Leaders, residents, caretaker state, Sidecar threads,
+access logs, and OMP state stay under `~/.feather`; Claude and Codex session
+stores stay under their harness homes; Rooms and their Wiki stay under
+`~/rooms`; and tmux/process/temp state remains runtime-managed. A new writable
+path must be classified into one of those groups before it is added.
 
 For a migration, stop all Feather writers, copy and validate the instance
 assets, then start one release with `FEATHER_STATE_DIR`. Deployment tooling may
@@ -212,6 +260,7 @@ existing state. Defaults and rollback compatibility are recorded in
 | `frontend/src/App.tsx` | UI shell — sidebar, header, tabs, input bar |
 | `frontend/src/api.ts` | REST + SSE client, types |
 | `frontend/src/components/MessageView.tsx` | Chat bubbles with markdown rendering |
+| `frontend/src/components/Sidecar.tsx` | Sidecar panel — paired-agent thread view |
 | `frontend/src/components/Terminal.tsx` | xterm.js + WebSocket terminal |
 | `frontend/src/index.tsx` | SolidJS mount point |
 

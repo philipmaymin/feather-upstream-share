@@ -1,0 +1,4 @@
+{
+  "example-local": { "url": "http://127.0.0.1:9001", "label": "Example Local" },
+  "example-remote": { "url": "http://10.0.0.10:9000", "label": "Example Remote" }
+}

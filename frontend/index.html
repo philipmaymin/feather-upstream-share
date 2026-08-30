@@ -34,24 +34,57 @@
     #root { position: fixed; top: 0; left: 0; width: 100%; height: 100%; overflow: hidden; }
     html { overscroll-behavior: none; -webkit-text-size-adjust: 100%; }
     body {
-      background: #0a0e14; color: #e5e5e5;
+      background: var(--bg-base, #0a0e14); color: var(--text-primary, #e5e5e5);
       font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif;
       -webkit-font-smoothing: antialiased;
       -webkit-tap-highlight-color: transparent;
-      touch-action: manipulation;
+      touch-action: pan-x pan-y;
       overscroll-behavior: none;
     }
+    /* Chat bubble metadata — action icons subtly visible by default (matches pi-dashboard) */
+    .msg-row .msg-action { opacity: 0.35 !important; transition: opacity 0.15s, color 0.15s; }
+    .msg-row:hover .msg-action { opacity: 0.75 !important; }
+    .msg-row .msg-action:hover { opacity: 1 !important; color: var(--text-primary) !important; }
+    /* Markdown rendering (file viewer) */
+    .prose h1 { font-size: 18px; font-weight: 700; margin: 18px 0 8px; color: #fff; }
+    .prose h2 { font-size: 14px; font-weight: 700; margin: 18px 0 6px; color: #e5e5e5; text-transform: uppercase; letter-spacing: 0.05em; }
+    .prose h3 { font-size: 13px; font-weight: 600; margin: 14px 0 4px; color: #c8c8c8; }
+    .prose p { margin: 6px 0; color: #c0c0c0; }
+    .prose ul, .prose ol { margin: 6px 0 6px 20px; color: #c0c0c0; }
+    .prose li { margin: 2px 0; }
+    .prose code { background: #1a1a2e; color: #ffb86c; padding: 1px 5px; border-radius: 3px; font-size: 12px; font-family: ui-monospace, monospace; }
+    .prose pre { background: #06080c; border: 1px solid #1e1e1e; border-radius: 6px; padding: 10px 12px; margin: 8px 0; overflow-x: auto; }
+    .prose pre code { background: none; color: #d0d0d0; padding: 0; font-size: 12px; }
+    .prose a { color: #73b8ff; text-decoration: none; }
+    .prose a:hover { text-decoration: underline; }
+    .prose strong { color: #fff; font-weight: 600; }
+    .prose hr { border: none; border-top: 1px solid #1e1e1e; margin: 16px 0; }
+    .prose blockquote { border-left: 3px solid #2a3a55; padding-left: 12px; color: #888; margin: 8px 0; }
   </style>
   <script>
     // iOS PWA keyboard fix — pin the root to the visual viewport so it shrinks with the keyboard
     function syncViewport() {
       var vv = window.visualViewport;
-      var h = vv ? vv.height : window.innerHeight;
+      // Skip if user is pinch-zoomed — don't resize layout during zoom
+      if (vv && vv.scale > 1.01) return;
+      var layoutH = window.innerHeight;
+      var visualH = vv ? vv.height : layoutH;
+      // How much the visual viewport claims is obscured (software keyboard, etc.)
+      var inset = layoutH - visualH;
+      var ae = document.activeElement;
+      var editing = !!ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT' || ae.isContentEditable);
+      // iPad/hardware keyboard: while an input is focused, iPadOS shows only a small
+      // floating accessory bar yet reports a large inset, leaving dead space below
+      // the app. Ignore that lie. Gated on `editing` so the no-keyboard steady state
+      // (incl. iPhone Safari's own toolbar chrome) keeps the original visual-viewport
+      // behavior, and a real on-screen keyboard (inset >= 150) still lifts the composer.
+      var floatingBar = editing && inset > 0 && inset < 150;
+      var h = floatingBar ? layoutH : visualH;
       var root = document.getElementById('root');
       document.documentElement.style.setProperty('--vh', h * 0.01 + 'px');
       if (root) {
         root.style.height = h + 'px';
-        root.style.top = (vv ? vv.offsetTop : 0) + 'px';
+        root.style.top = (floatingBar ? 0 : (vv ? vv.offsetTop : 0)) + 'px';
       }
       // Prevent iOS from scrolling the body
       window.scrollTo(0, 0);
@@ -61,6 +94,10 @@
       window.visualViewport.addEventListener('scroll', syncViewport);
     }
     window.addEventListener('resize', syncViewport);
+    // Prevent pinch-to-zoom (iOS Safari ignores user-scalable=no)
+    document.addEventListener('gesturestart', function(e) { e.preventDefault(); });
+    document.addEventListener('gesturechange', function(e) { e.preventDefault(); });
+    document.addEventListener('gestureend', function(e) { e.preventDefault(); });
     // Run after DOM ready
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', syncViewport);

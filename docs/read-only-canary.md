@@ -19,10 +19,12 @@ not the security boundary.
 ## Allowed HTTP surface
 
 Static assets and non-API GET/HEAD requests remain readable. API GET/HEAD is
-allowlisted to health, session lists/messages/streams/exports, Sidecar
-lists/threads/streams, project/search/activity summaries, quick links, mute and
-push-subscription reads, starred messages, file reads/previews, agents, auth
-identity, build version, and Rooms.
+allowlisted to health; feed, Room, project, search, activity, usage, identity,
+and build summaries; session messages, streams, exports, protocol runs, and
+Room membership; Room updates, friction, residents, Wiki index, and Wiki pages;
+Sidecar lists, threads, and streams; quick links, mute state, push subscriptions,
+starred messages; and classified file, local-media, bridge, and protocol reads.
+Unknown future GET endpoints remain closed until explicitly classified.
 
 Every other API request receives HTTP 403 with:
 
@@ -30,14 +32,15 @@ Every other API request receives HTTP 403 with:
 { "error": "read-only canary", "code": "FEATHER_READ_ONLY" }
 ```
 
-This includes all POST/DELETE mutations, unknown future GET endpoints, uploads,
-transcription, push-key generation, session/tmux control, Room changes, Sidecar
-delivery and cleanup, and editor launch.
+This includes all POST/DELETE mutations, uploads, transcription, push-key
+generation, session/tmux control, session model changes, Leader or resident
+changes, Room updates, Sidecar delivery and cleanup, and editor launch.
 
 Terminal, shell, and streaming-transcription WebSocket upgrades receive HTTP
 403 before WebSocket, PTY, or upstream connection creation. The idle reaper,
-auto-title/activity controllers, notification poller, and Sidecar garbage
-collection are disabled, and startup does not create or chmod state paths.
+auto-title/activity controllers, notification poller, Room pulses, Sidecar
+synchronization/priming, and Sidecar garbage collection are disabled, and
+startup does not create or chmod state paths.
 
 ## Deployment containment
 
@@ -48,3 +51,9 @@ home/state/tmux bind mounts. Before exposure, the migration preflight must rejec
 absolute symlinks, sockets, temporary paths, mounts, or writable realpaths that
 escape those copied roots. The server's JSON-state layer separately rejects
 recorded state files that resolve outside their configured state root.
+
+The canary gate must record the process PID, install a termination trap, and
+verify that both that process and its listener are gone before promotion.
+Closing SSH or a hub session is not cleanup for a detached canary. After an
+interrupted gate, match the recorded PID to its command line before terminating
+it; never kill an unverified PID.

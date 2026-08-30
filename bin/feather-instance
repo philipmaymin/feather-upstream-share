@@ -67,7 +67,6 @@ if owner=$(session_feather_url) && is_feather_url "$owner"; then
   printf '%s' "$owner"
   exit 0
 fi
-
 ports=()
 add_port() {
   local candidate="${1:-}" existing

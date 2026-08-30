@@ -84,9 +84,9 @@ test('mirrors parent and child execution across completion, replay, and responsi
     type: 'assistant', uuid: `native-live-trace-${Date.now()}`, timestamp: new Date().toISOString(), isSidechain: false, isMeta: false,
     message: { role: 'assistant', content: [{ type: 'tool_use', id: 'durable-parent-read', name: 'Read', input: { path: '/tmp/durable-parent' } }] },
   })
-  await page.waitForTimeout(300)
-  await expect(page.getByTestId('live-work-turn')).toHaveCount(0)
   expect(started.status).toBe(204)
+  await expect(page.getByTestId('omp-parent-execution')).toBeVisible({ timeout: 10000 })
+  await expect(page.getByTestId('live-work-turn')).toHaveCount(0)
 
   const promptsTab = page.getByRole('button', { name: 'Prompts', exact: true })
   await expect(promptsTab).toBeVisible()

@@ -10,11 +10,15 @@ test-results/
 uploads/
 .feather-state/
 quick-links.json
+project-labels.json
 session-meta.json
 .sessions.json
 starred.json
 users.json
-project-labels.json
+feed-interactions.json
+muted.json
+push-keys.json
+push-subscriptions.json
 boxes.json
 sharing.json
 *.json.last-good
@@ -25,3 +29,5 @@ generate-pdf.mjs
 MISSING-FEATURES.md
 issues/
 *-results.tsv
+.gstack/
+*.bak

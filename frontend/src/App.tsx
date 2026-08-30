@@ -1,13 +1,14 @@
 declare const __BUILD_TIME__: string
 declare const __BUILD_VERSION__: string
-import { createSignal, createEffect, createMemo, onMount, onCleanup, Show, For } from 'solid-js'
+import { createSignal, createEffect, createMemo, onMount, onCleanup, Show, For, Suspense } from 'solid-js'
 import { MessageView, RichMarkdown } from './components/MessageView'
 import { Terminal } from './components/Terminal'
 import { SidecarThread } from './components/Sidecar'
+import { RoomWikiView } from './components/RoomWikiView'
 import RoomsHome from './RoomsHome'
 import FeedHome from './FeedHome'
-import type { SessionMeta, Message, QuestionData, SidecarGroup, RoomUpdate, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot, ProtocolRunSnapshot } from './api'
-import { fetchSessions, fetchRooms, fetchRoomUpdates, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, createSidecar } from './api'
+import type { SessionMeta, Message, QuestionData, SidecarGroup, SidecarMessage, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot, ProtocolRunSnapshot } from './api'
+import { fetchSessions, fetchRooms, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, fetchSidecar, subscribeSidecar, createSidecar, fetchSessionRoom } from './api'
 import type { SearchResult } from './api'
 import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
@@ -16,6 +17,7 @@ import { appUrl } from './lib/appPath.js'
 import { deriveToolIntentState, isFinalAssistantMessage, toolIntentTransition } from './lib/toolIntentStatus.js'
 import { deriveTodoSnapshot, todoSnapshotFromDetails, todoSnapshotFromMessage } from './lib/ompTodo.js'
 import { createOmpMirrorState, reduceOmpMirrorState } from './lib/ompMirror.js'
+import { mergeRoomThreadMessages } from './lib/roomThread.js'
 import { createProtocolRunsState, orderedProtocolRuns, reduceProtocolRunSnapshot, replaceProtocolRuns } from './lib/protocolRuns.js'
 
 interface QuickLink { label: string; url: string }
@@ -63,6 +65,7 @@ function voiceStatusLabel(memo: VoiceMemo) {
   return memo.error || 'Transcription failed'
 }
 
+
 function resizeImage(blob: Blob, maxDim = 1600): Promise<Blob> {
   return new Promise((resolve) => {
     const img = new Image()
@@ -75,6 +78,7 @@ function resizeImage(blob: Blob, maxDim = 1600): Promise<Blob> {
       resolve(value)
     }
     img.onload = () => {
+      URL.revokeObjectURL(url)
       const { width: w, height: h } = img
       if (w <= maxDim && h <= maxDim) { finish(blob); return }
       const scale = Math.min(maxDim / w, maxDim / h)
@@ -165,8 +169,8 @@ const isFledgeHost = location.hostname === 'app.feather.plus' || new URLSearchPa
 type HomeView = 'feed' | 'rooms'
 
 export default function App() {
-  const [authUser, setAuthUser] = createSignal<{ username: string; admin: boolean } | null>(null)
-  const [authChecked, setAuthChecked] = createSignal(false)
+  const [authUser, setAuthUser] = createSignal<{ username: string; admin: boolean } | null>({ username: 'philip', admin: true })
+  const [authChecked, setAuthChecked] = createSignal(true)
   const [loginError, setLoginError] = createSignal('')
   const [loginLoading, setLoginLoading] = createSignal(false)
 
@@ -185,11 +189,12 @@ export default function App() {
   const [creating, setCreating] = createSignal(false)
   const [resumingId, setResumingId] = createSignal<string | null>(null)
   const [text, setText] = createSignal('')
-  const [tab, setTab] = createSignal<'chat' | 'files' | 'terminal' | 'prompts' | 'updates'>('chat')
-  const [updatesList, setUpdatesList] = createSignal<RoomUpdate[]>([])
-  const [updatesLoading, setUpdatesLoading] = createSignal(false)
-  const [updatesError, setUpdatesError] = createSignal<string | null>(null)
-  const [updatesRoomName, setUpdatesRoomName] = createSignal<string | null>(null)
+  const [tab, setTab] = createSignal<'chat' | 'wiki' | 'files' | 'terminal' | 'prompts'>('chat')
+  const [wikiRoomName, setWikiRoomName] = createSignal<string | undefined>()
+  const [wikiLookupState, setWikiLookupState] = createSignal<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [wikiRetry, setWikiRetry] = createSignal(0)
+  const [roomSidecarId, setRoomSidecarId] = createSignal<string | null>(null)
+  const [roomThread, setRoomThread] = createSignal<SidecarMessage[]>([])
   const [filesMode, setFilesMode] = createSignal<'changed' | 'browse'>('browse')
   const TEXT_EXTS: Record<string, true> = { '.txt': true, '.md': true, '.js': true, '.ts': true, '.tsx': true, '.jsx': true, '.json': true, '.css': true, '.py': true, '.rb': true, '.go': true, '.rs': true, '.sh': true, '.yml': true, '.yaml': true, '.toml': true, '.cfg': true, '.conf': true, '.ini': true, '.env': true, '.sql': true, '.csv': true, '.xml': true, '.log': true, '.jsonl': true, '.svelte': true, '.vue': true, '.astro': true, '.mjs': true, '.cjs': true }
   const IMAGE_EXTS: Record<string, true> = { '.png': true, '.jpg': true, '.jpeg': true, '.gif': true, '.webp': true, '.svg': true, '.bmp': true, '.ico': true }
@@ -316,13 +321,6 @@ export default function App() {
   const [recordingTime, setRecordingTime] = createSignal(0)
   const transcribing = () => voiceMemos().some(memo => memo.status === 'transcribing')
   const [audioLevel, setAudioLevel] = createSignal(0)
-  const [spinGestureState, setSpinGestureState] = createSignal<SpinGestureState>('off')
-  const [motionSamples, setMotionSamples] = createSignal(0)
-  const [motionPeakDps, setMotionPeakDps] = createSignal(0)
-  const [motionDegrees, setMotionDegrees] = createSignal(0)
-  const [motionSeries, setMotionSeries] = createSignal<MotionChartPoint[]>([])
-  const [tossCalibration, setTossCalibration] = createSignal(false)
-  const [tossCalibrationStats, setTossCalibrationStats] = createSignal<TossCalibrationStats>({ maxPeakDps: 0, maxDegrees: 0, hits: 0 })
   const [hasMore, setHasMore] = createSignal(false)
   const [loadingMore, setLoadingMore] = createSignal(false)
   const [renaming, setRenaming] = createSignal(false)
@@ -341,7 +339,7 @@ export default function App() {
     onCleanup(() => clearInterval(timer))
   })
   const sidecarsForSession = (sessionId: string) =>
-    sidecars().filter(group => group.status === 'active'
+    sidecars().filter(group => group.kind !== 'room' && group.status === 'active'
       && group.members.some(member => !member.spawned && member.sessionId.slice(0, 8) === sessionId.slice(0, 8)))
   async function spawnSidecarFor(sessionId: string) {
     const task = prompt('Task / opening message for the sidecar (optional):') ?? ''
@@ -428,11 +426,9 @@ export default function App() {
   let fileInputRef: HTMLInputElement | undefined
   let dragCounter = 0
   let mediaRestoreGeneration = 0
-  let updatesGeneration = 0
 
   function cancelSelectionWork() {
     selectionGeneration++
-    updatesGeneration++
     messagesAbortController?.abort()
     messagesAbortController = null
     cleanupSSE?.()
@@ -619,6 +615,22 @@ export default function App() {
       const s = cur()
       if (s?.isActive) handleInterrupt(s.id)
     }
+    // After Send the composer is blurred (dismissing the keyboard/iPad floating bar).
+    // The first printable keystroke on a hardware keyboard re-focuses it and captures
+    // the character, so typing resumes seamlessly without tapping the field again.
+    if (tab() === 'chat' && currentId() && textareaRef &&
+        document.activeElement !== textareaRef &&
+        e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.isComposing) {
+      const ae = document.activeElement as HTMLElement | null
+      const editable = !!ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)
+      if (!editable) {
+        e.preventDefault()
+        textareaRef.focus()
+        setText(text() + e.key)
+        textareaRef.style.height = 'auto'
+        textareaRef.style.height = Math.min(textareaRef.scrollHeight, 120) + 'px'
+      }
+    }
   }
 
   async function initApp() {
@@ -644,7 +656,7 @@ export default function App() {
     }
   }
 
-  onMount(async () => {
+  onMount(() => {
     // Expose the immutable build embedded in this resident bundle. Besides
     // making stale-client checks testable, this avoids learning a misleading
     // "baseline" from a server that may already have advanced.
@@ -673,12 +685,13 @@ export default function App() {
     // Warm Rooms alongside /api/me so the first render costs one round trip,
     // not two; fetchRooms coalesces this with RoomsHome's own refresh.
     fetchRooms().catch(() => {})
-    const user = await checkAuth()
+    // Caddy/Authelia is the authentication boundary. Direct loopback access is
+    // intentionally the Philip instance, so informational identity lookup must
+    // never block the UI from mounting.
+    setAuthUser({ username: 'philip', admin: true })
     setAuthChecked(true)
-    if (user) {
-      setAuthUser(user)
-      await initApp()
-    }
+    void checkAuth().then(user => { if (user) setAuthUser(user) })
+    void initApp()
     // Check for updates every 30 seconds
     async function checkForUpdate() {
       try {
@@ -1108,13 +1121,13 @@ export default function App() {
     messageScrollRef.scrollTo({ top: messageScrollRef.scrollTop + offset })
   }
 
-  async function handleNew(newTab = false, agent: AgentId = 'omp') {
+  async function handleNew(newTab = false, agent: AgentId = 'omp', model?: string) {
     setCreating(true)
     // Open the window synchronously to avoid popup blockers (iOS Safari
     // blocks window.open after an await breaks the user-gesture chain)
     const w = newTab ? window.open('', '_blank') : null
     try {
-      const id = await createSession(undefined, agent)
+      const id = await createSession(undefined, agent, agent === 'omp' && model ? { model } : {})
       // Fetch without project filter since the new session has no project yet
       updateSessions(await fetchSessions())
       if (w) {
@@ -1167,6 +1180,7 @@ export default function App() {
   function handleInterruptConfirm(id: string) {
     if (confirm('Stop Claude?')) handleInterrupt(id)
   }
+
 
   async function handleDelete(id: string) {
     if (!confirm('Delete this session?')) return
@@ -1412,7 +1426,6 @@ export default function App() {
     onQueued?.()
     await deliverPendingMessage(record)
   }
-
   function processVoiceMemo(memo: VoiceMemo): Promise<void> {
     return runMediaOperationOnce(voiceMemosInFlight, memo.id, () => withMediaRecordClaim(memo.id, async () => {
       let transcript = memo.transcript
@@ -1701,7 +1714,71 @@ export default function App() {
         actions: [...actions].sort((a, b) => (actionOrder.indexOf(a) === -1 ? 99 : actionOrder.indexOf(a)) - (actionOrder.indexOf(b) === -1 ? 99 : actionOrder.indexOf(b))),
       }))
       .sort((a, b) => b.lastSeen.localeCompare(a.lastSeen))
+
   })
+  const activeTodo = () => ompMirror().parent.todo || todoSnapshot()
+  const activeSubagents = () => ompMirror().childOrder.map(id => ompMirror().children[id]).filter(Boolean)
+
+  function mergeRoomThreadMessage(message: SidecarMessage) {
+    setRoomThread((current) => {
+      const existing = current.findIndex((candidate) => candidate.seq === message.seq)
+      if (existing >= 0) {
+        const next = [...current]
+        next[existing] = message
+        return next
+      }
+      return [...current, message].sort((a, b) => a.seq - b.seq)
+    })
+  }
+
+  let roomThreadGeneration = 0
+  createEffect(() => {
+    const id = currentId()
+    const generation = ++roomThreadGeneration
+    let unsubscribe: (() => void) | undefined
+    let disposed = false
+    setRoomSidecarId(null)
+    setRoomThread([])
+    onCleanup(() => {
+      disposed = true
+      unsubscribe?.()
+    })
+    if (!id) return
+    fetchSessionRoom(id).then((roomName) => {
+      if (!roomName || disposed || generation !== roomThreadGeneration) return
+      const groupId = `room-${roomName}`
+      return fetchSidecar(groupId).then(({ group, thread }) => {
+        if (disposed || generation !== roomThreadGeneration || group?.kind !== 'room') return
+        if (group.members.find((member) => member.role === 'leader')?.sessionId !== id) return
+        setRoomSidecarId(groupId)
+        setRoomThread(thread)
+        unsubscribe = subscribeSidecar(groupId, mergeRoomThreadMessage)
+      })
+    }).catch(() => {})
+  })
+
+  const roomChatMessages = createMemo<Message[]>(() =>
+    mergeRoomThreadMessages(messages(), roomThread(), roomSidecarId()) as Message[])
+  // The Wiki is Room-owned. Resolve the current session's Room only when the
+  // tab opens; RoomWikiView then reads curated pages, never raw updates/traces.
+  let wikiRoomGeneration = 0
+  createEffect(() => {
+    const id = currentId()
+    wikiRetry()
+    const generation = ++wikiRoomGeneration
+    setWikiRoomName(undefined)
+    setWikiLookupState('idle')
+    if (tab() !== 'wiki' || !id) return
+    setWikiLookupState('loading')
+    fetchSessionRoom(id).then((room) => {
+      if (generation !== wikiRoomGeneration) return
+      setWikiRoomName(room || undefined)
+      setWikiLookupState('ready')
+    }).catch(() => {
+      if (generation === wikiRoomGeneration) setWikiLookupState('error')
+    })
+  })
+
 
   const tabStyle = (t: string) => ({
     padding: '9px 14px', border: 'none', 'border-bottom': tab() === t ? '2px solid var(--success)' : '2px solid transparent',
@@ -1713,8 +1790,6 @@ export default function App() {
   // traffic, not prompts, so include only messages with non-empty text blocks.
   const userPrompts = () => messages().filter(message => message.role === 'user' &&
     (message.content || []).some(block => block.type === 'text' && (block.text || '').trim()))
-  const activeTodo = () => ompMirror().parent.todo || todoSnapshot()
-  const activeSubagents = () => ompMirror().childOrder.map(id => ompMirror().children[id]).filter(Boolean)
   const promptText = (message: Message) => (message.content || [])
     .filter(block => block.type === 'text').map(block => block.text || '').join('\n').trim()
   const formatFeedTime = (timestamp: string | null | undefined) => {
@@ -1730,32 +1805,6 @@ export default function App() {
     if (scroller) requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight })
   })
 
-  async function loadSessionUpdates(id: string, generation: number) {
-    setUpdatesLoading(true)
-    setUpdatesError(null)
-    setUpdatesRoomName(null)
-    setUpdatesList([])
-    try {
-      const rooms = await fetchRooms(1000)
-      if (generation !== updatesGeneration || tab() !== 'updates' || currentId() !== id) return
-      const room = rooms.find(candidate => candidate.sessions.some(session => session.id === id))
-      if (!room) return
-      const updates = await fetchRoomUpdates(room.name)
-      if (generation !== updatesGeneration || tab() !== 'updates' || currentId() !== id) return
-      setUpdatesRoomName(room.name)
-      setUpdatesList(updates)
-    } catch (error: any) {
-      if (generation === updatesGeneration && tab() === 'updates' && currentId() === id) setUpdatesError(error?.message || String(error))
-    } finally {
-      if (generation === updatesGeneration && tab() === 'updates' && currentId() === id) setUpdatesLoading(false)
-    }
-  }
-  createEffect(() => {
-    const id = currentId()
-    const active = tab() === 'updates'
-    const generation = ++updatesGeneration
-    if (active && id) loadSessionUpdates(id, generation)
-  })
 
   async function handleLogin(e: Event) {
     e.preventDefault()
@@ -1815,8 +1864,6 @@ export default function App() {
   return (
     <>
     <style>{`textarea::-webkit-scrollbar { display: none; }`}</style>
-    <Show when={authChecked()} fallback={<div style={{ display: 'flex', 'align-items': 'center', 'justify-content': 'center', height: '100vh', background: '#0a0e14', color: '#555', 'font-family': "-apple-system, system-ui, sans-serif" }}>Loading...</div>}>
-    <Show when={authUser()} fallback={<LoginScreen />}>
     <div
       onTouchStart={onTouchStart}
       onTouchEnd={onTouchEnd}
@@ -1951,14 +1998,15 @@ export default function App() {
                   else if (t >= weekStart) groups[2].items.push(s)
                   else groups[3].items.push(s)
                 }
-                return <For each={groups.filter(g => g.items.length > 0)}>{(group) => <>
+                return <><For each={groups.filter(g => g.items.length > 0)}>{(group) => <>
                   <div style={{ padding: '6px 16px 2px', 'font-size': '10px', 'font-weight': '600', color: '#555', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>{group.label}</div>
                   <For each={group.items}>{(s) => (
-                    <div onClick={() => { if (sidebarRenaming() !== s.id) select(s.id) }}
+                    <div data-session-id={s.id} onClick={() => { if (sidebarRenaming() !== s.id) select(s.id) }}
                       onDblClick={(e) => { e.preventDefault(); setSidebarRenameText(s.title); setSidebarRenaming(s.id) }}
                       onContextMenu={(e) => { e.preventDefault(); setSidebarRenameText(s.title); setSidebarRenaming(s.id) }}
                       style={{ padding: '10px 16px', cursor: 'pointer', 'border-left': s.id === currentId() ? '3px solid #4aba6a' : '3px solid transparent', background: s.id === currentId() ? '#1a1a2e' : 'transparent', 'border-bottom': '1px solid #111', '-webkit-tap-highlight-color': 'transparent' }}>
                       <Show when={sidebarRenaming() === s.id} fallback={
+                        <>
                         <div style={{ display: 'flex', 'align-items': 'center', gap: '8px' }}>
                           <Show when={s.isActive}><span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#4aba6a', 'flex-shrink': '0' }} /></Show>
                           <Show when={!s.isActive && unreadSessions().has(s.id)}><span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#73b8ff', 'flex-shrink': '0' }} /></Show>
@@ -1971,6 +2019,10 @@ export default function App() {
                           <span style={{ 'font-size': '9px', padding: '1px 5px', 'border-radius': '3px', ...agentBadgeColors(s.agent), 'flex-shrink': '0', 'font-weight': '600' }}>{agentBadgeLabel(s.agent)}</span>
                           <span style={{ 'font-size': '11px', color: '#555', 'flex-shrink': '0' }}>{timeAgo(s.updatedAt)}</span>
                         </div>
+                        <Show when={s.projectLabel}>
+                          <div style={{ 'font-size': '10px', color: '#555', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', 'margin-top': '2px' }}>{s.projectLabel}</div>
+                        </Show>
+                        </>
                       }>
                         <input
                           value={sidebarRenameText()}
@@ -2008,7 +2060,7 @@ export default function App() {
                       </Show>
                     </div>
                   )}</For>
-                </>}</For>
+                </>}</For></>
               })()}
               </Show>
             </div>
@@ -2031,6 +2083,7 @@ export default function App() {
           </Show>
         </div>
       </div>
+
 
       <Show when={openSidecarId()}>
         <div style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.55)', 'z-index': '200', display: 'flex', 'justify-content': 'flex-end' }}
@@ -2084,6 +2137,7 @@ export default function App() {
                 />
               </Show>
               <div style={{ flex: '1' }} />
+
               <div style={{ position: 'relative' }}>
                 <button onClick={() => setMenuOpen(!menuOpen())} style={{ background: 'none', border: 'none', color: '#888', 'font-size': '18px', cursor: 'pointer', padding: '4px 6px', '-webkit-tap-highlight-color': 'transparent' }}>{'\u22EE'}</button>
                 <Show when={menuOpen()}>
@@ -2117,7 +2171,7 @@ export default function App() {
           <div style={{ display: 'flex', 'align-items': 'center', 'border-bottom': '1px solid #1e1e1e', 'padding-left': '16px', 'flex-shrink': '0', 'overflow-x': 'auto', 'scrollbar-width': 'none', '-webkit-overflow-scrolling': 'touch' }}>
             <button onClick={() => setTab('chat')} style={tabStyle('chat')}>Chat</button>
             <button onClick={() => setTab('prompts')} style={tabStyle('prompts')}>Prompts</button>
-            <button onClick={() => setTab('updates')} style={tabStyle('updates')}>Updates</button>
+            <button data-testid="wiki-tab" onClick={() => setTab('wiki')} style={tabStyle('wiki')}>Wiki</button>
             <button onClick={() => { setTab('files'); if (!browseDir()) openFileBrowser() }} style={tabStyle('files')}>Files{touchedFiles().length > 0 ? ` (${touchedFiles().length})` : ''}</button>
             <button onClick={() => setTab('terminal')} style={tabStyle('terminal')}>Terminal</button>
           </div>
@@ -2141,7 +2195,7 @@ export default function App() {
               <div style={{ position: 'relative', height: '100%' }}>
                 <RoomsHome
                   onOpen={select}
-                  onNewChat={(agent) => handleNew(false, agent)}
+                  onNewChat={(agent, model) => handleNew(false, agent, model)}
                   onSessionsChanged={() => fetchSessions().then(updateSessions).catch(() => {})}
                   creating={creating()}
                   codexAvailable={codexAvailable()}
@@ -2168,7 +2222,7 @@ export default function App() {
           }>
             <div data-testid="chat-panel" style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
               <MessageView
-                messages={messages()}
+                messages={roomChatMessages()}
                 loading={loading()}
                 hasMore={hasMore()}
                 loadingMore={loadingMore()}
@@ -2193,6 +2247,21 @@ export default function App() {
                 scrollRefCb={(el) => { messageScrollRef = el }}
                 sessionId={loadedSessionId()}
               />
+            </div>
+            <div data-testid="wiki-panel" style={{ display: tab() === 'wiki' ? 'block' : 'none', height: '100%', overflow: 'hidden' }}>
+              <Show when={tab() === 'wiki'}>
+                <Show when={wikiLookupState() === 'loading'}>
+                  <div style={{ color: '#666', 'font-size': '13px', padding: '24px 16px' }}>Finding this chat's Room…</div>
+                </Show>
+                <Show when={wikiLookupState() === 'error'}>
+                  <div role="alert" style={{ color: '#d45555', 'font-size': '13px', padding: '24px 16px' }}>
+                    Could not load the Room Wiki. <button onClick={() => setWikiRetry(value => value + 1)} style={{ background: 'none', border: 'none', color: '#73b8ff', padding: '0', cursor: 'pointer' }}>Retry</button>
+                  </div>
+                </Show>
+                <Show when={wikiLookupState() === 'ready'}>
+                  <RoomWikiView room={wikiRoomName()} />
+                </Show>
+              </Show>
             </div>
             <div style={{ display: tab() === 'files' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%' }}>
               {/* Mode toggle */}
@@ -2306,7 +2375,11 @@ export default function App() {
               </Show>
             </div>
             <div style={{ display: tab() === 'terminal' ? 'block' : 'none', height: '100%' }}>
-              <Terminal sessionId={tab() === 'terminal' ? currentId() : null} />
+              <Show when={tab() === 'terminal'}>
+                <Suspense fallback={<div style={{ padding: '12px', color: '#888' }}>Loading terminal…</div>}>
+                  <Terminal sessionId={currentId()} />
+                </Suspense>
+              </Show>
             </div>
             <div data-testid="prompts-panel" style={{ display: tab() === 'prompts' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>
               <div ref={promptsScroller} style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '12px 16px 24px' }}>
@@ -2324,35 +2397,9 @@ export default function App() {
               </div>
             </div>
 
-            <div data-testid="updates-panel" style={{ display: tab() === 'updates' ? 'flex' : 'none', 'flex-direction': 'column', height: '100%', overflow: 'hidden' }}>
-              <div style={{ flex: '1', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch', padding: '12px 16px 24px' }}>
-                <Show when={updatesError()}><div style={{ color: '#d45555', 'font-size': '13px', padding: '8px 4px' }}>{updatesError()}</div></Show>
-                <Show when={updatesLoading()}><div style={{ color: '#666', 'font-size': '13px', padding: '8px 4px' }}>Loading updates…</div></Show>
-                <Show when={!updatesLoading() && !updatesError() && !updatesRoomName()}>
-                  <div style={{ color: '#666', 'font-size': '13px', padding: '8px 4px', 'line-height': '1.5' }}>This chat isn't in a Room, so it has no Updates feed. Updates live per Room — open the Rooms home screen to see them.</div>
-                </Show>
-                <Show when={updatesRoomName()}>
-                  <div style={{ 'font-size': '12px', color: '#7a8290', 'margin-bottom': '10px' }}>Updates for <span style={{ color: '#9aa4b2', 'font-weight': '600' }}>#{updatesRoomName()}</span></div>
-                  <For each={[...updatesList()].reverse()} fallback={<div style={{ color: '#666', 'font-size': '13px', padding: '4px' }}>No updates yet in this Room.</div>}>
-                    {(update) => (
-                      <div style={{ padding: '9px 0', 'border-bottom': '1px solid #14141c' }}>
-                        <div style={{ 'font-size': '10px', color: '#5a6472', 'font-family': 'monospace', 'margin-bottom': '3px' }}>{formatFeedTime(update.ts)}</div>
-                        <div style={{ 'font-size': '13px', color: '#d0d4da', 'line-height': '1.5', 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{update.text}</div>
-                      </div>
-                    )}
-                  </For>
-                </Show>
-              </div>
-            </div>
           </Show>
         </div>
 
-        {/* Drag overlay */}
-        <Show when={dragging()}>
-          <div style={{ position: 'absolute', inset: '0', background: 'rgba(74,186,106,0.1)', border: '2px dashed #4aba6a', 'border-radius': '12px', 'z-index': '100', display: 'flex', 'align-items': 'center', 'justify-content': 'center', 'pointer-events': 'none' }}>
-            <span style={{ color: '#4aba6a', 'font-size': '18px', 'font-weight': '600' }}>Drop files to attach</span>
-          </div>
-        </Show>
 
         {/* File viewer modal */}
         <Show when={viewingFile()}>
@@ -2419,7 +2466,7 @@ export default function App() {
                       <div style={{ padding: '20px', color: '#666', 'font-size': '13px' }}>Loading…</div>
                     </Show>
                     <Show when={v.kind === 'text' && !v.error && v.content && isMd}>
-                      <div style={{ padding: '4px 24px', color: '#d0d0d0', 'font-size': '14px', 'line-height': '1.55' }}><RichMarkdown text={v.content} onOpenFile={openFile} /></div>
+                      <div style={{ padding: '4px 24px', color: '#d0d0d0', 'font-size': '14px', 'line-height': '1.55' }}><RichMarkdown text={v.content} onOpenFile={openFile} allowRemoteImages={false} /></div>
                     </Show>
                     <Show when={v.kind === 'text' && !v.error && v.content && !isMd}>
                       <pre style={{ margin: '0', padding: '16px 20px', color: '#d0d0d0', 'font-size': '12px', 'font-family': "'SF Mono', Menlo, monospace", 'white-space': 'pre-wrap', 'word-break': 'break-word' }}>{v.content}</pre>
@@ -2659,8 +2706,6 @@ export default function App() {
         </Show>
       </div>
     </div>
-    </Show>
-    </Show>
     </>
   )
 }

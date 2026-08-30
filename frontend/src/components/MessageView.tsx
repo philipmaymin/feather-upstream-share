@@ -7,6 +7,8 @@ import markedKatex from 'marked-katex-extension'
 import katex from 'katex'
 import 'katex/dist/katex.min.css'
 import DOMPurify from 'dompurify'
+import Anser from 'anser'
+import { createTwoFilesPatch } from 'diff'
 import hljs from 'highlight.js/lib/core'
 import javascript from 'highlight.js/lib/languages/javascript'
 import typescript from 'highlight.js/lib/languages/typescript'
@@ -72,6 +74,7 @@ function renderMathCode(math: MathCode): string | false {
 }
 
 
+
 const marked = new Marked(
   { gfm: true, breaks: true },
   markedHighlight({
@@ -101,11 +104,11 @@ const marked = new Marked(
 const mdCache = new Map<string, string>()
 const MD_CACHE_MAX = 2000
 
-function renderMarkdown(text: string): string {
+export function renderMarkdown(text: string): string {
   const cached = mdCache.get(text)
   if (cached !== undefined) return cached
   const html = marked.parse(text.trimEnd()) as string
-  const safe = DOMPurify.sanitize(html, { ADD_ATTR: ['class', 'target', 'rel'] })
+  const safe = DOMPurify.sanitize(html, { ADD_ATTR: ['class', 'target', 'rel'], FORBID_TAGS: ['style'] })
     .replace(/<table>/g, '<div class="table-wrap"><table>')
     .replace(/<\/table>/g, '</table></div>')
   if (mdCache.size >= MD_CACHE_MAX) {
@@ -115,6 +118,17 @@ function renderMarkdown(text: string): string {
   mdCache.set(text, safe)
   return safe
 }
+// Persistent Room knowledge and resident A2A are passive content. They may
+// contain links and formatting, but must never inject controls, CSS, embedded
+// browsing contexts, or resources that load from the network automatically.
+export function renderWikiMarkdown(text: string): string {
+  return DOMPurify.sanitize(renderMarkdown(text), {
+    ADD_ATTR: ['class', 'target', 'rel'],
+    FORBID_TAGS: ['style', 'form', 'input', 'button', 'textarea', 'select', 'option', 'img', 'picture', 'source', 'video', 'audio', 'track', 'iframe', 'object', 'embed', 'link', 'meta'],
+    FORBID_ATTR: ['style', 'action', 'formaction', 'src', 'srcset', 'background', 'autofocus'],
+  })
+}
+
 
 function isRemoteImageReference(value: string | null): boolean {
   if (!value) return false
@@ -156,7 +170,7 @@ function renderRichMarkdown(text: string, allowRemoteImages: boolean): string {
 // while still rendering headings, lists, links, tables, and code immediately.
 function renderLiveMarkdown(text: string): string {
   const html = marked.parse(text.trimEnd()) as string
-  return DOMPurify.sanitize(html, { ADD_ATTR: ['class', 'target', 'rel'], FORBID_TAGS: ['img'] })
+  return DOMPurify.sanitize(html, { ADD_ATTR: ['class', 'target', 'rel'], FORBID_TAGS: ['img', 'style'] })
 }
 
 // ── Message export helpers ──────────────────────────────────────────────
@@ -272,7 +286,6 @@ function collapseCodeBlocks(el: HTMLElement) {
     wrapper.appendChild(btn)
   }
 }
-
 function injectCopyButtons(el: HTMLElement) {
   for (const pre of el.querySelectorAll('pre')) {
     if (pre.closest('.code-block-shell')) continue
@@ -470,7 +483,6 @@ function enhanceTables(el: HTMLElement, onExpandTable?: (html: string) => void) 
       table.parentNode?.insertBefore(frame, table)
       frame.appendChild(table)
     }
-
     const expand = document.createElement('button')
     expand.type = 'button'
     expand.className = 'md-table-expand'
@@ -497,6 +509,38 @@ function enhanceMarkdown(el: HTMLElement, onImageClick?: (src: string) => void, 
 
 function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '')
+}
+
+// Render ANSI escape sequences as inline-styled HTML. Tool output is plain
+// text: escape markup first (Anser does NOT escape by default), so quoted
+// HTML like <style>body{display:none}</style> renders as text instead of
+// becoming live DOM. DOMPurify stays as the backstop.
+function ansiToSafeHtml(raw: string): string {
+  const html = Anser.ansiToHtml(Anser.escapeForHtml(raw))
+  return DOMPurify.sanitize(html, { ADD_ATTR: ['style'], FORBID_TAGS: ['style'] })
+}
+
+type DiffKind = 'meta' | 'hunk' | 'add' | 'del' | 'ctx'
+function buildUnifiedDiff(oldText: string, newText: string, filePath: string): Array<{ line: string; kind: DiffKind }> {
+  const patch = createTwoFilesPatch(filePath, filePath, oldText, newText, 'before', 'after', { context: 3 })
+  const lines = patch.split('\n')
+  // Skip the first 4 header lines (Index, ===, ---, +++) — too noisy inline
+  return lines.slice(4).map(l => {
+    if (l.startsWith('@@')) return { line: l, kind: 'hunk' as const }
+    if (l.startsWith('+')) return { line: l, kind: 'add' as const }
+    if (l.startsWith('-')) return { line: l, kind: 'del' as const }
+    return { line: l, kind: 'ctx' as const }
+  })
+}
+
+function diffLineStyle(kind: DiffKind): Record<string, string> {
+  switch (kind) {
+    case 'hunk': return { color: 'var(--info)', background: 'rgba(59,130,246,0.10)' }
+    case 'add':  return { color: 'var(--diff-add-text)', background: 'var(--diff-add-bg)' }
+    case 'del':  return { color: 'var(--diff-del-text)', background: 'var(--diff-del-bg)' }
+    case 'meta': return { color: 'var(--text-dim)', 'font-weight': '600' }
+    default:     return { color: 'var(--text-secondary)' }
+  }
 }
 
 // ── Tool rendering ──────────────────────────────────────────────────────────
@@ -603,9 +647,13 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
   }
   if (block.type === 'thinking' && block.thinking) {
     return (
-      <details style={{ margin: '4px 0' }}>
-        <summary style={{ color: '#c4993a', 'font-size': '12px', cursor: 'pointer' }}>Thinking...</summary>
-        <div style={{ color: '#999', 'font-size': '12px', 'white-space': 'pre-wrap', 'max-height': '200px', overflow: 'auto', padding: '8px', background: '#0d1117', 'border-radius': '4px', 'margin-top': '4px' }}>
+      <details style={{ margin: '4px 0', 'border-left': '2px solid rgba(168,85,247,0.35)', 'padding-left': '12px' }}>
+        <summary style={{ display: 'flex', 'align-items': 'center', gap: '6px', color: 'var(--text-muted)', 'font-size': '12px', cursor: 'pointer', 'list-style': 'none', 'user-select': 'none', padding: '2px 0' }}>
+          <span style={{ color: '#c084fc', 'font-size': '13px', 'line-height': '1', width: '12px', display: 'inline-flex', 'align-items': 'center' }}>◉</span>
+          <span style={{ color: '#c084fc' }}>Reasoning</span>
+          <span style={{ 'margin-left': 'auto', color: 'var(--text-ghost)', 'font-size': '10px' }}>▸</span>
+        </summary>
+        <div style={{ 'margin-top': '6px', 'margin-left': '4px', padding: '10px 14px', background: 'rgba(168,85,247,0.04)', border: '1px solid rgba(168,85,247,0.12)', 'border-radius': '10px', color: 'var(--text-secondary)', 'font-size': '12px', 'white-space': 'pre-wrap', 'max-height': '400px', 'overflow-y': 'auto', 'line-height': '1.55', 'box-shadow': '0 1px 3px rgba(0,0,0,0.15)' }}>
           {block.thinking}
         </div>
       </details>
@@ -657,14 +705,18 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
       {result && renderBlock(result, onImageClick, onExpandTable, undefined, onOpenFile)}
     </>
   }
+  // Orphaned tool_result (no matching tool_use in loaded messages) — render standalone
   if (block.type === 'tool_result') {
-    const rawContent = typeof block.content === 'string' ? block.content : Array.isArray(block.content) ? block.content.map((c: any) => c.text || '').join('') : ''
+    const contentArr = Array.isArray(block.content) ? block.content : typeof block.content === 'string' ? [{ type: 'text', text: block.content }] : []
+    const images = contentArr.filter((c: any) => c.type === 'image' && c.source?.data)
+    const rawContent = contentArr.filter((c: any) => c.type !== 'image').map((c: any) => c.text || '').join('')
     const raw = stripAnsi(rawContent)
     const isErr = block.is_error
+    const hasImages = images.length > 0
     const isLong = raw.length > 200
     const preview = raw.slice(0, 200)
     const lineCount = raw.split('\n').length
-    const label = isErr ? 'error' : `output${isLong ? ` (${lineCount} lines)` : ''}`
+    const label = isErr ? 'error' : hasImages ? `image${images.length > 1 ? 's' : ''}` : `output${isLong ? ` (${lineCount} lines)` : ''}`
     return (
       <details style={{ margin: '2px 0', overflow: 'hidden' }} open={isErr || !isLong}>
         <summary style={{ padding: '1px 0', 'font-size': '9px', 'font-weight': '500', 'text-transform': 'uppercase', 'letter-spacing': '0.05em', color: isErr ? '#e07070' : '#777', cursor: isLong ? 'pointer' : 'default', 'list-style': isLong ? undefined : 'none' }}>
@@ -733,7 +785,6 @@ function formatFullDate(iso: string) {
     return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   } catch { return '' }
 }
-
 function isQuestionBlock(block: ContentBlock): boolean {
   if (block.type !== 'tool_use') return false
   return block.name === 'AskUserQuestion' || block.name?.toLowerCase() === 'ask'
@@ -824,7 +875,7 @@ const markdownCSS = `
 .markdown ul, .markdown ol { margin: 4px 0; padding-left: 20px; }
 .markdown li { margin: 2px 0; }
 .markdown code {
-  background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 3px;
+  background: var(--code-bg); padding: 1px 5px; border-radius: 3px;
   font-family: 'SF Mono', Menlo, 'Courier New', monospace; font-size: 0.88em;
 }
 .markdown pre { margin: 8px 0; border-radius: 6px; overflow-x: hidden; background: #0d1117; padding: 10px 12px; position: relative; }
@@ -836,7 +887,7 @@ const markdownCSS = `
 .code-expand-btn { display: block; width: 100%; padding: 4px 0; margin-top: -1px; background: #0d1117; border: 1px solid #333; border-top: none; border-radius: 0 0 6px 6px; color: #fab283; font-size: 0.75em; font-family: -apple-system, system-ui, sans-serif; cursor: pointer; text-align: center; transition: background-color 0.2s, color 0.2s; }
 .code-expand-btn:hover { background: #161b22; color: #fcd9b8; }
 .markdown blockquote {
-  margin: 6px 0; padding: 4px 12px; border-left: 3px solid #444; color: #999;
+  margin: 6px 0; padding: 4px 12px; border-left: 3px solid var(--text-faint); color: var(--text-secondary);
 }
 .markdown .md-table-frame { position: relative; max-width: 100%; margin: 8px 0; overflow-x: auto; border: 1px solid #333; border-radius: 7px; -webkit-overflow-scrolling: touch; }
 .markdown table { border-collapse: collapse; width: max-content; min-width: 100%; max-width: none; margin: 0; font-size: 0.9em; table-layout: auto; }
@@ -856,6 +907,8 @@ const markdownCSS = `
 .md-table-modal-body .md-col-wide { min-width: 18rem; max-width: 42rem; white-space: normal; overflow-wrap: break-word; }
 .markdown a { color: #73b8ff; text-decoration: none; }
 .markdown a:hover { text-decoration: underline; }
+.feather-path { color: var(--link); text-decoration: none; cursor: pointer; }
+.feather-path:hover { text-decoration: underline; }
 .markdown img { max-width: 100%; border-radius: 6px; }
 .markdown img.md-local-img { display: block; max-height: 400px; margin: 8px 0; object-fit: contain; }
 .markdown hr { border: none; border-top: 1px solid #333; margin: 12px 0; }
@@ -1126,6 +1179,7 @@ type MessageViewRuntime = {
   contextPercent?: number
 }
 
+
 type MessageViewProps = {
   messages: Message[]
   loading: boolean
@@ -1136,6 +1190,7 @@ type MessageViewProps = {
   onKeys?: (keys: string[]) => void
   starred?: Set<string>
   onToggleStar?: (uuid: string) => void
+
   working?: boolean
   statusText?: string | null
   intentHistory?: string[]
@@ -1182,6 +1237,7 @@ export function MessageView(props: MessageViewProps) {
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
   }
+
 
   const selectedSubagent = createMemo(() => {
     const selectedId = selectedSubagentId()
@@ -1470,6 +1526,7 @@ export function MessageView(props: MessageViewProps) {
     )
   }
 
+
   let scrollRef: HTMLDivElement | undefined
   let assistantStreamMarkdownRef: HTMLDivElement | undefined
   const [pinned, setPinned] = createSignal(true)
@@ -1693,7 +1750,11 @@ export function MessageView(props: MessageViewProps) {
 
   const renderMsg = (msg: Message, trace: Message[] = [], suppressWork = false) => {
     const textBlock = msg.content?.find(b => b.type === 'text' && b.text)
-    const { cleanText, images, files } = textBlock?.text ? extractImages(textBlock.text) : { cleanText: textBlock?.text || '', images: [], files: [] }
+    const { cleanText, images, files } = msg.passive
+      ? { cleanText: textBlock?.text || '', images: [], files: [] }
+      : textBlock?.text
+        ? extractImages(textBlock.text)
+        : { cleanText: textBlock?.text || '', images: [], files: [] }
     const hasImages = images.length > 0
     const hasFiles = files.length > 0
     const hasAttachments = hasImages || hasFiles
@@ -1726,7 +1787,7 @@ export function MessageView(props: MessageViewProps) {
             if (msg.role === 'assistant' && (block.type === 'thinking' || block.type === 'tool_result' || (block.type === 'tool_use' && !isQuestionBlock(block)))) return null
             if (block.type === 'text' && block.text) {
               const display = hasAttachments ? cleanText : block.text
-              return display ? <div class="markdown" innerHTML={renderMarkdown(display)} ref={(el) => queueMicrotask(() => enhanceMarkdown(el, (src) => setLightbox(src), openExpandedTable, props.onOpenFile))} /> : null
+              return display ? <div class="markdown" innerHTML={msg.passive ? renderWikiMarkdown(display) : renderMarkdown(display)} ref={(el) => queueMicrotask(() => enhanceMarkdown(el, (src) => setLightbox(src), openExpandedTable, props.onOpenFile))} /> : null
             }
             if (isQuestionBlock(block)) {
               const rawQuestions = Array.isArray(block.input?.questions)
@@ -1816,20 +1877,114 @@ export function MessageView(props: MessageViewProps) {
       </Show>
       <div ref={contentRef}>
       <Show when={props.loading}>
-        <div style={{ color: '#555', 'text-align': 'center', padding: '40px' }}>Loading...</div>
+        <div style={{ color: 'var(--text-dim)', 'text-align': 'center', padding: '40px' }}>Loading...</div>
       </Show>
       <Show when={props.hasMore && !props.loading}>
         <div style={{ 'text-align': 'center', padding: '12px' }}>
           <button onClick={() => props.onLoadEarlier?.()} disabled={props.loadingMore}
-            style={{ background: '#1a1a2e', border: '1px solid #333', color: '#73b8ff', padding: '6px 16px', 'border-radius': '6px', 'font-size': '12px', cursor: props.loadingMore ? 'wait' : 'pointer' }}>
+            style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-medium)', color: 'var(--link)', padding: '6px 16px', 'border-radius': '6px', 'font-size': '12px', cursor: props.loadingMore ? 'wait' : 'pointer' }}>
             {props.loadingMore ? 'Loading...' : 'Load earlier messages'}
           </button>
         </div>
       </Show>
-      {/* Lightbox */}
+      {/* Lightbox with pinch-to-zoom */}
       <Show when={lightbox()}>
-        <div onClick={() => setLightbox(null)} style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.85)', 'z-index': '200', display: 'flex', 'align-items': 'center', 'justify-content': 'center', cursor: 'zoom-out' }}>
-          <img src={lightbox()!} style={{ 'max-width': '95vw', 'max-height': '95vh', 'object-fit': 'contain', 'border-radius': '8px' }} />
+        {(() => {
+          const [scale, setScale] = createSignal(1)
+          const [tx, setTx] = createSignal(0)
+          const [ty, setTy] = createSignal(0)
+          let startDist = 0
+          let startScale = 1
+          let startTx = 0
+          let startTy = 0
+          let startMidX = 0
+          let startMidY = 0
+          let lastTap = 0
+          let moved = false
+
+          function dist(t: TouchList) {
+            const dx = t[1].clientX - t[0].clientX
+            const dy = t[1].clientY - t[0].clientY
+            return Math.sqrt(dx * dx + dy * dy)
+          }
+
+          function onTouch(e: TouchEvent) {
+            if (e.type === 'touchstart') {
+              moved = false
+              if (e.touches.length === 2) {
+                e.preventDefault()
+                startDist = dist(e.touches)
+                startScale = scale()
+                startTx = tx()
+                startTy = ty()
+                startMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2
+                startMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2
+              } else if (e.touches.length === 1 && scale() > 1) {
+                e.preventDefault()
+                startTx = tx()
+                startTy = ty()
+                startMidX = e.touches[0].clientX
+                startMidY = e.touches[0].clientY
+              }
+            } else if (e.type === 'touchmove') {
+              if (e.touches.length === 2) {
+                e.preventDefault()
+                moved = true
+                const newScale = Math.min(5, Math.max(1, startScale * (dist(e.touches) / startDist)))
+                setScale(newScale)
+                const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2
+                const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2
+                setTx(startTx + midX - startMidX)
+                setTy(startTy + midY - startMidY)
+              } else if (e.touches.length === 1 && scale() > 1) {
+                e.preventDefault()
+                moved = true
+                setTx(startTx + e.touches[0].clientX - startMidX)
+                setTy(startTy + e.touches[0].clientY - startMidY)
+              }
+            } else if (e.type === 'touchend') {
+              // Snap back if scale went below 1
+              if (scale() <= 1) { setScale(1); setTx(0); setTy(0) }
+            }
+          }
+
+          function onClick(e: MouseEvent) {
+            // Double-tap to zoom
+            const now = Date.now()
+            if (now - lastTap < 300) {
+              e.stopPropagation()
+              if (scale() > 1) { setScale(1); setTx(0); setTy(0) }
+              else { setScale(2.5) }
+              lastTap = 0
+              return
+            }
+            lastTap = now
+            // Single tap close (with delay to detect double-tap)
+            if (!moved && scale() <= 1) {
+              setTimeout(() => { if (Date.now() - lastTap >= 280) setLightbox(null) }, 300)
+            }
+          }
+
+          return (
+            <div
+              onClick={onClick}
+              onTouchStart={onTouch} onTouchMove={onTouch} onTouchEnd={onTouch}
+              style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.85)', 'z-index': '200', display: 'flex', 'align-items': 'center', 'justify-content': 'center', cursor: scale() > 1 ? 'grab' : 'zoom-out', 'touch-action': 'none' }}
+            >
+              <img src={lightbox()!} style={{ 'max-width': '95vw', 'max-height': '95vh', 'object-fit': 'contain', 'border-radius': '8px', transform: `translate(${tx()}px, ${ty()}px) scale(${scale()})`, 'transform-origin': 'center center', transition: scale() === 1 ? 'transform 0.2s ease' : 'none', 'pointer-events': 'none' }} draggable={false} />
+            </div>
+          )
+        })()}
+      </Show>
+
+      {/* PDF viewer modal */}
+      <Show when={pdfViewer()}>
+        <div style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.92)', 'z-index': '200', display: 'flex', 'flex-direction': 'column' }}>
+          <div style={{ display: 'flex', 'align-items': 'center', 'justify-content': 'space-between', padding: '8px 12px', background: 'var(--bg-secondary)' }}>
+            <span style={{ color: 'var(--text-secondary)', 'font-size': '13px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', flex: '1' }}>{pdfViewer()!.split('/').pop()}</span>
+            <button onClick={() => setPdfViewer(null)} style={{ background: 'none', border: 'none', color: 'var(--text-primary)', 'font-size': '24px', cursor: 'pointer', padding: '4px 8px', 'line-height': '1' }}>&times;</button>
+          </div>
+          <iframe src={pdfViewer()!} style={{ flex: '1', border: 'none', width: '100%', background: '#fff' }} />
         </div>
       </Show>
       {/* PDF viewer */}
@@ -1924,8 +2079,8 @@ export function MessageView(props: MessageViewProps) {
         style={{
           position: 'absolute', bottom: '12px', right: '16px', 'z-index': '10',
           width: '32px', height: '32px', 'border-radius': '50%',
-          background: '#1a1a2e', color: '#e5e5e5',
-          border: '1px solid #333', cursor: 'pointer',
+          background: 'var(--bg-surface)', color: 'var(--text-primary)',
+          border: '1px solid var(--border-medium)', cursor: 'pointer',
           'font-size': '16px', display: 'flex', 'align-items': 'center', 'justify-content': 'center',
           'box-shadow': '0 2px 8px rgba(0,0,0,0.35)', opacity: '0.9',
           '-webkit-tap-highlight-color': 'transparent',
@@ -1935,7 +2090,7 @@ export function MessageView(props: MessageViewProps) {
           <span style={{
             position: 'absolute', top: '-8px', right: '-8px',
             'min-width': '20px', height: '20px', padding: '0 5px',
-            background: '#4aba6a', color: '#000',
+            background: 'var(--accent)', color: 'var(--accent-text)',
             'font-size': '11px', 'font-weight': '600', 'border-radius': '10px',
             display: 'flex', 'align-items': 'center', 'justify-content': 'center', 'line-height': '1',
           }}>{newMsgCount() > 99 ? '99+' : newMsgCount()}</span>

@@ -38,10 +38,21 @@ export interface Project {
   cwd?: string | null
 }
 
+export interface RoomResident {
+  role: string
+  sessionId: string
+  agent: string
+  title: string
+  status: 'working' | 'waiting' | 'offline'
+}
+
 export interface RoomInfo {
   name: string
   cwd: string
   sessions: SessionMeta[]
+  leaderSessionId: string | null
+  residents: RoomResident[]
+  sidecarGroupId: string | null
   active: boolean
   latest: { role: string; text: string } | null
   updatedAt: string | null
@@ -74,6 +85,9 @@ function normalizeRoom(room: RoomInfo): RoomInfo {
     session.id !== pulse.sessionId && !/^Keep working: #/.test(session.title || ''))
   return {
     ...room,
+    leaderSessionId: room.leaderSessionId || null,
+    residents: Array.isArray(room.residents) ? room.residents : [],
+    sidecarGroupId: room.sidecarGroupId || null,
     sessions,
     active: sessions.some(session => session.isActive),
     latest: pulseWasNewest ? null : room.latest,
@@ -111,6 +125,33 @@ export async function fetchRooms(maxAgeMs = 0): Promise<RoomInfo[]> {
   try { return await roomsRequest }
   finally { roomsRequest = null }
 }
+export async function fetchSessionRoom(sessionId: string): Promise<string | null> {
+  const response = await fetch(`${BASE}/api/sessions/${encodeURIComponent(sessionId)}/room`)
+  return (await responseJson<{ room: string | null }>(response)).room || null
+}
+
+export interface RoomWikiPageMeta {
+  name: string
+  size: number
+  updatedAt: string
+}
+
+export interface RoomWikiPage {
+  name: string
+  content: string
+  updatedAt: string
+}
+
+export async function fetchRoomWiki(room: string): Promise<RoomWikiPageMeta[]> {
+  const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/wiki`)
+  return (await responseJson<{ pages: RoomWikiPageMeta[] }>(response)).pages
+}
+
+export async function fetchRoomWikiPage(room: string, page: string): Promise<RoomWikiPage> {
+  const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/wiki/page?name=${encodeURIComponent(page)}`)
+  return responseJson<RoomWikiPage>(response)
+}
+
 
 export interface RoomUpdate { id: string | null; ts: string | null; title?: string; text: string }
 
@@ -195,6 +236,7 @@ export interface Message {
   timestamp: string
   content: ContentBlock[]
   delivery?: 'queued' | 'sent' | 'delivered'
+  passive?: boolean
   stopReason?: string
   cwd?: string
   model?: string
@@ -448,11 +490,21 @@ export async function sendSessionKeys(id: string, keys: string[]): Promise<void>
 }
 
 
-export async function createSession(cwd?: string, agent?: 'claude' | 'codex' | 'omp'): Promise<string> {
+export interface CreateSessionOptions {
+  model?: string
+  roomName?: string
+  roomRole?: 'leader'
+}
+
+export async function createSession(cwd?: string, agent?: 'claude' | 'codex' | 'omp', options: CreateSessionOptions = {}): Promise<string> {
   const id = crypto.randomUUID()
-  const response = await fetch(`${BASE}/api/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, cwd, agent }) })
-  await responseJson(response)
-  return id
+  const response = await fetch(`${BASE}/api/sessions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, cwd, agent, ...options }),
+  })
+  const created = await responseJson<{ id?: string }>(response)
+  return created.id || id
 }
 
 export const resumeSession = (id: string, cwd?: string) =>
@@ -527,7 +579,7 @@ export async function searchSessions(query: string, project?: string | null): Pr
 
 export async function checkAuth(): Promise<{ username: string; admin: boolean } | null> {
   try {
-    const r = await fetch(`${BASE}/api/me`)
+    const r = await fetch(`${BASE}/api/me`, { cache: 'no-store' })
     if (!r.ok) return null
     return await r.json()
   } catch { return null }
@@ -574,6 +626,8 @@ export interface SidecarMember {
 
 export interface SidecarGroup {
   id: string
+  kind?: 'sidecar' | 'room'
+  roomName?: string
   members: SidecarMember[]
   agent: string
   task: string
@@ -711,6 +765,7 @@ export interface OmpBridgeEvent {
   messageId?: string
   text?: string
   reason?: string
+
   attempt?: number
   provider?: string
   maxAttempts?: number

@@ -25,6 +25,8 @@ matrix row/version and a downgrade adapter before the new writer is deployed.
 
 | Document | Owner/root | Valid root/schema | Missing default | Mutation compatibility with `601c2dc` | Mode |
 |---|---|---|---|---|---|
+| `boxes.json` | Instance state | Object keyed by box id | `{}` | Read-only in compatible releases; no envelope added | `0600` |
+| `sharing.json` | Instance state | Object with optional `owner`, `peers`, `grants` | `{}` | Keyed updates preserve unknown document, peer, and grant fields | `0600` |
 | `session-meta.json` | Instance state | Object keyed by session id | `{}` | Per-session updates spread existing records; deletion removes only the selected id | Existing mode, new `0644` |
 | `project-labels.json` | Instance state | Object keyed by project id | `{}` | Label updates preserve all other keys | Existing mode, new `0644` |
 | `feed-interactions.json` | Instance state | Schema 1 `{ "schema": 1, "posts": { ... } }` | `{ "schema": 1, "posts": {} }` | Per-post reaction/comment updates preserve unrelated posts; bounded snapshots retain the originating session; older releases ignore and retain the unknown file | `0600` |
@@ -34,11 +36,20 @@ matrix row/version and a downgrade adapter before the new writer is deployed.
 | `push-keys.json` | Instance state | Object | `{}` | Existing key pair is retained; generation writes the same shape | `0600` |
 | `push-subscriptions.json` | Instance state | Array | `[]` | Endpoint updates preserve unrelated subscriptions | Existing mode, new `0644` |
 | `room-sessions.json` | `~/.feather` coordination state | Object mapping session id to Room name | `{}` | Assignment updates preserve all other mappings | Existing mode, new `0644` |
+| `room-mains.json` | `~/.feather` coordination state | Object mapping Room name to Leader session id | `{}` | Uses the legacy Main filename/shape; stale-Leader repair replaces only the selected Room | Existing mode, new `0644` |
+| `room-residents.json` | `~/.feather` coordination state | Object mapping Room name to role-keyed resident records | `{}` | Roster changes preserve unrelated Rooms and roles; Sidecar group synchronization does not replace Fledge state | Existing mode, new `0644` |
+| `room-pulses.json` | `~/.feather` coordination state | Object mapping Room name to caretaker status | `{}` | Caretaker writes preserve unrelated Room records | Existing mode, new `0644` |
 | `sidecars/groups.json` | `~/.feather/sidecars` coordination state | Object keyed by group id | `{}` | Group/member/sequence updates preserve unknown document and group fields | Existing mode, new `0644` |
 
-`sidecars/<id>/chat.jsonl` and agent transcripts are append-only event streams,
-not whole-document JSON state, so they are outside this primitive and matrix.
-Release `version.json` is an immutable release asset, not instance state.
+`updates.jsonl`, `sidecars/<id>/chat.jsonl`, and agent transcripts are
+append-only event streams, while Room `wiki/` contains curated files. They are
+outside this whole-document primitive and matrix. The Room update stream remains
+live for Fledge timeline dispatches even though the standalone Updates tab is
+retired. `room-mains.json` and `room-residents.json` coexist with, and never
+replace, the instance-owned `feed-interactions.json`.
+
+Release `version.json` is an immutable release asset required by health-version
+and release-manifest gates, not instance state.
 
 ## Rollback gate
 
@@ -50,10 +61,11 @@ that release to touch the sole-writer root. If any future schema is not marked
 compatible, use its tested downgrade adapter; restoring an older snapshot after
 accepted new writes would discard those writes.
 
-The automated rehearsal starts the single-server build against a temporary
-external state root, verifies that copied quick-link state remains readable,
-performs a representative mutation, and confirms that no fallback state leaked
-under the temporary home. The other rows retain their exact v0 root types and
-mutation shapes; a production cutover still requires the per-document
-copied-state rehearsal above rather than treating that representative test as
-production authorization.
+The automated rehearsals start the single-server build against a temporary
+external state root, verify copied quick-link state remains readable, perform a
+representative mutation, and confirm no fallback state leaked under the
+temporary home. Sharing compatibility is separately exercised against a copied
+pre-U9 fixture containing unknown fields. The other rows retain their exact root
+types and mutation shapes; a production cutover still requires the
+per-document copied-state rehearsal above rather than treating representative
+tests as production authorization.

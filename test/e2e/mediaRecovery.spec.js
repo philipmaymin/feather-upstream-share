@@ -16,7 +16,6 @@ test.beforeEach(async ({ page }) => {
     status: 200, contentType: 'application/json', body: JSON.stringify({ ok: true }),
   }))
 })
-
 test.beforeAll(() => {
   const projectDir = fs.readdirSync(CLAUDE_PROJECTS)
     .map(name => path.join(CLAUDE_PROJECTS, name))
@@ -146,7 +145,6 @@ test('a send survives leaving during delivery and retries against its original c
   expect(sendAttempts).toBeGreaterThanOrEqual(2)
   expect(new Set(messageIds).size).toBe(1)
 })
-
 test('an in-flight attachment send does not block another room and clears the acknowledged origin draft', async ({ page }) => {
   let releaseSend
   let sendReceived = false

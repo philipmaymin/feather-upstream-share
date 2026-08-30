@@ -67,6 +67,8 @@ function fixture() {
   fs.mkdirSync(room, { recursive: true })
   fs.writeFileSync(path.join(room, 'AGENTS.md'), '# Test room\n')
   fs.writeFileSync(path.join(room, 'notes.md'), '# Notes\n')
+  fs.mkdirSync(path.join(room, 'wiki'))
+  fs.writeFileSync(path.join(room, 'wiki/Home.md'), '# Home\n')
   const bin = path.join(root, 'bin')
   fs.mkdirSync(bin)
   const tmuxLog = path.join(root, 'tmux.log')
@@ -194,9 +196,12 @@ describe('server-enforced read-only canary', () => {
     const readable = [
       '/api/health', '/api/feed', '/api/sessions',
       `/api/sessions/${fx.sessionId}/messages`, `/api/sessions/${fx.sessionId}/export`,
+      `/api/sessions/${fx.sessionId}/room`,
       `/api/files/raw?path=${encodeURIComponent(fx.readableFile)}`,
       `/api/files/list?dir=${encodeURIComponent(fx.home)}`,
-      '/api/rooms', '/api/rooms/test-room/updates', '/api/sidecar', '/api/sidecar/stale-group',
+      '/api/rooms', '/api/rooms/test-room/updates', '/api/rooms/test-room/residents',
+      '/api/rooms/test-room/wiki', '/api/rooms/test-room/wiki/page?name=Home',
+      '/api/sidecar', '/api/sidecar/stale-group',
       '/api/projects', '/api/search?q=fixture', '/api/quick-links', '/api/mute',
       '/api/push/subscribe', '/api/starred', '/api/starred/album', '/api/agents',
       '/api/running', '/api/usage', '/api/digest', '/api/me', '/api/version',
@@ -224,6 +229,7 @@ describe('server-enforced read-only canary', () => {
       ['POST', `/api/sessions/${fx.sessionId}/delete`, {}],
       ['POST', `/api/sessions/${fx.sessionId}/rename`, { title: 'changed' }],
       ['POST', `/api/sessions/${fx.sessionId}/fork`, {}],
+
       ['POST', '/api/sidecar/stale-group/post', { from: 'driver', to: 'peer', text: 'no' }],
       ['POST', '/api/sidecar', { driverSessionId: fx.sessionId }],
       ['POST', '/api/quick-links', []], ['POST', '/api/starred', {}],
@@ -316,7 +322,6 @@ describe('server-enforced read-only canary', () => {
     )
     assert.doesNotMatch(calls, /paste-buffer/)
   })
-
   it('returns stable durable send receipts while preserving unkeyed client behavior', async () => {
     const fx = fixture()
     fs.mkdirSync(path.join(fx.state, 'uploads'))
@@ -392,4 +397,5 @@ describe('server-enforced read-only canary', () => {
     assert.equal(oversized.status, 413)
     assert.deepEqual(await oversized.json(), { error: 'audio exceeds 25 MB limit' })
   })
+
 })

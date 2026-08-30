@@ -93,7 +93,6 @@ describe('Room keep-working scheduler', () => {
       assert.equal((await pause.json()).pulse.status, 'paused')
       assert.equal(fs.readFileSync(tmuxReg, 'utf8').split('\n').includes(`f-${state.idle.sessionId}`), false,
         'pausing a Room must stop its running background tmux session immediately')
-
     } finally {
       child.kill('SIGTERM')
       await new Promise((resolve) => child.once('exit', resolve))
@@ -154,11 +153,13 @@ describe('Room keep-working scheduler', () => {
         if (workingCount(state) >= 2) break
         await new Promise((resolve) => setTimeout(resolve, 20))
       }
+
       await new Promise((resolve) => setTimeout(resolve, 400))
       state = readState()
       assert.equal(workingCount(state), 2, stderr)
       const launches = fs.readFileSync(tmuxLog, 'utf8').trim().split('\n').filter(Boolean)
       assert.equal(launches.length, 2, `expected 2 launches, got ${launches.length}: ${stderr}`)
+
       assert.equal(state.r1.status, 'working')
       assert.equal(state.r2.status, 'working')
       for (const name of ['r3', 'r4', 'r5']) assert.equal(state[name].status, 'waiting', `${name} should be deferred`)

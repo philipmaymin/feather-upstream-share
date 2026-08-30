@@ -122,6 +122,49 @@ describe('sidecar store (v1 + v2 multi-peer)', () => {
     assert.equal(updated.g1.futureGroupField, 7)
   })
 
+  it('syncs a durable Room group while preserving its JSONL thread and sequence', () => {
+    const first = sc.syncRoomGroup({
+      roomName: 'feather',
+      members: [
+        { sessionId: '11111111-1111-4111-8111-111111111111', role: 'leader' },
+        { sessionId: '22222222-2222-4222-8222-222222222222', role: 'caretaker' },
+      ],
+    })
+    assert.equal(first.id, 'room-feather')
+    assert.equal(first.kind, 'room')
+    assert.ok(first.members.every((member) => member.spawned === false))
+    const message = sc.appendMessage(first.id, { from: 'leader', to: 'caretaker', text: 'maintain wiki' })
+    assert.equal(message.seq, 1)
+
+    const synced = sc.syncRoomGroup({
+      roomName: 'feather',
+      members: [
+        { sessionId: '11111111-1111-4111-8111-111111111111', role: 'leader' },
+        { sessionId: '33333333-3333-4333-8333-333333333333', role: 'caretaker' },
+      ],
+    })
+    assert.equal(synced.seq, 1)
+    assert.equal(synced.createdAt, first.createdAt)
+    assert.equal(synced.members.find((member) => member.role === 'caretaker').sessionId, '33333333-3333-4333-8333-333333333333')
+    assert.equal(sc.readThread(first.id)[0].text, 'maintain wiki')
+    assert.deepEqual(sc.resolveRecipients(synced, ['leader'], 'caretaker').missing, ['invalid address'])
+    assert.throws(() => sc.appendMessage(first.id, { from: 'leader', to: ['caretaker'], text: 'poison' }), /invalid sidecar message/)
+    fs.appendFileSync(path.join(tmpHome, '.feather/sidecars/room-feather/chat.jsonl'), JSON.stringify({
+      ts: Date.now(), seq: 2, from: 'leader', to: ['caretaker'], text: 'poison',
+    }) + '\n')
+    assert.equal(sc.readThread(first.id).some((entry) => entry.text === 'poison'), false)
+    sc.markMembersPrimed(first.id, ['caretaker:33333333-3333-4333-8333-333333333333'])
+    assert.deepEqual(sc.getGroup(first.id).primedMembers, ['caretaker:33333333-3333-4333-8333-333333333333'])
+    assert.equal(
+      sc.formatInbound(first.id, { seq: 1, from: 'leader', text: 'maintain wiki' }),
+      '[feather-sidecar room-feather 1 leader] \"maintain wiki\"',
+    )
+    const renamed = sc.renameRoomGroup('feather', 'renamed')
+    assert.equal(renamed.id, 'room-renamed')
+    assert.equal(renamed.roomName, 'renamed')
+    assert.equal(sc.getGroup('room-feather'), null)
+    assert.equal(sc.readThread('room-renamed')[0].text, 'maintain wiki')
+  })
   it('fails closed when the existing group registry is malformed', () => {
     const groupsFile = path.join(tmpHome, '.feather/sidecars/groups.json')
     fs.writeFileSync(groupsFile, '{broken')

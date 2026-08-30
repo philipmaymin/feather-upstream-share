@@ -1,0 +1,11 @@
+{
+  "owner": "allan",
+  "peers": {
+    "phil": { "token": "<generate with: node server.js --add-peer phil --all --control>", "policy": "all", "control": true },
+    "zak":  { "token": "<generate with: node server.js --add-peer zak>", "policy": "selected" }
+  },
+  "grants": [
+    { "peer": "zak", "box": "local", "session": "00000000-0000-0000-0000-000000000000" },
+    { "peer": "zak", "box": "*", "project": "-home-user-example" }
+  ]
+}

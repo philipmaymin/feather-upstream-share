@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feather Terminal Capture — Ratified Plan &amp; Validation Contract</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#10161f; --panel2:#141c27; --line:#1e2a3a;
+    --text:#d7e0ea; --dim:#8394a7; --faint:#5a6b7e;
+    --accent:#5eb1ff; --green:#4ade80; --amber:#fbbf24; --red:#f87171;
+    --violet:#c084fc; --mono:'JetBrains Mono','SF Mono',ui-monospace,Menlo,Consolas,monospace;
+    --sans:Inter,-apple-system,'Segoe UI',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{-webkit-text-size-adjust:100%}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.6;font-size:16px}
+  .wrap{max-width:880px;margin:0 auto;padding:48px 24px 96px}
+  a{color:var(--accent);text-decoration:none}
+  /* hero */
+  .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent);margin-bottom:14px}
+  h1{font-size:clamp(28px,5vw,40px);line-height:1.15;font-weight:750;letter-spacing:-.02em;margin-bottom:14px}
+  .lede{font-size:18px;color:var(--dim);max-width:60ch}
+  .byline{margin-top:22px;display:flex;flex-wrap:wrap;gap:10px}
+  .chip{font-family:var(--mono);font-size:12px;padding:5px 12px;border:1px solid var(--line);border-radius:999px;color:var(--dim);background:var(--panel)}
+  .chip b{color:var(--green);font-weight:600}
+  /* sections */
+  section{margin-top:64px}
+  h2{font-size:22px;font-weight:700;letter-spacing:-.01em;margin-bottom:6px}
+  .sub{color:var(--faint);font-size:14px;margin-bottom:22px}
+  h2 .n{font-family:var(--mono);color:var(--accent);font-size:15px;margin-right:10px}
+  p{margin-bottom:14px;color:var(--text)}
+  p.dim{color:var(--dim)}
+  code{font-family:var(--mono);font-size:.86em;background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 6px;color:#a8c7e8;white-space:nowrap}
+  /* cards */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:20px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px}
+  .card h3{font-size:14px;font-weight:650;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+  .card p{font-size:14px;color:var(--dim);margin:0}
+  .dot{width:8px;height:8px;border-radius:50%;flex:none}
+  /* callout */
+  .callout{border-left:3px solid var(--accent);background:var(--panel);border-radius:0 12px 12px 0;padding:16px 20px;margin:20px 0}
+  .callout.warn{border-color:var(--amber)}
+  .callout.good{border-color:var(--green)}
+  .callout p{margin:0;font-size:15px}
+  .callout p+p{margin-top:8px}
+  .callout .t{font-weight:650;font-size:13px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}
+  .callout.warn .t{color:var(--amber)} .callout.good .t{color:var(--green)} .callout .t{color:var(--accent)}
+  /* debate timeline */
+  .tl{border-left:2px solid var(--line);margin:24px 0 0 8px;padding-left:26px;display:flex;flex-direction:column;gap:22px}
+  .tl .ev{position:relative}
+  .tl .ev::before{content:'';position:absolute;left:-33px;top:6px;width:12px;height:12px;border-radius:50%;background:var(--bg);border:2.5px solid var(--accent)}
+  .tl .ev.peer::before{border-color:var(--violet)}
+  .tl .ev.critic::before{border-color:var(--red)}
+  .tl .ev.all::before{border-color:var(--green);background:var(--green)}
+  .who{font-family:var(--mono);font-size:12px;letter-spacing:.06em;color:var(--faint);margin-bottom:3px}
+  .who b{color:var(--text);font-weight:600}
+  .ev p{font-size:15px;color:var(--dim);margin:0}
+  .ev p strong{color:var(--text);font-weight:600}
+  /* tables */
+  .tblwrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;margin:20px 0}
+  table{border-collapse:collapse;width:100%;min-width:640px;font-size:14px}
+  th{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);text-align:left;padding:12px 16px;background:var(--panel2);border-bottom:1px solid var(--line)}
+  td{padding:11px 16px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--dim)}
+  tr:last-child td{border-bottom:none}
+  td:first-child{font-family:var(--mono);font-size:13px;color:var(--accent);white-space:nowrap}
+  td b{color:var(--text);font-weight:600}
+  tr.hl td{background:rgba(94,177,255,.05)}
+  /* phases */
+  .phase{display:flex;gap:18px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:12px;align-items:flex-start}
+  .pnum{font-family:var(--mono);font-weight:700;font-size:13px;color:var(--bg);background:var(--accent);border-radius:8px;padding:4px 10px;flex:none;margin-top:2px}
+  .phase.spike .pnum{background:var(--amber)}
+  .phase h3{font-size:15px;font-weight:650;margin-bottom:4px}
+  .phase h3 .sz{font-family:var(--mono);font-size:11px;color:var(--faint);font-weight:500;margin-left:8px}
+  .phase p{font-size:14px;color:var(--dim);margin:0}
+  .phase .gates{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-top:6px}
+  /* decision */
+  .decide{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:18px}
+  .opt{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}
+  .opt.rec{border-color:var(--green)}
+  .opt .tag{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:10px;color:var(--faint)}
+  .opt.rec .tag{color:var(--green)}
+  .opt h3{font-size:16px;margin-bottom:8px}
+  .opt p{font-size:14px;color:var(--dim);margin-bottom:0}
+  footer{margin-top:80px;padding-top:24px;border-top:1px solid var(--line);color:var(--faint);font-size:13px;font-family:var(--mono)}
+  footer a{color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="kicker">Feather · 2026-07-12</div>
+  <h1>Terminal Capture:<br>the plan, the contract, the no-babysitting build</h1>
+  <p class="lede">Any CLI agent — Claude Code, Codex, Gemini CLI — renders through a terminal framebuffer.
+  Feather will own that framebuffer, persist it, and re-render it on the web as a faithful terminal
+  <em>or</em> any way you want it. Built autonomously, verified by machines, ratified by three parties.</p>
+  <div class="byline">
+    <span class="chip">Claude Fable&nbsp;5 · driver <b>✓ signed</b></span>
+    <span class="chip">GPT 5.6 Soul · design peer <b>✓ signed</b></span>
+    <span class="chip">GPT 5.6 Soul · validation critic <b>✓ signed</b></span>
+  </div>
+
+  <section>
+    <h2><span class="n">01</span>What we found when we actually read the code</h2>
+    <p class="sub">You asked if either of us had read feather or your home directory. We hadn't. Then we did.</p>
+    <div class="cards">
+      <div class="card">
+        <h3><span class="dot" style="background:var(--green)"></span>The terminal already exists</h3>
+        <p><code>server.js:2253–2326</code> already spawns node-pty → <code>tmux attach</code> per WebSocket, and the frontend renders it with <b>ghostty-web</b> (not xterm.js), with typing and resize working. "See + type" was an easy false win waiting to be re-claimed.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--amber)"></span>You already ran this experiment</h3>
+        <p><code>~/cli2html</code> + the <code>~/autoweb-cli2html</code> loop: homegrown VT emulator, semantic transform, 418 keeps — then a silent crash death-spiral for 100+ iterations. The screenshot-LLM keep signal rewarded 300 trivial colorization rules over the hard TUI goal.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--red)"></span>A real security hole</h3>
+        <p>The terminal WebSocket upgrade path has <b>no app-layer auth</b> — it leans entirely on Authelia. Now covered by gate G7 (auth + cross-session isolation).</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--red)"></span>Tests touch your real data</h3>
+        <p>Existing e2e writes into the real <code>~/.claude</code> and needs a hand-started server on :4870 — both are babysitting hazards. Gate G9 makes everything hermetic: temp HOME, random port, managed boot, proven cleanup.</p>
+      </div>
+    </div>
+    <div class="callout">
+      <p class="t">So the plan changed</p>
+      <p>Phase 1 is <strong>not</strong> "add a live terminal." It is: <strong>replace the ephemeral per-WebSocket attach with durable, always-on capture</strong> — an append-only event log + checkpoints + reconnect-from-seq — so nothing is ever lost, viewers can come and go (iOS Safari kills backgrounded tabs constantly), and replay is free.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">02</span>The architecture in one breath</h2>
+    <p class="sub">Full detail in <code>docs/plans/2026-07-12-003-feat-terminal-capture-plan.md</code></p>
+    <p><strong>Two immutable projections of every session.</strong> The <strong>terminal</strong> (raw PTY bytes — authoritative for what you saw, input, replay) and the <strong>transcript</strong> (the agent's own <code>.jsonl</code> — authoritative for thinking / tool calls / text, which Feather already parses). They are <em>never</em> fused to manufacture semantics; they're loosely correlated, confidence-scored, and used only for navigation — click a thinking block, the terminal replay seeks to that moment.</p>
+    <p class="dim">On top: a declarative styling layer (thinking tinted, tool calls collapsed, whatever you want) over stable semantic classes, then plain ES-module renderer plugins, then optional OSC semantic marks agents could emit natively. Raw evidence stays immutable; every interpretation is derived and versioned, so better parsers can re-enrich history forever.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">03</span>How three models fought about it</h2>
+    <p class="sub">Sidecar group <code>acbcbfd8</code> — full thread preserved in <code>~/.feather/sidecars/</code></p>
+    <div class="tl">
+      <div class="ev"><div class="who"><b>Claude</b> · draft</div><p>PTY capture + framebuffer↔transcript <strong>join by timestamp</strong> for semantics.</p></div>
+      <div class="ev peer"><div class="who"><b>Design peer</b> · hard take</div><p><strong>The join will lie to you</strong> — redraws, spinners, wrapping, buffering. Keep two projections; correlate only for navigation. Immutable evidence, versioned interpretations.</p></div>
+      <div class="ev"><div class="who"><b>Claude</b> · pushback</div><p>De-scope the 100-spectator fantasy — this is one user on two devices. The killer feature is <strong>driving Claude Code from the iPad</strong>. Envelope stays minimal, no Phase-0 scaffolding.</p></div>
+      <div class="ev critic"><div class="who"><b>Validation critic</b> · verdict on contract v1</div><p><strong>"Strong skeleton, NOT safe for autonomous execution."</strong> tmux capture-pane can't be the fidelity oracle; marker tests prove only markers; capture must be always-on with zero viewers; an evaluator inside the builder's checkout can be rewritten by the builder; halt-and-notify violates no-babysitting.</p></div>
+      <div class="ev peer"><div class="who"><b>Design peer</b> · last objection</div><p>A home-dir evaluator under the <strong>same Unix user</strong> is theater — a dangerously-permissioned builder can chmod its own report card. Require a separate OS principal.</p></div>
+      <div class="ev all"><div class="who"><b>All three</b> · contract v2</div><p><strong>SIGN · SIGN · SIGN.</strong> Every objection incorporated. Ratified in <code>docs/plans/2026-07-12-004</code>.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">04</span>The validation contract — 16 gates</h2>
+    <p class="sub">One hermetic command, <code>npm run gates</code>, is the only definition of progress. No screenshots, no "looks good," no agent prose. Agent claims are never evidence; machine receipts are.</p>
+    <div class="tblwrap"><table>
+      <tr><th>Gate</th><th>Proves</th><th>The anti-theater teeth</th></tr>
+      <tr><td>G1</td><td><b>Fidelity</b></td><td>Full cell grids (glyph, color, attrs, cursor, modes) vs <b>golden fixtures validated once against two independent emulators</b>. Server and browser each gated separately. tmux capture-pane is diagnostic only.</td></tr>
+      <tr><td>G2</td><td><b>Capture completeness</b></td><td>Capture is <b>always-on from session creation</b> — proven with zero viewers attached. Per-chunk hashes + byte-for-byte comparison, not just "markers arrived."</td></tr>
+      <tr><td>G3</td><td><b>Reconnect</b></td><td>Real sockets killed server-side at a recorded seq; output emitted while dead; stale-seq, seq-ahead, racing-reconnect, restart-during-outage all covered.</td></tr>
+      <tr><td>G4</td><td><b>Replay determinism</b></td><td>Baseline = fresh-process replay from seq 0 <b>with checkpoints disabled</b>; checkpoint+suffix must match it at many cuts. Corrupt a checkpoint → graceful fallback, never a wrong screen.</td></tr>
+      <tr><td>G5</td><td><b>Input bytes</b></td><td>Browser keystrokes asserted as <b>exact bytes, exactly once</b>, at a raw-mode fixture. Spectator rejection proven by unchanged fixture bytes, not by a forgeable server response.</td></tr>
+      <tr><td>G6</td><td><b>Crash recovery</b></td><td>Torn-write fault matrix; <b>one policy: recover the valid prefix</b> — a torn tail must never brick startup.</td></tr>
+      <tr class="hl"><td>G7</td><td><b>Security</b></td><td>Malicious OSC/escape corpus through <b>every consumer</b> (live, restore, replay, export, rules, plugins): zero script/nav/clipboard effects. Plus app-layer WS auth + cross-session isolation — fixes the hole we found.</td></tr>
+      <tr><td>G8</td><td><b>Resource bounds</b></td><td>Deterministic invariants only: producer never blocked by a stalled client, queue caps hold, no fd leaks. Wall-clock numbers are reported benchmarks, <b>never blocking</b> — flaky gates stall autonomous loops.</td></tr>
+      <tr><td>G9</td><td><b>Hermetic regression</b></td><td>Whole suite in temp HOME, random port, managed boot, <code>retries: 0</code>, cleanup verified by injected-leak test.</td></tr>
+      <tr><td>G10</td><td><b>Mobile</b></td><td>Two tiers: Playwright WebKit simulation per-iteration, plus a <b>blocking real-iPad/iPhone device-farm gate at phase certification</b> (Option B, chosen — see §07).</td></tr>
+      <tr><td>G11–G16</td><td><b>The rest</b></td><td>Event schema &amp; seq monotonicity · multi-session isolation · transcript-authority invariant (capture can never mutate semantics) · correlation honesty under clock skew · presentation rules · plugins/OSC · tmux lifecycle.</td></tr>
+    </table></div>
+  </section>
+
+  <section>
+    <h2><span class="n">05</span>The autonomy harness — you never babysit</h2>
+    <p class="sub">autoweb v2, built against the exact ways autoweb v1 failed</p>
+    <div class="cards">
+      <div class="card">
+        <h3><span class="dot" style="background:var(--accent)"></span>Builders don't grade themselves</h3>
+        <p>The evaluator runs as a <b>separate OS principal</b> — a peer container on your 10.88.0.x bridge with its own pinned, read-only copy of gates and fixtures. A builder editing <code>package.json</code>, fixtures, or goldens changes nothing. Keep/revert verdicts and receipts are written where builders can't forge them.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--green)"></span>Self-healing before pinging you</h3>
+        <p>5 consecutive failures → preserve evidence, auto-revert to last green, run a bounded diagnosis/replan worker, resume once. <b>You're only notified if the recovery itself fails.</b> No more silent 100-iteration death spirals.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--violet)"></span>Anti-accretion by tripwire</h3>
+        <p>Terminal code lives in new modules behind a boundary — nothing appended to the 2.3k-line server.js. Consolidation triggers on measured duplication/complexity, not a scheduled refactor ritual. No 32k-line ui.html, ever again.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--amber)"></span>Phases end with receipts</h3>
+        <p>Done = full suite ×3 in fresh hermetic environments, then a machine-readable receipt: git SHA, pinned gate-tree hash, seeds, per-gate results, artifacts. You get one digest per phase. Prose is never proof.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">06</span>Build order</h2>
+    <div class="phase spike"><div class="pnum">U0</div><div><h3>The evaluator itself<span class="sz">first, gated by its own meta-checks</span></h3><p>Hermetic runner, fixture TUI, goldens cross-validated against two emulators, leak detection proven by injecting a deliberate leak.</p></div></div>
+    <div class="phase spike"><div class="pnum">SPIKE</div><div><h3>Backend decision<span class="sz">S · architecture gate</span></h3><p>Can the current tmux-attach path be made durable, or move to pipe-pane / control mode / owned PTY? Current path tested <em>first</em>; output is a machine-written <code>backend-decision.json</code> with measured pass/fail per candidate — a lazy worker can't just pick one.</p><div class="gates">G1 · G2 · input/resize subset</div></div></div>
+    <div class="phase"><div class="pnum">P1</div><div><h3>Durable capture replaces ephemeral attach<span class="sz">M</span></h3><p>Always-on event log, checkpoints, reconnect-from-seq, coalesced binary frames, thin typing.</p><div class="gates">G1–G4 · G6–G9 · G11 · G12 · G16</div></div></div>
+    <div class="phase"><div class="pnum">P2</div><div><h3>Drive Claude Code from the iPad<span class="sz">M · the killer feature</span></h3><p>Full keyboard/paste/Esc/Ctrl affordances, controller-vs-spectator ownership across devices. Done = a real approval/edit cycle from the iPad, no SSH.</p><div class="gates">G5 · G10 · ownership</div></div></div>
+    <div class="phase"><div class="pnum">P3</div><div><h3>Replay + navigation<span class="sz">M</span></h3><p>Seek, scrub, live-follow, asciicast export; click a transcript block → terminal seeks to that moment.</p><div class="gates">G4 · G6 · G13</div></div></div>
+    <div class="phase"><div class="pnum">P4</div><div><h3>Presentation rules<span class="sz">S/M</span></h3><p>Your styling layer: thinking tinted, tools collapsed, density controls — declarative rules over stable semantic classes, persisted, live-previewed.</p><div class="gates">G14</div></div></div>
+    <div class="phase"><div class="pnum">P5</div><div><h3>Renderer plugins + OSC marks<span class="sz">M</span></h3><p>Plain ES-module renderers (your app, your JS) and experimental OSC stable-ID marks agents could emit natively — possibly a tiny published spec.</p><div class="gates">G15 · G7 expansion</div></div></div>
+  </section>
+
+  <section>
+    <h2><span class="n">07</span>Mobile validation — decided</h2>
+    <p class="sub">Allan chose Option B on 2026-07-12</p>
+    <div class="decide">
+      <div class="opt">
+        <div class="tag">Option A · inner loop only</div>
+        <h3>Simulated-mobile</h3>
+        <p>Playwright WebKit + synthetic keyboard/suspension gates stay as the fast per-iteration check on Linux — but they no longer count as mobile proof.</p>
+      </div>
+      <div class="opt rec">
+        <div class="tag">Option B · chosen · blocking</div>
+        <h3>Real-device farm</h3>
+        <p>Physical iPad/iPhone Safari (BrowserStack/Appium): open app, type a fixture nonce with the software keyboard, background 10s, resume, assert resync, rotate, paste. Blocks Phase 2 certification. Runs at certification, not per-iteration, to bound cost and flake.</p>
+      </div>
+    </div>
+    <div class="callout good" style="margin-top:20px">
+      <p class="t">Status</p>
+      <p>Contract v2 ratified by all three parties, G10 = Option B. <strong>Implementation Unit 0 now includes provisioning the device-farm account + tunnel</strong> alongside the evaluator container. The build is clear to kick off.</p>
+    </div>
+  </section>
+
+  <footer>
+    plan: docs/plans/2026-07-12-003-feat-terminal-capture-plan.md · contract: docs/plans/2026-07-12-004-terminal-capture-validation-contract.md · debate: ~/.feather/sidecars/acbcbfd8…/chat.jsonl
+  </footer>
+</div>
+</body>
+</html>

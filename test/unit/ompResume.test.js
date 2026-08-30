@@ -55,6 +55,7 @@ describe('safe OMP resume', () => {
     fs.mkdirSync(stateDir, { recursive: true })
     fs.mkdirSync(binDir, { recursive: true })
 
+
     const goodFeatherId = 'resume-good-feather-id'
     const goodDir = path.join(home, '.feather/omp-sessions', goodFeatherId)
     fs.mkdirSync(goodDir)

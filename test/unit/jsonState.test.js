@@ -293,8 +293,10 @@ describe('server and rollback integration', () => {
     const homeDir = path.join(root, 'home')
     fs.mkdirSync(stateDir)
     fs.mkdirSync(homeDir)
-    const linksFile = path.join(stateDir, 'quick-links.json')
-    fs.writeFileSync(linksFile, '{broken')
+    const mainsDir = path.join(homeDir, '.feather')
+    fs.mkdirSync(mainsDir)
+    const mainsFile = path.join(mainsDir, 'room-mains.json')
+    fs.writeFileSync(mainsFile, '{broken')
 
     const result = spawnSync(process.execPath, ['server-single.js'], {
       cwd: path.resolve(import.meta.dirname, '../..'),
@@ -304,8 +306,8 @@ describe('server and rollback integration', () => {
     })
 
     assert.notEqual(result.status, 0)
-    assert.match(result.stderr, /malformed quick links/)
-    assert.equal(fs.readFileSync(linksFile, 'utf8'), '{broken')
+    assert.match(result.stderr, /malformed Room leaders/)
+    assert.equal(fs.readFileSync(mainsFile, 'utf8'), '{broken')
   })
 
   it('rehearses the pre-atomic release against an unchanged v0 state shape', async (t) => {

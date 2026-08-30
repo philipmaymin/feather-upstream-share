@@ -110,7 +110,6 @@ async function readOmpSseEvents(reader, minimum) {
   })
   return { events, payload }
 }
-
 before(async () => {
   let port
   let stateDir
@@ -186,6 +185,7 @@ case "$1" in
     printf '\n' >> "$state/sent"
     ;;
   send-keys)
+    [ -f "$state/fail-send" ] && exit 7
     previous=""
     target=""
     for argument in "$@"; do
@@ -488,6 +488,7 @@ describe('retired Auto and CoS APIs', () => {
     })
   }
 })
+
 
 // ── Sessions ────────────────────────────────────────────────────────────────
 
@@ -1021,6 +1022,31 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
   })
 })
 
+describe('GET /api/sessions/:id/room', () => {
+  it('resolves exact Room membership without depending on the capped Room snapshot', async () => {
+    const missing = await (await fetch(`${BASE}/api/sessions/no-such-session-ever/room`)).json()
+    assert.equal(missing.room, null)
+
+    const roomName = `api-room-${Date.now().toString(36)}`
+    const created = await fetch(`${BASE}/api/rooms`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: roomName }),
+    })
+    assert.equal(created.status, 200)
+    const assigned = await fetch(`${BASE}/api/rooms/${roomName}/assign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: TEST_SESSION_ID }),
+    })
+    assert.equal(assigned.status, 200)
+
+    const response = await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/room`)
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { room: roomName })
+  })
+})
+
 // ── SSE ─────────────────────────────────────────────────────────────────────
 
 describe('GET /api/sessions/:id/stream (SSE)', () => {
@@ -1247,21 +1273,40 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
           type: 'assistant_snapshot',
           messageId: 'm1',
           text: 'Hello',
-          thinking: 'must not cross the boundary',
+          thinking: 'must not cross the answer boundary',
+        }, {
+          type: 'work_snapshot',
+          messageId: 'm1',
+          blocks: [
+            { type: 'thinking', thinking: 'Live reasoning inside Details.' },
+            { type: 'tool_use', id: 'call-1', name: 'bash', intent: 'Checking state', input: { command: 'secret command' } },
+          ],
         }] }),
       })
       assert.equal(accepted.status, 204)
 
-      const { value } = await reader.read()
-      const payload = decoder.decode(value)
+      let payload = ''
+      while (payload.split('\n').filter(line => line.startsWith('data: ')).length < 2) {
+        const { value, done } = await reader.read()
+        if (done || !value) break
+        payload += decoder.decode(value)
+      }
       assert.match(payload, /event: omp_event/)
-      const dataLine = payload.split('\n').find(line => line.startsWith('data: '))
-      assert.deepEqual(JSON.parse(dataLine.replace('data: ', '')), {
+      const dataLines = payload.split('\n').filter(line => line.startsWith('data: '))
+      assert.deepEqual(dataLines.map(line => JSON.parse(line.replace('data: ', ''))), [{
         type: 'assistant_snapshot',
         messageId: 'm1',
         text: 'Hello',
-      })
+      }, {
+        type: 'work_snapshot',
+        messageId: 'm1',
+        blocks: [
+          { type: 'thinking', thinking: 'Live reasoning inside Details.' },
+          { type: 'tool_use', id: 'call-1', name: 'bash', intent: 'Checking state' },
+        ],
+      }])
       assert.equal(payload.includes('must not cross'), false)
+      assert.equal(payload.includes('secret command'), false)
     } finally {
       ctrl.abort()
       try { fs.unlinkSync(path.join(tokenDir, tokenName)) } catch {}
@@ -1448,7 +1493,50 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
 
 })
 
+describe('POST /api/sessions', () => {
+  it('rejects non-UUID session ids before they reach tmux or filesystem paths', async () => {
+    const response = await fetch(`${BASE}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: '../;touch-pwned', cwd: fixtureHome, agent: 'omp' }),
+    })
+    assert.equal(response.status, 400)
+    assert.match((await response.json()).error, /session id must be a UUID/)
+  })
+
+  it('trusts a Claude workspace before launch', async () => {
+    const response = await fetch(`${BASE}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: '20000000-0000-4000-8000-000000000321', cwd: fixtureHome, agent: 'claude' }),
+    })
+    assert.equal(response.status, 200)
+    const trust = JSON.parse(fs.readFileSync(path.join(fixtureHome, '.claude.json'), 'utf8'))
+    assert.equal(trust.projects[fixtureHome].hasTrustDialogAccepted, true)
+  })
+})
+
 // ── Error handling ──────────────────────────────────────────────────────────
+
+describe('POST /api/sessions/:id/send', () => {
+  it('normalizes process exit codes to a JSON 500 response', async () => {
+    fs.writeFileSync(path.join(tmuxFixtureDir, 'fail-send'), '1')
+    let response
+    try {
+      response = await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Feather-Message-ID': 'process-exit-status-0001' },
+        body: JSON.stringify({ text: 'must not crash Express status handling' }),
+      })
+    } finally {
+      fs.unlinkSync(path.join(tmuxFixtureDir, 'fail-send'))
+    }
+    assert.equal(response.status, 500)
+    const body = await response.json()
+    assert.equal(typeof body.error, 'string')
+    assert.ok(body.error.length > 0)
+  })
+})
 
 describe('POST /api/sessions/:id/interrupt', () => {
   it('returns 500 for nonexistent tmux session', async () => {
@@ -1668,3 +1756,44 @@ describe('Council protocol-run APIs', () => {
     assert.match(payload, /"lastSeq":/)
   })
 })
+
+// ── /api/file (serves local files for chat image embeds and links) ──────────
+
+describe('GET /api/file', () => {
+
+  it('serves a file by absolute path', async () => {
+    const r = await fetch(`${BASE}/api/file?path=${encodeURIComponent(toolFixture)}`)
+    assert.equal(r.status, 200)
+    const body = await r.text()
+    assert.ok(body.includes('<svg'))
+  })
+
+  it('normalizes ../ segments instead of passing them to sendFile', async () => {
+    const dodgy = path.join(path.dirname(toolFixture), 'nope', '..', path.basename(toolFixture))
+    const r = await fetch(`${BASE}/api/file?path=${encodeURIComponent(dodgy)}`)
+    assert.equal(r.status, 200)
+    const body = await r.text()
+    assert.ok(body.includes('<svg'))
+  })
+
+  it('rejects relative paths', async () => {
+    const r = await fetch(`${BASE}/api/file?path=etc/passwd`)
+    assert.equal(r.status, 400)
+  })
+
+  it('rejects paths containing null bytes', async () => {
+    const r = await fetch(`${BASE}/api/file?path=${encodeURIComponent('/etc/passwd\0.png')}`)
+    assert.equal(r.status, 400)
+  })
+
+  it('rejects repeated path params (array injection)', async () => {
+    const r = await fetch(`${BASE}/api/file?path=/etc/hostname&path=/etc/hostname`)
+    assert.equal(r.status, 400)
+  })
+
+  it('404s for missing files', async () => {
+    const r = await fetch(`${BASE}/api/file?path=${encodeURIComponent(path.join(fixtureHome, 'no-such-file-ever.png'))}`)
+    assert.equal(r.status, 404)
+  })
+})
+

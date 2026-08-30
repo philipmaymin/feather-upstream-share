@@ -70,7 +70,12 @@ case "$cmd" in
     [ -n "$to" ] && [ -n "$text" ] || die "usage: sidecar post --to <role|a,b|all> <text>"
     prefix=$(self_prefix)
     [ -n "$group" ] || group="${SIDECAR_GROUP:-}"
+    auth_headers=()
+    if [ -n "${FEATHER_SESSION_ID:-}" ] && [ -n "${FEATHER_BRIDGE_TOKEN:-}" ]; then
+      auth_headers=(-H "X-Feather-Session-ID: $FEATHER_SESSION_ID" -H "X-Feather-Bridge-Token: $FEATHER_BRIDGE_TOKEN")
+    fi
     resp=$(curl -sS -X POST "$BASE/api/sidecar/post" \
+      "${auth_headers[@]}" \
       -H 'Content-Type: application/json' \
       -d "$(jq -nc --arg p "$prefix" --arg to "$to" --arg t "$text" --arg g "$group" \
             '{fromPrefix:$p, to:$to, text:$t} + (if $g=="" then {} else {group:$g} end)')") \

@@ -21,12 +21,14 @@ import { ensureStateLayout, resolveStatePaths } from './lib/state-paths.js';
 import { createJsonState, isJsonRecord } from './lib/json-state.js';
 import { encodeProjectPath, groupRoomSessions } from './lib/rooms.js';
 import { parseFrictionNotes } from './lib/friction.js';
-import { resolveOmpModel, resolveOmpThinking, ompLaunchCommand, ompTmuxArgs } from './lib/omp.js';
+import { resolveOmpModel, resolveOmpThinking, ompLaunchCommand, ompTmuxArgs, sanitizeOmpModel } from './lib/omp.js';
 import { ompSessionCwdFromHead, ompSessionIdFromHead, ompTurnBoundaryFromLine } from './lib/omp-session.js';
 import { inferLegacyTmuxOwner, legacyTmuxSessionName, tmuxSessionName } from './lib/tmux-session.js';
 import { extractOsc8HttpUrls } from './lib/terminal-hyperlinks.js';
 import { prepareTmuxTerminal } from './lib/terminal-attach.js';
 import { createProtocolRunStore } from './lib/protocol-runs.js';
+import { listWikiPages, readWikiPage, verifiedWikiRoot } from './lib/room-wiki.js';
+import { ROOM_LEADER_PROMPT_VERSION, roomLeaderPrompt } from './lib/room-leader.js';
 
 // Load ~/.env if present
 try {
@@ -65,6 +67,7 @@ const ROOM_PULSE_MAX_CONCURRENT = Math.max(1, Number.isFinite(configuredPulseMax
 const ROOM_PULSE_STARTED_AT = Date.now();
 const READ_ONLY_ERROR = Object.freeze({ error: 'read-only canary', code: 'FEATHER_READ_ONLY' });
 const SESSION_READ_ROUTE = /^\/api\/sessions\/[^/]+\/(messages|stream|export|protocol-runs)$/;
+const SESSION_ROOM_ROUTE = /^\/api\/sessions\/[^/]+\/room$/;
 
 const PORT = parseInt(process.env.PORT || '4870');
 const HOST = process.env.HOST || '127.0.0.1';
@@ -552,6 +555,41 @@ function ensureCodexTrust(cwd) {
     fs.appendFileSync(cfg, block);
   } catch (e) { console.warn(`[codex] could not write trust for ${cwd}:`, e.message); }
 }
+// Claude Code's workspace trust prompt defaults to "No, exit". Feather sends
+// Enter after launch to dismiss harmless startup prompts, so trust the cwd
+// durably before starting or resuming a Claude process.
+function ensureClaudeTrust(cwd) {
+  const trustedCwd = cwd || HOME;
+  const cfg = path.join(HOME, '.claude.json');
+  let settings = {};
+  try {
+    settings = JSON.parse(fs.readFileSync(cfg, 'utf8'));
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.warn(`[claude] could not read workspace trust for ${trustedCwd}:`, error.message);
+      return;
+    }
+  }
+  const projects = isJsonRecord(settings.projects) ? settings.projects : {};
+  const current = isJsonRecord(projects[trustedCwd]) ? projects[trustedCwd] : {};
+  if (current.hasTrustDialogAccepted === true) return;
+  const next = {
+    ...settings,
+    projects: {
+      ...projects,
+      [trustedCwd]: { ...current, hasTrustDialogAccepted: true },
+    },
+  };
+  const temporary = `${cfg}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(next), { mode: 0o600 });
+    fs.renameSync(temporary, cfg);
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch {}
+    console.warn(`[claude] could not trust workspace ${trustedCwd}:`, error.message);
+  }
+}
+
 
 // ── Tmux management ────────────────────────────────────────────────────────
 
@@ -667,6 +705,26 @@ const shouldMigrateTmux = !READ_ONLY_MODE
   && !/^(0|false|no|off)$/i.test(String(process.env.FEATHER_MIGRATE_TMUX || '').trim());
 migrateLegacyTmuxSessions(shouldMigrateTmux);
 
+function ompSessionModel(id) {
+  return sanitizeOmpModel(readMeta()[id]?.ompModel || '') || OMP_MODEL;
+}
+
+function roomLeaderNameForSession(id) {
+  return Object.entries(ROOM_LEADERS_STATE.read())
+    .find(([, sessionId]) => sessionId === id)?.[0] || null;
+}
+
+function writeRoomLeaderPrompt(id, roomName) {
+  if (!roomName) return null;
+  const promptDir = path.join(HOME, '.feather', 'room-leader-prompts');
+  fs.mkdirSync(promptDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(promptDir, 0o700);
+  const promptPath = path.join(promptDir, `${id}-v${ROOM_LEADER_PROMPT_VERSION}.md`);
+  fs.writeFileSync(promptPath, roomLeaderPrompt(roomName), { mode: 0o600 });
+  fs.chmodSync(promptPath, 0o600);
+  return promptPath;
+}
+
 function spawnTmuxClaude(name, claudeArgs, dir) {
   try { execFileSync('tmux', ['kill-session', '-t', name], { stdio: 'ignore' }); } catch {}
   const claudeCmd = `claude ${claudeArgs} --dangerously-skip-permissions --disallowed-tools "AskUserQuestion,EnterPlanMode,ExitPlanMode"`;
@@ -702,9 +760,16 @@ function spawnTmuxOmp(name, ompArgs, dir, options = {}) {
   fs.writeFileSync(path.join(sessionDir, '.feather-bridge.json'), JSON.stringify({
     url: bridgeUrl, token: bridgeToken, sessionId,
   }), { mode: 0o600 });
+  const leaderPromptFile = writeRoomLeaderPrompt(sessionId, roomLeaderNameForSession(sessionId));
+  const leaderArg = leaderPromptFile ? ` --append-system-prompt ${shellQuote(leaderPromptFile)}` : '';
   const extensionArg = ` --extension ${shellQuote(OMP_BRIDGE_EXTENSION)}`;
   const configArg = ` --config ${shellQuote(OMP_FEATHER_CONFIG)}`;
-  const launch = ompLaunchCommand(`${ompArgs}${extensionArg}${configArg}`, OMP_MODEL, OMP_THINKING, options);
+  const launch = ompLaunchCommand(
+    `${ompArgs}${leaderArg}${extensionArg}${configArg}`,
+    ompSessionModel(sessionId),
+    OMP_THINKING,
+    options,
+  );
   const ompCmd = [
     `export FEATHER_BRIDGE_URL=${shellQuote(bridgeUrl)}`,
     `FEATHER_BRIDGE_TOKEN=${shellQuote(bridgeToken)}`,
@@ -814,7 +879,25 @@ function adoptNewCodexUuid(featherId, beforeUuids, spawnCwd = null, attempts = 3
   setTimeout(tick, 500);
 }
 
-function spawnOrResume(id, cwd, resume = false, agent = null) {
+function validateFreshSessionId(id) {
+  if (typeof id !== 'string' || !UUID_RE.test(id)) throw httpError(400, 'session id must be a UUID');
+  const assignments = readRoomAssignments();
+  const leaders = ROOM_LEADERS_STATE.read();
+  const residentIds = Object.values(ROOM_RESIDENTS_STATE.read())
+    .flatMap(residents => Object.values(residents).map(resident => resident.sessionId));
+  if (readMeta()[id]
+    || assignments[id]
+    || Object.values(leaders).includes(id)
+    || residentIds.includes(id)
+    || tmuxIsActive(id)
+    || fs.existsSync(path.join(OMP_SESSIONS, id))
+    || findJsonlPath(id)) {
+    throw httpError(409, 'session id already exists');
+  }
+  return id;
+}
+
+function spawnOrResume(id, cwd, resume = false, agent = null, { ompModel = '' } = {}) {
   const resolvedAgent = agent || (resume ? getAgentForSession(id) : DEFAULT_AGENT);
   const name = tmuxName(id);
 
@@ -855,8 +938,14 @@ function spawnOrResume(id, cwd, resume = false, agent = null) {
       if (!ompId) throw new Error(`Cannot resume OMP session ${id}: exact OMP session id not found`);
       spawnTmuxOmp(name, `--resume ${ompId} --session-dir ${sessionDir}`, cwd || getOmpSessionCwd(id) || HOME);
     } else {
+      const model = sanitizeOmpModel(ompModel);
       const meta = readMeta();
-      meta[id] = { ...(meta[id] || {}), agent: 'omp', cwd: cwd || HOME };
+      meta[id] = {
+        ...(meta[id] || {}),
+        agent: 'omp',
+        cwd: cwd || HOME,
+        ...(model ? { ompModel: model } : {}),
+      };
       writeMeta(meta);
       spawnTmuxOmp(name, `--session-dir ${sessionDir}`, cwd || HOME);
     }
@@ -864,7 +953,13 @@ function spawnOrResume(id, cwd, resume = false, agent = null) {
   }
 
   const dir = cwd || (resume ? findSessionCwd(id) : null) || HOME;
-  const args = resume ? `--resume ${id}` : `--session-id ${id}`;
+  ensureClaudeTrust(dir);
+  const leaderPromptFile = writeRoomLeaderPrompt(id, roomLeaderNameForSession(id));
+  const leaderArg = leaderPromptFile ? ` --append-system-prompt-file ${leaderPromptFile}` : '';
+  const args = `${resume ? `--resume ${id}` : `--session-id ${id}`}${leaderArg}`;
+  const meta = readMeta();
+  meta[id] = { ...(meta[id] || {}), agent: 'claude', cwd: dir };
+  writeMeta(meta);
   spawnTmuxClaude(name, args, dir);
 }
 
@@ -2270,8 +2365,9 @@ app.use(express.json({ limit: '512kb' }));
 const READ_ONLY_API_ROUTES = [
   /^\/api\/health$/,
   /^\/api\/(agents|feed|rooms|version|projects|search|sessions|running|usage|digest|me)$/,
-  /^\/api\/rooms\/[^/]+\/(updates|friction)$/,
+  /^\/api\/rooms\/[^/]+\/(updates|friction|wiki|wiki\/page|residents)$/,
   SESSION_READ_ROUTE,
+  SESSION_ROOM_ROUTE,
   /^\/api\/sidecar$/,
   /^\/api\/sidecar\/[^/]+$/,
   /^\/api\/sidecar\/[^/]+\/stream$/,
@@ -2281,6 +2377,7 @@ const READ_ONLY_API_ROUTES = [
   /^\/api\/starred$/,
   /^\/api\/starred\/album$/,
   /^\/api\/files\/(list|raw|html)$/,
+  /^\/api\/file$/,
 ];
 
 function readOnlyRequestAllowed(req) {
@@ -2313,6 +2410,10 @@ app.use(express.static(STATIC_DIR, {
     }
   }
 }));
+
+// Missing fingerprinted assets are failures, never SPA navigations. Returning
+// index.html as JavaScript leaves stale clients on a white screen.
+app.use('/assets', (_req, res) => res.status(404).type('text/plain').send('asset not found'));
 
 app.use('/uploads', express.static(path.resolve(import.meta.dirname, 'uploads')));
 app.use('/opt/feather/uploads', express.static(path.resolve(import.meta.dirname, 'uploads')));
@@ -2755,10 +2856,40 @@ app.get('/api/agents', (_req, res) => {
 
 const ROOMS_HOME_DIR = STATE_PATHS.workspace.roomsDir;
 const ROOM_ASSIGN_FILE = STATE_PATHS.coordination.roomAssignmentsFile;
+const ROOM_LEADERS_FILE = STATE_PATHS.coordination.roomLeadersFile;
+const ROOM_RESIDENTS_FILE = STATE_PATHS.coordination.roomResidentsFile;
 const ROOM_PULSES_FILE = STATE_PATHS.coordination.roomPulsesFile;
 const ROOM_ASSIGN_STATE = createJsonState({
   file: ROOM_ASSIGN_FILE, root: path.dirname(ROOM_ASSIGN_FILE), document: 'Room assignments',
   defaultValue: {}, validate: isJsonRecord,
+});
+const ROOM_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+function isRoomLeaderState(value) {
+  return isJsonRecord(value) && Object.entries(value).every(([name, sessionId]) =>
+    ROOM_NAME_RE.test(name) && typeof sessionId === 'string' && UUID_RE.test(sessionId));
+}
+const ROOM_LEADERS_STATE = createJsonState({
+  file: ROOM_LEADERS_FILE, root: path.dirname(ROOM_LEADERS_FILE), document: 'Room leaders',
+  defaultValue: {}, validate: isRoomLeaderState,
+});
+const ROOM_RESIDENT_ROLE_RE = /^[a-z][a-z0-9-]{0,31}$/;
+function isRoomResidentState(value) {
+  if (!isJsonRecord(value)) return false;
+  const sessionIds = new Set();
+  for (const [roomName, residents] of Object.entries(value)) {
+    if (!ROOM_NAME_RE.test(roomName) || !isJsonRecord(residents)) return false;
+    for (const [role, resident] of Object.entries(residents)) {
+      if (role === 'leader' || !ROOM_RESIDENT_ROLE_RE.test(role) || !isJsonRecord(resident)) return false;
+      if (typeof resident.sessionId !== 'string' || !UUID_RE.test(resident.sessionId)) return false;
+      if (sessionIds.has(resident.sessionId)) return false;
+      sessionIds.add(resident.sessionId);
+    }
+  }
+  return true;
+}
+const ROOM_RESIDENTS_STATE = createJsonState({
+  file: ROOM_RESIDENTS_FILE, root: path.dirname(ROOM_RESIDENTS_FILE), document: 'Room residents',
+  defaultValue: {}, validate: isRoomResidentState,
 });
 const ROOM_PULSE_STATUSES = new Set(['waiting', 'working', 'paused', 'error']);
 function isRoomPulseState(value) {
@@ -2810,16 +2941,92 @@ function readRoomAssignments() {
   return ROOM_ASSIGN_STATE.read();
 }
 
+function validRoomLeaderDesignation(name, sessionId) {
+  if (!UUID_RE.test(sessionId)) return false;
+  if (ROOM_PULSES_STATE.read()[name]?.sessionId === sessionId) return false;
+  const assignments = readRoomAssignments();
+  const meta = readMeta();
+  if (assignments[sessionId] === name
+    && ['omp', 'claude'].includes(meta[sessionId]?.agent)
+    && (tmuxIsActive(sessionId) || fs.existsSync(path.join(OMP_SESSIONS, sessionId)))) {
+    return true;
+  }
+  const session = discoverSessions(0, null, [sessionId]).find(candidate => candidate.id === sessionId);
+  return !!session
+    && session.agent !== 'codex'
+    && roomNameForSession(sessionId) === name
+    && !sessionIsRoomPulse({ title: session.title });
+}
+
+function appointRoomLeader(name, sessionId, { assign = false, replaceStale = null } = {}) {
+  if (assign) ROOM_ASSIGN_STATE.update(current => ({ ...current, [sessionId]: name }));
+  ROOM_LEADERS_STATE.update(current => {
+    if (current[name] && current[name] !== sessionId && current[name] !== replaceStale) {
+      throw httpError(409, `#${name} already has a Leader`);
+    }
+    if (Object.entries(current).some(([roomName, leaderId]) => roomName !== name && leaderId === sessionId)) {
+      throw httpError(409, 'session is already Leader of another Room');
+    }
+    return { ...current, [name]: sessionId };
+  });
+}
+
+
 function listRoomDirs() {
   try {
+    const realRoomsRoot = fs.realpathSync(ROOMS_HOME_DIR);
     return fs.readdirSync(ROOMS_HOME_DIR).filter(name => {
-      if (name.startsWith('_') || name.startsWith('.')) return false;
+      if (!ROOM_NAME_RE.test(name)) return false;
       try {
-        return fs.statSync(path.join(ROOMS_HOME_DIR, name)).isDirectory()
-          && fs.existsSync(path.join(ROOMS_HOME_DIR, name, 'AGENTS.md'));
+        const roomPath = path.join(ROOMS_HOME_DIR, name);
+        const roomEntry = fs.lstatSync(roomPath);
+        if (roomEntry.isSymbolicLink() || !roomEntry.isDirectory()) return false;
+        if (path.dirname(fs.realpathSync(roomPath)) !== realRoomsRoot) return false;
+        const agentsEntry = fs.lstatSync(path.join(roomPath, 'AGENTS.md'));
+        return !agentsEntry.isSymbolicLink() && agentsEntry.isFile();
       } catch { return false; }
     }).sort();
   } catch { return []; }
+}
+
+function syncRoomSidecar(name, { primeNewResidents = false } = {}) {
+  const leaderId = ROOM_LEADERS_STATE.read()[name] || null;
+  if (!leaderId || !validRoomLeaderDesignation(name, leaderId)) return null;
+  const configured = ROOM_RESIDENTS_STATE.read()[name] || {};
+  const members = [
+    { sessionId: leaderId, role: 'leader' },
+    ...Object.entries(configured).map(([role, resident]) => ({ sessionId: resident.sessionId, role })),
+  ];
+  const id = sidecar.roomGroupId(name);
+  const previous = sidecar.getGroup(id);
+  const primedMembers = new Set(previous?.primedMembers || []);
+  const group = sidecar.syncRoomGroup({ roomName: name, members });
+  if (primeNewResidents) {
+    for (const member of members) {
+      const memberKey = `${member.role}:${member.sessionId}`;
+      if (member.role === 'leader' || primedMembers.has(memberKey)) continue;
+      const groupFlag = `--group ${id}`;
+      const prime = [
+        `You are the permanent ${member.role} resident of Room #${name}. Other residents: ${members.filter(candidate => candidate.role !== member.role).map(candidate => candidate.role).join(', ')}.`,
+        'Explicit Sidecar messages are visible to the human. Contribute only your distinct expertise; no status chatter.',
+        `Post: sidecar post ${groupFlag} --to <role|all> "..."`,
+        `Read: sidecar read ${groupFlag}`,
+        `Wait: sidecar wait ${groupFlag} --from <role|all> --count <N>`,
+        'Wait for a message and reply through this Room Sidecar group.',
+      ].join('\n');
+      sendInputToSession(member.sessionId, prime)
+        .then(() => sidecar.markMembersPrimed(id, [memberKey]))
+        .catch(error => console.warn(`[room sidecar] could not prime ${member.role} in #${name}:`, error.message));
+    }
+  }
+  return group;
+}
+
+function syncAllRoomSidecars(options) {
+  for (const name of listRoomDirs()) {
+    try { syncRoomSidecar(name, options); }
+    catch (error) { console.warn(`[room sidecar] #${name}:`, error.message); }
+  }
 }
 
 function ensureRoomsDoctrine() {
@@ -2951,7 +3158,7 @@ function appendRoomUpdate(name, text, title) {
   if (cleanTitle.length > ROOM_UPDATE_TITLE_MAX_CHARS) {
     throw httpError(413, `update title exceeds ${ROOM_UPDATE_TITLE_MAX_CHARS} characters`);
   }
-  const entry = { id: randomUUID(), ts: new Date().toISOString(), title: cleanTitle, text: clean };
+  const entry = { id: randomUUID().replaceAll('-', ''), ts: new Date().toISOString(), title: cleanTitle, text: clean };
   fs.appendFileSync(roomUpdatesFile(name), JSON.stringify(entry) + '\n');
   return entry;
 }
@@ -2978,14 +3185,26 @@ function roomFrictionSummary(name, complaints) {
 function buildRoomsSnapshot() {
   const names = listRoomDirs();
   const assignments = readRoomAssignments();
+  const leaders = ROOM_LEADERS_STATE.read();
+  const residentState = ROOM_RESIDENTS_STATE.read();
+  const sessionMeta = readMeta();
   const pulseState = ROOM_PULSES_STATE.read();
+  const pulseSessionIds = Object.values(pulseState).map(pulse => pulse?.sessionId).filter(Boolean);
+  const residentSessionIds = Object.values(residentState)
+    .flatMap(residents => Object.values(residents).map(resident => resident.sessionId));
+  const requiredIds = [...new Set([
+    ...Object.keys(assignments),
+    ...Object.values(leaders),
+    ...residentSessionIds,
+    ...pulseSessionIds,
+  ])];
   const recentSessions = sessionsSnapshotCache.get();
   const recentIds = new Set(recentSessions.map(session => session.id));
-  const missingAssignedIds = Object.keys(assignments).filter(id => !recentIds.has(id));
-  const assignedHistory = missingAssignedIds.length
-    ? discoverSessions(0, null, missingAssignedIds)
+  const missingRequiredIds = requiredIds.filter(id => !recentIds.has(id));
+  const requiredHistory = missingRequiredIds.length
+    ? discoverSessions(0, null, missingRequiredIds)
     : [];
-  const allSessions = [...recentSessions, ...assignedHistory];
+  const allSessions = [...recentSessions, ...requiredHistory];
   const byRoom = groupRoomSessions({
     roomNames: names,
     roomsRoot: ROOMS_HOME_DIR,
@@ -2996,7 +3215,35 @@ function buildRoomsSnapshot() {
 
   const rooms = names.map(name => {
     const sessions = byRoom.get(name);
-    const newest = sessions[0] || null;
+    const pulse = roomPulse(name, Date.now(), pulseState);
+    const requestedLeaderSessionId = leaders[name];
+    const eligibleLeader = session => session.agent !== 'codex'
+      && session.id !== pulse.sessionId
+      && !sessionIsRoomPulse({ title: session.title });
+    const leaderSessionId = sessions
+      .find(session => session.id === requestedLeaderSessionId && eligibleLeader(session))?.id || null;
+    const leaderSession = sessions.find(session => session.id === leaderSessionId) || null;
+    const residents = [];
+    if (leaderSession) {
+      residents.push({
+        role: 'leader',
+        sessionId: leaderSession.id,
+        agent: leaderSession.agent,
+        title: leaderSession.title,
+        status: leaderSession.isActive ? 'working' : 'waiting',
+      });
+    }
+    for (const [role, configured] of Object.entries(residentState[name] || {}).sort(([a], [b]) => a.localeCompare(b))) {
+      const session = sessions.find(candidate => candidate.id === configured.sessionId);
+      residents.push({
+        role,
+        sessionId: configured.sessionId,
+        agent: session?.agent || sessionMeta[configured.sessionId]?.agent || 'unknown',
+        title: session?.title || role,
+        status: session ? (session.isActive ? 'working' : 'waiting') : 'offline',
+      });
+    }
+    const newest = leaderSession || sessions[0] || null;
     let latest = newest ? lastRoomMessageSnippet(newest.id, newest.agent || 'claude') : null;
     let updatedAt = newest?.updatedAt || null;
     if (!latest) {
@@ -3013,8 +3260,11 @@ function buildRoomsSnapshot() {
       name,
       cwd: path.join(ROOMS_HOME_DIR, name),
       sessions,
+      leaderSessionId,
+      residents,
+      sidecarGroupId: leaderSessionId ? sidecar.roomGroupId(name) : null,
       active: sessions.some(session => session.isActive),
-      pulse: roomPulse(name, Date.now(), pulseState),
+      pulse,
       latest,
       updatedAt,
       updates: roomUpdatesSummary(name),
@@ -3029,9 +3279,59 @@ function buildRoomsSnapshot() {
 // view current without making every warm request wait for the synchronous scan.
 roomSnapshotCache = createSnapshotCache(buildRoomsSnapshot, { ttlMs: 10_000 });
 
+function roomNameForSession(id) {
+  const names = listRoomDirs();
+  const assignments = readRoomAssignments();
+  if (names.includes(assignments[id])) return assignments[id];
+  const session = discoverSessions(0, null, [id]).find(candidate => candidate.id === id);
+  if (!session) return null;
+  const grouped = groupRoomSessions({
+    roomNames: names,
+    roomsRoot: ROOMS_HOME_DIR,
+    sessions: [session],
+    assignments,
+  });
+  return names.find(name => grouped.get(name).some(candidate => candidate.id === id)) || null;
+}
+
+app.get('/api/sessions/:id/room', (req, res) => {
+  try { res.json({ room: roomNameForSession(req.params.id) }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 app.get('/api/rooms', (_req, res) => {
   try { res.json({ rooms: roomSnapshotCache.get() }); }
   catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.get('/api/rooms/:name/residents', (req, res) => {
+  try {
+    const room = roomSnapshotCache.get().find(candidate => candidate.name === req.params.name);
+    if (!room) throw httpError(404, 'no such room');
+    res.json({ residents: room.residents, sidecarGroupId: room.sidecarGroupId });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+app.get('/api/rooms/:name/wiki', (req, res) => {
+  try {
+    const { name } = req.params;
+    if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
+    const root = verifiedWikiRoot(ROOMS_HOME_DIR, name);
+    res.json({ pages: root ? listWikiPages(root) : [] });
+  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
+});
+
+app.get('/api/rooms/:name/wiki/page', (req, res) => {
+  try {
+    const { name } = req.params;
+    if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
+    const root = verifiedWikiRoot(ROOMS_HOME_DIR, name);
+    const page = root ? readWikiPage(root, String(req.query.name || '')) : null;
+    if (!page) throw httpError(404, 'no such wiki page');
+    res.json(page);
+  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
 app.get('/api/rooms/:name/friction', (req, res) => {
@@ -3050,7 +3350,7 @@ app.get('/api/rooms/:name/friction', (req, res) => {
 app.post('/api/rooms', (req, res) => {
   try {
     const name = String(req.body?.name || '').trim();
-    if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(name)) {
+    if (!ROOM_NAME_RE.test(name)) {
       throw httpError(400, 'bad room name (lowercase, digits, dashes)');
     }
     ensureRoomsDoctrine();
@@ -3078,7 +3378,7 @@ app.post('/api/rooms/:name/rename', (req, res) => {
   try {
     const oldName = req.params.name;
     const newName = String(req.body?.name || '').trim();
-    if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(newName)) {
+    if (!ROOM_NAME_RE.test(newName)) {
       throw httpError(400, 'bad room name (lowercase, digits, dashes)');
     }
     if (!listRoomDirs().includes(oldName)) throw httpError(404, 'no such room');
@@ -3099,12 +3399,32 @@ app.post('/api/rooms/:name/rename', (req, res) => {
       for (const session of room?.sessions || []) next[session.id] = newName;
       return next;
     });
+    ROOM_LEADERS_STATE.update(current => {
+      if (!(oldName in current)) return current;
+      const next = { ...current, [newName]: current[oldName] };
+      delete next[oldName];
+      return next;
+    });
+    ROOM_RESIDENTS_STATE.update(current => {
+      if (!(oldName in current)) return current;
+      const next = { ...current, [newName]: current[oldName] };
+      delete next[oldName];
+      return next;
+    });
     ROOM_PULSES_STATE.update(current => {
       if (!(oldName in current)) return current;
       const next = { ...current, [newName]: current[oldName] };
       delete next[oldName];
       return next;
     });
+    const oldSidecarGroupId = sidecar.roomGroupId(oldName);
+    const newSidecarGroupId = sidecar.roomGroupId(newName);
+    sidecar.renameRoomGroup(oldName, newName);
+    const roomSidecarClients = sidecarClients.get(oldSidecarGroupId);
+    if (roomSidecarClients) {
+      sidecarClients.delete(oldSidecarGroupId);
+      sidecarClients.set(newSidecarGroupId, roomSidecarClients);
+    }
 
     const meta = readMeta();
     let metaChanged = false;
@@ -3141,6 +3461,23 @@ app.post('/api/rooms/:name/assign', (req, res) => {
     const sessionId = String(req.body?.sessionId || '').trim();
     if (!sessionId) throw httpError(400, 'sessionId required');
     if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
+    const targetRoom = req.body?.remove ? null : name;
+    const leaderRoom = Object.entries(ROOM_LEADERS_STATE.read())
+      .find(([, leaderSessionId]) => leaderSessionId === sessionId)?.[0] || null;
+    if (leaderRoom && leaderRoom !== targetRoom) {
+      throw httpError(409, `the Leader of #${leaderRoom} cannot be moved or detached`);
+    }
+    const pulseRoom = Object.entries(ROOM_PULSES_STATE.read())
+      .find(([, pulse]) => pulse?.sessionId === sessionId)?.[0] || null;
+    if (pulseRoom && pulseRoom !== targetRoom) {
+      throw httpError(409, `keep-working controller of #${pulseRoom} cannot be moved or detached`);
+    }
+    const residentMatch = Object.entries(ROOM_RESIDENTS_STATE.read()).flatMap(([roomName, residents]) =>
+      Object.entries(residents).map(([role, resident]) => ({ roomName, role, sessionId: resident.sessionId })))
+      .find(resident => resident.sessionId === sessionId);
+    if (residentMatch && residentMatch.roomName !== targetRoom) {
+      throw httpError(409, `resident ${residentMatch.role} of #${residentMatch.roomName} cannot be moved or detached`);
+    }
     const assignments = ROOM_ASSIGN_STATE.update(current => {
       const next = { ...current };
       if (req.body?.remove) {
@@ -4012,7 +4349,7 @@ app.post('/api/feed/:postId/comments', async (req, res) => {
   }
 });
 
-const ROOM_PULSE_PROMPT = `Keep working on this room. Read AGENTS.md, notes.md, and the recent chats in this room. Then do the next useful thing fully autonomously. Do not ask the user to choose routine steps. Use tools and agents if useful. Append what you did and any open thread to notes.md. If you did something a person walking in cold would care about, also post a human-facing briefing with room update. Make every Room update timeline-ready: start with a specific Markdown H2 headline, then state the outcome, why it matters, current state or next action, and direct links to useful artifacts. Do not post raw internal logs or generic "update" headlines. Write for a busy, sharp executive who has not seen this room in a day; notes.md remains the terse working memory. If you hit a recurring annoyance, run: room complain "describe it plainly". If this room genuinely has no useful next action, run: room pause. Then stop.`;
+const ROOM_PULSE_PROMPT = `Keep working on this room. Read AGENTS.md, notes.md, and the recent chats in this room. Then do the next useful thing fully autonomously. Do not ask the user to choose routine steps. Use tools and agents if useful. Append what you did, the evidence, and any open thread to notes.md. Do not post an Updates feed and do not copy raw source material into the wiki; the Room caretaker will synthesize raw notes and sessions into curated knowledge. If you hit a recurring annoyance, run: room complain "describe it plainly". If this room genuinely has no useful next action, run: room pause. Then stop.`;
 
 function launchRoomPulse(name) {
   try {
@@ -4104,10 +4441,13 @@ function checkRoomPulses() {
 META_STATE.read();
 for (const state of USER_JSON_STATES.values()) state.read();
 ROOM_ASSIGN_STATE.read();
+ROOM_LEADERS_STATE.read();
+ROOM_RESIDENTS_STATE.read();
 ROOM_PULSES_STATE.read();
 MESSAGE_RECEIPTS_STATE.read();
 FEED_INTERACTIONS_STATE.read();
 readUserJson('push-subscriptions.json', []);
+if (!READ_ONLY_MODE) syncAllRoomSidecars();
 if (!READ_ONLY_MODE) await reconcileProtocolRunOwners();
 
 // Verify that a static directory is a coherent build: index.html points to a
@@ -4445,6 +4785,7 @@ app.get('/api/digest', (req, res) => {
 // ── Auth (trust Authelia Remote-User header) ────────────────────────────────
 
 app.get('/api/me', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   const remoteUser = req.headers['remote-user'];
   if (remoteUser) return res.json({ username: remoteUser.toLowerCase(), admin: true });
   // No Authelia header = direct localhost access, allow as default user
@@ -4522,21 +4863,62 @@ app.get('/api/sessions/:id/stream', (req, res) => {
   const hb = setInterval(() => {
     if (!writeSse(clients, res, 'event: heartbeat\ndata: {}\n\n')) clearInterval(hb);
   }, 15000);
+  // fs.watch can coalesce a burst and leave the final append unread until the
+  // next write. Reconcile active streams cheaply so live work never stalls.
+  const streamPath = findJsonlPath(sid);
+  const reconcile = streamPath ? setInterval(() => processFileChange(streamPath, sid), 1000) : null;
   res.on('close', () => {
     clearInterval(hb);
+    clearInterval(reconcile);
     clients.delete(res);
     ssePendingWrites.delete(res);
   });
 });
 
 app.post('/api/sessions', (req, res) => {
+  const agent = req.body.agent || DEFAULT_AGENT;
+  const roomRole = req.body.roomRole || null;
+  const roomName = String(req.body.roomName || '').trim();
+  let assignmentsBefore = null;
+  let leadersBefore = null;
   try {
-    spawnOrResume(req.body.id, req.body.cwd, false, req.body.agent);
+    const id = validateFreshSessionId(req.body.id);
+    if (roomRole && roomRole !== 'leader') throw httpError(400, 'unsupported Room role');
+    if (roomRole === 'leader') {
+      if (agent !== 'omp') throw httpError(409, 'new Room Leaders currently require OMP');
+      if (!listRoomDirs().includes(roomName)) throw httpError(404, 'no such room');
+      if (path.resolve(String(req.body.cwd || '')) !== path.join(ROOMS_HOME_DIR, roomName)) {
+        throw httpError(409, `leader cwd must be #${roomName}`);
+      }
+      assignmentsBefore = readRoomAssignments();
+      leadersBefore = ROOM_LEADERS_STATE.read();
+      const existingLeaderId = leadersBefore[roomName] || null;
+      if (existingLeaderId && validRoomLeaderDesignation(roomName, existingLeaderId)) {
+        syncRoomSidecar(roomName);
+        return res.json({
+          id: existingLeaderId,
+          status: 'existing',
+          agent: getAgentForSession(existingLeaderId),
+          roomRole,
+        });
+      }
+      const staleLeaderId = existingLeaderId && !validRoomLeaderDesignation(roomName, existingLeaderId)
+        ? existingLeaderId
+        : null;
+      appointRoomLeader(roomName, id, { assign: true, replaceStale: staleLeaderId });
+    }
+    spawnOrResume(id, req.body.cwd, false, agent, { ompModel: req.body.model || '' });
     sessionsSnapshotCache.invalidate();
     roomSnapshotCache.invalidate();
-    res.json({ id: req.body.id, status: 'starting' });
+    if (roomRole === 'leader') syncRoomSidecar(roomName);
+    res.json({ id, status: 'starting', agent, roomRole });
+  } catch (error) {
+    if (assignmentsBefore && leadersBefore) {
+      ROOM_ASSIGN_STATE.update(() => assignmentsBefore);
+      ROOM_LEADERS_STATE.update(() => leadersBefore);
+    }
+    res.status(error.status || 500).json({ error: error.message });
   }
-  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/sessions/:id/send', async (req, res) => {
@@ -4554,7 +4936,7 @@ app.post('/api/sessions/:id/send', async (req, res) => {
     paneStableCount.set(req.params.id, 0);
     res.json(response);
   }
-  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+  catch (e) { res.status(protocolErrorStatus(e)).json({ error: e.message }); }
 });
 
 const TERMINAL_KEYS = new Set(['Enter', 'Escape', 'Up', 'Down', 'Left', 'Right', 'Home', 'End', 'Space', 'Tab']);
@@ -4675,9 +5057,17 @@ app.post('/api/sessions/:id/fork', (req, res) => {
       const sessionDir = path.join(OMP_SESSIONS, id);
       const ompId = getOmpSessionId(id);
       if (!ompId) throw new Error(`Cannot fork OMP session ${id}: exact OMP session id not found`);
-      spawnTmuxOmp(forkName, `--resume ${ompId} --session-dir ${sessionDir}`, cwd);
+      spawnTmuxOmp(
+        forkName,
+        `--resume ${ompId} --session-dir ${sessionDir}`,
+        cwd,
+        { sessionId: id },
+      );
     } else {
-      spawnTmuxClaude(forkName, `--resume ${id} --fork-session`, cwd);
+      ensureClaudeTrust(cwd);
+      const leaderPromptFile = writeRoomLeaderPrompt(id, roomLeaderNameForSession(id));
+      const leaderArg = leaderPromptFile ? ` --append-system-prompt-file ${leaderPromptFile}` : '';
+      spawnTmuxClaude(forkName, `--resume ${id} --fork-session${leaderArg}`, cwd);
     }
     sessionsSnapshotCache.invalidate();
     roomSnapshotCache.invalidate();
@@ -4686,6 +5076,8 @@ app.post('/api/sessions/:id/fork', (req, res) => {
 });
 
 // ── Rooms (upstream Sidecar): grouped agent threads with a chat channel ──
+const SIDECAR_MESSAGE_MAX_CHARS = 16_000;
+
 
 const sidecarClients = new Map(); // groupId -> Set<res>
 
@@ -4700,6 +5092,7 @@ function sidecarBroadcast(groupId, msg) {
 
 function sidecarGcIfDriverGone(group) {
   if (READ_ONLY_MODE) return false;
+  if (group.kind === 'room') return false;
   const driver = group.members.find(member => !member.spawned);
   if (!driver || tmuxIsActive(driver.sessionId)) return false;
   for (const member of group.members) {
@@ -4719,7 +5112,7 @@ function sidecarDeliver(group, fromRole, to, text) {
   const message = sidecar.appendMessage(group.id, { from: fromRole, to, text });
   sidecarBroadcast(group.id, message);
   for (const target of targets) {
-    sendInputToSession(target.sessionId, sidecar.formatInbound(fromRole, text))
+    sendInputToSession(target.sessionId, sidecar.formatInbound(group.id, message))
       .catch(error => console.warn('[sidecar] route failed:', error.message));
   }
   return { ok: true, message };
@@ -4805,19 +5198,35 @@ app.post('/api/sidecar', (req, res) => {
   });
 });
 
-// CLI entrypoint: resolve the sender by its f-<8-char> tmux prefix.
+// CLI entrypoint: resolve the sender by its canonical session identity.
 app.post('/api/sidecar/post', (req, res) => {
   try {
     const { group: groupId, fromPrefix, from, to, text } = req.body || {};
-    if (!to || !text) return res.status(400).json({ error: 'to and text required' });
+    if (typeof to !== 'string' || !to || typeof text !== 'string' || !text) {
+      return res.status(400).json({ error: 'string to and text required' });
+    }
+    if (text.length > SIDECAR_MESSAGE_MAX_CHARS) {
+      return res.status(413).json({ error: 'sidecar message exceeds 16000 characters' });
+    }
+    const residentSessionId = String(req.get('X-Feather-Session-ID') || '');
+    const lookupKey = residentSessionId || fromPrefix;
     const group = groupId
       ? sidecar.getGroup(groupId)
-      : (fromPrefix ? sidecar.groupForSenderAndRole(fromPrefix, to) : null);
+      : (lookupKey ? sidecar.groupForSenderAndRole(lookupKey, to) : null);
     if (!group || group.status !== 'active') {
-      return res.status(404).json({ error: 'no active room for sender (you may be in several — pass --group)' });
+      return res.status(404).json({ error: 'no active sidecar group for sender (you may be in several — pass --group)' });
     }
-    if (sidecarGcIfDriverGone(group)) return res.status(410).json({ error: 'driver gone; room torn down' });
-    const fromRole = from || (fromPrefix ? sidecar.roleForPrefix(group, fromPrefix) : null) || 'unknown';
+    if (sidecarGcIfDriverGone(group)) return res.status(410).json({ error: 'driver gone; group torn down' });
+    const inferredRole = lookupKey ? sidecar.roleForPrefix(group, lookupKey) : null;
+    let authenticatedRoomRole = null;
+    if (group.kind === 'room') {
+      const member = group.members.find(candidate => candidate.sessionId === residentSessionId);
+      if (!member || !bridgeTokenValid(residentSessionId, req.get('X-Feather-Bridge-Token'))) {
+        return res.status(403).json({ error: 'invalid Room resident capability' });
+      }
+      authenticatedRoomRole = member.role;
+    }
+    const fromRole = group.kind === 'room' ? authenticatedRoomRole : (from || inferredRole || 'unknown');
     const result = sidecarDeliver(group, fromRole, to, text);
     if (result.error) return res.status(400).json(result);
     res.json({ ok: true, group: group.id, seq: result.message.seq });
@@ -4828,9 +5237,15 @@ app.post('/api/sidecar/post', (req, res) => {
 app.post('/api/sidecar/:id/post', (req, res) => {
   try {
     const { from, to, text } = req.body || {};
-    if (!to || !text) return res.status(400).json({ error: 'to and text required' });
+    if (typeof to !== 'string' || !to || typeof text !== 'string' || !text) {
+      return res.status(400).json({ error: 'string to and text required' });
+    }
+    if (text.length > SIDECAR_MESSAGE_MAX_CHARS) {
+      return res.status(413).json({ error: 'sidecar message exceeds 16000 characters' });
+    }
     const group = sidecar.getGroup(req.params.id);
     if (!group || group.status !== 'active') return res.status(404).json({ error: 'no active room' });
+    if (group.kind === 'room') return res.status(403).json({ error: 'Human Room messages go through the Leader chat' });
     if (sidecarGcIfDriverGone(group)) return res.status(410).json({ error: 'driver gone; room torn down' });
     const result = sidecarDeliver(group, from || 'driver', to, text);
     if (result.error) return res.status(400).json(result);
@@ -4842,6 +5257,9 @@ app.post('/api/sidecar/:id/peers', (req, res) => {
   try {
     const group = sidecar.getGroup(req.params.id);
     if (!group || group.status !== 'active') return res.status(404).json({ error: 'no active room' });
+    if (group.kind === 'room') {
+      return res.status(409).json({ error: 'Room group membership is managed by the resident registry' });
+    }
     const { role = 'peer', agent = group.agent || DEFAULT_AGENT, task = '' } = req.body || {};
     const peerId = crypto.randomUUID();
     sidecar.addMember(group.id, { sessionId: peerId, role, spawned: true });
@@ -4863,6 +5281,9 @@ app.post('/api/sidecar/:id/peers/:role/delete', (req, res) => {
   try {
     const group = sidecar.getGroup(req.params.id);
     if (!group) return res.status(404).json({ error: 'not found' });
+    if (group.kind === 'room') {
+      return res.status(409).json({ error: 'Room group membership is managed by the resident registry' });
+    }
     const member = group.members.find(candidate => candidate.role === req.params.role);
     if (!member) return res.status(404).json({ error: `no member with role ${req.params.role}` });
     if (!member.spawned) return res.status(400).json({ error: 'the driver cannot be removed' });
@@ -4876,6 +5297,7 @@ app.post('/api/sidecar/:id/delete', (req, res) => {
   try {
     const group = sidecar.getGroup(req.params.id);
     if (!group) return res.status(404).json({ error: 'not found' });
+    if (group.kind === 'room') return res.status(409).json({ error: 'Room groups are durable' });
     for (const member of group.members) {
       if (!member.spawned) continue;
       killTmuxSessions(member.sessionId);
@@ -5277,7 +5699,10 @@ app.get('/api/files/list', (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/files/raw', (req, res) => {
+const RAW_TEXT_EXTS = Object.freeze({ '.txt': true, '.md': true, '.js': true, '.ts': true, '.tsx': true, '.jsx': true, '.json': true, '.html': true, '.css': true, '.py': true, '.rb': true, '.go': true, '.rs': true, '.sh': true, '.yml': true, '.yaml': true, '.toml': true, '.cfg': true, '.conf': true, '.ini': true, '.env': true, '.sql': true, '.csv': true, '.xml': true, '.log': true, '.jsonl': true, '.svelte': true, '.vue': true, '.astro': true, '.mjs': true, '.cjs': true });
+const RAW_IMAGE_EXTS = Object.freeze({ '.png': true, '.jpg': true, '.jpeg': true, '.gif': true, '.webp': true, '.svg': true, '.bmp': true, '.ico': true });
+
+app.get(['/api/file', '/api/files/raw'], (req, res) => {
   try {
     const requestedPath = req.query.path;
     if (typeof requestedPath !== 'string' || !requestedPath || requestedPath.includes('\0')) {
@@ -5295,14 +5720,14 @@ app.get('/api/files/raw', (req, res) => {
     if (stat.size > 10 * 1024 * 1024) return res.status(413).json({ error: 'File too large (>10MB)' });
     if (req.query.download === '1') return res.download(resolved);
     const ext = path.extname(resolved).toLowerCase();
-    const textExts = new Set(['.txt', '.md', '.js', '.ts', '.tsx', '.jsx', '.json', '.html', '.css', '.py', '.rb', '.go', '.rs', '.sh', '.yml', '.yaml', '.toml', '.cfg', '.conf', '.ini', '.env', '.sql', '.csv', '.xml', '.log', '.jsonl', '.svelte', '.vue', '.astro', '.mjs', '.cjs']);
-    const imageExts = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico']);
+    const isText = RAW_TEXT_EXTS[ext] === true;
+    const isImage = RAW_IMAGE_EXTS[ext] === true;
     // .pdf inline (no attachment disposition): iOS standalone PWA renders the
     // attachment variant as garbled bytes in the target=_blank overlay
-    if (imageExts.has(ext) || ext === '.pdf') {
+    if (isImage || ext === '.pdf') {
       return res.sendFile(resolved);
     }
-    if (textExts.has(ext) || ext === '') {
+    if (isText || ext === '') {
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       return res.sendFile(resolved);
     }
@@ -5541,6 +5966,9 @@ server.listen(PORT, HOST, () => {
     try { sessionsSnapshotCache.get(); } catch {}
     try { roomSnapshotCache.get(); } catch {}
   }, 0);
+  if (!READ_ONLY_MODE) {
+    setTimeout(() => syncAllRoomSidecars({ primeNewResidents: true }), 1000);
+  }
   if (ROOM_PULSES_ENABLED) {
     setTimeout(checkRoomPulses, Math.min(ROOM_PULSE_CHECK_MS, ROOM_PULSE_INTERVAL_MS));
     setInterval(checkRoomPulses, ROOM_PULSE_CHECK_MS);
