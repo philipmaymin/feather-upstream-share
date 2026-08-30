@@ -3202,6 +3202,7 @@ app.post('/api/rooms/:name/updates', (req, res) => {
 });
 
 const FEED_DEFAULT_LIMIT = 20;
+const FEED_ERROR_ATTENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const FEED_MAX_LIMIT = 50;
 const FEED_SESSION_MESSAGES = 80;
 const FEED_TRANSCRIPT_BYTES = 4 * 1024 * 1024;
@@ -3382,6 +3383,12 @@ function feedLiveState(session) {
     };
   }
   if (activity) return { status: 'working', activity, why: `Active now: ${activity}` };
+  if (session.outcome === 'errored') {
+    const updatedAt = Date.parse(session.updatedAt || '');
+    if (Number.isFinite(updatedAt) && Date.now() - updatedAt > FEED_ERROR_ATTENTION_MS) {
+      return { status: 'finished', why: 'Historical error with no recent activity' };
+    }
+  }
   if (session.outcome === 'errored') {
     return { status: 'errored', why: 'The latest run ended with an error' };
   }

@@ -27,6 +27,7 @@ const FEED_IDS = {
   waiting: `feed-waiting-${Date.now()}`,
   working: `feed-working-${Date.now()}`,
   errored: `feed-errored-${Date.now()}`,
+  staleErrored: `feed-stale-errored-${Date.now()}`,
   finished: `feed-finished-${Date.now()}`,
   normalized: `feed-normalized-${Date.now()}`,
   empty: `feed-empty-${Date.now()}`,
@@ -211,6 +212,7 @@ esac
       finished: new Date(now - 10_000).toISOString(),
       update: new Date(now - 20_000).toISOString(),
       errored: new Date(now - 30_000).toISOString(),
+      staleErrored: new Date(now - 8 * 24 * 60 * 60 * 1000).toISOString(),
       working: new Date(now - 60_000).toISOString(),
       normalized: new Date(now - 90_000).toISOString(),
       waiting: new Date(now - 120_000).toISOString(),
@@ -223,6 +225,7 @@ esac
     seedConversation(FEED_IDS.waiting, feedTimestamps.waiting, 'Waiting fixture', 'Waiting assistant response.')
     seedConversation(FEED_IDS.working, feedTimestamps.working, 'Working fixture', 'Working assistant response.')
     seedConversation(FEED_IDS.errored, feedTimestamps.errored, 'Errored fixture', 'API Error: synthetic failure')
+    seedConversation(FEED_IDS.staleErrored, feedTimestamps.staleErrored, 'Stale errored fixture', 'API Error: historical synthetic failure')
     seedConversation(FEED_IDS.finished, feedTimestamps.finished, 'Finished fixture', 'Finished assistant response.')
     writeFeedSession(testProjectDir, FEED_IDS.normalized, [
       claudeFeedMessage('feed-normalized-user', new Date(Date.parse(feedTimestamps.normalized) - 1_000).toISOString(), 'user', 'Normalized fixture'),
@@ -614,6 +617,9 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
     assert.match(waiting.question, /Deploy this result/)
     assert.match(waiting.why, /Waiting for your answer/)
     assert.doesNotMatch(waiting.why, /ETA|minute|hour/i)
+    const staleError = body.posts.find(post => post.sessionId === FEED_IDS.staleErrored)
+    assert.equal(staleError.status, 'finished')
+    assert.match(staleError.why, /Historical error/)
   })
 
   it('orders Latest chronologically and filters Needs Me to waiting posts', async () => {
