@@ -136,3 +136,38 @@ test('resume reports progress and stays active across a stale sessions refresh',
   await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0)
 })
+
+test('send-triggered resume preserves the acknowledgement across a stale session list', async ({ page }) => {
+  let resumePosts = 0
+  const sentTo = []
+  await page.route('**/api/sessions**', async route => {
+    const url = new URL(route.request().url())
+    if (url.pathname !== '/api/sessions' || route.request().method() !== 'GET') return route.continue()
+    const response = await route.fetch()
+    const body = await response.json()
+    body.sessions = body.sessions.map(session => session.id === TARGET_ID ? { ...session, isActive: false } : session)
+    await route.fulfill({ response, json: body })
+  })
+  await page.route(`**/api/sessions/${TARGET_ID}/resume`, async route => {
+    resumePosts++
+    await route.fulfill({ json: { ok: true } })
+  })
+  await page.route(`**/api/sessions/${TARGET_ID}/send`, async route => {
+    sentTo.push(TARGET_ID)
+    await route.fulfill({ json: { ok: true, sentAt: new Date().toISOString() } })
+  })
+
+  await page.goto(`${BASE}/#${TARGET_ID}`)
+  await expect(page.getByText(TARGET_MESSAGE, { exact: true })).toBeVisible()
+  const composer = page.locator('textarea')
+  await composer.fill('resume and send only to this inactive chat')
+  await page.locator('button:has(svg polygon)').click()
+
+  await expect.poll(() => resumePosts).toBe(1)
+  await expect.poll(() => sentTo).toEqual([TARGET_ID])
+  await expect(page.getByText('Inactive', { exact: true })).toHaveCount(0)
+  const menu = page.locator('button').filter({ hasText: '⋮' })
+  await menu.click()
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Resume', exact: true })).toHaveCount(0)
+})

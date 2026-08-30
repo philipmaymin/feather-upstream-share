@@ -131,6 +131,45 @@ test('Room without a Leader expands before its OMP Leader is created', async ({ 
   })
 })
 
+test('failed Room assignment exposes the created ungrouped chat without opening it as a member', async ({ page }) => {
+  const createdId = 'created-but-ungrouped-chat'
+  const leader = {
+    id: 'failure-room-leader', title: '#failure-room Leader', updatedAt: '2026-08-30T12:00:00Z',
+    isActive: true, agent: 'omp', roomAssigned: true,
+  }
+  await page.route('**/api/rooms', route => route.fulfill({ json: { rooms: [{
+    name: 'failure-room', cwd: '/srv/rooms/failure-room', active: true, latest: null, updatedAt: leader.updatedAt,
+    leaderSessionId: leader.id,
+    residents: [{ role: 'leader', sessionId: leader.id, agent: 'omp', title: leader.title, status: 'working' }],
+    sidecarGroupId: 'room-failure-room', sessions: [leader],
+    updates: { count: 0, latestAt: null, latest: null },
+    friction: { count: 0, latestAt: null, latest: null },
+    pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null },
+  }] } }))
+  await page.route('**/api/sessions', async route => {
+    if (route.request().method() !== 'POST') return route.continue()
+    await route.fulfill({ json: { id: createdId, status: 'starting', agent: 'omp' } })
+  })
+  await page.route('**/api/rooms/failure-room/assign', route => route.fulfill({
+    status: 503,
+    json: { error: 'Room assignment unavailable' },
+  }))
+
+  await page.goto(BASE)
+  await page.getByText('#failure-room', { exact: true }).click()
+  await page.getByRole('button', { name: '+ New OMP chat' }).click()
+
+  const recovery = page.getByTestId('room-assignment-recovery')
+  await expect(recovery).toContainText(createdId)
+  await expect(recovery).toContainText('It remains ungrouped')
+  await expect(recovery).toContainText('Room assignment unavailable')
+  await expect(page).toHaveURL(/#?$/)
+  await expect(page.getByTestId('room-card-failure-room')).not.toContainText(createdId)
+
+  await recovery.getByRole('button', { name: `Open ungrouped chat ${createdId}` }).click()
+  await expect(page).toHaveURL(new RegExp(`#${createdId}$`))
+})
+
 test('Wiki presents caretaker synthesis and never exposes raw Updates or active content', async ({ page }) => {
   let updateRequests = 0
   let remoteMediaRequests = 0

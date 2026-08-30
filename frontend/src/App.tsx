@@ -8,8 +8,7 @@ import { RoomWikiView } from './components/RoomWikiView'
 import RoomsHome from './RoomsHome'
 import FeedHome from './FeedHome'
 import type { SessionMeta, Message, QuestionData, SidecarGroup, SidecarMessage, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot, ProtocolRunSnapshot } from './api'
-import { fetchSessions, fetchRooms, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, searchSessions, answerQuestion, fetchAgents, fetchSidecars, fetchSidecar, subscribeSidecar, createSidecar, fetchSessionRoom } from './api'
-import type { SearchResult } from './api'
+import { fetchSessions, fetchRooms, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, answerQuestion, fetchAgents, fetchSidecars, fetchSidecar, subscribeSidecar, createSidecar, fetchSessionRoom } from './api'
 import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
 import { listPendingMessages, putPendingMessage, patchPendingMessage, deletePendingMessage } from './lib/messageOutbox.js'
@@ -359,9 +358,10 @@ export default function App() {
   const [unreadSessions, setUnreadSessions] = createSignal<Set<string>>(new Set())
   const [searchOpen, setSearchOpen] = createSignal(false)
   const [searchQuery, setSearchQuery] = createSignal('')
-  const [searchResults, setSearchResults] = createSignal<SearchResult[]>([])
+  const [searchResults, setSearchResults] = createSignal<SessionMeta[]>([])
   const [searching, setSearching] = createSignal(false)
   let searchTimer: ReturnType<typeof setTimeout> | undefined
+  let searchGeneration = 0
 
   // File browser state
   interface DirEntry { name: string; path: string; isDir: boolean; size: number | null; mtime: string }
@@ -452,7 +452,7 @@ export default function App() {
   }
 
   // Update sessions and detect unread changes
-  function updateSessions(newSessions: SessionMeta[]) {
+  function updateSessions(newSessions: SessionMeta[], acknowledgedActiveId?: string) {
     const visibleSessions = newSessions.filter(session => !isRoomPulseSession(session))
     const active = currentId()
     const unread = new Set(unreadSessions())
@@ -468,7 +468,7 @@ export default function App() {
     }
     setUnreadSessions(unread)
     setSessions(visibleSessions)
-    if (active && (working() || toolIntentStatus())) {
+    if (active && active !== acknowledgedActiveId && (working() || toolIntentStatus())) {
       const listed = visibleSessions.find(session => session.id === active)
       if (listed && !listed.isActive) {
         setWorking(false)
@@ -911,7 +911,9 @@ export default function App() {
     const protocolRunsPromise = fetchProtocolRuns(id).catch(() => ({ runs: [] }))
     if (s) { lastSeenUpdatedAt.set(id, s.updatedAt); setLastSession(s) }
     else {
-      setLastSession({ id, title: 'New session', updatedAt: new Date().toISOString(), isActive: true })
+      setLastSession(previous => previous?.id === id
+        ? previous
+        : { id, title: 'New session', updatedAt: new Date().toISOString(), isActive: true })
       // The selected chat may be older than the bounded sidebar snapshot. Ask
       // for its exact ID instead of scanning every transcript.
       sessionMetaPromise.then(found => {
@@ -1072,16 +1074,38 @@ export default function App() {
     queueMicrotask(() => { if (isCurrentSelection(id, generation)) retryPendingMessages(id) })
   }
 
-  function doSearch(query: string) {
+  function resetSearch() {
+    searchGeneration++
     clearTimeout(searchTimer)
-    if (query.length < 2) { setSearchResults([]); setSearching(false); return }
+    setSearchQuery('')
+    setSearchResults([])
+    setSearching(false)
+  }
+
+  function closeSearch() {
+    setSearchOpen(false)
+    resetSearch()
+  }
+
+  function doSearch(query: string) {
+    const generation = ++searchGeneration
+    clearTimeout(searchTimer)
+    if (query.length < 2) {
+      setSearchResults([])
+      setSearching(false)
+      return
+    }
     setSearching(true)
     searchTimer = setTimeout(async () => {
       try {
-        const results = await searchSessions(query)
+        const results = await fetchSessions(null, query, 300)
+        if (generation !== searchGeneration) return
         setSearchResults(results.filter(result => !isRoomPulseSession(result)))
-      } catch {}
-      setSearching(false)
+      } catch {
+        if (generation !== searchGeneration) return
+        setSearchResults([])
+      }
+      if (generation === searchGeneration) setSearching(false)
     }, 300)
   }
 
@@ -1141,9 +1165,21 @@ export default function App() {
     finally { setCreating(false) }
   }
 
+  async function acknowledgeResumedSession(id: string) {
+    setSessions(previous => previous.map(session => session.id === id ? { ...session, isActive: true } : session))
+    setLastSession(previous => previous?.id === id ? { ...previous, isActive: true } : previous)
+
+    // The sessions endpoint deliberately serves a stale snapshot while it
+    // refreshes. Refresh metadata without erasing the resume acknowledgement.
+    const refreshed = (await fetchSessions()).map(session => session.id === id ? { ...session, isActive: true } : session)
+    updateSessions(refreshed, id)
+    const listed = refreshed.find(session => session.id === id)
+    setLastSession(previous => listed || (previous?.id === id ? { ...previous, isActive: true } : previous))
+  }
+
   async function handleResume(id: string) {
     if (resumingId()) return
-    const sess = sessions().find(s => s.id === id)
+    const sess = sessions().find(session => session.id === id) || (lastSession()?.id === id ? lastSession() : null)
     setResumingId(id)
     showMediaNotice('Resuming chat…')
     try {
@@ -1152,12 +1188,7 @@ export default function App() {
         const detail = await response.json().catch(() => ({}))
         throw new Error(detail.error || `HTTP ${response.status}`)
       }
-      // The sessions endpoint deliberately serves a stale snapshot while it
-      // refreshes. Preserve the resume acknowledgement instead of immediately
-      // painting this chat inactive again.
-      const refreshed = (await fetchSessions()).map(item => item.id === id ? { ...item, isActive: true } : item)
-      updateSessions(refreshed)
-      setLastSession(previous => previous?.id === id ? { ...previous, isActive: true } : previous)
+      await acknowledgeResumedSession(id)
       await select(id)
       showMediaNotice('Chat resumed.', 2500)
     } catch (error: any) {
@@ -1335,7 +1366,7 @@ export default function App() {
         if (session && !session.isActive) {
           const response = await resumeSession(session.id, session.cwd ?? undefined)
           if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || `HTTP ${response.status}`)
-          updateSessions(await fetchSessions())
+          await acknowledgeResumedSession(session.id)
         }
         await sendInput(record.sessionId, record.text, record.id)
         deletePendingMessage(record.id)
@@ -1657,8 +1688,14 @@ export default function App() {
     else if (!currentId()) setLastSession(null)
   })
 
-  // Effective session for header display (cur() is live, lastSession is fallback)
-  const headerSession = () => cur() || lastSession()
+  // Metadata for the selected identity remains authoritative when a bounded
+  // sidebar refresh omits it. An equal-ID list entry updates lastSession via
+  // the synchronization effect above.
+  const headerSession = () => {
+    const selected = currentId()
+    const exact = lastSession()
+    return exact?.id === selected ? exact : cur()
+  }
 
   createEffect(() => {
     const session = headerSession()
@@ -1920,7 +1957,10 @@ export default function App() {
                 <button onClick={() => handleNew(true)} disabled={creating()} title="Open new OMP chat in a new tab" style={{ padding: '10px 12px', background: creating() ? '#1a1a2e' : '#b97d32', color: creating() ? '#666' : '#111', border: 'none', 'border-radius': '8px', 'font-size': '14px', 'font-weight': '600', cursor: creating() ? 'wait' : 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                   &#8599;
                 </button>
-                <button onClick={() => { setSearchOpen(!searchOpen()); if (!searchOpen()) { setSearchQuery(''); setSearchResults([]) } }} title="Search chats" style={{ padding: '10px 12px', background: searchOpen() ? '#4aba6a' : '#1a1a2e', color: searchOpen() ? '#000' : '#888', border: '1px solid #333', 'border-radius': '8px', 'font-size': '14px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                <button onClick={() => {
+                  if (searchOpen()) closeSearch()
+                  else { resetSearch(); setSearchOpen(true) }
+                }} title="Search recent chat titles" style={{ padding: '10px 12px', background: searchOpen() ? '#4aba6a' : '#1a1a2e', color: searchOpen() ? '#000' : '#888', border: '1px solid #333', 'border-radius': '8px', 'font-size': '14px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                   &#x1F50D;
                 </button>
               </div>
@@ -1935,10 +1975,11 @@ export default function App() {
             <Show when={searchOpen()}>
               <div style={{ padding: '0 16px 8px' }}>
                 <input
-                  placeholder="Search all chats..."
+                  placeholder="Search recent chat titles..."
+                  aria-label="Search recent chat titles"
                   value={searchQuery()}
                   onInput={(e) => { setSearchQuery(e.target.value); doSearch(e.target.value) }}
-                  onKeyDown={(e) => { if (e.key === 'Escape') { setSearchOpen(false); setSearchQuery(''); setSearchResults([]) } }}
+                  onKeyDown={(e) => { if (e.key === 'Escape') closeSearch() }}
                   ref={(el) => setTimeout(() => el.focus(), 50)}
                   style={{ width: '100%', padding: '8px 12px', background: '#0e0e14', border: '1px solid #333', 'border-radius': '6px', color: '#e5e5e5', 'font-size': '13px', outline: 'none' }}
                 />
@@ -1952,26 +1993,23 @@ export default function App() {
                   <div style={{ padding: '20px 16px', color: '#555', 'font-size': '13px', 'text-align': 'center' }}>Searching...</div>
                 </Show>
                 <Show when={!searching() && searchResults().length === 0 && searchQuery().length >= 2}>
-                  <div style={{ padding: '20px 16px', color: '#555', 'font-size': '13px', 'text-align': 'center' }}>No results found</div>
+                  <div style={{ padding: '20px 16px', color: '#555', 'font-size': '13px', 'text-align': 'center' }}>No matching recent chat titles</div>
                 </Show>
                 <Show when={!searching() && searchResults().length > 0}>
-                  <div style={{ padding: '6px 16px 2px', 'font-size': '10px', 'font-weight': '600', color: '#555', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>{searchResults().length} result{searchResults().length !== 1 ? 's' : ''}</div>
-                  <For each={searchResults()}>{(r) => (
-                    <div onClick={() => { select(r.id); setSearchOpen(false); setSearchQuery(''); setSearchResults([]) }}
-                      style={{ padding: '10px 16px', cursor: 'pointer', 'border-left': r.id === currentId() ? '3px solid #4aba6a' : '3px solid transparent', background: r.id === currentId() ? '#1a1a2e' : 'transparent', 'border-bottom': '1px solid #111', '-webkit-tap-highlight-color': 'transparent' }}>
+                  <div style={{ padding: '6px 16px 2px', 'font-size': '10px', 'font-weight': '600', color: '#555', 'text-transform': 'uppercase', 'letter-spacing': '0.05em' }}>{searchResults().length} recent title{searchResults().length !== 1 ? 's' : ''}</div>
+                  <For each={searchResults()}>{(session) => (
+                    <div onClick={() => { select(session.id); closeSearch() }}
+                      style={{ padding: '10px 16px', cursor: 'pointer', 'border-left': session.id === currentId() ? '3px solid #4aba6a' : '3px solid transparent', background: session.id === currentId() ? '#1a1a2e' : 'transparent', 'border-bottom': '1px solid #111', '-webkit-tap-highlight-color': 'transparent' }}>
                       <div style={{ display: 'flex', 'align-items': 'center', gap: '8px' }}>
-                        <Show when={r.isActive}><span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#4aba6a', 'flex-shrink': '0' }} /></Show>
+                        <Show when={session.isActive}><span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: '#4aba6a', 'flex-shrink': '0' }} /></Show>
                         <div style={{ flex: '1', 'min-width': '0' }}>
-                          <div style={{ 'font-size': '13px', 'font-weight': '500', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{r.title}</div>
-                          <Show when={r.projectLabel}>
-                            <div style={{ 'font-size': '10px', color: '#444', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{r.projectLabel}</div>
+                          <div style={{ 'font-size': '13px', 'font-weight': '500', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{session.title}</div>
+                          <Show when={session.projectLabel || session.cwd}>
+                            <div style={{ 'font-size': '10px', color: '#444', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{session.projectLabel || session.cwd}</div>
                           </Show>
-                          <div style={{ 'font-size': '11px', color: '#666', 'margin-top': '4px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap' }}>{r.snippet}</div>
                         </div>
-                        <div style={{ 'flex-shrink': '0', 'text-align': 'right' }}>
-                          <div style={{ 'font-size': '11px', color: '#555' }}>{timeAgo(r.updatedAt)}</div>
-                          <div style={{ 'font-size': '10px', color: '#444' }}>{r.matchCount} match{r.matchCount !== 1 ? 'es' : ''}</div>
-                        </div>
+                        <span style={{ 'font-size': '9px', padding: '1px 5px', 'border-radius': '3px', ...agentBadgeColors(session.agent), 'flex-shrink': '0', 'font-weight': '600' }}>{agentBadgeLabel(session.agent)}</span>
+                        <div style={{ 'font-size': '11px', color: '#555', 'flex-shrink': '0' }}>{timeAgo(session.updatedAt)}</div>
                       </div>
                     </div>
                   )}</For>
@@ -2104,7 +2142,7 @@ export default function App() {
       <div style={{ flex: '1', display: 'flex', 'flex-direction': 'column', 'min-width': '0', height: '100%', position: 'relative' }}>
         <Show when={currentId() || !isFledgeHost || homeView() === 'rooms'}>
         {/* Header */}
-        <div style={{ position: 'relative', padding: '8px 16px 0 100px', 'padding-top': 'max(8px, env(safe-area-inset-top))', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'align-items': 'center', gap: '8px', 'min-height': '48px', 'flex-shrink': '0' }}>
+        <div data-testid="session-header" data-session-id={currentId() || ''} data-agent={headerSession()?.agent || ''} style={{ position: 'relative', padding: '8px 16px 0 100px', 'padding-top': 'max(8px, env(safe-area-inset-top))', 'border-bottom': '1px solid #1e1e1e', display: 'flex', 'align-items': 'center', gap: '8px', 'min-height': '48px', 'flex-shrink': '0' }}>
           <span data-testid="build-version" title={`Build ${__BUILD_VERSION__}`} style={{ position: 'absolute', top: '2px', right: '10px', color: '#444', 'font-size': '8px', 'font-family': "'SF Mono', Menlo, monospace", 'line-height': '1', 'letter-spacing': '0.02em', 'white-space': 'nowrap' }}>{__BUILD_TIME__}</span>
           <Show when={headerSession()} fallback={<span style={{ color: '#888', 'font-size': '14px', 'font-weight': '600' }}>{currentId() ? 'Loading...' : isFledgeHost ? 'Rooms' : 'Feather'}</span>}>
             {(s) => <>

@@ -87,6 +87,7 @@ export default function RoomsHome(props: {
   const [attachingRoom, setAttachingRoom] = createSignal<string | null>(null)
   const [attachCandidates, setAttachCandidates] = createSignal<SessionMeta[]>([])
   const [attachError, setAttachError] = createSignal<string | null>(null)
+  const [unassignedChat, setUnassignedChat] = createSignal<{ id: string, room: string, detail: string } | null>(null)
   const [attachQuery, setAttachQuery] = createSignal('')
   const [roomHarnesses, setRoomHarnesses] = createSignal<Record<string, AgentId>>(loadRoomHarnesses())
   const [ompModel, setOmpModel] = createSignal(localStorage.getItem('feather:ompModelOverride') || '')
@@ -148,7 +149,19 @@ export default function RoomsHome(props: {
       })
       // Leader membership is assigned atomically so its first prompt carries
       // the durable role. Other harnesses are grouped after launch.
-      if (!asLeader) await assignSessionToRoom(room.name, id).catch(() => {})
+      if (!asLeader) {
+        try {
+          await assignSessionToRoom(room.name, id)
+        } catch (cause) {
+          setUnassignedChat({
+            id,
+            room: room.name,
+            detail: cause instanceof Error ? cause.message : String(cause),
+          })
+          props.onSessionsChanged?.()
+          return
+        }
+      }
       props.onSessionsChanged?.()
       props.onOpen(id)
     } catch (e: any) { alert(e.message) }
@@ -373,6 +386,17 @@ export default function RoomsHome(props: {
         </div>
         <Show when={error()}>
           <div style={{ color: '#d45555', 'font-size': '13px', padding: '8px 4px' }}>{error()}</div>
+        </Show>
+        <Show when={unassignedChat()}>
+          {(failed) => (
+            <div role="alert" data-testid="room-assignment-recovery" style={{ color: '#ffaaa3', background: '#2a1515', border: '1px solid #61312d', 'border-radius': '9px', padding: '10px 12px', 'margin-bottom': '10px', 'font-size': '12px', 'line-height': '1.45' }}>
+              <div>Chat <code>{failed().id}</code> was created, but could not be added to #{failed().room}. It remains ungrouped. {failed().detail}</div>
+              <button onClick={() => { const chat = failed(); setUnassignedChat(null); props.onOpen(chat.id) }}
+                style={{ 'margin-top': '8px', background: '#4a2525', border: '1px solid #7b3e3e', color: '#ffd0cc', 'border-radius': '6px', padding: '5px 9px', cursor: 'pointer', 'font-size': '11px', 'font-weight': '700' }}>
+                Open ungrouped chat {failed().id}
+              </button>
+            </div>
+          )}
         </Show>
 
         <Show when={rooms()} fallback={<div style={{ color: '#555', 'text-align': 'center', padding: '40px', 'font-size': '13px' }}>Loading rooms…</div>}>

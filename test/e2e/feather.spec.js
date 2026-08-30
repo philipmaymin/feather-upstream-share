@@ -221,6 +221,121 @@ test.describe('Session selection', () => {
   })
 })
 
+test('sidebar searches recent all-harness titles with latest-query-wins', async ({ page }) => {
+  const olderTitle = 'Older Claude title result'
+  const currentOmpTitle = 'Current OMP title result'
+  let apiSearchCalls = 0
+  let olderRequests = 0
+  /** @type {() => void} */
+  let releaseOlder
+  const olderGate = new Promise(resolve => { releaseOlder = resolve })
+
+  await page.route('**/api/search**', route => {
+    apiSearchCalls++
+    return route.fulfill({ json: { results: [] } })
+  })
+  await page.route('**/api/sessions**', async route => {
+    const url = new URL(route.request().url())
+    if (url.pathname !== '/api/sessions' || route.request().method() !== 'GET') return route.continue()
+    const query = url.searchParams.get('q')
+    if (query === 'older') {
+      olderRequests++
+      await olderGate
+      return route.fulfill({ json: { sessions: [{
+        id: 'older-title-result', title: olderTitle, updatedAt: '2026-08-29T12:00:00Z',
+        isActive: false, agent: 'claude',
+      }] } })
+    }
+    if (query === 'current') {
+      return route.fulfill({ json: { sessions: [{
+        id: 'current-omp-title-result', title: currentOmpTitle, updatedAt: '2026-08-30T12:00:00Z',
+        isActive: true, agent: 'omp',
+      }] } })
+    }
+    return route.fulfill({ json: { sessions: [] } })
+  })
+
+  await page.goto(BASE)
+  await openSidebar(page)
+  await page.getByTitle('Search recent chat titles').click()
+  const input = page.getByRole('textbox', { name: 'Search recent chat titles' })
+  await expect(input).toHaveAttribute('placeholder', 'Search recent chat titles...')
+
+  await input.fill('older')
+  await expect.poll(() => olderRequests).toBe(1)
+  await input.fill('current')
+  await expect(page.getByText(currentOmpTitle, { exact: true })).toBeVisible()
+  await expect(page.getByText('OMP', { exact: true })).toBeVisible()
+
+  releaseOlder()
+  await page.waitForTimeout(100)
+  await expect(page.getByText(olderTitle, { exact: true })).toHaveCount(0)
+  await page.getByText(currentOmpTitle, { exact: true }).click()
+  await expect(page).toHaveURL(/#current-omp-title-result$/)
+  expect(apiSearchCalls).toBe(0)
+})
+
+test('deep-linked exact metadata survives an omitted bounded refresh', async ({ page }) => {
+  const id = 'older-deep-linked-chat'
+  const exact = {
+    id,
+    title: 'Exact archived Codex chat',
+    updatedAt: '2026-08-28T12:00:00Z',
+    isActive: false,
+    agent: 'codex',
+    cwd: '/srv/archive/exact-chat',
+  }
+  let exactRequests = 0
+  let boundedRequests = 0
+  let resumedCwd = null
+  /** @type {() => void} */
+  let releaseSecondExact
+  const secondExactGate = new Promise(resolve => { releaseSecondExact = resolve })
+
+  await page.route('**/api/sessions**', async route => {
+    const url = new URL(route.request().url())
+    if (url.pathname !== '/api/sessions' || route.request().method() !== 'GET') return route.continue()
+    if (url.searchParams.get('q') === id) {
+      exactRequests++
+      if (exactRequests === 2) await secondExactGate
+      return route.fulfill({ json: { sessions: [exact] } })
+    }
+    boundedRequests++
+    return route.fulfill({ json: { sessions: [] } })
+  })
+  await page.route(`**/api/sessions/${id}/messages*`, route => route.fulfill({
+    json: { messages: [], hasMore: false },
+  }))
+  await page.route(`**/api/sessions/${id}/protocol-runs`, route => route.fulfill({ json: { runs: [] } }))
+  await page.route(`**/api/sessions/${id}/resume`, route => {
+    resumedCwd = JSON.parse(route.request().postData() || '{}').cwd
+    return route.fulfill({ json: { ok: true } })
+  })
+
+  await page.goto(`${BASE}/#${id}`)
+  const header = page.getByTestId('session-header')
+  await expect(header).toContainText(exact.title)
+  await expect(header).toContainText(exact.cwd)
+  await expect(header).toHaveAttribute('data-session-id', id)
+  await expect(header).toHaveAttribute('data-agent', 'codex')
+
+  await page.locator('button').filter({ hasText: '⋮' }).click()
+  await page.getByRole('button', { name: 'Resume', exact: true }).click()
+  await expect.poll(() => boundedRequests).toBeGreaterThanOrEqual(2)
+  await expect.poll(() => exactRequests).toBe(2)
+  expect(resumedCwd).toBe(exact.cwd)
+
+  await expect(header).toContainText(exact.title)
+  await expect(header).toContainText(exact.cwd)
+  await expect(header).toHaveAttribute('data-agent', 'codex')
+  await expect(header).not.toContainText('New session')
+
+  releaseSecondExact()
+  await expect(page.getByRole('status')).toContainText('Chat resumed.')
+  await expect(header).toContainText(exact.title)
+  await expect(header).toContainText(exact.cwd)
+})
+
 // ── Message rendering ───────────────────────────────────────────────────────
 
 test.describe('Message rendering', () => {
