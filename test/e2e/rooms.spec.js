@@ -60,7 +60,7 @@ test('attaches and detaches an existing chat without duplicate Room rows', async
   await expect(page.getByText(candidate.title, { exact: true })).toHaveCount(1)
 })
 
-test('Room card always opens its durable Leader chat and lists residents separately', async ({ page }) => {
+test('Room card reveals residents and conversation history before a chat is opened', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   const leader = {
     id: 'leader-human-chat', title: '#feather Leader', updatedAt: '2026-08-23T23:00:00Z',
@@ -91,16 +91,18 @@ test('Room card always opens its durable Leader chat and lists residents separat
 
   await page.goto(BASE)
   await expect(page.getByTestId('room-card-feather')).toContainText('2 residents')
-  await page.getByTestId('room-card-feather').locator('button:has-text("›")').click()
+  await page.getByText('#feather', { exact: true }).click()
+  await expect(page).toHaveURL(/#?$/)
   await expect(page.getByTestId('resident-feather-leader')).toBeVisible()
   await expect(page.getByTestId('resident-feather-caretaker')).toBeVisible()
   await expect(page.getByText('One-off investigation', { exact: true })).toBeVisible()
   await expect(page.getByText('#feather Leader', { exact: true })).toHaveCount(0)
-  await page.getByText('#feather', { exact: true }).click()
+
+  await page.getByTestId('resident-feather-leader').click()
   await expect(page).toHaveURL(/#leader-human-chat$/)
 })
 
-test('opening a Room without a Leader creates its OMP Leader atomically', async ({ page }) => {
+test('Room without a Leader expands before its OMP Leader is created', async ({ page }) => {
   let sessionBody = null
   await page.route('**/api/rooms', route => route.fulfill({ json: { rooms: [{
     name: 'new-room', cwd: '/srv/rooms/new-room', active: false, latest: null, updatedAt: null,
@@ -117,6 +119,11 @@ test('opening a Room without a Leader creates its OMP Leader atomically', async 
 
   await page.goto(BASE)
   await page.getByText('#new-room', { exact: true }).click()
+  await expect(page).toHaveURL(/#?$/)
+  await expect(page.getByRole('button', { name: '+ Start OMP Leader' })).toBeVisible()
+  expect(sessionBody).toBeNull()
+
+  await page.getByRole('button', { name: '+ Start OMP Leader' }).click()
   await expect.poll(() => sessionBody).toMatchObject({
     agent: 'omp',
     roomName: 'new-room',

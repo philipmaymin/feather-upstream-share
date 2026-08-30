@@ -297,14 +297,7 @@ export default function RoomsHome(props: {
     }
   }
 
-  // Each Room has one canonical user-facing conversation owned by its Leader.
-  // If it has not been established yet, opening the card creates it atomically.
-  function openRoom(room: RoomInfo) {
-    if (busy()) return
-    const leader = leaderRoomSession(room)
-    if (leader) props.onOpen(leader.id)
-    else newChat(room, 'omp', true)
-  }
+
   const toggleExpand = (name: string) => setExpanded(expanded() === name ? null : name)
 
   function otherRoomSessions(room: RoomInfo) {
@@ -390,7 +383,7 @@ export default function RoomsHome(props: {
           }>
             <For each={rooms()!}>{(room) => (
               <div data-testid={`room-card-${room.name}`} style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '12px', 'margin-bottom': '10px', overflow: 'hidden' }}>
-                <div onClick={() => openRoom(room)} style={{ padding: '12px 16px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                <div onClick={() => toggleExpand(room.name)} style={{ padding: '12px 16px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                   <div style={{ display: 'flex', 'align-items': 'center', gap: '10px' }}>
                     <span style={{ width: '10px', height: '10px', 'border-radius': '50%', background: room.active ? '#4aba6a' : '#333', 'flex-shrink': '0' }} />
                     <span style={{ 'font-size': '16px', 'font-weight': '700', color: '#e5e5e5' }}>#{room.name}</span>
@@ -454,7 +447,7 @@ export default function RoomsHome(props: {
                   <div data-testid={`residents-${room.name}`} style={{ 'border-top': '1px solid #16161f', padding: '7px 16px 9px 28px' }}>
                     <div style={{ color: '#596373', 'font-size': '9px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.06em', 'margin-bottom': '5px' }}>Residents</div>
                     <For each={room.residents || []}>{(resident) => (
-                      <div data-testid={`resident-${room.name}-${resident.role}`} style={{ display: 'flex', 'align-items': 'center', gap: '8px', padding: '5px 0' }}>
+                      <div data-testid={`resident-${room.name}-${resident.role}`} onClick={() => props.onOpen(resident.sessionId)} style={{ display: 'flex', 'align-items': 'center', gap: '8px', padding: '5px 0', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                         <span style={{ width: '7px', height: '7px', 'border-radius': '50%', background: resident.status === 'working' ? '#4aba6a' : resident.status === 'waiting' ? '#596373' : '#5c3333', 'flex-shrink': '0' }} />
                         <span style={{ color: resident.role === 'leader' ? '#69c77f' : '#b6bfcc', 'font-size': '12px', 'font-weight': '650', 'text-transform': 'capitalize' }}>{resident.role}</span>
                         <span style={{ color: agentColor(resident.agent), 'font-size': '9px', 'font-weight': '600' }}>{resident.agent}</span>
@@ -464,8 +457,8 @@ export default function RoomsHome(props: {
                   </div>
                   <For each={otherRoomSessions(room)}>{(session) => sessionRow(room, session)}</For>
                   <div style={{ display: 'flex', 'flex-wrap': 'wrap', gap: '8px', padding: '10px 16px 12px 28px', 'border-top': '1px solid #16161f', position: 'relative' }}>
-                    <button onClick={() => newChat(room)} disabled={busy()}
-                      style={{ background: roomHarness(room.name) === 'omp' ? '#3a2a1e' : '#15202a', border: `1px solid ${roomHarness(room.name) === 'omp' ? '#68481f' : '#344657'}`, color: roomHarness(room.name) === 'omp' ? '#e0a050' : agentColor(roomHarness(room.name)), 'font-size': '12px', 'font-weight': '700', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>+ New {agentLabel(roomHarness(room.name))} chat</button>
+                    <button onClick={() => leaderRoomSession(room) ? newChat(room) : newChat(room, 'omp', true)} disabled={busy()}
+                      style={{ background: roomHarness(room.name) === 'omp' ? '#3a2a1e' : '#15202a', border: `1px solid ${roomHarness(room.name) === 'omp' ? '#68481f' : '#344657'}`, color: roomHarness(room.name) === 'omp' ? '#e0a050' : agentColor(roomHarness(room.name)), 'font-size': '12px', 'font-weight': '700', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>{leaderRoomSession(room) ? `+ New ${agentLabel(roomHarness(room.name))} chat` : '+ Start OMP Leader'}</button>
                     <details style={{ position: 'relative' }}>
                       <summary style={{ 'list-style': 'none', background: 'none', border: '1px solid #2b3038', color: '#777', 'font-size': '11px', padding: '6px 9px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Room options</summary>
                       <div style={{ position: 'absolute', top: '34px', left: '0', width: '180px', padding: '8px', background: '#11151c', border: '1px solid #333', 'border-radius': '9px', 'box-shadow': '0 8px 24px rgba(0,0,0,.45)', 'z-index': '20', display: 'flex', 'flex-direction': 'column', gap: '7px' }}>
