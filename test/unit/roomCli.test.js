@@ -77,17 +77,28 @@ describe('room assignment CLI', () => {
     fs.writeFileSync(path.join(roomDir, 'AGENTS.md'), '# Room: #health\n')
     fs.writeFileSync(path.join(roomDir, 'notes.md'), '# notes\n')
     const requests = []
+    const pulseSessionIds = []
     const server = http.createServer((request, response) => {
       const chunks = []
       request.on('data', (chunk) => chunks.push(chunk))
       request.on('end', () => {
+        if (request.url === '/api/rooms/health/pulse') {
+          pulseSessionIds.push(request.headers['x-feather-session-id'])
+        }
         requests.push({ url: request.url, body: JSON.parse(Buffer.concat(chunks).toString()) })
         response.writeHead(200, { 'Content-Type': 'application/json' })
         response.end('{"ok":true}')
       })
     })
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-    const env = { ...process.env, HOME: root, ROOMS_DIR: roomsDir, FEATHER_URL: `http://127.0.0.1:${server.address().port}` }
+    const env = {
+      ...process.env,
+      FEATHER_SESSION_ID: '',
+      HOME: root,
+      ROOMS_DIR: roomsDir,
+      FEATHER_URL: `http://127.0.0.1:${server.address().port}`,
+      PI_SESSION_FILE: path.join(root, '.feather/omp-sessions/pulse-owner/rollout.jsonl'),
+    }
     const cli = path.resolve(import.meta.dirname, '../../bin/room')
     try {
       await Promise.all([
@@ -109,6 +120,7 @@ describe('room assignment CLI', () => {
         { url: '/api/rooms/health/pulse', body: { enabled: false } },
         { url: '/api/rooms/health/pulse', body: { enabled: true } },
       ])
+      assert.deepEqual(pulseSessionIds, ['pulse-owner', 'pulse-owner'])
       // Both complaints woke #friction.
       const frictionWakes = requests.filter((r) => r.url === '/api/rooms/friction/pulse')
       assert.equal(frictionWakes.length, 2)

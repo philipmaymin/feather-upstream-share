@@ -75,6 +75,15 @@ read_room_text() {
   esac
   [ -n "$ROOM_TEXT" ] || die "room $command: text must not be empty"
 }
+current_feather_session_id() {
+  local id="${FEATHER_SESSION_ID:-}"
+  if [[ ! "$id" =~ ^[A-Za-z0-9_-]{1,128}$ ]] && [[ "${PI_SESSION_FILE:-}" = */* ]]; then
+    id="${PI_SESSION_FILE%/*}"
+    id="${id##*/}"
+  fi
+  [[ "$id" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || return 1
+  printf '%s' "$id"
+}
 # ── Room resolution ─────────────────────────────────────────────────────────
 resolve_room() {
   if [ -n "${ROOM_NAME:-}" ]; then return; fi
@@ -296,11 +305,16 @@ cmd_complain() {
 }
 
 cmd_pulse() {
-  local enabled="$1"
+  local enabled="$1" session_id
   resolve_room
   ensure_feather_url
-  curl -sf -X POST "$FEATHER_URL/api/rooms/$ROOM_NAME/pulse" \
-    -H 'Content-Type: application/json' -d "{\"enabled\":$enabled}" >/dev/null \
+  local curl_args=(-sf -X POST "$FEATHER_URL/api/rooms/$ROOM_NAME/pulse"
+    -H 'Content-Type: application/json' -d "{\"enabled\":$enabled}")
+  session_id="$(current_feather_session_id || true)"
+  if [ -n "$session_id" ]; then
+    curl_args+=(-H "X-Feather-Session-ID: $session_id")
+  fi
+  curl "${curl_args[@]}" >/dev/null \
     || die "feather refused to change automatic checks for #$ROOM_NAME"
   if [ "$enabled" = true ]; then echo "#${ROOM_NAME} will keep working"
   else echo "#${ROOM_NAME} automatic checks paused"; fi

@@ -3508,9 +3508,12 @@ app.post('/api/rooms/:name/pulse', (req, res) => {
         error: null,
       }),
     }));
-    // Pausing means stop now, not merely "do not launch again". Persist the
-    // disabled state first so the scheduler cannot race a replacement worker.
-    if (!req.body.enabled && previous?.sessionId) {
+    // A pulse pausing itself must finish this turn so the CLI receives the
+    // response and can record its handoff. The disabled state prevents any
+    // replacement launch. UI/external pauses still stop an in-flight worker.
+    const callerSessionId = String(req.get('X-Feather-Session-ID') || '').trim();
+    const selfPause = callerSessionId && callerSessionId === previous?.sessionId;
+    if (!req.body.enabled && previous?.sessionId && !selfPause) {
       killTmuxSessions(previous.sessionId);
     }
     const pulse = roomPulse(name, now);
