@@ -284,6 +284,28 @@ test.describe('Message rendering', () => {
     expect(code).toContain('DOMPurify.sanitize')
   })
 
+  test('code blocks wrap by default and persist the per-block toggle', async ({ page }) => {
+    const pre = page.locator('.markdown pre').first()
+    const code = pre.locator('code')
+    const toggle = pre.getByLabel('Wrap long code and output lines')
+
+    await pre.hover()
+    await expect(toggle).toBeChecked()
+    expect(await code.evaluate(el => getComputedStyle(el).whiteSpace)).toBe('pre-wrap')
+
+    await toggle.uncheck()
+    expect(await code.evaluate(el => getComputedStyle(el).whiteSpace)).toBe('pre')
+    expect(await page.evaluate(() => localStorage.getItem('feather-code-wrap'))).toBe('false')
+
+    await page.reload()
+    await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 5000 })
+    await pre.hover()
+    await expect(toggle).not.toBeChecked()
+    expect(await code.evaluate(el => getComputedStyle(el).whiteSpace)).toBe('pre')
+
+    await toggle.check()
+  })
+
   test('markdown links to local artifacts use the Files preview endpoint', async ({ page }) => {
     const link = page.getByRole('link', { name: 'Feather fixture' })
     const expectedPath = TEXT_ARTIFACT_PATH

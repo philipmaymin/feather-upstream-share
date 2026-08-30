@@ -184,6 +184,19 @@ function printMsg(uuid: string, container: HTMLElement, css: string) {
   setTimeout(() => w.print(), 300)
 }
 
+const CODE_WRAP_STORAGE_KEY = 'feather-code-wrap'
+
+function applyCodeWrap(enabled: boolean, persist = true) {
+  document.documentElement.classList.toggle('code-nowrap', !enabled)
+  for (const input of document.querySelectorAll<HTMLInputElement>('.code-wrap-checkbox')) {
+    input.checked = enabled
+  }
+  if (!persist) return
+  try {
+    window.localStorage.setItem(CODE_WRAP_STORAGE_KEY, String(enabled))
+  } catch {}
+}
+
 // Code-block copy buttons are injected after Markdown rendering and handled
 // here through the scroll container so rerenders do not accumulate listeners.
 function handleCopyClick(e: MouseEvent) {
@@ -225,12 +238,33 @@ function collapseCodeBlocks(el: HTMLElement) {
 
 function injectCopyButtons(el: HTMLElement) {
   for (const pre of el.querySelectorAll('pre')) {
-    if (pre.querySelector('.copy-btn')) continue
+    if (pre.querySelector('.code-tools')) continue
     pre.style.position = 'relative'
-    const btn = document.createElement('button')
-    btn.className = 'copy-btn'
-    btn.textContent = 'Copy'
-    pre.appendChild(btn)
+
+    const tools = document.createElement('div')
+    tools.className = 'code-tools'
+
+    const copy = document.createElement('button')
+    copy.className = 'copy-btn'
+    copy.textContent = 'Copy'
+    tools.appendChild(copy)
+
+    const wrap = document.createElement('label')
+    wrap.className = 'code-wrap-control'
+    wrap.title = 'Wrap long code and output lines'
+    const checkbox = document.createElement('input')
+    checkbox.type = 'checkbox'
+    checkbox.className = 'code-wrap-checkbox'
+    checkbox.checked = !document.documentElement.classList.contains('code-nowrap')
+    checkbox.setAttribute('aria-label', 'Wrap long code and output lines')
+    checkbox.onchange = (event) => {
+      event.stopPropagation()
+      applyCodeWrap(checkbox.checked)
+    }
+    wrap.append(checkbox, document.createTextNode('Wrap'))
+    tools.appendChild(wrap)
+
+    pre.appendChild(tools)
   }
 }
 
@@ -730,8 +764,10 @@ const markdownCSS = `
   background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 3px;
   font-family: 'SF Mono', Menlo, 'Courier New', monospace; font-size: 0.88em;
 }
-.markdown pre { margin: 8px 0; border-radius: 6px; overflow-x: auto; background: #0d1117; padding: 10px 12px; position: relative; }
-.markdown pre code { background: none; padding: 0; font-size: 0.85em; color: #c9d1d9; }
+.markdown pre { margin: 8px 0; border-radius: 6px; overflow-x: hidden; background: #0d1117; padding: 10px 12px; position: relative; }
+.markdown pre code { background: none; padding: 0; font-size: 0.85em; color: #c9d1d9; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+.code-nowrap .markdown pre { overflow-x: auto; }
+.code-nowrap .markdown pre code { white-space: pre; overflow-wrap: normal; word-break: normal; }
 .markdown pre.code-collapsed { max-height: 360px; overflow: hidden; }
 .markdown pre.code-collapsed::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 60px; background: linear-gradient(transparent, #0d1117); pointer-events: none; border-radius: 0 0 6px 6px; }
 .code-expand-btn { display: block; width: 100%; padding: 4px 0; margin-top: -1px; background: #0d1117; border: 1px solid #333; border-top: none; border-radius: 0 0 6px 6px; color: #fab283; font-size: 0.75em; font-family: -apple-system, system-ui, sans-serif; cursor: pointer; text-align: center; transition: background-color 0.2s, color 0.2s; }
@@ -784,16 +820,31 @@ const markdownCSS = `
 div:hover > div > .star-btn, div:hover > div > .action-menu-btn { opacity: 0.6 !important; }
 .star-btn:hover, .action-menu-btn:hover { opacity: 1 !important; }
 
-/* Code-block copy button */
+/* Code-block controls */
+.code-tools {
+  position: absolute; top: 6px; right: 6px; z-index: 2;
+  display: flex; align-items: center; gap: 5px;
+  opacity: 0; transition: opacity 0.15s;
+  font-family: -apple-system, system-ui, sans-serif;
+}
+pre:hover .code-tools, .code-tools:focus-within { opacity: 1; }
 .copy-btn {
-  position: absolute; top: 6px; right: 6px;
   background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15);
   color: var(--text-secondary); font-size: 11px; padding: 2px 8px; border-radius: 4px;
-  cursor: pointer; opacity: 0; transition: opacity 0.15s, background 0.15s;
-  font-family: -apple-system, system-ui, sans-serif; z-index: 2;
+  cursor: pointer; transition: background 0.15s;
+  font-family: inherit;
 }
-pre:hover .copy-btn { opacity: 1; }
 .copy-btn:hover { background: rgba(255,255,255,0.2); color: var(--text-primary); }
+.code-wrap-control {
+  display: inline-flex; align-items: center; gap: 3px;
+  min-height: 22px; padding: 0 6px;
+  border: 1px solid rgba(255,255,255,0.15); border-radius: 4px;
+  background: rgba(13,17,23,0.92); color: var(--text-secondary);
+  font-size: 11px; cursor: pointer; user-select: none;
+}
+.code-wrap-control:hover { background: rgba(255,255,255,0.1); color: var(--text-primary); }
+.code-wrap-control input { width: 11px; height: 11px; margin: 0; accent-color: #fab283; cursor: pointer; }
+@media (hover: none) { .code-tools { opacity: 1; } }
 
 /* Typing indicator bounce */
 @keyframes typing-bounce {
@@ -1411,6 +1462,11 @@ export function MessageView(props: MessageViewProps) {
   // Setting scrollTop directly here lands before the next paint.
   let contentRef: HTMLDivElement | undefined
   onMount(() => {
+    let enabled = true
+    try {
+      enabled = window.localStorage.getItem(CODE_WRAP_STORAGE_KEY) !== 'false'
+    } catch {}
+    applyCodeWrap(enabled, false)
     if (!contentRef) return
     const ro = new ResizeObserver(() => {
       if (untrack(pinned) && scrollRef) pinSync()
