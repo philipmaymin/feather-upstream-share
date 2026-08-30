@@ -851,16 +851,16 @@ function inputBoxText(name) {
 }
 
 async function sendText(name, text) {
-  // Use file-based paste for long text OR text with newlines (crossterm TUI
-  // doesn't handle literal newlines from send-keys -l; they become line breaks
-  // in the input area instead of being submitted)
+  // Use bracketed, literal file-based paste for long text or text with
+  // newlines so the TUI receives the entire prompt as one paste event instead
+  // of treating attachment-separating linefeeds as individual Enter presses.
   const isLong = text.length > 500 || text.includes('\n');
   if (isLong) {
     const tmp = `/tmp/feather-send-${Date.now()}.txt`;
     fs.writeFileSync(tmp, text);
     try {
       execFileSync('tmux', ['load-buffer', tmp], { stdio: 'ignore' });
-      execFileSync('tmux', ['paste-buffer', '-t', name], { stdio: 'ignore' });
+      execFileSync('tmux', codexPasteBufferArgs(name), { stdio: 'ignore' });
     } finally { try { fs.unlinkSync(tmp); } catch {} }
     await new Promise(r => setTimeout(r, 500));
   } else {
