@@ -70,15 +70,17 @@ function fixture() {
   const bin = path.join(root, 'bin')
   fs.mkdirSync(bin)
   const tmuxLog = path.join(root, 'tmux.log')
+  const tmuxPayload = path.join(root, 'tmux-payload.txt')
   fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh
 printf '%s\\n' "$*" >> "${tmuxLog}"
 case "$1" in
+  load-buffer) cat "$2" > "${tmuxPayload}" ;;
   list-panes) printf 'claude\\n' ;;
   capture-pane) printf '❯\\n' ;;
 esac
 exit 0
 `, { mode: 0o755 })
-  return { home, state, sessionId, sessionFile, readableFile, tmuxLog, bin }
+  return { home, state, sessionId, sessionFile, readableFile, tmuxLog, tmuxPayload, bin }
 }
 
 function inventory(root) {
@@ -282,6 +284,29 @@ describe('server-enforced read-only canary', () => {
     for (const route of ['/api/shell/', '/api/shell-near-match', '/api/terminal/', '/api/terminal-near-match']) {
       await expectClosedUpgrade(`ws://127.0.0.1:${port}${route}`)
     }
+  })
+
+  it('preserves multiline attachment prompts as one literal bracketed paste', async () => {
+    const fx = fixture()
+    fs.mkdirSync(path.join(fx.state, 'uploads'))
+    const { base } = await startServer(fx, false)
+    const text = [
+      'See this',
+      '[Attached image: /tmp/one.png]',
+      '[Attached file: /tmp/two.pdf] (two.pdf)',
+    ].join('\n')
+
+    const response = await fetch(`${base}/api/sessions/${fx.sessionId}/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+
+    assert.equal(response.status, 200)
+    assert.equal(fs.readFileSync(fx.tmuxPayload, 'utf8'), text)
+    const calls = fs.readFileSync(fx.tmuxLog, 'utf8')
+    assert.match(calls, new RegExp(`paste-buffer -p -r -t f-${fx.sessionId}`))
+    assert.doesNotMatch(calls, new RegExp(`paste-buffer -t f-${fx.sessionId}`))
   })
 
   it('returns stable durable send receipts while preserving unkeyed client behavior', async () => {
