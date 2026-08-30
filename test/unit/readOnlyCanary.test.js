@@ -166,15 +166,35 @@ function expectClosedUpgrade(url) {
   })
 }
 
-function expectOpenedUpgrade(url) {
+function expectShellRoundTrip(url) {
+  const nonce = `feather-shell-${process.pid}-${Date.now()}`
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url)
-    ws.once('open', () => { ws.close(); resolve() })
+    let output = ''
+    let settled = false
+    const finish = error => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      if (ws.readyState === WebSocket.OPEN) ws.close()
+      else if (ws.readyState === WebSocket.CONNECTING) ws.terminate()
+      if (error) reject(error)
+      else resolve({ nonce, output })
+    }
+    const timeout = setTimeout(() => finish(new Error(`shell output timed out: ${url}`)), 5000)
+    ws.once('open', () => ws.send(`printf '${nonce}\\n'\n`))
+    ws.on('message', data => {
+      output += data.toString()
+      if (output.includes(nonce)) finish()
+    })
     ws.once('unexpected-response', (_request, response) => {
       response.resume()
-      reject(new Error(`upgrade rejected with ${response.statusCode}: ${url}`))
+      finish(new Error(`upgrade rejected with ${response.statusCode}: ${url}`))
     })
-    ws.once('error', reject)
+    ws.once('error', finish)
+    ws.once('close', (code, reason) => {
+      finish(new Error(`shell closed before output (${code} ${reason.toString()}): ${url}`))
+    })
   })
 }
 
@@ -291,7 +311,8 @@ describe('server-enforced read-only canary', () => {
     assert.equal(reload.status, 200)
     assert.deepEqual(await reload.json(), { ok: true, reload: true })
 
-    await expectOpenedUpgrade(`ws://127.0.0.1:${port}/api/shell`)
+    const { nonce, output: shellOutput } = await expectShellRoundTrip(`ws://127.0.0.1:${port}/api/shell`)
+    assert.ok(shellOutput.includes(nonce), shellOutput)
     for (const route of ['/api/shell/', '/api/shell-near-match', '/api/terminal/', '/api/terminal-near-match']) {
       await expectClosedUpgrade(`ws://127.0.0.1:${port}${route}`)
     }

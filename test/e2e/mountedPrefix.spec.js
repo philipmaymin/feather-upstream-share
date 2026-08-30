@@ -258,12 +258,23 @@ test('production prefix carries SPA assets, REST, SSE, media, files, export, WS,
   await page.getByRole('button', { name: 'Terminal', exact: true }).click()
   await terminalSocket
 
-  await page.evaluate(() => new Promise(resolve => {
+  const shellNonce = `feather-mounted-shell-${process.pid}-${Date.now()}`
+  const shellOutput = await page.evaluate(nonce => new Promise((resolve, reject) => {
     const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/feather2/api/shell`)
-    socket.addEventListener('open', () => socket.close())
-    socket.addEventListener('close', resolve)
-    socket.addEventListener('error', resolve)
-  }))
+    let output = ''
+    socket.addEventListener('open', () => socket.send(`printf '${nonce}\\n'\n`))
+    socket.addEventListener('message', event => {
+      output += String(event.data)
+      if (!output.includes(nonce)) return
+      socket.close()
+      resolve(output)
+    })
+    socket.addEventListener('close', () => {
+      if (!output.includes(nonce)) reject(new Error('mounted shell closed before nonce output'))
+    })
+    socket.addEventListener('error', () => reject(new Error('mounted shell WebSocket failed')))
+  }), shellNonce)
+  expect(shellOutput).toContain(shellNonce)
   await expect.poll(() => proxyState.upgrades.some(entry => entry.path === '/feather2/api/shell' && entry.status === 101)).toBe(true)
 
   const beforeReloadAssets = mountedPaths.filter(value => value.startsWith('/feather2/assets/')).length

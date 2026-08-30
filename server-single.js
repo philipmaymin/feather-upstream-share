@@ -5957,6 +5957,8 @@ wss.on('connection', (ws, req) => {
       term = pty.spawn('bash', ['-l'], {
         name: 'xterm-256color', cols: terminalCols, rows: terminalRows, env: cleanEnv, cwd: HOME,
       });
+    } else {
+      const sessionId = url.searchParams.get('session');
       if (!sessionId) { ws.close(1008, 'session required'); return; }
       if (!tmuxIsActive(sessionId)) { ws.close(1000, 'Session not active'); return; }
       terminalSessionName = existingTmuxName(sessionId);
