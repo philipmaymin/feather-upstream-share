@@ -228,7 +228,7 @@ esac
     seedConversation(FEED_IDS.staleErrored, feedTimestamps.staleErrored, 'Stale errored fixture', 'API Error: historical synthetic failure')
     seedConversation(FEED_IDS.finished, feedTimestamps.finished, 'Finished fixture', 'Finished assistant response.')
     writeFeedSession(testProjectDir, FEED_IDS.normalized, [
-      claudeFeedMessage('feed-normalized-user', new Date(Date.parse(feedTimestamps.normalized) - 1_000).toISOString(), 'user', 'Normalized fixture'),
+      claudeFeedMessage('feed-normalized-user', new Date(Date.parse(feedTimestamps.normalized) - 1_000).toISOString(), 'user', '<file name="/tmp/pulse.md">\nKeep working on this room.'),
       claudeFeedMessage('feed-normalized-visible', feedTimestamps.normalized, 'assistant', [{ type: 'text', text: 'Visible **normalized** answer.' }]),
       claudeFeedMessage('feed-normalized-tool', feedTimestamps.excluded, 'assistant', [{ type: 'tool_use', id: 'feed-tool', name: 'Read', input: { path: '/tmp/input' } }]),
       claudeFeedMessage('feed-normalized-result', feedTimestamps.excluded, 'assistant', [{ type: 'tool_result', tool_use_id: 'feed-tool', content: 'internal output' }]),
@@ -643,6 +643,7 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
     assert.equal(normalized.message.uuid, 'feed-normalized-visible')
     assert.deepEqual(normalized.message.content, [{ type: 'text', text: 'Visible **normalized** answer.' }])
     assert.equal(normalized.room, 'alpha')
+    assert.equal(normalized.title, '#alpha progress')
     assert.equal(normalized.projectId, '-api-test-project')
     assert.equal(normalized.projectLabel, 'API Test')
     assert.equal(posts.some(post => post.sessionId === FEED_IDS.empty), false)

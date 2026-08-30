@@ -4,6 +4,8 @@ import { test, expect } from '@playwright/test'
 const BASE = process.env.FEATHER_URL || 'http://localhost:4870'
 const GENERATED_AT = '2026-08-30T16:00:00.000Z'
 
+test.use({ viewport: { width: 390, height: 844 } })
+
 const waitingPost = {
   id: 'session:waiting:answer', kind: 'session', timestamp: '2026-08-30T15:59:00.000Z',
   sessionId: 'waiting', room: 'launch', projectId: 'launch', projectLabel: 'Launch',
@@ -37,7 +39,7 @@ const olderPost = {
   id: 'session:older:result', kind: 'session', timestamp: '2026-08-28T10:00:00.000Z',
   sessionId: 'older', room: 'archive', projectId: 'archive', projectLabel: 'Archive',
   title: 'Earlier dispatch', agent: 'claude', status: 'finished',
-  message: { uuid: 'older-result', role: 'assistant', timestamp: '2026-08-28T10:00:00.000Z', content: [{ type: 'text', text: 'An older result remains reachable.' }] },
+  message: { uuid: 'older-result', role: 'assistant', timestamp: '2026-08-28T10:00:00.000Z', content: [{ type: 'text', text: 'The archival audit reconciled every deployment receipt against the immutable release manifest. The service identities, health endpoints, source commit, and tree hash all match the scheduled fleet release. No mutable state lives inside the release directory, every target still defaults to OMP, and the canary remains healthy. The review also checked rollback metadata, capability links, and delayed promotion ownership. The remaining evidence is intentionally long enough to prove that an ordinary completed dispatch becomes a compact preview instead of a presentation poster. This final sentence appears after the compact preview boundary.' }] },
   score: 40, why: 'Filed earlier',
 }
 
@@ -118,7 +120,11 @@ test('Fledge is a feed-first complete interface with internal chat navigation', 
   await expect(posts.first()).toContainText('Your move')
   await expect(posts.first()).toContainText('Choose the release channel')
   await expect(posts.first()).toContainText('Deployment decision')
-  await expect.poll(() => posts.first().locator('h2').evaluate(element => getComputedStyle(element).webkitLineClamp)).toBe('3')
+  await expect.poll(() => posts.first().locator('h2').evaluate(element => getComputedStyle(element).webkitLineClamp)).toBe('2')
+  const feedTop = await page.getByTestId('fledge-feed').evaluate(element => element.getBoundingClientRect().top)
+  expect(feedTop).toBeLessThanOrEqual(118)
+  const navHeight = await page.locator('.fledge-bottom-nav').evaluate(element => element.getBoundingClientRect().height)
+  expect(navHeight).toBeLessThanOrEqual(58)
   await expect(page.locator('a[href*="philip.feather.plus"]')).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Open menu' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Sessions' })).toHaveCount(0)
@@ -205,6 +211,15 @@ test('Fledge renders rich and curated media in-app and paginates without a conte
   const olderHeading = page.getByRole('heading', { name: 'Earlier dispatch', exact: true })
   if (await olderHeading.count() === 0) await page.getByRole('button', { name: 'Load older dispatches' }).click()
   await expect(olderHeading).toBeVisible()
+  const olderCard = page.locator('[data-post-id="session:older:result"]')
+  const more = olderCard.getByRole('button', { name: 'More', exact: true })
+  await expect(more).toBeVisible()
+  const compactHeight = await olderCard.evaluate(element => element.getBoundingClientRect().height)
+  expect(compactHeight).toBeLessThan(420)
+  await more.click()
+  await expect(olderCard.getByRole('button', { name: 'Show less', exact: true })).toBeVisible()
+  const expandedHeight = await olderCard.evaluate(element => element.getBoundingClientRect().height)
+  expect(expandedHeight).toBeGreaterThan(compactHeight + 50)
 })
 
 test('Fledge labels a saved feed as stale when refresh fails', async ({ page }) => {

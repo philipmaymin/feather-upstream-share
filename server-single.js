@@ -3739,6 +3739,14 @@ function feedCompletionWhy(timestamp, generatedAt, kind) {
   return recent ? 'Recent assistant completion' : 'Earlier assistant completion';
 }
 
+function feedSessionTitle(session, roomName) {
+  const title = String(session.title || '').trim();
+  if (title === String(session.id || '').slice(0, 8) || /^(?:<file name=.*(?:pulse|prompt)\.md|Keep working:\s*#)/i.test(title)) {
+    return roomName ? `#${roomName} progress` : 'Agent progress';
+  }
+  return title || (roomName ? `#${roomName} dispatch` : 'Agent dispatch');
+}
+
 function feedScore(status, timestamp) {
   const priority = { waiting: 4, errored: 3, working: 2, finished: 1 }[status];
   return priority * FEED_SCORE_BAND + Math.floor(Date.parse(timestamp) / 1000);
@@ -3804,7 +3812,7 @@ function buildLiveFeedPosts(generatedAt) {
       room: roomBySession.get(session.id) || null,
       projectId: session.projectId || null,
       projectLabel: session.projectLabel || null,
-      title: session.title,
+      title: feedSessionTitle(session, roomBySession.get(session.id)),
       agent: SUPPORTED_AGENTS.has(session.agent) ? session.agent : null,
       status,
       ...(live.question ? { question: live.question } : {}),

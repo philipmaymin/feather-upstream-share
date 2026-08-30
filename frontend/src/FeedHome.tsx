@@ -270,6 +270,17 @@ function isNestedControl(target: EventTarget | null, card: HTMLElement): boolean
   return !!control && control !== card
 }
 
+function hasRichDispatch(text: string): boolean {
+  return externalEmbeds(text).length > 0
+    || /!\[[^\]]*\]\([^)]+\)|(?:^|\s)(?:https?:\/\/|\/|~\/)\S+\.(?:avif|gif|html?|jpe?g|mov|mp4|pdf|png|svg|webm)(?:[?#]\S*)?/im.test(text)
+}
+
+function isExpandableDispatch(post: FeedPost, text: string): boolean {
+  return post.status === 'finished'
+    && !hasRichDispatch(text)
+    && (text.length > 360 || text.split('\n').length > 7)
+}
+
 export default function FeedHome(props: FeedHomeProps) {
   const [mode, setMode] = createSignal<FeedMode>('for-you')
   const [feeds, setFeeds] = createSignal<Record<FeedMode, FeedState>>({
@@ -286,6 +297,7 @@ export default function FeedHome(props: FeedHomeProps) {
       : Notification.permission === 'denied' ? 'denied' : 'idle',
   )
   const [interactions, setInteractions] = createSignal<Record<string, InteractionState>>({})
+  const [expandedPosts, setExpandedPosts] = createSignal<Set<string>>(new Set())
   const current = createMemo(() => feeds()[mode()])
   const personalized = createMemo(() => {
     const raw = current().response?.posts || []
@@ -347,6 +359,15 @@ export default function FeedHome(props: FeedHomeProps) {
         ...patch,
       },
     }))
+  }
+
+  const togglePostExpansion = (postId: string) => {
+    setExpandedPosts(current => {
+      const next = new Set(current)
+      if (next.has(postId)) next.delete(postId)
+      else next.add(postId)
+      return next
+    })
   }
 
   const updatePost = (postId: string, update: (post: FeedPost) => FeedPost) => {
@@ -869,8 +890,10 @@ export default function FeedHome(props: FeedHomeProps) {
             </div>
           </Show>
 
-          <For each={posts()}>{(post, index) => {
+          <For each={posts()}>{post => {
             const text = () => messageText(post)
+            const expandable = () => isExpandableDispatch(post, text())
+            const expanded = () => expandedPosts().has(post.id)
             return (
               <div class="fledge-slide" data-feed-post-id={post.id} data-post-id={post.id} data-testid="fledge-post">
                 <article
@@ -884,10 +907,6 @@ export default function FeedHome(props: FeedHomeProps) {
                     if (!isNestedControl(event.target, event.currentTarget)) openPost(post)
                   }}
                 >
-                  <div class="fledge-card-register" aria-hidden="true">
-                    <span>{String(index() + 1).padStart(2, '0')}</span>
-                    <i />
-                  </div>
 
                   <div class="fledge-card-main">
                     <div class="fledge-card-topline">
@@ -895,6 +914,8 @@ export default function FeedHome(props: FeedHomeProps) {
                         <span class="fledge-status-dot" aria-hidden="true" />
                         {statusLabel(post.status)}
                       </span>
+                      <span class="fledge-card-place">{post.room || post.projectLabel || 'Unfiled'}</span>
+                      <Show when={post.agent}><span class="fledge-card-agent">{post.agent}</span></Show>
                       <time dateTime={post.timestamp}>{formatTimestamp(post.timestamp)}</time>
                     </div>
 
@@ -906,12 +927,7 @@ export default function FeedHome(props: FeedHomeProps) {
                     </Show>
 
                     <div class="fledge-card-heading">
-                      <div class="fledge-provenance">
-                        <span>{post.room || post.projectLabel || 'Unfiled field note'}</span>
-                        <Show when={post.agent}><span>{post.agent}</span></Show>
-                        <span>{post.kind === 'room-update' ? 'Room update' : 'Conversation'}</span>
-                      </div>
-                      <h2>{post.title}</h2>
+                      <h2 title={post.title}>{post.title}</h2>
                     </div>
 
                     <Show when={post.activity?.trim()}>
@@ -924,7 +940,7 @@ export default function FeedHome(props: FeedHomeProps) {
                     <Show when={text()}>
                       <section class="fledge-dispatch-body" aria-label={contentLabel(post)}>
                         <div class="fledge-section-label">{contentLabel(post)}</div>
-                        <div class="fledge-markdown">
+                        <div class="fledge-markdown" classList={{ 'fledge-dispatch-collapsed': expandable() && !expanded() }}>
                           <RichMarkdown text={text()} onOpenFile={props.onOpenFile} allowRemoteImages={false} />
                           <For each={externalEmbeds(text())}>{embed => (
                             <figure class="fledge-external-embed" data-platform={embed.platform.toLowerCase()}>
@@ -940,11 +956,21 @@ export default function FeedHome(props: FeedHomeProps) {
                             </figure>
                           )}</For>
                         </div>
+                        <Show when={expandable()}>
+                          <button
+                            type="button"
+                            class="fledge-more"
+                            aria-expanded={expanded()}
+                            onClick={event => { event.stopPropagation(); togglePostExpansion(post.id) }}
+                          >
+                            {expanded() ? 'Show less' : 'More'}
+                          </button>
+                        </Show>
                       </section>
                     </Show>
 
                     <aside class="fledge-why">
-                      <span>Why this is here</span>
+                      <span>Why</span>
                       <p>{post.why}{personalized().reasons[post.id] ? ` · ${personalized().reasons[post.id]}` : ''}</p>
                     </aside>
 
@@ -1011,6 +1037,15 @@ export default function FeedHome(props: FeedHomeProps) {
                         <span class="fledge-interaction-note" aria-live="polite">
                           {interactions()[post.id]?.error || interactions()[post.id]?.notice || ''}
                         </span>
+                        <button
+                          type="button"
+                          class="fledge-conversation-arrow"
+                          aria-label={post.sessionId ? 'Open conversation' : 'Open Room'}
+                          title={post.sessionId ? 'Open conversation' : 'Open Room'}
+                          onClick={() => openPost(post)}
+                        >
+                          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M14 7l5 5-5 5" /></svg>
+                        </button>
                       </div>
 
                       <Show when={interactions()[post.id]?.replyOpen}>
@@ -1057,14 +1092,6 @@ export default function FeedHome(props: FeedHomeProps) {
                         </div>
                       </Show>
                     </section>
-                    <footer class="fledge-card-footer">
-                      <button type="button" class="fledge-open" onClick={() => openPost(post)}>
-                        <span>{post.sessionId ? 'Open conversation' : 'Open Room'}</span>
-                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M14 7l5 5-5 5" /></svg>
-                      </button>
-                      <span class="fledge-card-id">Dispatch {post.id.slice(0, 8)}</span>
-
-                    </footer>
                   </div>
                 </article>
               </div>

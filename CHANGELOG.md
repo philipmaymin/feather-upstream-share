@@ -5,6 +5,7 @@
 - **Feedback returns to the originating Feather.** Thumbs up/down persist as preference evidence, failed deliveries remain retryable with exact idempotency markers, and inline comments keep their originating session binding and render the Feather's next human-facing reply beneath the dispatch.
 - **Room updates are timeline-ready.** Each briefing stores or derives a concise headline while retaining timestamp, Room/session provenance, Markdown body, and artifact links; autonomous Room prompts now request the same publishable structure.
 - **The new surface keeps strict boundaries.** Feather binds to loopback by default behind Authelia, feed state lives outside immutable releases with owner-only permissions, post IDs are opaque, push endpoints are bounded to public HTTPS destinations, social and local HTML run without same-origin privilege, and browser back/forward returns between feed and chat without losing position.
+- **The feed is now a compact continuous timeline.** Poster-sized snap cards and numbered gutters are gone; headers, controls, reasons, and reactions use one dense hierarchy, ordinary results preview six lines with in-place expansion, and waiting decisions retain their full highlighted question.
 
 ## 2026-08-28 - Readable chat, native math, and bounded browser cleanup
 - **LaTeX renders natively in chat.** Inline and display math now use KaTeX, including math-only backtick spans and fenced `math`, `latex`, or `tex` blocks.
