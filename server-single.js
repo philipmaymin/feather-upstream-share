@@ -3214,9 +3214,27 @@ function buildRoomsSnapshot() {
   const frictionComplaints = readFrictionComplaints();
 
   const rooms = names.map(name => {
-    const sessions = byRoom.get(name);
+    let sessions = byRoom.get(name);
     const pulse = roomPulse(name, Date.now(), pulseState);
     const requestedLeaderSessionId = leaders[name];
+    if (requestedLeaderSessionId
+      && !sessions.some(session => session.id === requestedLeaderSessionId)
+      && validRoomLeaderDesignation(name, requestedLeaderSessionId)) {
+      const meta = sessionMeta[requestedLeaderSessionId] || {};
+      let updatedAt = meta.updatedAt || new Date(ROOM_PULSE_STARTED_AT).toISOString();
+      try {
+        updatedAt = fs.statSync(path.join(OMP_SESSIONS, requestedLeaderSessionId)).mtime.toISOString();
+      } catch {}
+      sessions = [{
+        id: requestedLeaderSessionId,
+        title: meta.title || `#${name} Leader`,
+        updatedAt,
+        isActive: tmuxIsActive(requestedLeaderSessionId),
+        agent: meta.agent,
+        cwd: meta.cwd || path.join(ROOMS_HOME_DIR, name),
+        roomAssigned: true,
+      }, ...sessions];
+    }
     const eligibleLeader = session => session.agent !== 'codex'
       && session.id !== pulse.sessionId
       && !sessionIsRoomPulse({ title: session.title });

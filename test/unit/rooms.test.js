@@ -64,7 +64,7 @@ describe('portable Room membership', () => {
     assert.equal(detached.get('marriage')[1].roomAssigned, undefined)
   })
 
-  it('includes a non-default-home Room session and an assigned session older than the discovery limit', async () => {
+  it('includes old assigned sessions and a freshly spawned transcriptless Leader', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-rooms-portable-'))
     roots.push(root)
     const home = path.join(root, 'zak-home')
@@ -72,6 +72,7 @@ describe('portable Room membership', () => {
     const projects = path.join(home, '.claude/projects')
     const roomDir = path.join(home, 'rooms/marriage')
     const otherRoomDir = path.join(home, 'rooms/other')
+    const freshRoomDir = path.join(home, 'rooms/fresh')
     const ordinaryProject = path.join(projects, encodeProjectPath(path.join(home, 'ordinary')))
     const roomProject = path.join(projects, encodeProjectPath(roomDir))
     fs.mkdirSync(stateDir)
@@ -80,10 +81,13 @@ describe('portable Room membership', () => {
     fs.mkdirSync(path.join(home, '.feather'), { recursive: true })
     fs.mkdirSync(roomDir, { recursive: true })
     fs.mkdirSync(otherRoomDir, { recursive: true })
+    fs.mkdirSync(freshRoomDir, { recursive: true })
     fs.writeFileSync(path.join(roomDir, 'AGENTS.md'), '# Room: #marriage\n')
     fs.writeFileSync(path.join(roomDir, 'notes.md'), '# #marriage — notes\n')
     fs.writeFileSync(path.join(otherRoomDir, 'AGENTS.md'), '# Room: #other\n')
     fs.writeFileSync(path.join(otherRoomDir, 'notes.md'), '# #other — notes\n')
+    fs.writeFileSync(path.join(freshRoomDir, 'AGENTS.md'), '# Room: #fresh\n')
+    fs.writeFileSync(path.join(freshRoomDir, 'notes.md'), '# #fresh — notes\n')
     const invalidRoomDir = path.join(home, 'rooms/Bad Room')
     fs.mkdirSync(invalidRoomDir)
     fs.writeFileSync(path.join(invalidRoomDir, 'AGENTS.md'), '# invalid\n')
@@ -130,12 +134,18 @@ describe('portable Room membership', () => {
       timestamp: '2021-01-01T00:00:00Z',
     })
     fs.utimesSync(residentFile, new Date('2021-01-01T00:00:00Z'), new Date('2021-01-01T00:00:00Z'))
+    const freshLeaderId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    fs.mkdirSync(path.join(home, '.feather/omp-sessions', freshLeaderId), { recursive: true })
+    fs.writeFileSync(path.join(stateDir, 'session-meta.json'), JSON.stringify({
+      [freshLeaderId]: { agent: 'omp', cwd: freshRoomDir, title: '#fresh Leader' },
+    }))
     fs.writeFileSync(path.join(home, '.feather/room-sessions.json'), JSON.stringify({
       [oldId]: 'marriage',
       [residentId]: 'marriage',
       [movedId]: 'other',
+      [freshLeaderId]: 'fresh',
     }))
-    fs.writeFileSync(path.join(home, '.feather/room-mains.json'), JSON.stringify({ marriage: oldId }))
+    fs.writeFileSync(path.join(home, '.feather/room-mains.json'), JSON.stringify({ marriage: oldId, fresh: freshLeaderId }))
     fs.writeFileSync(path.join(home, '.feather/room-residents.json'), JSON.stringify({
       marriage: { caretaker: { sessionId: residentId } },
     }))
@@ -179,6 +189,14 @@ describe('portable Room membership', () => {
         ['leader', oldId],
         ['caretaker', residentId],
       ])
+      const fresh = rooms.find((room) => room.name === 'fresh')
+      assert.equal(fresh.leaderSessionId, freshLeaderId)
+      assert.deepEqual(fresh.sessions.map((session) => session.id), [freshLeaderId])
+      assert.equal(fresh.sessions[0].title, '#fresh Leader')
+      assert.equal(fresh.sessions[0].roomAssigned, true)
+      assert.deepEqual(fresh.residents.map((resident) => [resident.role, resident.sessionId]), [
+        ['leader', freshLeaderId],
+      ])
 
       const blockedDetach = await fetch(`http://127.0.0.1:${port}/api/rooms/marriage/assign`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -186,7 +204,10 @@ describe('portable Room membership', () => {
       })
       assert.equal(blockedDetach.status, 409)
       assert.match((await blockedDetach.json()).error, /Leader.*cannot be moved or detached/)
-      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, '.feather/room-mains.json'), 'utf8')), { marriage: oldId })
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, '.feather/room-mains.json'), 'utf8')), {
+        marriage: oldId,
+        fresh: freshLeaderId,
+      })
       const blockedResidentDetach = await fetch(`http://127.0.0.1:${port}/api/rooms/marriage/assign`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId: residentId, remove: true }),
