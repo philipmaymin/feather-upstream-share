@@ -202,7 +202,7 @@ function applyCodeWrap(enabled: boolean, persist = true) {
 function handleCopyClick(e: MouseEvent) {
   const btn = (e.target as HTMLElement).closest('.copy-btn') as HTMLElement | null
   if (!btn) return
-  const code = btn.closest('pre')?.querySelector('code')
+  const code = btn.closest('.code-block-shell')?.querySelector('pre code')
   if (!code) return
   navigator.clipboard.writeText(code.textContent || '').then(() => {
     btn.textContent = 'Copied!'
@@ -238,8 +238,7 @@ function collapseCodeBlocks(el: HTMLElement) {
 
 function injectCopyButtons(el: HTMLElement) {
   for (const pre of el.querySelectorAll('pre')) {
-    if (pre.querySelector('.code-tools')) continue
-    pre.style.position = 'relative'
+    if (pre.closest('.code-block-shell')) continue
 
     const tools = document.createElement('div')
     tools.className = 'code-tools'
@@ -264,7 +263,10 @@ function injectCopyButtons(el: HTMLElement) {
     wrap.append(checkbox, document.createTextNode('Wrap'))
     tools.appendChild(wrap)
 
-    pre.appendChild(tools)
+    const shell = document.createElement('div')
+    shell.className = 'code-block-shell'
+    pre.parentNode!.insertBefore(shell, pre)
+    shell.append(tools, pre)
   }
 }
 
@@ -820,14 +822,26 @@ const markdownCSS = `
 div:hover > div > .star-btn, div:hover > div > .action-menu-btn { opacity: 0.6 !important; }
 .star-btn:hover, .action-menu-btn:hover { opacity: 1 !important; }
 
-/* Code-block controls */
+/* Code-block controls: dedicated toolbar above code, never overlaid on text */
+.code-block-shell {
+  margin: 8px 0;
+  overflow: hidden;
+  border: 1px solid #2a2f38;
+  border-radius: 6px;
+  background: #0d1117;
+}
+.markdown .code-block-shell > pre,
+.markdown .code-block-shell .code-collapse-wrapper > pre {
+  margin: 0;
+  border-radius: 0;
+}
 .code-tools {
-  position: absolute; top: 6px; right: 6px; z-index: 2;
-  display: flex; align-items: center; gap: 5px;
-  opacity: 0; transition: opacity 0.15s;
+  display: flex; align-items: center; justify-content: flex-end; gap: 5px;
+  min-height: 30px; padding: 4px 6px;
+  border-bottom: 1px solid #2a2f38;
+  background: #111720;
   font-family: -apple-system, system-ui, sans-serif;
 }
-pre:hover .code-tools, .code-tools:focus-within { opacity: 1; }
 .copy-btn {
   background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15);
   color: var(--text-secondary); font-size: 11px; padding: 2px 8px; border-radius: 4px;
@@ -844,7 +858,6 @@ pre:hover .code-tools, .code-tools:focus-within { opacity: 1; }
 }
 .code-wrap-control:hover { background: rgba(255,255,255,0.1); color: var(--text-primary); }
 .code-wrap-control input { width: 11px; height: 11px; margin: 0; accent-color: #fab283; cursor: pointer; }
-@media (hover: none) { .code-tools { opacity: 1; } }
 
 /* Typing indicator bounce */
 @keyframes typing-bounce {

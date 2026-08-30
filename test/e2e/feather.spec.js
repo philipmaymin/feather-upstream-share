@@ -286,10 +286,17 @@ test.describe('Message rendering', () => {
 
   test('code blocks wrap by default and persist the per-block toggle', async ({ page }) => {
     const pre = page.locator('.markdown pre').first()
+    const shell = pre.locator('xpath=ancestor::div[contains(@class,"code-block-shell")]')
     const code = pre.locator('code')
-    const toggle = pre.getByLabel('Wrap long code and output lines')
+    const toolbar = shell.locator('.code-tools')
+    const toggle = toolbar.getByLabel('Wrap long code and output lines')
 
-    await pre.hover()
+    await expect(toolbar).toBeVisible()
+    const toolbarBox = await toolbar.boundingBox()
+    const preBox = await pre.boundingBox()
+    expect(toolbarBox).not.toBeNull()
+    expect(preBox).not.toBeNull()
+    expect(toolbarBox.y + toolbarBox.height).toBeLessThanOrEqual(preBox.y + 1)
     await expect(toggle).toBeChecked()
     expect(await code.evaluate(el => getComputedStyle(el).whiteSpace)).toBe('pre-wrap')
 
@@ -299,7 +306,7 @@ test.describe('Message rendering', () => {
 
     await page.reload()
     await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 5000 })
-    await pre.hover()
+    await expect(toolbar).toBeVisible()
     await expect(toggle).not.toBeChecked()
     expect(await code.evaluate(el => getComputedStyle(el).whiteSpace)).toBe('pre')
 
