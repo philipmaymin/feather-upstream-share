@@ -63,13 +63,13 @@ In `startTerminal`, retain the existing bash spawn for `isShell`. Put the `sessi
 
 ### Step 2: Replace handshake-only unit coverage with a nonce round trip
 
-Extend the writable-mode WebSocket helper/test in `test/unit/readOnlyCanary.test.js`: connect to `/api/shell`, send a harmless `printf` command containing a unique nonce, collect output until the nonce appears, close, and assert a normal usable exchange. The test must fail on the current fall-through implementation. Keep the existing read-only rejection assertions.
+Extend the writable-mode WebSocket helper/test in `test/unit/readOnlyCanary.test.js`: connect to `/api/shell`, send a harmless expression whose expected result is not present in the input (for example arithmetic rendered through `printf`), collect output until that derived result appears, close, and assert a usable exchange. A literal nonce embedded in the command is insufficient because terminal echo can produce a false positive. Keep read-only rejection assertions.
 
 **Verify**: `node --test test/unit/readOnlyCanary.test.js` → all pass.
 
 ### Step 3: Prove mounted-prefix shell I/O
 
-Update the `/feather2/api/shell` section in `mountedPrefix.spec.js` to send and observe a unique nonce through the proxied WebSocket before closing. Keep the 101 routing assertion, but make nonce output the behavioral gate.
+Update the `/feather2/api/shell` section in `mountedPrefix.spec.js` with the same derived-output proof. Keep the 101 routing assertion, but make actual command result—not echoed input—the behavioral gate.
 
 **Verify**: `npx playwright test test/e2e/mountedPrefix.spec.js --grep "production prefix"` → 1 pass.
 
@@ -84,7 +84,7 @@ Update the `/feather2/api/shell` section in `mountedPrefix.spec.js` to send and 
 ## Done criteria
 
 - [ ] Shell and tmux startup are mutually exclusive.
-- [ ] A nonce round trip passes in unit and mounted-prefix coverage.
+- [ ] A derived-output shell round trip passes in unit and mounted-prefix coverage.
 - [ ] `node --check server-single.js` exits 0.
 - [ ] No files outside Scope changed.
 
