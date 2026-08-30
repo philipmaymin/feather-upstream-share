@@ -36,6 +36,7 @@ The full browser suite exposed two concrete gaps. `view_image` summaries truncat
 ## Scope
 
 - `frontend/src/lib/toolPresentation.js`
+- `frontend/src/components/MessageView.tsx`
 - `test/unit/toolPresentation.test.js`
 - `test/e2e/toolImagePreview.spec.js` only if expectation needs a platform-neutral path case
 - `test/e2e/rooms-home.spec.js`
@@ -45,12 +46,13 @@ No other source or test files.
 ## Steps
 
 1. For `view_image`/`viewImage`, present the path basename (platform-neutral `/` or `\\` separators) instead of the generic first-80-character prefix. Keep `toolImagePath` and preview routing unchanged. Add/extend the unit assertion with a deliberately long path whose basename is `tool-preview.svg`.
-2. Update the no-Leader Rooms-home test to expect `+ Start OMP Leader`, click it, and assert the created session request uses OMP plus `roomName` and `roomRole: leader`. Do not change production Room behavior.
+2. Render the inline `view_image` preview as a semantic button named `Open <basename> full screen`, with a useful image alt, while preserving the exact preview URL, dimensions, zoom affordance, and `onImageClick` lightbox behavior.
+3. Update the no-Leader Rooms-home test to expect `+ Start OMP Leader`, click it, and assert the created session request uses OMP plus `roomName` and `roomRole: leader`. Do not change production Room behavior.
 
 ## Done criteria
 
 - [ ] Long `view_image` summary contains the complete basename and extension.
-- [ ] Existing tool preview opens the same local path.
+- [ ] Existing tool preview is a semantic named button and opens the same local path/lightbox.
 - [ ] No-Leader Room test asserts explicit atomic Leader creation.
 - [ ] Only Scope files change.
 
@@ -58,7 +60,7 @@ No other source or test files.
 
 - Tool path summary behavior is shared with a public payload rather than presentation only.
 - The Room fixture unexpectedly includes a valid Leader.
-- Fix requires production Room source changes.
+- Fix requires files outside the expanded Scope.
 
 ## Maintenance notes
 
