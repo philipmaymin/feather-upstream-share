@@ -42,6 +42,7 @@ test.afterAll(() => {
 
 test('view_image expands to a tappable preview and full-screen lightbox', async ({ page }) => {
   await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
+  await page.getByTestId('work-log-summary').click()
 
   const summary = page.locator('summary').filter({ hasText: 'View Image' })
   await expect(summary).toContainText('tool-preview.svg')
