@@ -286,7 +286,7 @@ describe('server-enforced read-only canary', () => {
     }
   })
 
-  it('preserves multiline attachment prompts as one literal bracketed paste', async () => {
+  it('keeps attachment markers in one terminal submission', async () => {
     const fx = fixture()
     fs.mkdirSync(path.join(fx.state, 'uploads'))
     const { base } = await startServer(fx, false)
@@ -303,10 +303,13 @@ describe('server-enforced read-only canary', () => {
     })
 
     assert.equal(response.status, 200)
-    assert.equal(fs.readFileSync(fx.tmuxPayload, 'utf8'), text)
     const calls = fs.readFileSync(fx.tmuxLog, 'utf8')
-    assert.match(calls, new RegExp(`paste-buffer -p -r -t f-${fx.sessionId}`))
-    assert.doesNotMatch(calls, new RegExp(`paste-buffer -t f-${fx.sessionId}`))
+    const oneLine = text.replace(/\n/g, ' ')
+    assert.ok(
+      calls.split('\n').includes(`send-keys -t f-${fx.sessionId} -l ${oneLine}`),
+      calls,
+    )
+    assert.doesNotMatch(calls, /paste-buffer/)
   })
 
   it('returns stable durable send receipts while preserving unkeyed client behavior', async () => {

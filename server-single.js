@@ -851,27 +851,31 @@ function inputBoxText(name) {
 }
 
 async function sendText(name, text) {
-  // Use bracketed, literal file-based paste for long text or text with
-  // newlines so the TUI receives the entire prompt as one paste event instead
-  // of treating attachment-separating linefeeds as individual Enter presses.
-  const isLong = text.length > 500 || text.includes('\n');
+  // OMP's prompt editor currently submits on LF even when tmux wraps a paste in
+  // bracketed-paste controls. Keep attachment-bearing prompts on one terminal
+  // line so their established path markers cannot become separate submissions.
+  // Receipts still hash and retain the original composed text.
+  const terminalText = /\[Attached (?:image|file): /.test(text)
+    ? text.replace(/\r?\n+/g, ' ').trim()
+    : text;
+  const isLong = terminalText.length > 500 || terminalText.includes('\n');
   if (isLong) {
     const tmp = `/tmp/feather-send-${Date.now()}.txt`;
-    fs.writeFileSync(tmp, text);
+    fs.writeFileSync(tmp, terminalText);
     try {
       execFileSync('tmux', ['load-buffer', tmp], { stdio: 'ignore' });
       execFileSync('tmux', codexPasteBufferArgs(name), { stdio: 'ignore' });
     } finally { try { fs.unlinkSync(tmp); } catch {} }
     await new Promise(r => setTimeout(r, 500));
   } else {
-    execFileSync('tmux', ['send-keys', '-t', name, '-l', text], { stdio: 'ignore' });
+    execFileSync('tmux', ['send-keys', '-t', name, '-l', terminalText], { stdio: 'ignore' });
     await new Promise(r => setTimeout(r, 300));
   }
 
   // Re-send Enter only while the exact text remains in the input box. Once the
   // box clears, the message has either submitted or queued and must not be sent
   // again.
-  const marker = text.replace(/\s+/g, ' ').trim().slice(0, 40);
+  const marker = terminalText.replace(/\s+/g, ' ').trim().slice(0, 40);
   for (let attempt = 0; attempt < 2; attempt++) {
     try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
     await new Promise(r => setTimeout(r, 500));
