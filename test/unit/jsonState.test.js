@@ -233,6 +233,17 @@ describe('server and rollback integration', () => {
     fs.mkdirSync(roomDir, { recursive: true })
     fs.mkdirSync(path.join(homeDir, '.feather'), { recursive: true })
     fs.writeFileSync(path.join(roomDir, 'AGENTS.md'), '# marriage')
+    const claudeProjectDir = path.join(homeDir, '.claude/projects/-json-state-fixture')
+    fs.mkdirSync(claudeProjectDir, { recursive: true })
+    fs.writeFileSync(path.join(claudeProjectDir, 'session2.jsonl'), JSON.stringify({
+      type: 'user',
+      uuid: 'session2-message',
+      cwd: roomDir,
+      timestamp: '2026-08-30T00:00:00Z',
+      isMeta: false,
+      isSidechain: false,
+      message: { role: 'user', content: 'JSON state fixture' },
+    }) + '\n')
     fs.writeFileSync(path.join(stateDir, 'session-meta.json'), JSON.stringify({
       session1: { agent: 'claude', futureSessionField: { keep: true } },
       futureDocumentField: { keep: true },
