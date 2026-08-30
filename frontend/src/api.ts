@@ -882,17 +882,17 @@ export function subscribeMessages(id: string, options: SubscribeMessagesOptions)
       if (!alive()) return
       retries = 0
       onStatus?.('connected')
-      if (lastEventId) {
-        fetch(`${BASE}/api/sessions/${id}/messages`)
-          .then(response => response.ok ? response.json() : null)
-          .then(data => {
-            if (closed || sourceGeneration !== generation || source !== es) return
-            if (!data?.messages?.length) return
-            const last = data.messages[data.messages.length - 1]
-            if (last.stopReason) onMessage(last)
-          })
-          .catch(() => {})
-      }
+      // Reconcile after every successful stream connection, including the
+      // first. A transcript append can land after the initial GET but before
+      // EventSource is fully registered; replaying the bounded latest page is
+      // safe because App deduplicates messages by UUID.
+      fetch(`${BASE}/api/sessions/${id}/messages`)
+        .then(response => response.ok ? response.json() : null)
+        .then(data => {
+          if (closed || sourceGeneration !== generation || source !== es) return
+          for (const message of data?.messages || []) onMessage(message)
+        })
+        .catch(() => {})
     })
     source.addEventListener('heartbeat', () => { alive() })
     source.addEventListener('message', (event) => {
