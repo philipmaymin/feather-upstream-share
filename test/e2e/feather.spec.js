@@ -473,14 +473,14 @@ test.describe('Message rendering', () => {
   test('assistant text beside a tool call stays exposed outside Activity', async ({ page }) => {
     const progress = page.getByText('I found the mismatch and am checking one last source.', { exact: true })
     await expect(progress).toBeVisible()
-    const bubble = page.locator('[data-role="assistant"]').filter({ has: progress })
-    await expect(bubble.getByTestId('work-log-summary')).toContainText('Activity')
-    await expect(page.getByText('The implementation is now verified.', { exact: true })).toBeVisible()
+    const activityRow = page.locator('[data-role="assistant"]').filter({ has: progress })
+    await expect(activityRow.getByTestId('work-log-summary')).toContainText('Activity')
+    await expect(page.locator('[data-role="assistant"]').filter({ hasText: 'The implementation is now verified.' })).toBeVisible()
   })
 
   test('an open Activity panel stays open while later execution updates arrive', async ({ page }) => {
     const workLog = page.locator('details.work-log').first()
-    await workLog.locator('summary').click()
+    await workLog.getByTestId('work-log-summary').click()
     await expect(workLog).toHaveJSProperty('open', true)
 
     const updateUuid = 'e2e-activity-later-update'
@@ -496,38 +496,43 @@ test.describe('Message rendering', () => {
   })
 
   test('Activity precedes a tool-using final answer in chronological turn order', async ({ page }) => {
-    const bubble = page.locator('[data-role="assistant"]').filter({ hasText: 'The implementation is now verified.' }).first()
-    const chronological = await bubble.evaluate(element => {
-      const activity = element.querySelector('.work-log')
-      const answer = [...element.querySelectorAll('.markdown')].find(node => node.textContent?.includes('The implementation is now verified.'))
-      return !!(activity && answer && (activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING))
+    const chronological = await page.locator('[data-role="assistant"]').evaluateAll(rows => {
+      const activity = rows.find(row =>
+        row.textContent?.includes('I found the mismatch and am checking one last source.') &&
+        row.querySelector('.work-log'))
+      const answer = rows.find(row => row.textContent?.includes('The implementation is now verified.'))
+      return !!(activity && answer && activity !== answer &&
+        (activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING))
     })
     expect(chronological).toBe(true)
   })
 
   test('tool_use block is preserved inside Activity', async ({ page }) => {
-    const toolBubble = page.locator('[data-role="assistant"]').filter({ hasText: 'The implementation is now verified.' }).first()
-    await toolBubble.getByTestId('work-log-summary').click()
-    await expect(toolBubble.getByText('Read').first()).toBeVisible()
+    const activityRow = page.locator('[data-role="assistant"]').filter({ hasText: 'I found the mismatch and am checking one last source.' })
+    const workLog = activityRow.locator('details.work-log')
+    await workLog.getByTestId('work-log-summary').click()
+    await expect(activityRow.getByText('Read').first()).toBeVisible()
   })
 
   test('tool_result output is revealed from Activity and the tool call', async ({ page }) => {
-    const toolBubble = page.locator('[data-role="assistant"]').filter({ hasText: 'The implementation is now verified.' }).first()
-    await toolBubble.getByTestId('work-log-summary').click()
-    const result = toolBubble.locator('summary:has-text("output")')
+    const activityRow = page.locator('[data-role="assistant"]').filter({ hasText: 'I found the mismatch and am checking one last source.' })
+    const workLog = activityRow.locator('details.work-log')
+    await workLog.getByTestId('work-log-summary').click()
+    const result = activityRow.locator('summary:has-text("output")')
     await expect(result.first()).toBeVisible()
   })
 
   test('failed work is flagged quietly and its error remains reachable inside Activity', async ({ page }) => {
-    const toolBubble = page.locator('[data-role="assistant"]').filter({ hasText: 'The implementation is now verified.' }).first()
-    const workLog = toolBubble.getByTestId('work-log-summary')
-    await expect(workLog).toContainText('Activity')
-    await expect(workLog).toContainText('1 issue')
-    await workLog.click()
-    const summary = toolBubble.locator('summary', { hasText: 'missing.txt' })
+    const activityRow = page.locator('[data-role="assistant"]').filter({ hasText: 'I found the mismatch and am checking one last source.' })
+    const workLog = activityRow.locator('details.work-log')
+    const activitySummary = workLog.getByTestId('work-log-summary')
+    await expect(activitySummary).toContainText('Activity')
+    await expect(activitySummary).toContainText('1 issue')
+    await activitySummary.click()
+    const summary = activityRow.locator('summary', { hasText: 'missing.txt' })
     await expect(summary).toBeVisible()
     await summary.click()
-    const error = page.locator('summary:has-text("error")')
+    const error = activityRow.locator('summary:has-text("error")')
     await expect(error.first()).toBeVisible()
   })
 
