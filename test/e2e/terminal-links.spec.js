@@ -222,6 +222,17 @@ test('mobile Return input and visible toolbar controls both reach the terminal',
   })
   await expect.poll(() => terminalKeys.filter(value => value === 'Escape').length).toBe(2)
 
+  // If the next tap loses pointerup but still emits click, a recent touch on a
+  // different key must not suppress that click.
+  await page.evaluate(() => {
+    const prior = document.querySelector('button[aria-label="Down arrow"]')
+    const next = document.querySelector('button[aria-label="Up arrow"]')
+    prior?.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'touch' }))
+    next?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }))
+  })
+  await expect.poll(() => terminalKeys.filter(value => value === 'Down').length).toBe(2)
+  await expect.poll(() => terminalKeys.filter(value => value === 'Up').length).toBe(2)
+
   // Canvas keyboard input still queues while the terminal WebSocket reconnects.
   // Toolbar controls use the independent HTTP path tested above.
   await terminalSocket.close()

@@ -109,6 +109,7 @@ export function Terminal(props: { sessionId: string | null }) {
   let keyboardEnterTimer: number | undefined
   let keyNoticeTimer: number | undefined
   let lastTouchKeyAt = 0
+  let lastTouchKey = ''
   let connectionGeneration = 0
   const [copied, setCopied] = createSignal(false)
   const [hasSelection, setHasSelection] = createSignal(false)
@@ -399,6 +400,7 @@ export function Terminal(props: { sessionId: string | null }) {
     reconnectTimer = undefined
     pendingTerminalInput = []
     lastTouchKeyAt = 0
+    lastTouchKey = ''
     ws?.close()
     ws = null
     term?.dispose()
@@ -482,6 +484,7 @@ export function Terminal(props: { sessionId: string | null }) {
   function sendKeyFromPointer(event: PointerEvent, key: string) {
     if (event.pointerType !== 'touch' && event.pointerType !== 'pen') return
     event.preventDefault()
+    lastTouchKey = key
     lastTouchKeyAt = performance.now()
     void sendToolbarKey(key)
   }
@@ -490,7 +493,7 @@ export function Terminal(props: { sessionId: string | null }) {
     // iOS may suppress its synthetic click after terminal focus changes. Send
     // on the native touch pointer path, and ignore the compatibility click if
     // the browser still emits one. Mouse and keyboard clicks continue here.
-    if (performance.now() - lastTouchKeyAt < 750) return
+    if (lastTouchKey === key && performance.now() - lastTouchKeyAt < 750) return
     void sendToolbarKey(key)
   }
 
