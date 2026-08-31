@@ -120,7 +120,7 @@ function genericSummary(input) {
   if (typeof input === 'string') return shortValue(input.split('\n')[0])
   if (!input || typeof input !== 'object') return shortValue(input)
 
-  for (const key of ['command', 'cmd', 'query', 'q', 'url', 'path', 'file_path', 'location', 'description', 'prompt', 'raw']) {
+  for (const key of ['i', 'title', 'description', 'command', 'cmd', 'query', 'q', 'url', 'path', 'file_path', 'location', 'prompt', 'raw']) {
     if (input[key] != null) return shortValue(input[key])
   }
 
@@ -218,6 +218,28 @@ export function toolPresentation(rawName, input) {
     ? 'Web'
     : canonicalToolName(rawName)
   return { name, summary: toolSummary(name, input) }
+}
+
+export function activityDescription(rawName, input, intent = '') {
+  const declared = textValue(intent).trim()
+  if (declared) return declared
+
+  const { name, summary } = toolPresentation(rawName, input)
+  switch (name) {
+    case 'Bash': return summary ? `Running ${summary}` : 'Running a command'
+    case 'Eval':
+    case 'IPython': return summary || 'Evaluating data'
+    case 'Grep': return summary ? `Searching ${summary}` : 'Searching files'
+    case 'Glob': return summary ? `Finding ${summary}` : 'Finding files'
+    case 'Write': return summary ? `Writing ${summary}` : 'Writing a file'
+    case 'Edit': return summary ? `Editing ${summary}` : 'Editing a file'
+    case 'Patch': return summary ? `Updating ${summary}` : 'Updating files'
+    case 'Read': return summary ? `Reading ${summary}` : 'Reading a file'
+    case 'WebFetch': return summary ? `Fetching ${summary}` : 'Fetching a page'
+    case 'WebSearch': return summary ? `Searching ${summary}` : 'Searching the web'
+    case 'Agent': return summary || 'Delegating work'
+    default: return summary || 'Working'
+  }
 }
 
 export function toolImagePath(rawName, input) {

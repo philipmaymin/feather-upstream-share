@@ -463,69 +463,69 @@ test.describe('Message rendering', () => {
     await page.getByTitle('Close').click()
   })
 
-  test('thinking is folded into quiet Details beside the final answer', async ({ page }) => {
-    await expect(page.getByText(/Feather uses .*marked.* with GFM support/)).toBeVisible()
-    const summary = page.getByTestId('work-log-summary').first()
-    await expect(summary).toContainText('Details')
-    await expect(page.getByText('Let me explain the markdown pipeline step by step.')).not.toBeVisible()
-    await summary.click()
-    const detail = page.getByTestId('work-log-detail').first()
-    await expect(detail).toContainText('1 execution step')
-    await expect(detail).toContainText('markdown pipeline')
+  test('reasoning-only direct answers have no completed Activity disclosure', async ({ page }) => {
+    const bubble = page.locator('[data-role="assistant"]').filter({ hasText: /Feather uses .*marked.* with GFM support/ }).first()
+    await expect(bubble).toBeVisible()
+    await expect(bubble.getByTestId('work-log-summary')).toHaveCount(0)
+    await expect(page.getByText('Planning the markdown pipeline.')).not.toBeVisible()
   })
 
-  test('assistant text beside a tool call stays exposed outside Details', async ({ page }) => {
+  test('assistant text beside a tool call stays exposed outside Activity', async ({ page }) => {
     const progress = page.getByText('I found the mismatch and am checking one last source.', { exact: true })
     await expect(progress).toBeVisible()
     const bubble = page.locator('[data-role="assistant"]').filter({ has: progress })
-    await expect(bubble.getByTestId('work-log-summary')).toContainText('Details')
+    await expect(bubble.getByTestId('work-log-summary')).toContainText('Activity')
     await expect(page.getByText('The implementation is now verified.', { exact: true })).toBeVisible()
   })
 
-  test('an open Details panel stays open while later execution updates arrive', async ({ page }) => {
+  test('an open Activity panel stays open while later execution updates arrive', async ({ page }) => {
     const workLog = page.locator('details.work-log').first()
     await workLog.locator('summary').click()
     await expect(workLog).toHaveJSProperty('open', true)
 
-    const updateUuid = 'e2e-details-later-update'
+    const updateUuid = 'e2e-activity-later-update'
     if (!fs.readFileSync(testSessionPath, 'utf8').includes(updateUuid)) {
       writeLine({
         type: 'assistant', uuid: updateUuid, timestamp: new Date().toISOString(),
         isSidechain: false, isMeta: false,
-        message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'A later execution update arrived.' }] },
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tool_later', name: 'Read', input: { file_path: '/src/later.ts' } }] },
       })
     }
 
-    await expect(page.getByTestId('work-log-summary')).toHaveCount(3)
     await expect(workLog).toHaveJSProperty('open', true)
-    await expect(workLog.getByText('markdown pipeline')).toBeVisible()
   })
 
-  test('Details precedes the final answer in chronological turn order', async ({ page }) => {
-    const bubble = page.locator('[data-role="assistant"]').filter({ hasText: 'Feather uses marked with GFM support.' }).first()
+  test('Activity precedes a tool-using final answer in chronological turn order', async ({ page }) => {
+    const bubble = page.locator('[data-role="assistant"]').filter({ hasText: 'The implementation is now verified.' }).first()
     const chronological = await bubble.evaluate(element => {
-      const details = element.querySelector('.work-log')
-      const answer = [...element.querySelectorAll('.markdown')].find(node => node.textContent?.includes('Feather uses marked with GFM support.'))
-      return !!(details && answer && (details.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING))
+      const activity = element.querySelector('.work-log')
+      const answer = [...element.querySelectorAll('.markdown')].find(node => node.textContent?.includes('The implementation is now verified.'))
+      return !!(activity && answer && (activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING))
     })
     expect(chronological).toBe(true)
   })
 
-  test('tool_use block is preserved inside Details', async ({ page }) => {
-    await page.getByTestId('work-log-summary').filter({ hasText: 'issue' }).click()
-    const toolUse = page.locator('text=Read').first()
-    await expect(toolUse).toBeVisible()
+  test('tool_use block is preserved inside Activity', async ({ page }) => {
+    const toolBubble = page.locator('[data-role="assistant"]').filter({ hasText: 'The implementation is now verified.' }).first()
+    await toolBubble.getByTestId('work-log-summary').click()
+    await expect(toolBubble.getByText('Read').first()).toBeVisible()
   })
 
-  test('tool_result shows output label inside Details', async ({ page }) => {
-    await page.getByTestId('work-log-summary').filter({ hasText: 'issue' }).click()
-    const result = page.locator('summary:has-text("output")')
+  test('tool_result output is revealed from Activity and the tool call', async ({ page }) => {
+    const toolBubble = page.locator('[data-role="assistant"]').filter({ hasText: 'The implementation is now verified.' }).first()
+    await toolBubble.getByTestId('work-log-summary').click()
+    const result = toolBubble.locator('summary:has-text("output")')
     await expect(result.first()).toBeVisible()
   })
 
-  test('failed work is flagged quietly and its error remains reachable', async ({ page }) => {
-    const summary = page.getByTestId('work-log-summary').filter({ hasText: 'issue' })
-    await expect(summary).toContainText('1 issue')
+  test('failed work is flagged quietly and its error remains reachable inside Activity', async ({ page }) => {
+    const toolBubble = page.locator('[data-role="assistant"]').filter({ hasText: 'The implementation is now verified.' }).first()
+    const workLog = toolBubble.getByTestId('work-log-summary')
+    await expect(workLog).toContainText('Activity')
+    await expect(workLog).toContainText('1 issue')
+    await workLog.click()
+    const summary = toolBubble.locator('summary', { hasText: 'missing.txt' })
+    await expect(summary).toBeVisible()
     await summary.click()
     const error = page.locator('summary:has-text("error")')
     await expect(error.first()).toBeVisible()
@@ -775,9 +775,9 @@ test.describe('Live updates', () => {
 
     const liveWork = page.getByTestId('live-work-turn')
     await expect(liveWork).toBeVisible()
-    await expect(liveWork.getByTestId('work-log-summary')).toContainText('Details')
+    await expect(liveWork.getByTestId('work-log-summary')).toContainText('Activity')
     await expect(liveWork.getByTestId('work-log-summary')).toContainText('Inspecting upload recovery.')
-    await expect(page.getByTestId('working-indicator')).toHaveCount(0)
+    await expect(page.getByTestId('thinking-indicator')).toHaveCount(0)
 
     writeLine({
       type: 'assistant', uuid: `e2e-status-2-${Date.now()}`, timestamp: '2025-06-15T14:06:05Z',

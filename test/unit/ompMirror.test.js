@@ -31,7 +31,7 @@ describe('OMP mirror reducer', () => {
     })
   })
 
-  it('settles each assistant segment and recreates execution for current work', () => {
+  it('preserves chronological execution across assistant segments', () => {
     const running = reduce([
       { type: 'agent_start' },
       { type: 'todo', phases: [{ name: 'Keep', tasks: [{ content: 'Preserve Todo', status: 'in_progress' }] }] },
@@ -45,18 +45,19 @@ describe('OMP mirror reducer', () => {
 
     const continued = reduceOmpMirrorState(settled, { type: 'tool_execution_start', toolCallId: 'tool-2', toolName: 'bash' })
     assert.equal(continued.parent.runStatus, 'running')
-    assert.deepEqual(continued.parent.timeline.map(item => item.key), ['tool:tool-2'])
+    assert.deepEqual(continued.parent.timeline.map(item => item.key), ['thinking:segment-1:0', 'tool:tool-1', 'tool:tool-2'])
     assert.equal(continued.parent.todo.active, 'Preserve Todo')
     assert.equal(continued.parent.segment, settled.parent.segment + 1)
 
     const toolEnded = reduceOmpMirrorState(continued, { type: 'tool_execution_end', toolCallId: 'tool-2', toolName: 'bash', result: 'done' })
     const reasoning = reduceOmpMirrorState(toolEnded, { type: 'work_snapshot', messageId: 'segment-2', blocks: [{ type: 'thinking', thinking: 'Current segment' }] })
-    assert.deepEqual(reasoning.parent.timeline.map(item => item.key), ['thinking:segment-2:0'])
+    assert.deepEqual(reasoning.parent.timeline.map(item => item.key), ['thinking:segment-1:0', 'tool:tool-1', 'tool:tool-2', 'thinking:segment-2:0'])
     assert.equal(reasoning.parent.segment, continued.parent.segment + 1)
 
     const cancelled = reduceOmpMirrorState(reasoning, { type: 'assistant_cancel', messageId: 'segment-2' })
     assert.equal(cancelled.parent.runStatus, 'cancelled')
-    assert.equal(cancelled.parent.timeline[0].status, 'cancelled')
+    assert.equal(cancelled.parent.timeline.at(-1).status, 'cancelled')
+    assert.equal(cancelled.parent.timeline.slice(0, -1).every(item => item.status === 'success'), true)
   })
 
   it('routes child work, answer text, and Todo away from the parent while retaining lifecycle identity', () => {
@@ -103,9 +104,18 @@ describe('OMP mirror reducer', () => {
       type: 'subagent_lifecycle', id: `child-${index}`, agent: 'scout', status: 'completed', index,
     }))
     const bounded = reduce(events)
+    const withTodo = reduceOmpMirrorState(bounded, {
+      type: 'todo',
+      phases: [{ name: 'Previous turn', tasks: [{ content: 'Must not leak', status: 'completed' }] }],
+    })
+    const withTimeline = reduceOmpMirrorState(withTodo, {
+      type: 'tool_execution_start', toolCallId: 'previous-tool', toolName: 'bash',
+    })
     assert.equal(bounded.childOrder.length, OMP_CHILD_LIMIT)
-    const reset = reduceOmpMirrorState(bounded, { type: 'agent_start' })
+    const reset = reduceOmpMirrorState(withTimeline, { type: 'agent_start' })
     assert.deepEqual(reset.childOrder, [])
     assert.deepEqual(reset.children, {})
+    assert.equal(reset.parent.todo, null)
+    assert.deepEqual(reset.parent.timeline, [])
   })
 })

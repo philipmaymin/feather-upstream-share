@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { deriveTodoSnapshot, todoSnapshotFromMessage } from '../../frontend/src/lib/ompTodo.js'
+import { deriveTodoSnapshot, reduceTodoSnapshot, todoSnapshotFromMessage } from '../../frontend/src/lib/ompTodo.js'
 
 const todoMessage = (phases) => ({
   role: 'assistant',
@@ -43,5 +43,24 @@ describe('OMP Todo snapshots', () => {
       total: 1,
       active: null,
     })
+  })
+
+  it('resets Todo history at a new user turn', () => {
+    const previous = todoMessage([{ name: 'Previous', tasks: [{ content: 'Must not leak', status: 'completed' }] }])
+    const currentUser = { role: 'user', content: [{ type: 'text', text: 'Answer directly.' }] }
+    const currentAnswer = { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] }
+
+    assert.equal(deriveTodoSnapshot([previous, currentUser, currentAnswer]), null)
+  })
+
+  it('applies the same reset to live user messages while preserving unrelated updates', () => {
+    const previous = todoSnapshotFromMessage(todoMessage([
+      { name: 'Previous', tasks: [{ content: 'Must not leak', status: 'completed' }] },
+    ]))
+    const unrelated = { role: 'assistant', content: [{ type: 'text', text: 'Still working.' }] }
+    const currentUser = { role: 'user', content: [{ type: 'text', text: 'Start fresh.' }] }
+
+    assert.equal(reduceTodoSnapshot(previous, unrelated), previous)
+    assert.equal(reduceTodoSnapshot(previous, currentUser), null)
   })
 })

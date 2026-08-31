@@ -27,11 +27,14 @@ export function todoSnapshotFromMessage(message) {
   return undefined
 }
 
+export function reduceTodoSnapshot(current, message) {
+  if (message?.role === 'user') return null
+  const next = todoSnapshotFromMessage(message)
+  return next === undefined ? current : next
+}
+
 export function deriveTodoSnapshot(messages) {
   let snapshot = null
-  for (const message of messages || []) {
-    const next = todoSnapshotFromMessage(message)
-    if (next !== undefined) snapshot = next
-  }
+  for (const message of messages || []) snapshot = reduceTodoSnapshot(snapshot, message)
   return snapshot
 }

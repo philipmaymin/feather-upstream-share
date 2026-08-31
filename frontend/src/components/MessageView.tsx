@@ -23,11 +23,10 @@ import diff from 'highlight.js/lib/languages/diff'
 import sql from 'highlight.js/lib/languages/sql'
 import yaml from 'highlight.js/lib/languages/yaml'
 import markdown from 'highlight.js/lib/languages/markdown'
-import { toolImagePath, toolInputText, toolPresentation } from '../lib/toolPresentation.js'
+import { activityDescription, toolImagePath, toolInputText, toolPresentation } from '../lib/toolPresentation.js'
 import { localFilePath } from '../lib/localMedia.js'
 import { appUrl } from '../lib/appPath.js'
 import { extractImages } from '../lib/attachments.js'
-import { activeOmpStep } from '../lib/ompMirror.js'
 import { ProtocolRunCard } from './ProtocolRunCard'
 import { runsForInvocation } from '../lib/protocolRuns.js'
 
@@ -785,6 +784,17 @@ function timelineToolPresentation(item: Extract<OmpTimelineItem, { kind: 'tool' 
   return toolPresentation(item.toolName, args)
 }
 
+function timelineActivityDescription(item: Extract<OmpTimelineItem, { kind: 'tool' }>) {
+  const args = item.args && typeof item.args === 'object' && !Array.isArray(item.args) ? item.args as Record<string, unknown> : {}
+  return activityDescription(item.toolName, args, item.intent)
+}
+
+function latestActivityDescription(scope: OmpWorkScope) {
+  const latest = [...scope.timeline].reverse().find(item => item.status === 'running') || scope.timeline.at(-1)
+  if (!latest) return ''
+  return latest.kind === 'thinking' ? 'Reasoning' : timelineActivityDescription(latest)
+}
+
 function formatFullDate(iso: string) {
   try {
     const d = new Date(iso)
@@ -806,7 +816,7 @@ function isTraceAssistantMsg(m: Message): boolean {
   const hasThinking = m.content.some(block => block.type === 'thinking')
   const hasText = m.content.some(block => block.type === 'text' && block.text?.trim())
   // Text is user-facing even when the same native OMP message also launches a
-  // tool. renderMsg keeps the tool/thinking blocks in Details while leaving
+  // tool. renderMsg keeps the tool blocks in Activity while leaving
   // that text exposed in the conversation.
   return !hasText && (hasTool || hasThinking)
 }
@@ -932,10 +942,6 @@ const markdownCSS = `
 .work-log-issue-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .work-log-detail { margin-top: 6px; padding: 10px 12px; border: 1px solid #2a2a3a; border-radius: 9px; background: #0d1117; font-size: 13px; line-height: 1.5; }
 .work-log-meta { margin-bottom: 8px; color: #555; font-size: 10px; }
-.work-log-reasoning { margin: 2px 0 4px; padding-left: 8px; border-left: 1px solid rgba(192,132,252,0.3); color: #999; font-size: 12px; line-height: 1.4; }
-.work-log-reasoning p { margin: 0 0 4px; }
-.work-log-reasoning p:last-child { margin-bottom: 0; }
-.work-log-reasoning ul, .work-log-reasoning ol { margin: 2px 0 4px; }
 
 /* Message action buttons - show on hover */
 .star-btn, .action-menu-btn { -webkit-tap-highlight-color: transparent; }
@@ -1016,13 +1022,6 @@ div:hover > div > .star-btn { opacity: 0.6 !important; }
   border-radius: 9px; background: var(--bg-secondary); font-size: 13px; line-height: 1.5;
 }
 .work-log-meta { margin-bottom: 8px; color: var(--text-ghost); font-size: 10px; }
-.work-log-reasoning {
-  margin: 2px 0 4px; padding-left: 8px; border-left: 1px solid rgba(192,132,252,0.3);
-  color: var(--text-secondary); font-size: 12px; line-height: 1.4;
-}
-.work-log-reasoning p { margin: 0 0 4px; }
-.work-log-reasoning p:last-child { margin-bottom: 0; }
-.work-log-reasoning ul, .work-log-reasoning ol { margin: 2px 0 4px; }
 
 
 /* OMP mirror: one quiet disclosure, then a bounded chronological run rail */
@@ -1045,8 +1044,8 @@ div:hover > div > .star-btn { opacity: 0.6 !important; }
 .execution-thinking { padding: 8px 10px; color: var(--text-secondary); font-size: 11px; line-height: 1.45; }
 .execution-thinking-label { margin-bottom: 4px; color: var(--text-muted); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
 .execution-tool > summary { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 38px; padding: 0 10px; cursor: pointer; list-style: none; }
-.execution-tool-name { flex-shrink: 0; color: var(--text-primary); font: 600 11px 'SF Mono', Menlo, monospace; }
-.execution-tool-intent { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); font-size: 11px; }
+.execution-tool-name { min-width: 0; max-width: 30%; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font: 500 10px 'SF Mono', Menlo, monospace; }
+.execution-tool-intent { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); font-size: 11px; font-weight: 600; }
 .execution-payload { padding: 8px 10px; border-top: 1px solid var(--border-subtle); }
 .execution-payload-label { margin-bottom: 4px; color: var(--text-faint); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
 .execution-payload pre { max-height: 220px; overflow: auto; margin: 0; color: var(--text-secondary); font: 10px/1.45 'SF Mono', Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -1076,17 +1075,18 @@ div:hover > div > .star-btn { opacity: 0.6 !important; }
 .agent-answer-label { margin-bottom: 5px; color: var(--text-muted); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
 @media (max-width: 520px) {
   .execution-tool > summary { min-height: 44px; }
+  .execution-tool-name { display: none; }
   .agent-layout.is-open { display: block; }
   .agent-rail > li { flex-basis: 100%; max-width: none; }
   .agent-inspector { max-height: none; overflow: visible; margin-top: 10px; padding: 10px 0 0; border-top: 1px solid var(--border-medium); border-left: none; }
 }
-.work-details { width: 100%; max-width: 960px; margin: 0 auto 10px; color: var(--text-secondary); }
+.work-details { width: min(100%, 78ch); margin: 0 0 8px; color: var(--text-secondary); }
 .work-details > .execution-detail { max-height: min(58vh, 520px); overflow: auto; }
 .work-details > summary::-webkit-details-marker { display: none; }
-.work-details > .execution-summary { min-height: 34px; padding: 0 2px; border: 0; background: transparent; }
-.work-details[open] > .execution-summary { border-bottom: 1px solid var(--border-subtle); }
+.work-details > .execution-summary { min-height: 40px; padding: 0 11px; border: 1px solid var(--border-subtle); border-radius: 10px; background: var(--bg-surface); }
+.work-details[open] > .execution-summary { border-radius: 10px 10px 0 0; border-bottom-color: transparent; }
 .work-details[open] > .execution-summary .execution-chevron { transform: rotate(90deg); }
-.work-details > .execution-detail { padding: 5px 0 0; border: 0; }
+.work-details > .execution-detail { padding: 8px 10px; border: 1px solid var(--border-subtle); border-top: 0; border-radius: 0 0 10px 10px; background: var(--bg-surface); }
 .work-details .execution-item { padding: 0 0 2px 14px; }
 .work-details .execution-item:not(:last-child)::before { left: 3px; top: 14px; bottom: -2px; background: var(--border-subtle); }
 .work-details .execution-node { left: 0; top: 12px; width: 7px; height: 7px; border: 0; }
@@ -1102,6 +1102,8 @@ div:hover > div > .star-btn { opacity: 0.6 !important; }
 .work-details .execution-title { color: var(--text-muted); font-weight: 600; }
 .work-details .execution-active { flex: 0 1 auto; max-width: 75%; color: var(--text-primary); }
 .work-details .execution-status { margin-left: 2px; }
+.thinking-indicator { display: flex; align-items: center; gap: 8px; width: fit-content; max-width: min(100%, 78ch); min-height: 44px; margin: 0 0 10px; padding: 10px 14px; box-sizing: border-box; border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; background: #1e1e1e; color: var(--text-secondary); font-size: 13px; line-height: 1.45; }
+.thinking-indicator-dot { width: 7px; height: 7px; flex-shrink: 0; border-radius: 50%; background: var(--info); animation: typing-bounce 1.2s ease-in-out infinite; }
 /* highlight.js theme — uses CSS variables for theme switching */
 .hljs { color: var(--code-text); }
 .hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-section, .hljs-link { color: var(--hljs-keyword); }
@@ -1199,7 +1201,6 @@ type MessageViewProps = {
 
   working?: boolean
   statusText?: string | null
-  intentHistory?: string[]
   assistantStream?: { text: string; ended: boolean } | null
   work?: OmpWorkScope | null
   todo?: OmpTodoSnapshot | null
@@ -1307,14 +1308,11 @@ export function MessageView(props: MessageViewProps) {
     )
   }
 
-  function ExecutionEntry(entryProps: { item: OmpTimelineItem; summaryIntent?: string }) {
+  function ExecutionEntry(entryProps: { item: OmpTimelineItem }) {
     const thinking = createMemo(() => entryProps.item.kind === 'thinking' ? entryProps.item : null)
     const tool = createMemo(() => entryProps.item.kind === 'tool' ? entryProps.item : null)
     const presentation = createMemo(() => tool() ? timelineToolPresentation(tool()!) : null)
-    const intent = createMemo(() => {
-      const value = tool()?.intent || presentation()?.summary || ''
-      return value === entryProps.summaryIntent ? '' : value
-    })
+    const description = createMemo(() => tool() ? timelineActivityDescription(tool()!) : '')
     const input = createMemo(() => executionValue(tool()?.args))
     const output = createMemo(() => executionValue(tool()?.result !== undefined ? tool()?.result : tool()?.partialResult))
     return (
@@ -1323,8 +1321,8 @@ export function MessageView(props: MessageViewProps) {
         <Show when={thinking()} fallback={
           <details class="execution-card execution-tool" open={tool()?.status === 'error'} data-testid="omp-tool-card" data-tool-call-id={tool()?.toolCallId} data-status={tool()?.status}>
             <summary>
+              <span class="execution-tool-intent">{description()}</span>
               <span class="execution-tool-name">{presentation()?.name || tool()?.toolName}</span>
-              <Show when={intent()}><span class="execution-tool-intent">{intent()}</span></Show>
               <span class="execution-tool-chevron" aria-hidden="true">›</span>
               <span class="execution-status">{executionStatusMark(tool()?.status || '')} {executionStatusLabel(tool()?.status || '')}</span>
             </summary>
@@ -1360,10 +1358,10 @@ export function MessageView(props: MessageViewProps) {
     return op === 'wait' || op === 'jobs' || op === 'inbox' || op === 'list'
   }
 
-  function renderTimelineItems(timeline: () => OmpTimelineItem[], summaryIntent?: () => string) {
+  function renderTimelineItems(timeline: () => OmpTimelineItem[]) {
     return (
       <ol class="execution-timeline">
-        <Index each={timeline()}>{(item) => <ExecutionEntry item={item()} summaryIntent={summaryIntent?.()} />}</Index>
+        <Index each={timeline()}>{(item) => <ExecutionEntry item={item()} />}</Index>
       </ol>
     )
   }
@@ -1371,7 +1369,7 @@ export function MessageView(props: MessageViewProps) {
   function renderExecutionTimeline(scope: () => OmpWorkScope, testId: string, inspector = false) {
     const visibleTimeline = createMemo(() => inspector ? scope().timeline : scope().timeline.filter(item => !hideParentOrchestration(item)))
     const visibleScope = () => ({ ...scope(), timeline: visibleTimeline() })
-    const summary = () => activeOmpStep(visibleScope())
+    const summary = () => latestActivityDescription(visibleScope())
     let executionDetails: HTMLDetailsElement | undefined
     let renderedSegment = scope().segment
     createEffect(() => {
@@ -1507,23 +1505,45 @@ export function MessageView(props: MessageViewProps) {
     )
   }
   function renderParentExecution(scope: () => OmpWorkScope) {
-    const timeline = createMemo(() => scope().timeline.filter(item => !hideParentOrchestration(item)))
+    const timeline = createMemo(() => scope().timeline.filter(isParentActivity))
     const visibleScope = () => ({ ...scope(), timeline: timeline() })
-    const summary = () => activeOmpStep(visibleScope()) || `${timeline().length} steps`
+    const runningSubagent = () => (props.subagents || []).find(agent => executionStatusLabel(agent.status) === 'Running')
+    const runningJobs = () => (props.jobs || []).filter(job => job.status === 'running')
+    const runningJob = () => runningJobs()[0]
+    const activityStatus = () => scope().runStatus === 'running' || runningSubagent() || runningJob() ? 'running' : scope().runStatus
+    const actionCount = () => timeline().length + (props.subagents?.length || 0) + runningJobs().length
+    const latestDescription = () => latestActivityDescription(visibleScope())
+    const summary = () => {
+      if (activityStatus() === 'running') {
+        return latestDescription()
+          || props.todo?.active
+          || runningSubagent()?.assignment
+          || runningSubagent()?.task
+          || runningJob()?.label
+          || runningJob()?.type
+          || 'In progress'
+      }
+      if (latestDescription()) {
+        return actionCount() > 1 ? `${latestDescription()} · ${actionCount()} actions` : latestDescription()
+      }
+      if (actionCount() > 0) return `${actionCount()} action${actionCount() === 1 ? '' : 's'}`
+      if ((props.todo?.total || 0) > 0) return `${props.todo!.completed}/${props.todo!.total} planned`
+      return 'Complete'
+    }
     const hasWork = () => timeline().length > 0 || (props.todo?.total || 0) > 0 || (props.subagents?.length || 0) > 0 || (props.jobs || []).some(job => job.status === 'running')
     return (
       <Show when={hasWork()}>
         <details class="work-details" data-testid="omp-parent-execution" data-segment={scope().segment}>
           <summary class="execution-summary" data-testid="omp-parent-execution-summary">
             <span class="execution-chevron">›</span>
-            <span class="execution-title">{scope().runStatus === 'running' ? 'Working' : 'Details'}</span>
+            <span class="execution-title">Activity</span>
             <span class="execution-active">{summary()}</span>
-            <span class="execution-status" aria-label={executionStatusLabel(scope().runStatus)} title={executionStatusLabel(scope().runStatus)} style={{ color: executionStatusColor(scope().runStatus) }}>{executionStatusMark(scope().runStatus)}</span>
+            <span class="execution-status" aria-label={executionStatusLabel(activityStatus())} title={executionStatusLabel(activityStatus())} style={{ color: executionStatusColor(activityStatus()) }}>{executionStatusMark(activityStatus())}</span>
           </summary>
           <div class="execution-detail">
             <Show when={(props.todo?.total || 0) > 0}>{renderTodo(() => props.todo!, 'omp-todo')}</Show>
             <Show when={timeline().length > 0}>
-              <div data-testid="omp-parent-execution-timeline">{renderTimelineItems(timeline, summary)}</div>
+              <div data-testid="omp-parent-execution-timeline">{renderTimelineItems(timeline)}</div>
             </Show>
             {renderWorkAuxiliarySurfaces()}
           </div>
@@ -1691,14 +1711,29 @@ export function MessageView(props: MessageViewProps) {
       && message.content.some(block => block.type === 'tool_result')
       && message.content.filter(block => block.type === 'tool_result').every(block => !!block.tool_use_id && toolUseIds().has(block.tool_use_id))
   }
+  function isActivityBlock(block: ContentBlock) {
+    return block.type === 'tool_result' || (block.type === 'tool_use' && !isQuestionBlock(block))
+  }
+  function messageHasActivity(message: Message) {
+    return (message.content || []).some(isActivityBlock)
+  }
+  function messagesHaveActivity(messages: Message[]) {
+    return messages.some(messageHasActivity)
+  }
+  function isParentActivity(item: OmpTimelineItem) {
+    return item.kind === 'tool' && !hideParentOrchestration(item)
+  }
   const renderItems = createMemo(() => buildRenderItems(props.messages, isPureToolResultMsg))
   const hasCurrentWork = createMemo(() => !!props.work && (
-    props.work.timeline.length > 0 ||
+    props.work.timeline.some(isParentActivity) ||
     (props.todo?.total || 0) > 0 ||
     (props.subagents?.length || 0) > 0 ||
     (props.jobs || []).some(job => job.status === 'running')
   ))
-  const liveLegacyWork = createMemo(() => props.working && !hasCurrentWork() && renderItems().at(-1)?.kind === 'chain')
+  const liveLegacyWork = createMemo(() => {
+    const latest = renderItems().at(-1)
+    return props.working && !hasCurrentWork() && latest?.kind === 'chain' && messagesHaveActivity(latest.messages)
+  })
   const workAttachedToAnswer = createMemo(() => {
     if (!hasCurrentWork()) return false
     const latest = renderItems().at(-1)
@@ -1716,7 +1751,7 @@ export function MessageView(props: MessageViewProps) {
     // the execution chain, so keep the user's disclosure choice against it.
     const disclosureKey = messages[0]?.uuid || messages[0]?.timestamp || 'work-log'
     const blocks = messages.flatMap(message => message.content || [])
-    const traceBlocks = blocks.filter(block => block.type === 'thinking' || block.type === 'tool_use' || block.type === 'tool_result')
+    const traceBlocks = blocks.filter(isActivityBlock)
     const renderedToolUseIds = new Set(traceBlocks.filter(block => block.type === 'tool_use' && block.id).map(block => block.id!))
     const errorCount = traceBlocks.filter(block =>
       block.type === 'tool_result' ? !!block.is_error && (!block.tool_use_id || !renderedToolUseIds.has(block.tool_use_id)) :
@@ -1735,7 +1770,7 @@ export function MessageView(props: MessageViewProps) {
     }}>
       <summary class="work-log-summary" data-testid="work-log-summary">
         <span class="work-log-chevron">›</span>
-        <span style={{ color: 'var(--text-muted)', 'font-weight': '600' }}>Details</span>
+        <span style={{ color: 'var(--text-muted)', 'font-weight': '600' }}>Activity</span>
         <Show when={live && props.statusText}><span class="work-log-active">{props.statusText}</span><span class="work-log-live-dot" aria-label="Running" /></Show>
         <Show when={errorCount > 0}>
           <span class="work-log-issue"><span class="work-log-issue-dot" />{errorCount} issue{errorCount === 1 ? '' : 's'}</span>
@@ -1743,13 +1778,10 @@ export function MessageView(props: MessageViewProps) {
       </summary>
       <div class="work-log-detail" data-testid="work-log-detail">
         <div class="work-log-meta">{traceBlocks.length} execution step{traceBlocks.length === 1 ? '' : 's'} · {formatTime(last?.timestamp || '')}</div>
-        <For each={messages}>{(message) => <For each={message.content}>{(block) => {
+        <For each={traceBlocks}>{(block) => {
           if (block.type === 'tool_result' && block.tool_use_id && renderedToolUseIds.has(block.tool_use_id)) return null
-          if (block.type === 'thinking' && block.thinking) {
-            return <div class="markdown work-log-reasoning" innerHTML={renderMarkdown(block.thinking)} ref={(element) => queueMicrotask(() => enhanceMarkdown(element, (src) => setLightbox(src), openExpandedTable, props.onOpenFile))} />
-          }
           return renderBlock(block, (src) => setLightbox(src), openExpandedTable, getResult, props.onOpenFile)
-        }}</For>}</For>
+        }}</For>
       </div>
     </details>
   }
@@ -1764,10 +1796,9 @@ export function MessageView(props: MessageViewProps) {
     const hasImages = images.length > 0
     const hasFiles = files.length > 0
     const hasAttachments = hasImages || hasFiles
-    const inlineTraceBlocks = msg.role === 'assistant' && !suppressWork ? (msg.content || []).filter(block =>
-      block.type === 'thinking' || block.type === 'tool_result' ||
-      (block.type === 'tool_use' && !isQuestionBlock(block))
-    ) : []
+    const inlineTraceBlocks = msg.role === 'assistant' && !suppressWork
+      ? (msg.content || []).filter(isActivityBlock)
+      : []
     const workLogMessages = inlineTraceBlocks.length > 0 ? [...trace, { ...msg, content: inlineTraceBlocks }] : trace
 
     return <div class="msg-row" style={{ display: 'flex', 'flex-direction': 'column', 'align-items': msg.role === 'user' ? 'flex-end' : 'flex-start', 'margin-bottom': '10px' }}>
@@ -2021,19 +2052,20 @@ export function MessageView(props: MessageViewProps) {
         </Show>
         if (item.kind === 'turn') return <Show
           when={mirroredCurrentTurn() && item.msg.role === 'assistant'}
-          fallback={<>{renderMsg(item.msg, item.trace)}<Show when={item.msg.role === 'user'}><For each={runsForInvocation(props.protocolRuns || [], item.msg.uuid)}>{run => <ProtocolRunCard run={run} />}</For></Show></>}
+          fallback={<>{renderMsg(item.msg, item.trace.filter(messageHasActivity))}<Show when={item.msg.role === 'user'}><For each={runsForInvocation(props.protocolRuns || [], item.msg.uuid)}>{run => <ProtocolRunCard run={run} />}</For></Show></>}
         >
           <>{renderParentExecution(() => props.work!)}{renderMsg(item.msg, [], true)}</>
         </Show>
         // Keep an unfinished or failed trace reachable even before a final
         // answer arrives; it stays collapsed so it does not dominate chat.
-        return <Show when={!mirroredCurrentTurn() && !currentProtocolOwnsWork()}>
-          <div class="live-work-disclosure" data-testid={props.working && isLatestItem() ? 'live-work-turn' : undefined} style={{ margin: '4px 0 10px' }}>{renderWorkLog(item.messages, !!props.working && isLatestItem())}</div>
+        return <Show when={!mirroredCurrentTurn() && !currentProtocolOwnsWork() && messagesHaveActivity(item.messages)}>
+          <div class="live-work-disclosure" data-testid={props.working && isLatestItem() ? 'live-work-turn' : undefined} style={{ margin: '4px 0 10px' }}>{renderWorkLog(item.messages.filter(messageHasActivity), !!props.working && isLatestItem())}</div>
         </Show>
       }}</For>
       <Show when={hasCurrentWork() && !workAttachedToAnswer()}>
         {renderParentExecution(() => props.work!)}
       </Show>
+
 
 
       <Show when={props.approval}>
@@ -2053,26 +2085,15 @@ export function MessageView(props: MessageViewProps) {
       <Show when={props.notice}><div role="status" style={{ margin: '0 0 10px', padding: '8px 11px', 'border-radius': '9px', border: '1px solid #d8a13b', background: 'rgba(216,161,59,.08)', color: '#d8a13b', 'font-size': '12px' }}>{props.notice!.text}</div></Show>
 
       <Show when={props.assistantStream?.text}>
-        <div data-testid="assistant-stream" aria-live="polite" style={{ display: 'flex', 'justify-content': 'flex-start', 'margin-bottom': '10px' }}><div style={{ position: 'relative', 'max-width': '100%', padding: '10px 14px', 'border-radius': '12px', background: '#1a1a2e', border: '1px solid rgba(255,255,255,.06)', color: '#e5e5e5', 'font-size': '14px', 'line-height': '1.55', 'word-break': 'break-word' }}><div class="markdown" innerHTML={renderLiveMarkdown(props.assistantStream!.text)} ref={assistantStreamMarkdownRef} /><span aria-hidden="true" style={{ position: 'absolute', right: '7px', bottom: '7px', display: 'inline-block', width: '2px', height: '10px', background: '#aaa', opacity: props.assistantStream!.ended ? '.35' : '.9' }} /></div></div>
+        <div data-testid="assistant-stream" aria-live="polite" style={{ display: 'flex', 'justify-content': 'flex-start', 'margin-bottom': '10px' }}><div class="asst-bubble" style={{ position: 'relative', width: 'fit-content', 'max-width': 'min(100%, 78ch)', 'min-height': '44px', padding: '10px 14px', 'border-radius': '12px', background: '#1a1a2e', border: '1px solid rgba(255,255,255,.06)', color: '#e5e5e5', 'font-size': '14px', 'line-height': '1.55', 'word-break': 'break-word', 'box-sizing': 'border-box' }}><div class="markdown" innerHTML={renderLiveMarkdown(props.assistantStream!.text)} ref={assistantStreamMarkdownRef} /><span aria-hidden="true" style={{ position: 'absolute', right: '7px', bottom: '7px', display: 'inline-block', width: '2px', height: '10px', background: '#aaa', opacity: props.assistantStream!.ended ? '.35' : '.9' }} /></div></div>
       </Show>
 
-      <Show when={props.working && !currentProtocolOwnsWork() && !hasCurrentWork() && !liveLegacyWork()}>
-        <div style={{ display: 'flex', 'align-items': 'flex-start', 'margin-bottom': '10px' }}>
-          <div role="status" data-testid="working-indicator" aria-live="polite" style={{ padding: '9px 12px', 'border-radius': '16px 16px 16px 4px', background: 'var(--bg-surface)', display: 'flex', gap: '6px', 'align-items': 'center', 'max-width': '92%' }}>
-            <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: 'var(--text-secondary)', 'animation': 'typing-bounce 1.2s ease-in-out infinite', 'flex-shrink': '0' }} />
-            <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: 'var(--text-secondary)', 'animation': 'typing-bounce 1.2s ease-in-out 0.2s infinite', 'flex-shrink': '0' }} />
-            <span style={{ width: '6px', height: '6px', 'border-radius': '50%', background: 'var(--text-secondary)', 'animation': 'typing-bounce 1.2s ease-in-out 0.4s infinite', 'flex-shrink': '0' }} />
-            <Show when={props.statusText}>
-              <Show when={(props.intentHistory?.length || 0) > 1} fallback={<span style={{ 'margin-left': '6px', 'font-size': '12px', color: 'var(--text-secondary)', 'line-height': '1.35', 'word-break': 'break-word' }}>{props.statusText}</span>}>
-                <details style={{ 'margin-left': '6px' }}>
-                  <summary style={{ cursor: 'pointer', 'font-size': '12px', color: 'var(--text-secondary)', 'line-height': '1.35', 'word-break': 'break-word' }}>{props.statusText}</summary>
-                  <div style={{ 'margin-top': '6px', padding: '6px 8px', 'border-left': '1px solid var(--border-medium)', color: 'var(--text-muted)', 'font-size': '10px', 'line-height': '1.45' }}>
-                    <For each={(props.intentHistory || []).slice(0, -1)}>{(intent) => <div>{intent}</div>}</For>
-                  </div>
-                </details>
-              </Show>
-            </Show>
-          </div>
+
+
+      <Show when={props.working && !currentProtocolOwnsWork() && !hasCurrentWork() && !liveLegacyWork() && !props.assistantStream?.text}>
+        <div role="status" data-testid="thinking-indicator" aria-live="polite" class="thinking-indicator">
+          <span class="thinking-indicator-dot" aria-hidden="true" />
+          <span>{props.statusText || 'Thinking…'}</span>
         </div>
       </Show>
       </div>

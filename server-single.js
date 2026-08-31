@@ -1785,6 +1785,17 @@ function deleteReplayEntries(store, predicate) {
   }
 }
 
+function settleReplayToolsForOwner(store, owner) {
+  for (const entry of store.entries.values()) {
+    if (replayOwner(entry.event) !== owner || !entry.event.type.startsWith('tool_execution_')) continue;
+    const settled = { ...entry.event, type: 'tool_execution_end', isError: !!entry.event.isError };
+    const bytes = Buffer.byteLength(JSON.stringify(settled));
+    store.bytes += bytes - entry.bytes;
+    entry.event = settled;
+    entry.bytes = bytes;
+  }
+}
+
 function isTransientReplayEventForOwner(event, owner) {
   return replayOwner(event) === owner && (
     event.type === 'assistant_snapshot' ||
@@ -1813,7 +1824,9 @@ function rememberOmpBridgeEvent(sessionId, event) {
   const store = replayStoreFor(sessionId);
   if (event.type === 'assistant_cancel' && event.willContinue) {
     const owner = replayOwner(event);
-    deleteReplayEntries(store, candidate => isTransientReplayEventForOwner(candidate, owner));
+    settleReplayToolsForOwner(store, owner);
+    deleteReplayEntries(store, candidate => replayOwner(candidate) === owner
+      && (candidate.type === 'assistant_snapshot' || candidate.type === 'work_snapshot'));
     return;
   }
   if (event.type === 'tool_approval_resolved') {
@@ -1828,7 +1841,7 @@ function rememberOmpBridgeEvent(sessionId, event) {
 
   if (event.type === 'agent_start' && !event.subagentId) {
     deleteReplayEntries(store, candidate => isParentTransientReplayEvent(candidate)
-      || (!candidate.subagentId && (candidate.type === 'assistant_end' || candidate.type === 'assistant_cancel')));
+      || (!candidate.subagentId && (candidate.type === 'todo' || candidate.type === 'assistant_end' || candidate.type === 'assistant_cancel')));
     pruneSettledSubagentReplay(store);
   }
 

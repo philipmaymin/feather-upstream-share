@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { toolImagePath, toolPresentation } from '../../frontend/src/lib/toolPresentation.js'
+import { activityDescription, toolImagePath, toolPresentation } from '../../frontend/src/lib/toolPresentation.js'
 
 describe('Codex tool presentation', () => {
   it('identifies web weather calls even when Codex stores the tool as run', () => {
@@ -56,5 +56,19 @@ describe('Codex tool presentation', () => {
     assert.deepEqual(toolPresentation('read', { path: {} }), { name: 'Read', summary: '' })
     assert.deepEqual(toolPresentation('__proto__', {}), { name: 'Proto', summary: '' })
     assert.deepEqual(toolPresentation('exec_command', { cmd: {} }), { name: 'Bash', summary: '' })
+  })
+
+  it('turns plumbing tools into intent-first Activity descriptions', () => {
+    assert.equal(activityDescription('eval', { title: 'Evaluating Activity state' }), 'Evaluating Activity state')
+    assert.equal(activityDescription('bash', { command: 'npm test' }), 'Running npm test')
+    assert.equal(activityDescription('grep', { pattern: 'TODO', path: 'src' }), 'Searching TODO in src')
+    assert.equal(activityDescription('write', { path: 'src/state.js' }), 'Writing src/state.js')
+  })
+
+  it('prefers the declared intent over every tool-derived fallback', () => {
+    assert.equal(
+      activityDescription('bash', { command: 'git status' }, 'Checking repository state'),
+      'Checking repository state',
+    )
   })
 })

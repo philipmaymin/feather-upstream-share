@@ -112,6 +112,43 @@ test('an acknowledged send preserves composer edits typed while the request is i
   await expect.poll(() => page.evaluate(id => localStorage.getItem(`feather-draft-${id}`), sessionId)).toBe('newer unsent thought')
 })
 
+test('a queue failure restores the prior Activity and leaves the draft unsent', async ({ page }) => {
+  fs.appendFileSync(sessionPath, JSON.stringify({
+    type: 'assistant', uuid: `media-prior-todo-${Date.now()}`, timestamp: new Date().toISOString(), isSidechain: false, isMeta: false,
+    message: { role: 'assistant', content: [{
+      type: 'tool_result', name: 'todo',
+      details: { phases: [{ name: 'Prior turn', tasks: [{ content: 'Preserve on failure', status: 'completed' }] }] },
+    }] },
+  }) + '\n')
+  await page.addInitScript(() => {
+    const original = Storage.prototype.setItem
+    Storage.prototype.setItem = function (key, value) {
+      if (key.startsWith('feather-message-outbox-v1')) throw new DOMException('Storage unavailable', 'QuotaExceededError')
+      return original.call(this, key, value)
+    }
+  })
+
+  await page.goto(`/#${sessionId}`, { waitUntil: 'domcontentloaded' })
+  const activity = page.getByTestId('omp-parent-execution')
+  await expect(activity).toContainText('Preserve on failure')
+  const composer = page.locator('textarea')
+  await composer.fill('this send cannot be queued')
+  await page.locator('button[title="Send"]').last().click()
+  await expect(activity).toContainText('Preserve on failure')
+  await expect(page.getByTestId('thinking-indicator')).toHaveCount(0)
+  await expect(composer).toHaveValue('this send cannot be queued')
+  await expect(page.locator('.msg-row').filter({ hasText: 'this send cannot be queued' })).toHaveCount(0)
+
+  fs.appendFileSync(sessionPath, JSON.stringify({
+    type: 'user', uuid: `media-reset-todo-${Date.now()}`, timestamp: new Date().toISOString(), isSidechain: false, isMeta: false,
+    message: { role: 'user', content: 'reset prior Todo for later tests' },
+  }) + '\n')
+  fs.appendFileSync(sessionPath, JSON.stringify({
+    type: 'assistant', uuid: `media-reset-complete-${Date.now()}`, timestamp: new Date().toISOString(), isSidechain: false, isMeta: false,
+    message: { role: 'assistant', content: [{ type: 'text', text: 'reset complete' }] },
+  }) + '\n')
+})
+
 test('a send survives leaving during delivery and retries against its original chat after reload', async ({ page }) => {
   let sendAttempts = 0
   const messageIds = []
@@ -181,7 +218,7 @@ test('an in-flight attachment send does not block another room and clears the ac
 
   releaseSend()
   await expect.poll(() => sendAcknowledged).toBe(true)
-  await expect(page.getByTestId('working-indicator')).toHaveCount(0)
+  await expect(page.getByTestId('thinking-indicator')).toHaveCount(0)
   await expect(secondComposer).toHaveValue('work in the second room')
 
   await page.locator('button').first().click()

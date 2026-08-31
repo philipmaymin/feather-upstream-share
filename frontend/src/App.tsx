@@ -1,6 +1,6 @@
 declare const __BUILD_TIME__: string
 declare const __BUILD_VERSION__: string
-import { createSignal, createEffect, createMemo, onMount, onCleanup, Show, For, Suspense } from 'solid-js'
+import { batch, createSignal, createEffect, createMemo, onMount, onCleanup, Show, For, Suspense } from 'solid-js'
 import { MessageView, RichMarkdown } from './components/MessageView'
 import { Terminal } from './components/Terminal'
 import { SidecarThread } from './components/Sidecar'
@@ -14,7 +14,7 @@ import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, 
 import { listPendingMessages, putPendingMessage, patchPendingMessage, deletePendingMessage } from './lib/messageOutbox.js'
 import { appUrl } from './lib/appPath.js'
 import { deriveToolIntentState, isFinalAssistantMessage, toolIntentTransition } from './lib/toolIntentStatus.js'
-import { deriveTodoSnapshot, todoSnapshotFromDetails, todoSnapshotFromMessage } from './lib/ompTodo.js'
+import { deriveTodoSnapshot, reduceTodoSnapshot, todoSnapshotFromDetails } from './lib/ompTodo.js'
 import { createOmpMirrorState, reduceOmpMirrorState } from './lib/ompMirror.js'
 import { mergeRoomThreadMessages } from './lib/roomThread.js'
 import { createProtocolRunsState, orderedProtocolRuns, reduceProtocolRunSnapshot, replaceProtocolRuns } from './lib/protocolRuns.js'
@@ -278,7 +278,6 @@ export default function App() {
   const [working, setWorking] = createSignal(false)
   const [toolIntentStatus, setToolIntentStatus] = createSignal('')
   const [dragging, setDragging] = createSignal(false)
-  const [toolIntentHistory, setToolIntentHistory] = createSignal<string[]>([])
   const [assistantStream, setAssistantStream] = createSignal<AssistantStream | null>(null)
   const [todoSnapshot, setTodoSnapshot] = createSignal<OmpTodoSnapshot | null>(null)
   const [ompMirror, setOmpMirror] = createSignal<OmpMirrorState>(createOmpMirrorState())
@@ -296,6 +295,18 @@ export default function App() {
     clearTimeout(assistantStreamStaleTimer)
     assistantStreamStaleTimer = undefined
     setAssistantStream(null)
+  }
+  function resetOmpTurn(mirror = reduceOmpMirrorState(ompMirror(), { type: 'agent_start' })) {
+    batch(() => {
+      setTodoSnapshot(null)
+      setOmpMirror(mirror)
+      setOmpNotice(null)
+      setOmpApproval(null)
+      setOmpJobs(current => current.filter(job => job.status === 'running'))
+      setToolIntentStatus('')
+      clearAssistantStream()
+      setWorking(true)
+    })
   }
   function clearOmpLiveSurfaces() {
     setTodoSnapshot(null)
@@ -417,6 +428,7 @@ export default function App() {
 
   let cleanupSSE: (() => void) | null = null
   let selectionGeneration = 0
+  let lifecycleRevision = 0
   let messagesAbortController: AbortController | null = null
   let mediaRecorder: MediaRecorder | null = null
   let mediaStream: MediaStream | null = null
@@ -473,14 +485,12 @@ export default function App() {
       if (listed && !listed.isActive) {
         setWorking(false)
         setToolIntentStatus('')
-        setToolIntentHistory([])
         clearAssistantStream()
       } else if (!listed) {
         findSessionMeta(active, visibleSessions).then(session => {
           if (currentId() === active && session && !session.isActive) {
             setWorking(false)
             setToolIntentStatus('')
-            setToolIntentHistory([])
             clearAssistantStream()
           }
         })
@@ -596,7 +606,6 @@ export default function App() {
       if (working()) {
         setWorking(false)
         setToolIntentStatus('')
-        setToolIntentHistory([])
         clearAssistantStream()
       }
     }, 5 * 60 * 1000)
@@ -760,6 +769,11 @@ export default function App() {
   })
 
   function handleOmpEvent(event: OmpBridgeEvent) {
+    lifecycleRevision++
+    if (!event.subagentId && event.type === 'agent_start') {
+      resetOmpTurn(reduceOmpMirrorState(ompMirror(), event))
+      return
+    }
     setOmpMirror(current => reduceOmpMirrorState(current, event))
 
     if (event.type === 'subagent_lifecycle' || event.type === 'subagent_progress') return
@@ -830,10 +844,6 @@ export default function App() {
       if (!event.willContinue) setWorking(false)
       return
     }
-    if (event.type === 'agent_start') {
-      setWorking(true)
-      return
-    }
     if (event.type === 'agent_end') {
       if (!event.willContinue) setWorking(false)
       return
@@ -892,7 +902,6 @@ export default function App() {
     setMessages([])
     setHasMore(false)
     setToolIntentStatus('')
-    setToolIntentHistory([])
     clearAssistantStream()
     clearOmpLiveSurfaces()
     clearProtocolRunSurfaces()
@@ -948,7 +957,6 @@ export default function App() {
       const toolIntentState = deriveToolIntentState(msgs)
       const turnEnded = last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence'
       setToolIntentStatus(!isActive || turnEnded ? '' : toolIntentState.status)
-      setToolIntentHistory(!isActive || turnEnded ? [] : toolIntentState.history)
       setTodoSnapshot(deriveTodoSnapshot(msgs))
       if (!isActive || turnEnded) setWorking(false)
       else if (last.role === 'user' || toolIntentState.working) setWorking(true)
@@ -963,7 +971,6 @@ export default function App() {
       }
     } else {
       setToolIntentStatus('')
-      setToolIntentHistory([])
       setTodoSnapshot(null)
       setWorking(isActive)
     }
@@ -985,21 +992,24 @@ export default function App() {
       clearTimeout(assistantDoneTimer)
       // If new content arrives while a question is showing, it was a false positive
       if (question() && msg.role === 'assistant' && !msg.stopReason) setQuestion(null)
+      const wasWorking = working()
+      if (msg.role === 'user' && !wasWorking) {
+        lifecycleRevision++
+        resetOmpTurn()
+      }
       const toolIntentUpdate = toolIntentTransition({
         status: toolIntentStatus(),
-        history: toolIntentHistory(),
         working: working(),
       }, msg)
       setToolIntentStatus(toolIntentUpdate.status)
-      setToolIntentHistory(toolIntentUpdate.history)
-      const todo = todoSnapshotFromMessage(msg)
-      if (todo !== undefined) setTodoSnapshot(todo)
+      if (msg.role !== 'user' || !wasWorking) {
+        setTodoSnapshot(current => reduceTodoSnapshot(current, msg))
+      }
       if (isFinalAssistantMessage(msg)) clearAssistantStream()
       // Use stop_reason to accurately track working state
       if (msg.stopReason === 'end_turn' || msg.stopReason === 'stop_sequence') {
         setWorking(false)
         setToolIntentStatus('')
-        setToolIntentHistory([])
         clearTimeout(workingTimer)
         // Refresh session list to pick up auto-generated title
         const cur = sessions().find(s => s.id === id)
@@ -1019,7 +1029,6 @@ export default function App() {
           if (isCurrentSelection(id, generation) && working()) {
             setWorking(false)
             setToolIntentStatus('')
-            setToolIntentHistory([])
             clearTimeout(workingTimer)
           }
         }, 5000)
@@ -1203,7 +1212,6 @@ export default function App() {
     if (id === currentId()) {
       setWorking(false)
       setToolIntentStatus('')
-      setToolIntentHistory([])
       clearAssistantStream()
     }
   }
@@ -1233,7 +1241,6 @@ export default function App() {
     setMessages([])
     setWorking(false)
     setToolIntentStatus('')
-    setToolIntentHistory([])
     clearAssistantStream()
     clearOmpLiveSurfaces()
     clearProtocolRunSurfaces()
@@ -1383,7 +1390,6 @@ export default function App() {
           })
           setWorking(true)
           setToolIntentStatus('')
-          setToolIntentHistory([])
           clearAssistantStream()
           startWorkingTimeout()
         }
@@ -1443,15 +1449,51 @@ export default function App() {
   async function sendSessionText(rawText: string, targetId: string, messageId: string = crypto.randomUUID(), onQueued?: () => void) {
     const fullText = rawText.trim()
     if (!fullText) return
-    const existing = (listPendingMessages() as PendingMessage[]).find(message => message.id === messageId)
-    const record = putPendingMessage({
-      id: messageId,
-      sessionId: targetId,
-      text: fullText,
-      createdAt: existing?.createdAt ?? Date.now(),
-      attempts: existing?.attempts ?? 0,
-      error: existing?.error,
-    }) as PendingMessage
+    const targetIsCurrent = targetId === currentId()
+    const startsNewTurn = targetIsCurrent && !working()
+    const sendSelection = selectionGeneration
+    const sendRevision = targetIsCurrent ? ++lifecycleRevision : 0
+    const previousTurn = startsNewTurn ? {
+      todo: todoSnapshot(),
+      mirror: ompMirror(),
+      notice: ompNotice(),
+      approval: ompApproval(),
+      jobs: ompJobs(),
+      intent: toolIntentStatus(),
+      stream: assistantStream()?.ended ? null : assistantStream(),
+      working: working(),
+    } : null
+    if (startsNewTurn) resetOmpTurn()
+    let record: PendingMessage
+    try {
+      const existing = (listPendingMessages() as PendingMessage[]).find(message => message.id === messageId)
+      record = putPendingMessage({
+        id: messageId,
+        sessionId: targetId,
+        text: fullText,
+        createdAt: existing?.createdAt ?? Date.now(),
+        attempts: existing?.attempts ?? 0,
+        error: existing?.error,
+      }) as PendingMessage
+    } catch (error) {
+      if (previousTurn
+        && sendSelection === selectionGeneration
+        && sendRevision === lifecycleRevision
+        && targetId === currentId()) {
+        batch(() => {
+          setTodoSnapshot(previousTurn.todo)
+          setOmpMirror(previousTurn.mirror)
+          setOmpNotice(previousTurn.notice)
+          setOmpApproval(previousTurn.approval)
+          setOmpJobs(previousTurn.jobs)
+          setToolIntentStatus(previousTurn.intent)
+          clearAssistantStream()
+          setAssistantStream(previousTurn.stream)
+          setWorking(previousTurn.working)
+        })
+      }
+      throw error
+    }
     refreshPendingMessages()
     appendPendingMessages(targetId)
     onQueued?.()
@@ -1702,7 +1744,6 @@ export default function App() {
     if (!loading() && session && !session.isActive) {
       setWorking(false)
       setToolIntentStatus('')
-      setToolIntentHistory([])
       clearAssistantStream()
     }
   })
@@ -2272,7 +2313,6 @@ export default function App() {
                 onToggleStar={(uuid) => { if (loadedSessionId()) toggleStar(loadedSessionId()!, uuid) }}
                 working={working()}
                 statusText={toolIntentStatus()}
-                intentHistory={toolIntentHistory()}
                 assistantStream={assistantStream()}
                 work={ompMirror().parent}
                 todo={activeTodo()}

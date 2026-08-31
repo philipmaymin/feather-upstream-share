@@ -21,7 +21,7 @@ describe('OMP tool-intent status lifecycle', () => {
     assert.equal(isFinalAssistantMessage(message('assistant', [thinking('still working')])), false)
   })
 
-  it('keeps clickable unresolved intent history in the current user turn', () => {
+  it('keeps the latest unresolved intent in the current user turn', () => {
     const messages = [
       message('user', [text('Fix the upload.')]),
       message('assistant', [tool('read', {}, 'Inspecting upload recovery')]),
@@ -30,7 +30,6 @@ describe('OMP tool-intent status lifecycle', () => {
     ]
     assert.deepEqual(deriveToolIntentState(messages), {
       status: 'Testing the repaired upload',
-      history: ['Inspecting upload recovery', 'Testing the repaired upload'],
       working: true,
     })
   })
@@ -41,10 +40,10 @@ describe('OMP tool-intent status lifecycle', () => {
       message('assistant', [tool('bash', {}, 'Testing')]),
     ]
     assert.deepEqual(deriveToolIntentState([...working, message('assistant', [thinking('done'), text('Fixed.')])]), {
-      status: '', history: [], working: false,
+      status: '', working: false,
     })
     assert.deepEqual(deriveToolIntentState([...working, message('user', [text('One more thing.')])]), {
-      status: '', history: [], working: true,
+      status: '', working: true,
     })
   })
 
@@ -52,6 +51,6 @@ describe('OMP tool-intent status lifecycle', () => {
     assert.deepEqual(deriveToolIntentState([
       message('user', [text('Investigate this.')]),
       message('assistant', [thinking('checking'), tool('read')]),
-    ]), { status: '', history: [], working: true })
+    ]), { status: '', working: true })
   })
 })

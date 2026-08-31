@@ -17,14 +17,11 @@ export function isFinalAssistantMessage(message) {
 }
 
 export function toolIntentTransition(currentState, message) {
-  const state = currentState || { status: '', history: [], working: false }
-  if (message?.role === 'user') return { status: '', history: [], working: true }
+  const state = currentState || { status: '', working: false }
+  if (message?.role === 'user') return { status: '', working: true }
   const update = toolIntentMessage(message)
-  if (update) {
-    const history = state.history.at(-1) === update ? state.history : [...state.history, update].slice(-20)
-    return { status: update, history, working: true }
-  }
-  if (isFinalAssistantMessage(message)) return { status: '', history: [], working: false }
+  if (update) return { status: update, working: true }
+  if (isFinalAssistantMessage(message)) return { status: '', working: false }
   const hasTrace = message?.role === 'assistant' && Array.isArray(message.content) &&
     message.content.some(block =>
       block?.type === 'thinking' || block?.type === 'tool_use' || block?.type === 'tool_result'
@@ -33,7 +30,7 @@ export function toolIntentTransition(currentState, message) {
 }
 
 export function deriveToolIntentState(messages) {
-  let state = { status: '', history: [], working: false }
+  let state = { status: '', working: false }
   for (const message of messages || []) state = toolIntentTransition(state, message)
   return state
 }
