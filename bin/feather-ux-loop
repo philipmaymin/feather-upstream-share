@@ -130,24 +130,27 @@ def ensure_candidate(seed_ref: str) -> None:
         run(["git", "worktree", "add", "-b", CANDIDATE_BRANCH, str(CANDIDATE_DIR), seed_ref], cwd=SOURCE_REPO, timeout=120)
 
 
-def agent_prompt(run_dir: Path, critique: dict, deployed: str, upstream: str) -> str:
+def agent_prompt(run_dir: Path, critique: dict, deployed: str, upstream: str, prior_validation: Path | None) -> str:
     selected = None
     index = critique.get("highest_priority_index")
     findings = critique.get("findings") or []
-    if isinstance(index, int) and 0 <= index < len(findings):
+    if prior_validation is None and isinstance(index, int) and 0 <= index < len(findings):
         selected = findings[index]
     decision_path = run_dir / "decision.json"
-    return f"""You are the unattended Feather maintenance candidate editor. Work only in the current automation-owned candidate worktree and the supplied run directory. Do not commit, push, stage, promote, restart services, send messages, access credentials, or touch live mutable state.
+    recovery = str(prior_validation) if prior_validation else "none"
+    return f"""You are the unattended Feather maintenance candidate editor. Work only in the current automation-owned candidate worktree and supplied run directories. Do not commit, push, stage, promote, restart services, send messages, access credentials, or touch live mutable state.
 
 Current deployed commit: {deployed}
 Fetched upstream head: {upstream}
 Synthetic recording directory: {run_dir}
+Prior failed outer validation log: {recovery}
 Gemini model-only verdict: {critique.get('verdict')}
 Selected Gemini hypothesis: {json.dumps(selected, ensure_ascii=False)}
 
-Do two bounded jobs in this order:
+Do these bounded jobs in order:
+0. Recovery: when a prior validation log is named, read it completely, find the earliest causal failures rather than the cascades, and repair the preserved candidate diff before doing anything new. Do not add a new UX change during recovery.
 1. Refeather: inspect the upstream commits represented by origin/main but not yet represented in this downstream candidate. Port all applicable behavior into the existing downstream architecture. Never blindly merge modular upstream server files over server-single.js, and preserve Fledge, Rooms, OMP, Authelia, immutable release, state, and fleet contracts. If there is no new applicable upstream behavior, make no upstream edit.
-2. UX: Gemini is a hypothesis, never evidence. Only if the selected hypothesis has a timestamp and observable contract, reproduce it locally with automation/feather-ux/record.mjs against synthetic data. If reproduced, implement exactly one smallest cause-linked fix. If not reproduced or merely aesthetic, make no UX edit.
+2. UX: Gemini is a hypothesis, never evidence. Only if there is no recovery log and the selected hypothesis has a timestamp and observable contract, reproduce it locally with automation/feather-ux/record.mjs against synthetic data. If reproduced, implement exactly one smallest cause-linked fix. If not reproduced or merely aesthetic, make no UX edit.
 
 Keep changes surgical. No documentation files. Do not add retries, telemetry, abstractions, or unrelated cleanup. Run only targeted checks needed while editing; the outer controller owns full validation. Before exiting, write strict JSON to {decision_path} with this shape:
 {{
@@ -161,18 +164,21 @@ Keep changes surgical. No documentation files. Do not add retries, telemetry, ab
 A changed outcome requires a real worktree diff. A no_change outcome requires a clean worktree. A blocked outcome must name the concrete blocker and leave no knowingly unsafe partial implementation."""
 
 
-def invoke_agent(run_dir: Path, critique: dict, deployed: str, upstream: str) -> dict:
+def invoke_agent(run_dir: Path, critique: dict, deployed: str, upstream: str, prior_validation: Path | None = None) -> dict:
     decision_path = run_dir / "decision.json"
     if decision_path.exists():
         decision_path.unlink()
     before_head = git("rev-parse", "HEAD", cwd=CANDIDATE_DIR)
-    prompt = agent_prompt(run_dir, critique, deployed, upstream)
+    prompt = agent_prompt(run_dir, critique, deployed, upstream, prior_validation)
     command = [
         "omp", "--cwd", str(CANDIDATE_DIR), "--add-dir", str(run_dir),
         "--model", os.environ.get("FEATHER_UX_AGENT_MODEL", "openai-codex/gpt-5.6-sol"),
         "--thinking", "high", "--approval-mode", "yolo", "--max-time", "90m",
-        "--no-session", "--no-title", "-p", prompt,
+        "--no-session", "--no-title",
     ]
+    if prior_validation:
+        command.extend(["--add-dir", str(prior_validation.parent)])
+    command.extend(["-p", prompt])
     result = run(command, cwd=CANDIDATE_DIR, env={"FEATHER_CURL": "/bin/false"}, unset_env=("FEATHER_URL",), log=run_dir / "agent.log", timeout=95 * 60, check=False)
     if result.returncode != 0:
         raise LoopError(f"OMP candidate editor failed; log={run_dir / 'agent.log'}")
@@ -446,7 +452,15 @@ def loop_command(_args: argparse.Namespace) -> int:
             seed_ref = os.environ.get("FEATHER_UX_SEED_REF", deployed)
             ensure_candidate(seed_ref)
             upstream = git("rev-parse", "origin/main", cwd=CANDIDATE_DIR)
-            decision = invoke_agent(run_dir, critique, deployed, upstream)
+            prior_validation = None
+            if state.get("lastStatus") == "failed" and isinstance(state.get("lastRun"), str):
+                previous_dir = STATE_DIR / "runs" / state["lastRun"]
+                for name in ("source-browser.log", "unit.log", "build.log"):
+                    candidate_log = previous_dir / name
+                    if candidate_log.exists():
+                        prior_validation = candidate_log
+                        break
+            decision = invoke_agent(run_dir, critique, deployed, upstream, prior_validation)
             paths = changed_paths()
             if decision["outcome"] == "blocked":
                 if paths:
