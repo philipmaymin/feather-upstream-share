@@ -193,15 +193,27 @@ test('mobile Return input and visible toolbar controls both reach the terminal',
   const tapButton = async (name) => {
     const button = page.getByRole('button', { name, exact: true })
     await button.evaluate(element => element.scrollIntoView({ block: 'nearest', inline: 'center' }))
+    await expect(button, `${name} toolbar key should be visible after scrolling`).toBeVisible()
+    await button.click({ trial: true })
     const box = await button.boundingBox()
-    expect(box).not.toBeNull()
-    expect(box.x).toBeGreaterThanOrEqual(0)
-    expect(box.x + box.width).toBeLessThanOrEqual(390)
-    await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2)
+    if (!box) throw new Error(`${name} toolbar key has no bounding box`)
+    const viewport = page.viewportSize()
+    if (!viewport) throw new Error(`${name} toolbar key test has no viewport`)
+    const center = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+    expect(center.x, `${name} toolbar key center x should be inside the viewport`).toBeGreaterThanOrEqual(0)
+    expect(center.x, `${name} toolbar key center x should be inside the viewport`).toBeLessThan(viewport.width)
+    expect(center.y, `${name} toolbar key center y should be inside the viewport`).toBeGreaterThanOrEqual(0)
+    expect(center.y, `${name} toolbar key center y should be inside the viewport`).toBeLessThan(viewport.height)
+    const hitTargetIsButton = await button.evaluate((element, point) => {
+      const hit = document.elementFromPoint(point.x, point.y)
+      return !!hit && (hit === element || element.contains(hit))
+    }, center)
+    expect(hitTargetIsButton, `${name} toolbar key should receive a touch at its center`).toBe(true)
+    await page.touchscreen.tap(center.x, center.y)
   }
 
   await tapButton('Enter')
-  await expect.poll(() => terminalKeys).toEqual(['Enter'])
+  await expect.poll(() => terminalKeys, { message: 'Enter touch key should be delivered exactly once' }).toEqual(['Enter'])
   await expect(page.getByRole('status')).toHaveText('Sent Enter')
 
   for (const [name, key] of [
@@ -209,7 +221,9 @@ test('mobile Return input and visible toolbar controls both reach the terminal',
     ['Up arrow', 'Up'], ['Right arrow', 'Right'],
   ]) {
     await tapButton(name)
-    await expect.poll(() => terminalKeys.filter(value => value === key).length).toBe(1)
+    await expect.poll(() => terminalKeys.filter(value => value === key).length, {
+      message: `${key} touch key should be delivered exactly once`,
+    }).toBe(1)
   }
 
   // iOS can suppress the compatibility click after terminal focus changes.
@@ -220,7 +234,9 @@ test('mobile Return input and visible toolbar controls both reach the terminal',
     element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'touch' }))
     element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }))
   })
-  await expect.poll(() => terminalKeys.filter(value => value === 'Escape').length).toBe(2)
+  await expect.poll(() => terminalKeys.filter(value => value === 'Escape').length, {
+    message: 'Escape pointerup plus compatibility click should deliver exactly one additional key',
+  }).toBe(2)
 
   // If the next tap loses pointerup but still emits click, a recent touch on a
   // different key must not suppress that click.
@@ -230,8 +246,12 @@ test('mobile Return input and visible toolbar controls both reach the terminal',
     prior?.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerType: 'touch' }))
     next?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }))
   })
-  await expect.poll(() => terminalKeys.filter(value => value === 'Down').length).toBe(2)
-  await expect.poll(() => terminalKeys.filter(value => value === 'Up').length).toBe(2)
+  await expect.poll(() => terminalKeys.filter(value => value === 'Down').length, {
+    message: 'Down touch pointerup should remain the primary delivery',
+  }).toBe(2)
+  await expect.poll(() => terminalKeys.filter(value => value === 'Up').length, {
+    message: 'Up click-only fallback should survive a recent touch on a different key',
+  }).toBe(2)
 
   // Canvas keyboard input still queues while the terminal WebSocket reconnects.
   // Toolbar controls use the independent HTTP path tested above.
