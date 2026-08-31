@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""Run one synthetic UX review, one bounded candidate edit, and a gated Refeather."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+HOME = Path(os.environ.get("HOME", "/home/user"))
+STATE_DIR = Path(os.environ.get("FEATHER_UX_STATE_DIR", HOME / ".local/state/feather/ux-loop"))
+SOURCE_REPO = Path(os.environ.get("FEATHER_UX_SOURCE_REPO", "/home/user/feather-next"))
+CURRENT_LINK = Path(os.environ.get("FEATHER_UX_CURRENT_LINK", HOME / ".local/share/feather/current"))
+FLEET_STATE = Path(os.environ.get("FEATHER_UX_FLEET_STATE", "/var/lib/feather/refeather/fleet-schedule.json"))
+FLEET_CONFIG = Path(os.environ.get("FEATHER_UX_FLEET_CONFIG", "/etc/feather/fleet.json"))
+CANDIDATE_DIR = STATE_DIR / "candidate"
+CANDIDATE_BRANCH = os.environ.get("FEATHER_UX_CANDIDATE_BRANCH", "auto/feather-ux")
+FOCUSES = ("outcome-inbox", "room-question", "conversation-return", "rich-results")
+ALLOWED_SETTLED_FLEET_STATES = {"succeeded", "failed", "rolled_back"}
+MIN_PROMOTION_AGE_SECONDS = 24 * 60 * 60
+
+
+class LoopError(RuntimeError):
+    pass
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None,
+        log: Path | None = None, timeout: int | None = None, check: bool = True) -> subprocess.CompletedProcess:
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    result = subprocess.run(
+        command,
+        cwd=str(cwd) if cwd else None,
+        env=merged_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+        check=False,
+    )
+    if log:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(result.stdout)
+    if check and result.returncode != 0:
+        raise LoopError(f"command failed ({result.returncode}): {' '.join(command)}; log={log}")
+    return result
+
+
+def git(*args: str, cwd: Path = SOURCE_REPO, check: bool = True) -> str:
+    return run(["git", *args], cwd=cwd, check=check).stdout.strip()
+
+
+def release_gate(status: str, age_hours: float) -> tuple[bool, str]:
+    if status not in ALLOWED_SETTLED_FLEET_STATES:
+        return False, f"prior fleet schedule is {status or 'unknown'}, not settled"
+    if age_hours < 24:
+        return False, f"Philip canary is only {age_hours:.2f} hours old"
+    return True, "prior fleet schedule settled and Philip canary is at least 24 hours old"
+
+
+def gate_command(args: argparse.Namespace) -> int:
+    allowed, reason = release_gate(args.status, args.age_hours)
+    print(json.dumps({"allowed": allowed, "reason": reason}))
+    return 0
+
+
+def read_state() -> dict:
+    path = STATE_DIR / "state.json"
+    if not path.exists():
+        return {"schema": 1, "focusIndex": 0, "runs": 0}
+    data = json.loads(path.read_text())
+    if data.get("schema") != 1 or not isinstance(data.get("focusIndex"), int):
+        raise LoopError("invalid UX loop state")
+    return data
+
+
+def write_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / "state.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2) + "\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+
+
+def deployed_commit() -> str:
+    target = CURRENT_LINK.resolve(strict=True)
+    commit = target.name
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise LoopError(f"current release is not commit-addressed: {target}")
+    git("cat-file", "-e", f"{commit}^{{commit}}")
+    return commit
+
+
+def ensure_candidate(seed_ref: str) -> None:
+    run(["git", "fetch", "origin", "main"], cwd=SOURCE_REPO, timeout=180)
+    run(["git", "fetch", "fork"], cwd=SOURCE_REPO, timeout=180)
+    if (CANDIDATE_DIR / ".git").exists():
+        branch = git("branch", "--show-current", cwd=CANDIDATE_DIR)
+        if branch != CANDIDATE_BRANCH:
+            raise LoopError(f"candidate worktree uses unexpected branch {branch}")
+        return
+    CANDIDATE_DIR.parent.mkdir(parents=True, exist_ok=True)
+    branch_exists = run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{CANDIDATE_BRANCH}"], cwd=SOURCE_REPO, check=False).returncode == 0
+    if branch_exists:
+        run(["git", "worktree", "add", str(CANDIDATE_DIR), CANDIDATE_BRANCH], cwd=SOURCE_REPO, timeout=120)
+    else:
+        git("cat-file", "-e", f"{seed_ref}^{{commit}}")
+        run(["git", "worktree", "add", "-b", CANDIDATE_BRANCH, str(CANDIDATE_DIR), seed_ref], cwd=SOURCE_REPO, timeout=120)
+
+
+def agent_prompt(run_dir: Path, critique: dict, deployed: str, upstream: str) -> str:
+    selected = None
+    index = critique.get("highest_priority_index")
+    findings = critique.get("findings") or []
+    if isinstance(index, int) and 0 <= index < len(findings):
+        selected = findings[index]
+    decision_path = run_dir / "decision.json"
+    return f"""You are the unattended Feather maintenance candidate editor. Work only in the current automation-owned candidate worktree and the supplied run directory. Do not commit, push, stage, promote, restart services, send messages, access credentials, or touch live mutable state.
+
+Current deployed commit: {deployed}
+Fetched upstream head: {upstream}
+Synthetic recording directory: {run_dir}
+Gemini model-only verdict: {critique.get('verdict')}
+Selected Gemini hypothesis: {json.dumps(selected, ensure_ascii=False)}
+
+Do two bounded jobs in this order:
+1. Refeather: inspect the upstream commits represented by origin/main but not yet represented in this downstream candidate. Port all applicable behavior into the existing downstream architecture. Never blindly merge modular upstream server files over server-single.js, and preserve Fledge, Rooms, OMP, Authelia, immutable release, state, and fleet contracts. If there is no new applicable upstream behavior, make no upstream edit.
+2. UX: Gemini is a hypothesis, never evidence. Only if the selected hypothesis has a timestamp and observable contract, reproduce it locally with automation/feather-ux/record.mjs against synthetic data. If reproduced, implement exactly one smallest cause-linked fix. If not reproduced or merely aesthetic, make no UX edit.
+
+Keep changes surgical. No documentation files. Do not add retries, telemetry, abstractions, or unrelated cleanup. Run only targeted checks needed while editing; the outer controller owns full validation. Before exiting, write strict JSON to {decision_path} with this shape:
+{{
+  "schema": 1,
+  "outcome": "changed" | "no_change" | "blocked",
+  "upstream": {{"head": "{upstream}", "integrated": ["commit sha or behavior"], "note": "concise"}},
+  "ux": {{"findingIndex": integer or null, "reproduced": true | false, "change": "concise or empty", "evidence": "local observable evidence"}},
+  "targetedChecks": ["exact command/result"],
+  "blocker": "empty unless blocked"
+}}
+A changed outcome requires a real worktree diff. A no_change outcome requires a clean worktree. A blocked outcome must name the concrete blocker and leave no knowingly unsafe partial implementation."""
+
+
+def invoke_agent(run_dir: Path, critique: dict, deployed: str, upstream: str) -> dict:
+    decision_path = run_dir / "decision.json"
+    if decision_path.exists():
+        decision_path.unlink()
+    before_head = git("rev-parse", "HEAD", cwd=CANDIDATE_DIR)
+    prompt = agent_prompt(run_dir, critique, deployed, upstream)
+    command = [
+        "omp", "--cwd", str(CANDIDATE_DIR), "--add-dir", str(run_dir),
+        "--model", os.environ.get("FEATHER_UX_AGENT_MODEL", "openai-codex/gpt-5.6-sol"),
+        "--thinking", "high", "--approval-mode", "yolo", "--max-time", "90m",
+        "--no-session", "--no-title", "-p", prompt,
+    ]
+    result = run(command, cwd=CANDIDATE_DIR, log=run_dir / "agent.log", timeout=95 * 60, check=False)
+    if result.returncode != 0:
+        raise LoopError(f"OMP candidate editor failed; log={run_dir / 'agent.log'}")
+    if git("rev-parse", "HEAD", cwd=CANDIDATE_DIR) != before_head:
+        raise LoopError("candidate editor committed despite the no-commit boundary")
+    if not decision_path.exists():
+        raise LoopError("candidate editor did not write decision.json")
+    decision = json.loads(decision_path.read_text())
+    if decision.get("schema") != 1 or decision.get("outcome") not in {"changed", "no_change", "blocked"}:
+        raise LoopError("candidate editor wrote an invalid decision")
+    return decision
+
+
+def changed_paths() -> list[str]:
+    output = git("status", "--porcelain", "-z", cwd=CANDIDATE_DIR)
+    if not output:
+        return []
+    paths = []
+    entries = [entry for entry in output.split("\0") if entry]
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        code = entry[:2]
+        path_value = entry[3:]
+        if code[0] in {"R", "C"}:
+            index += 1
+            if index >= len(entries):
+                raise LoopError("malformed renamed path in git status")
+            path_value = entries[index]
+        paths.append(path_value)
+        index += 1
+    forbidden = [path_value for path_value in paths if re.search(r"(^|/)(\.env(?:\.|$)|credentials?|secrets?)(/|$)", path_value, re.I)]
+    if forbidden:
+        raise LoopError(f"candidate touched forbidden credential paths: {forbidden}")
+    return paths
+
+
+def allocate_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def wait_health(port: int, expected_version: str | None = None, timeout: int = 30) -> dict:
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as response:
+                body = json.load(response)
+            if body.get("status") != "ok":
+                raise LoopError(f"health returned {body}")
+            if expected_version and body.get("version") != expected_version:
+                raise LoopError(f"health version {body.get('version')} != {expected_version}")
+            return body
+        except Exception as error:
+            last_error = error
+            time.sleep(0.25)
+    raise LoopError(f"server on {port} did not become healthy: {last_error}")
+
+
+def run_browser_suite(root: Path, static_override: str, run_dir: Path, label: str) -> None:
+    port = allocate_port()
+    with tempfile.TemporaryDirectory(prefix="feather-ux-e2e-") as temporary:
+        home = Path(temporary) / "home"
+        state = Path(temporary) / "state"
+        (home / ".claude/projects/synthetic").mkdir(parents=True)
+        state.mkdir(parents=True)
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(home), "FEATHER_STATE_DIR": str(state), "PORT": str(port), "HOST": "127.0.0.1",
+            "FEATHER_ROOM_PULSES": "0", "FEATHER_PUSH_POLL": "0",
+        })
+        if static_override:
+            env["STATIC_OVERRIDE"] = static_override
+        server_log = (run_dir / f"{label}-server.log").open("w")
+        server = subprocess.Popen(["node", "server-single.js"], cwd=root, env=env, stdout=server_log, stderr=subprocess.STDOUT, text=True)
+        try:
+            wait_health(port)
+            run(
+                ["npx", "playwright", "test", "--workers=1"],
+                cwd=CANDIDATE_DIR,
+                env={"FEATHER_URL": f"http://127.0.0.1:{port}", "HOME": str(home), "PLAYWRIGHT_BROWSERS_PATH": os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(HOME / ".cache/ms-playwright"))},
+                log=run_dir / f"{label}-browser.log",
+                timeout=20 * 60,
+            )
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=3)
+            server_log.close()
+
+
+def validate_candidate(run_dir: Path) -> None:
+    run(["npm", "test"], cwd=CANDIDATE_DIR, log=run_dir / "unit.log", timeout=20 * 60)
+    run(["npm", "run", "build"], cwd=CANDIDATE_DIR, log=run_dir / "build.log", timeout=20 * 60)
+    run_browser_suite(CANDIDATE_DIR, "static-test", run_dir, "source")
+    run(["git", "diff", "--check"], cwd=CANDIDATE_DIR, log=run_dir / "diff-check.log", timeout=60)
+
+
+def publish_candidate(run_dir: Path) -> None:
+    upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", cwd=CANDIDATE_DIR, check=False)
+    if not upstream:
+        run(["git", "push", "-u", "fork", CANDIDATE_BRANCH], cwd=CANDIDATE_DIR, log=run_dir / "push.log", timeout=180)
+    else:
+        run(["git", "push", "fork", CANDIDATE_BRANCH], cwd=CANDIDATE_DIR, log=run_dir / "push.log", timeout=180)
+
+
+def commit_candidate(run_dir: Path, focus: str) -> str:
+    run(["git", "add", "-A"], cwd=CANDIDATE_DIR)
+    stamp = utc_now().strftime("%Y-%m-%d %H:%M UTC")
+    run(["git", "commit", "-m", f"Automated Feather UX pass: {focus} ({stamp})"], cwd=CANDIDATE_DIR, log=run_dir / "commit.log", timeout=120)
+    commit = git("rev-parse", "HEAD", cwd=CANDIDATE_DIR)
+    publish_candidate(run_dir)
+    return commit
+
+def fleet_status() -> dict:
+    binary = CURRENT_LINK / "bin/refeather-fleet"
+    result = run(["sudo", str(binary), "status", "--state", str(FLEET_STATE)], timeout=60)
+    return json.loads(result.stdout)
+
+
+def current_canary_age_hours() -> float:
+    return max(0.0, (time.time() - os.lstat(CURRENT_LINK).st_mtime) / 3600)
+
+
+def stage_release(run_dir: Path) -> Path:
+    result = run([str(CANDIDATE_DIR / "bin/refeather"), "stage", "--source", str(CANDIDATE_DIR)], cwd=CANDIDATE_DIR, log=run_dir / "stage.log", timeout=30 * 60)
+    candidates = [Path(line.strip()) for line in result.stdout.splitlines() if line.strip().startswith("/")]
+    if not candidates:
+        raise LoopError("refeather stage did not report a release path")
+    release = candidates[-1]
+    if not release.is_dir() or not re.fullmatch(r"[0-9a-f]{40}", release.name):
+        raise LoopError(f"invalid staged release path {release}")
+    return release
+
+
+def validate_immutable(release: Path, run_dir: Path) -> str:
+    version = json.loads((release / "version.json").read_text())["version"]
+    port = allocate_port()
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(HOME), "PORT": str(port), "HOST": "127.0.0.1", "FEATHER_READ_ONLY": "1",
+        "FEATHER_ROOM_PULSES": "0", "FEATHER_PUSH_POLL": "0",
+    })
+    server_log = (run_dir / "immutable-server.log").open("w")
+    server = subprocess.Popen(["node", "server-single.js"], cwd=release, env=env, stdout=server_log, stderr=subprocess.STDOUT, text=True)
+    try:
+        wait_health(port, version)
+        run(
+            ["npx", "playwright", "test", "--workers=1"], cwd=CANDIDATE_DIR,
+            env={"FEATHER_URL": f"http://127.0.0.1:{port}", "PLAYWRIGHT_BROWSERS_PATH": os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(HOME / ".cache/ms-playwright"))},
+            log=run_dir / "immutable-browser.log", timeout=20 * 60,
+        )
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=3)
+        server_log.close()
+    return version
+
+
+def promote(release: Path, version: str, run_dir: Path) -> None:
+    command = [
+        "sudo", str(CANDIDATE_DIR / "bin/refeather"), "promote", "--release", str(release),
+        "--current-link", str(CURRENT_LINK), "--systemd-unit", "feather.service",
+        "--systemd-unit", "feather-philip.service", "--health-url", "http://127.0.0.1:4870/api/health",
+        "--health-url", "http://127.0.0.1:4871/api/health",
+    ]
+    run(command, cwd=CANDIDATE_DIR, log=run_dir / "promote.log", timeout=10 * 60)
+    for port in (4870, 4871):
+        wait_health(port, version, timeout=30)
+    run(["sudo", "systemctl", "start", "feather-fleet-promote.service"], log=run_dir / "fleet-sync.log", timeout=10 * 60)
+
+
+def maybe_release(candidate_commit: str, run_dir: Path) -> dict:
+    current = deployed_commit()
+    if candidate_commit == current:
+        return {"promoted": False, "reason": "candidate equals deployed commit"}
+    schedule = fleet_status()
+    age_hours = current_canary_age_hours()
+    allowed, reason = release_gate(str(schedule.get("status", "")), age_hours)
+    gate_receipt = {"allowed": allowed, "reason": reason, "fleetStatus": schedule.get("status"), "canaryAgeHours": age_hours}
+    (run_dir / "release-gate.json").write_text(json.dumps(gate_receipt, indent=2) + "\n")
+    if not allowed:
+        return {"promoted": False, "reason": reason}
+    release = stage_release(run_dir)
+    version = validate_immutable(release, run_dir)
+    promote(release, version, run_dir)
+    return {"promoted": True, "release": str(release), "version": version}
+
+
+def loop_command(_args: argparse.Namespace) -> int:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = STATE_DIR / "loop.lock"
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(json.dumps({"status": "skipped", "reason": "another UX loop owns the full-cycle lock"}))
+            return 0
+
+        state = read_state()
+        focus = FOCUSES[state["focusIndex"] % len(FOCUSES)]
+        run_id = utc_now().strftime("%Y%m%dT%H%M%SZ") + f"-{focus}"
+        run_dir = STATE_DIR / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        receipt = {"schema": 1, "runId": run_id, "focus": focus, "startedAt": utc_now().isoformat(), "status": "running"}
+        (run_dir / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        try:
+            run(["node", str(ROOT / "automation/feather-ux/record.mjs"), str(run_dir), focus], cwd=ROOT, log=run_dir / "record.log", timeout=10 * 60)
+            run([sys.executable, str(ROOT / "automation/feather-ux/critique.py"), str(run_dir)], cwd=ROOT, log=run_dir / "critique.log", timeout=15 * 60)
+            critique = json.loads((run_dir / "critique.json").read_text())
+            deployed = deployed_commit()
+            seed_ref = os.environ.get("FEATHER_UX_SEED_REF", deployed)
+            ensure_candidate(seed_ref)
+            upstream = git("rev-parse", "origin/main", cwd=CANDIDATE_DIR)
+            decision = invoke_agent(run_dir, critique, deployed, upstream)
+            paths = changed_paths()
+            if decision["outcome"] == "blocked":
+                if paths:
+                    raise LoopError(f"blocked candidate left partial changes: {paths}")
+                candidate_commit = git("rev-parse", "HEAD", cwd=CANDIDATE_DIR)
+                release = {"promoted": False, "reason": f"candidate blocked: {decision.get('blocker', '')}"}
+            elif paths:
+                if decision["outcome"] != "changed":
+                    raise LoopError(f"candidate changed files but reported {decision['outcome']}: {paths}")
+                validate_candidate(run_dir)
+                candidate_commit = commit_candidate(run_dir, focus)
+                release = maybe_release(candidate_commit, run_dir)
+            else:
+                if decision["outcome"] == "changed":
+                    raise LoopError("candidate reported changed without a worktree diff")
+                candidate_commit = git("rev-parse", "HEAD", cwd=CANDIDATE_DIR)
+                publish_candidate(run_dir)
+                release = maybe_release(candidate_commit, run_dir)
+
+            receipt.update({
+                "status": "succeeded", "completedAt": utc_now().isoformat(), "decision": decision,
+                "candidateCommit": candidate_commit, "release": release,
+            })
+            state.update({
+                "focusIndex": (state["focusIndex"] + 1) % len(FOCUSES), "runs": int(state.get("runs", 0)) + 1,
+                "lastRun": run_id, "lastStatus": "succeeded", "candidateCommit": candidate_commit,
+                "lastUpstream": upstream,
+            })
+            write_state(state)
+        except Exception as error:
+            receipt.update({"status": "failed", "completedAt": utc_now().isoformat(), "error": str(error)})
+            state.update({"lastRun": run_id, "lastStatus": "failed", "lastError": str(error)})
+            write_state(state)
+            (run_dir / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+            print(json.dumps({"status": "failed", "runDir": str(run_dir), "error": str(error)}))
+            return 1
+        (run_dir / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        print(json.dumps({"status": "succeeded", "runDir": str(run_dir), "focus": focus, "release": receipt["release"]}))
+        return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser()
+    commands = root.add_subparsers(dest="command")
+    commands.add_parser("run")
+    gate = commands.add_parser("gate")
+    gate.add_argument("--status", required=True)
+    gate.add_argument("--age-hours", type=float, required=True)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.command == "gate":
+        return gate_command(args)
+    if args.command in {None, "run"}:
+        return loop_command(args)
+    raise LoopError(f"unknown command {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

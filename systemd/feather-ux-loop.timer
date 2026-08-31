@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the guarded Feather UX improvement loop every six hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+AccuracySec=2min
+RandomizedDelaySec=5min
+Unit=feather-ux-loop.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,23 @@
+[Unit]
+Description=Record, critique, improve, and conditionally Refeather one synthetic UX journey
+After=network-online.target feather-philip.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=user
+Group=user
+WorkingDirectory=/home/user
+Environment=HOME=/home/user
+Environment=PATH=/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=FEATHER_URL=http://127.0.0.1:4871
+Environment=FEATHER_UX_SOURCE_REPO=/home/user/feather-next
+Environment=FEATHER_UX_CURRENT_LINK=/home/user/.local/share/feather/current
+Environment=FEATHER_UX_PLAYWRIGHT_ROOT=/home/user/.local/share/feather/current
+Environment=FEATHER_UX_STATE_DIR=/home/user/.local/state/feather/ux-loop
+Environment=PLAYWRIGHT_BROWSERS_PATH=/home/user/.cache/ms-playwright
+ExecStart=/home/user/.local/lib/feather-ux-loop/bin/feather-ux-loop run
+TimeoutStartSec=4h
+KillMode=mixed
+UMask=0077
+Nice=10
