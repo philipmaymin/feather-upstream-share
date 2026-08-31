@@ -13,6 +13,7 @@ const waitingPost = {
   question: 'Choose the release channel before deployment can continue.',
   message: { uuid: 'answer', role: 'assistant', timestamp: '2026-08-30T15:59:00.000Z', content: [{ type: 'text', text: 'The release is ready once you choose the channel.' }] },
   score: 400, why: 'Waiting for your decision',
+  importance: 'feature',
 }
 
 const richPost = {
@@ -24,6 +25,8 @@ const richPost = {
     content: [{ type: 'text', text: '## Research packet\n\nThe useful files are [report](/tmp/fledge-report.pdf), [interactive](/tmp/fledge-demo.html), and [clip](/tmp/fledge-clip.mp4).\n\n![tracking pixel](https://tracker.example/pixel.png)\n\nhttps://x.com/example/status/1234567890123456789' }],
   },
   score: 100, why: 'Completed recently', reaction: null,
+  importance: 'feature',
+  media: { kind: 'video', path: '/tmp/fledge-clip.mp4', name: 'fledge-clip.mp4' },
   comments: [{ id: 'existing-comment', text: 'Can you narrow this to the strongest example?', createdAt: '2026-08-30T15:45:00.000Z', delivery: 'delivered', reply: { text: 'Yes. The report is the strongest example because it contains the complete evidence chain.', timestamp: '2026-08-30T15:46:00.000Z' } }],
 }
 
@@ -33,6 +36,15 @@ const updatePost = {
   title: '#films update', agent: null, status: 'finished',
   updateText: '### Worth watching\n\nA Feather curated this for the stream: https://www.tiktok.com/@example/video/7412345678901234567',
   score: 90, why: 'New Room update',
+  importance: 'feature',
+}
+
+const quietPost = {
+  id: 'room-update:films:routine', kind: 'room-update', timestamp: '2026-08-30T15:10:00.000Z',
+  sessionId: 'films', room: 'films', projectId: 'films', projectLabel: 'Films',
+  title: 'Routine production note', agent: null, status: 'finished', importance: 'note',
+  updateText: 'Receipt filenames were normalized for the next internal pass.',
+  score: 80, why: 'Quiet note · Recent Room update',
 }
 
 const olderPost = {
@@ -41,20 +53,25 @@ const olderPost = {
   title: 'Earlier dispatch', agent: 'claude', status: 'finished',
   message: { uuid: 'older-result', role: 'assistant', timestamp: '2026-08-28T10:00:00.000Z', content: [{ type: 'text', text: 'The archival audit reconciled every deployment receipt against the immutable release manifest. The service identities, health endpoints, source commit, and tree hash all match the scheduled fleet release. No mutable state lives inside the release directory, every target still defaults to OMP, and the canary remains healthy. The review also checked rollback metadata, capability links, and delayed promotion ownership. The remaining evidence is intentionally long enough to prove that an ordinary completed dispatch becomes a compact preview instead of a presentation poster. This final sentence appears after the compact preview boundary.' }] },
   score: 40, why: 'Filed earlier',
+  importance: 'feature',
 }
 
 function feedResponse(mode, before) {
   if (before) return {
     generatedAt: GENERATED_AT,
     nextBefore: null,
-    counts: { waiting: 1, working: 0, errored: 0, finished: 3 },
+    counts: { waiting: 1, working: 0, errored: 0, finished: 4, important: 4, notes: 1 },
     posts: [olderPost],
   }
-  const all = mode === 'needs-me' ? [waitingPost] : mode === 'latest' ? [waitingPost, richPost, updatePost] : [waitingPost, richPost, updatePost]
+  const all = mode === 'needs-me'
+    ? [waitingPost]
+    : mode === 'latest'
+      ? [waitingPost, richPost, updatePost, quietPost]
+      : [waitingPost, richPost, updatePost]
   return {
     generatedAt: GENERATED_AT,
     nextBefore: mode === 'needs-me' ? null : '2026-08-29T00:00:00.000Z',
-    counts: { waiting: 1, working: 0, errored: 0, finished: 3 },
+    counts: { waiting: 1, working: 0, errored: 0, finished: 4, important: 4, notes: 1 },
     posts: all,
   }
 }
@@ -94,6 +111,9 @@ async function installFixtureRoutes(page, state = { failFeed: false }) {
     if (path === '/api/sidecar') return route.fulfill({ json: { groups: [] } })
     if (path === '/api/quick-links') return route.fulfill({ json: [] })
     if (path === '/api/version') return route.fulfill({ json: {} })
+    if (path === '/api/files/media') {
+      return route.fulfill({ status: 200, contentType: 'video/mp4', body: 'media' })
+    }
     if (path === '/api/files/raw') {
       const file = url.searchParams.get('path') || ''
       const contentType = file.endsWith('.pdf') ? 'application/pdf' : file.endsWith('.mp4') ? 'video/mp4' : 'application/octet-stream'
@@ -117,6 +137,12 @@ test('Fledge is a feed-first complete interface with internal chat navigation', 
   await expect(page.getByTestId('fledge-needs-count')).toContainText('1 waiting')
   const posts = page.getByTestId('fledge-post')
   await expect(posts).toHaveCount(3)
+  await expect(page.getByRole('button', { name: 'For You', exact: true })).toContainText('Important only')
+  await expect(page.locator('.fledge-pulse')).toContainText('4 done')
+  await expect(page.locator('.fledge-pulse')).toContainText('1 more in Latest')
+  await expect(posts.first()).toHaveAttribute('data-importance', 'feature')
+  await expect(posts.first().locator('.fledge-card-avatar')).toBeVisible()
+  await expect(page.getByText('Routine production note', { exact: true })).toHaveCount(0)
   await expect(posts.first()).toContainText('Your move')
   await expect(posts.first()).toContainText('Choose the release channel')
   await expect(posts.first()).toContainText('Deployment decision')
@@ -171,6 +197,21 @@ test('Fledge renders rich and curated media in-app and paginates without a conte
 
   const richCard = page.locator('[data-post-id="session:rich:result"]')
   await expect(richCard.getByText('The report is the strongest example because it contains the complete evidence chain.')).toBeVisible()
+  await expect(richCard).toHaveAttribute('data-importance', 'feature')
+  await expect(richCard.locator('.fledge-primary-media video')).toBeVisible()
+  const featureHeight = await richCard.evaluate(element => element.getBoundingClientRect().height)
+  await page.getByText('Latest', { exact: true }).click()
+  const quietCard = page.locator('[data-post-id="room-update:films:routine"]')
+  await expect(quietCard).toHaveAttribute('data-importance', 'note')
+  await expect(quietCard.getByRole('heading', { name: 'Routine production note' })).toBeVisible()
+  await expect(quietCard.getByRole('button', { name: 'Show me more like this' })).toHaveCount(0)
+  const noteHeight = await quietCard.evaluate(element => element.getBoundingClientRect().height)
+  expect(noteHeight).toBeLessThan(featureHeight)
+  const noteColor = await quietCard.locator('.fledge-card-heading h2').evaluate(element => getComputedStyle(element).color)
+  const featureColor = await richCard.locator('.fledge-card-heading h2').evaluate(element => getComputedStyle(element).color)
+  expect(noteColor).not.toBe(featureColor)
+  await page.getByText('For You', { exact: true }).click()
+  await expect(page.getByText('Routine production note', { exact: true })).toHaveCount(0)
   await richCard.getByRole('button', { name: 'Show me more like this' }).click()
   await expect(richCard.getByRole('button', { name: 'Show me more like this' })).toHaveAttribute('aria-pressed', 'true')
   await expect(richCard.getByRole('button', { name: 'Retry feedback' })).toBeVisible()
@@ -180,14 +221,15 @@ test('Fledge renders rich and curated media in-app and paginates without a conte
   await richCard.getByRole('button', { name: 'Show me less like this' }).click()
   await expect(richCard.getByRole('button', { name: 'Show me more like this' })).toHaveAttribute('aria-pressed', 'false')
   await expect(richCard.getByRole('button', { name: 'Show me less like this' })).toHaveAttribute('aria-pressed', 'true')
-  await richCard.getByRole('button', { name: 'Reply: respond inline to this dispatch' }).click()
-  await richCard.getByLabel('Reply inside this dispatch').fill('Please turn that into a one-page brief.')
-  await richCard.getByRole('button', { name: 'Send reply' }).click()
+  await richCard.getByRole('button', { name: 'Ask a follow-up' }).click()
+  await expect(richCard.getByLabel('Ask about this result')).toBeFocused()
+  await richCard.getByLabel('Ask about this result').fill('Please turn that into a one-page brief.')
+  await richCard.getByRole('button', { name: 'Ask', exact: true }).click()
   await expect(richCard.getByText('Delivery failed. Your draft is still here.')).toBeVisible()
-  await richCard.getByLabel('Reply inside this dispatch').fill('Please turn that into a concise one-page brief.')
-  await richCard.getByRole('button', { name: 'Send reply' }).click()
+  await richCard.getByLabel('Ask about this result').fill('Please turn that into a concise one-page brief.')
+  await richCard.getByRole('button', { name: 'Ask', exact: true }).click()
   await expect(richCard.getByText('Delivery failed. Your draft is still here.')).toBeVisible()
-  await richCard.getByRole('button', { name: 'Send reply' }).click()
+  await richCard.getByRole('button', { name: 'Ask', exact: true }).click()
   await expect(richCard.getByText('Please turn that into a concise one-page brief.')).toHaveCount(1)
   expect(state.commentIds).toHaveLength(3)
   expect(state.commentIds[0]).not.toBe(state.commentIds[1])
@@ -205,7 +247,7 @@ test('Fledge renders rich and curated media in-app and paginates without a conte
   await page.getByTitle('Close').click()
 
   await page.getByRole('link', { name: 'clip' }).click()
-  await expect(page.locator('video[playsinline]')).toBeVisible()
+  await expect(page.locator('video[src*="/api/files/raw"]')).toBeVisible()
   await page.getByTitle('Close').click()
 
   const olderHeading = page.getByRole('heading', { name: 'Earlier dispatch', exact: true })

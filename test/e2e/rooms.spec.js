@@ -39,10 +39,12 @@ test('attaches and detaches an existing chat without duplicate Room rows', async
 
   await page.goto(BASE)
   await expect(page.getByText('#marriage')).toBeVisible()
+  await page.getByTestId('history-marriage').click()
+  await page.getByText('Room options', { exact: true }).click()
   await expect(page.getByTestId('pulse-marriage')).toHaveText('Stop background')
   await page.getByTestId('pulse-marriage').click()
   await expect(page.getByTestId('pulse-marriage')).toHaveText('Start background')
-  await page.locator('button:has-text("›")').click()
+  await page.getByText('Room options', { exact: true }).click()
   await page.getByTestId('attach-existing-marriage').click()
   await expect(page.getByTestId('attach-picker-marriage')).toBeVisible()
   await page.getByTestId(`attach-${candidate.id}`).click()
@@ -60,7 +62,7 @@ test('attaches and detaches an existing chat without duplicate Room rows', async
   await expect(page.getByText(candidate.title, { exact: true })).toHaveCount(1)
 })
 
-test('Room card reveals residents and conversation history before a chat is opened', async ({ page }) => {
+test('Room card opens its Leader while History reveals only past chats', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   const leader = {
     id: 'leader-human-chat', title: '#feather Leader', updatedAt: '2026-08-23T23:00:00Z',
@@ -92,14 +94,19 @@ test('Room card reveals residents and conversation history before a chat is open
   await page.goto(BASE)
   await expect(page.getByTestId('room-card-feather')).toContainText('2 residents')
   await page.getByText('#feather', { exact: true }).click()
+  await expect(page).toHaveURL(/#leader-human-chat$/)
+
+  await page.goto(BASE)
+  await page.getByTestId('history-feather').click()
   await expect(page).toHaveURL(/#?$/)
-  await expect(page.getByTestId('resident-feather-leader')).toBeVisible()
-  await expect(page.getByTestId('resident-feather-caretaker')).toBeVisible()
+  await expect(page.getByText('Past chats', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('resident-feather-leader')).toHaveCount(0)
+  await expect(page.getByTestId('resident-feather-caretaker')).toHaveCount(0)
   await expect(page.getByText('One-off investigation', { exact: true })).toBeVisible()
   await expect(page.getByText('#feather Leader', { exact: true })).toHaveCount(0)
 
-  await page.getByTestId('resident-feather-leader').click()
-  await expect(page).toHaveURL(/#leader-human-chat$/)
+  await page.getByText('One-off investigation', { exact: true }).click()
+  await expect(page).toHaveURL(/#other-chat$/)
 })
 
 test('Room without a Leader expands before its OMP Leader is created', async ({ page }) => {
@@ -156,7 +163,7 @@ test('failed Room assignment exposes the created ungrouped chat without opening 
   }))
 
   await page.goto(BASE)
-  await page.getByText('#failure-room', { exact: true }).click()
+  await page.getByTestId('history-failure-room').click()
   await page.getByRole('button', { name: '+ New OMP chat' }).click()
 
   const recovery = page.getByTestId('room-assignment-recovery')
@@ -199,6 +206,8 @@ test('Wiki presents caretaker synthesis and never exposes raw Updates or active 
   })
 
   await page.goto(BASE)
+  await page.getByTestId('history-briefings').click()
+  await page.getByText('Room options', { exact: true }).click()
   await page.getByTestId('wiki-briefings').click()
   const panel = page.getByTestId('wiki-panel-briefings')
   await expect(panel).toContainText('The caretaker synthesized durable evidence')
@@ -219,6 +228,7 @@ test('passes the chosen model only when launching a new OMP session', async ({ p
   })
 
   await page.goto(BASE)
+  await page.getByText('New chat outside a Room', { exact: true }).click()
   await page.getByTestId('omp-model-override').fill('anthropic/claude-opus-5')
   await page.getByRole('button', { name: '+ OMP', exact: true }).click()
   await expect.poll(() => sessionBody).toMatchObject({
@@ -250,8 +260,16 @@ test('shows friction only on the Room that reported it', async ({ page }) => {
   await page.route('**/api/rooms/health/friction', route => route.fulfill({ json: { complaints, count: 1 } }))
 
   await page.goto(BASE)
+  await page.getByTestId('history-health').click()
+  await page.getByText('Room options', { exact: true }).click()
   await expect(page.getByTestId('friction-health')).toContainText('1')
+  await page.getByTestId('history-health').click()
+  await page.getByTestId('history-family').click()
+  await page.getByText('Room options', { exact: true }).click()
   await expect(page.getByTestId('friction-family')).toContainText('0')
+  await page.getByTestId('history-family').click()
+  await page.getByTestId('history-health').click()
+  await page.getByText('Room options', { exact: true }).click()
   await page.getByTestId('friction-health').click()
   const panel = page.getByTestId('friction-panel-health')
   await expect(panel).toBeVisible()

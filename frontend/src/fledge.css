@@ -2,11 +2,11 @@
   --fledge-ink: #081015;
   --fledge-surface: #0d171c;
   --fledge-raised: #132027;
-  --fledge-paper: #f1eddf;
-  --fledge-muted: #b8b6aa;
-  --fledge-dim: #7f8987;
-  --fledge-rule: #2b3b3d;
-  --fledge-rule-strong: #435456;
+  --fledge-paper: #e7eaed;
+  --fledge-muted: #a1abb3;
+  --fledge-dim: #65717c;
+  --fledge-rule: #26343c;
+  --fledge-rule-strong: #3b4b55;
   --fledge-acid: #c7f36b;
   --fledge-acid-ink: #172009;
   --fledge-coral: #ff7a61;
@@ -40,15 +40,6 @@
   box-sizing: border-box;
 }
 
-.fledge-root::before {
-  position: absolute;
-  z-index: -1;
-  inset: 0;
-  content: '';
-  pointer-events: none;
-  background-image: repeating-linear-gradient(105deg, transparent 0, transparent 3.8rem, rgba(241, 237, 223, .025) 3.85rem, transparent 3.9rem);
-  opacity: .24;
-}
 
 .fledge-sr-only {
   position: absolute;
@@ -339,6 +330,10 @@
 .fledge-pulse-waiting b {
   color: var(--fledge-amber);
 }
+.fledge-pulse-quiet,
+.fledge-pulse-quiet b {
+  color: var(--fledge-dim);
+}
 
 .fledge-feed-frame {
   position: relative;
@@ -403,52 +398,95 @@
   display: block;
   width: 100%;
   min-height: 0;
-  padding: 0 .5rem;
+  padding: 0;
 }
 
 .fledge-card {
   position: relative;
   display: block;
   width: 100%;
-  max-width: 46rem;
+  max-width: 42rem;
   min-height: 0;
   margin: 0 auto;
   overflow: hidden;
   border: 0;
   border-bottom: .0625rem solid var(--fledge-rule);
-  border-left: .1875rem solid transparent;
   border-radius: 0;
   color: var(--fledge-paper);
-  background: var(--fledge-surface);
+  background: transparent;
   box-shadow: none;
   cursor: pointer;
-  transition: border-color 180ms cubic-bezier(.22, 1, .36, 1);
+  transition: background-color 140ms ease, border-color 140ms ease;
 }
 
 .fledge-card:hover {
   border-bottom-color: var(--fledge-rule-strong);
+  background: rgba(255, 255, 255, .018);
 }
 
 .fledge-card-working {
-  border-left-color: var(--fledge-acid);
-  background: linear-gradient(90deg, rgba(199, 243, 107, .055), transparent 24%), var(--fledge-surface);
+  background: transparent;
 }
 
 .fledge-card-errored {
-  border-left-color: var(--fledge-error);
-  background: linear-gradient(90deg, rgba(255, 141, 120, .07), transparent 28%), var(--fledge-surface);
+  background: rgba(255, 141, 120, .025);
 }
 
 .fledge-card-waiting {
-  border-left-color: var(--fledge-amber);
-  background: linear-gradient(90deg, rgba(255, 189, 89, .14), rgba(255, 122, 97, .035) 48%, transparent), var(--fledge-surface);
+  background: rgba(255, 189, 89, .045);
 }
 
 .fledge-card-main {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: 2.5rem minmax(0, 1fr);
+  gap: .6875rem;
   min-width: 0;
-  padding: .75rem;
+  padding: .75rem .875rem;
+}
+
+.fledge-card-avatar {
+  display: grid;
+  place-items: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  border: .0625rem solid var(--fledge-rule-strong);
+  border-radius: 50%;
+  color: var(--fledge-muted);
+  background: var(--fledge-raised);
+  font-family: var(--fledge-body);
+  font-size: .8125rem;
+  font-weight: 800;
+}
+
+.fledge-card-content {
+  min-width: 0;
+}
+
+.fledge-card-feature .fledge-card-avatar {
+  border-color: rgba(199, 243, 107, .58);
+  color: var(--fledge-acid-ink);
+  background: var(--fledge-acid);
+}
+
+.fledge-card-waiting .fledge-card-avatar {
+  border-color: var(--fledge-amber);
+  color: var(--fledge-ink);
+  background: var(--fledge-amber);
+}
+
+.fledge-card-note .fledge-card-main {
+  grid-template-columns: 1.75rem minmax(0, 1fr);
+  gap: .5625rem;
+  padding: .5rem .875rem;
+}
+
+.fledge-card-note .fledge-card-avatar {
+  width: 1.75rem;
+  height: 1.75rem;
+  border-color: var(--fledge-rule);
+  color: var(--fledge-dim);
+  background: transparent;
+  font-size: .625rem;
 }
 
 .fledge-card-topline {
@@ -487,6 +525,7 @@
 }
 
 .fledge-card-working .fledge-status-dot { background: var(--fledge-acid); }
+.fledge-card-feature .fledge-status-dot { background: var(--fledge-acid); }
 .fledge-card-errored .fledge-status-dot { background: var(--fledge-error); }
 .fledge-status-waiting { color: var(--fledge-amber); }
 .fledge-status-waiting .fledge-status-dot { background: var(--fledge-amber); }
@@ -532,14 +571,14 @@
 .fledge-your-move p {
   margin: 0;
   max-width: 36rem;
-  font-family: var(--fledge-display);
+  font-family: var(--fledge-body);
   font-size: 1.0625rem;
   font-weight: 700;
   line-height: 1.3;
 }
 
 .fledge-card-heading {
-  padding: .5rem 0 .375rem;
+  padding: .375rem 0 .3125rem;
 }
 
 .fledge-card-heading h2 {
@@ -548,14 +587,33 @@
   max-width: 42rem;
   overflow: hidden;
   color: var(--fledge-paper);
-  font-family: var(--fledge-display);
-  font-size: clamp(1.375rem, 6vw, 1.625rem);
-  font-weight: 700;
-  line-height: 1.12;
-  letter-spacing: -.025em;
-  text-wrap: balance;
+  font-family: var(--fledge-body);
+  font-size: 1rem;
+  font-weight: 750;
+  line-height: 1.25;
+  letter-spacing: -.012em;
+  text-wrap: pretty;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+.fledge-card-feature .fledge-card-heading h2 {
+  font-size: clamp(1.1875rem, 5vw, 1.375rem);
+  font-weight: 800;
+  line-height: 1.18;
+}
+
+.fledge-card-note .fledge-card-heading {
+  padding: .1875rem 0 .125rem;
+}
+
+.fledge-card-note .fledge-card-heading h2 {
+  color: var(--fledge-muted);
+  font-size: .8125rem;
+  font-weight: 650;
+  line-height: 1.25;
+  text-wrap: nowrap;
+  -webkit-line-clamp: 1;
 }
 
 .fledge-phase {
@@ -605,7 +663,36 @@
   max-width: none;
   color: var(--fledge-paper);
   font-size: .875rem;
+  line-height: 1.45;
+}
+
+.fledge-card-feature .fledge-markdown {
+  font-size: .9375rem;
   line-height: 1.5;
+}
+
+.fledge-card-note .fledge-dispatch-body {
+  margin: 0;
+}
+
+.fledge-card-note .fledge-markdown {
+  max-height: 2.25rem;
+  overflow: hidden;
+  color: var(--fledge-dim);
+  font-size: .75rem;
+  line-height: 1.4;
+}
+
+.fledge-card-note .fledge-markdown .markdown > * {
+  display: none;
+}
+
+.fledge-card-note .fledge-markdown .markdown > :first-child {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .fledge-markdown .markdown {
@@ -621,7 +708,11 @@
 .fledge-markdown .markdown h3,
 .fledge-markdown .markdown h4 {
   color: var(--fledge-paper);
-  font-family: var(--fledge-display);
+  font-family: var(--fledge-body);
+}
+
+.fledge-card-feature .fledge-dispatch-body .markdown img {
+  display: none;
 }
 
 .fledge-markdown .markdown a {
@@ -694,6 +785,61 @@
   background: var(--fledge-ink);
 }
 
+.fledge-primary-media {
+  position: relative;
+  margin: .625rem 0 .75rem;
+  overflow: hidden;
+  border: .0625rem solid var(--fledge-rule-strong);
+  border-radius: .875rem;
+  background: #030607;
+}
+
+.fledge-primary-media img,
+.fledge-primary-media video {
+  display: block;
+  width: 100%;
+  max-height: min(32rem, 62vh);
+  object-fit: contain;
+  background: #030607;
+}
+
+.fledge-primary-media figcaption {
+  padding: .375rem .625rem;
+  overflow: hidden;
+  color: var(--fledge-dim);
+  font-family: var(--fledge-mono);
+  font-size: .5625rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fledge-card-note .fledge-phase,
+.fledge-card-note .fledge-why,
+.fledge-card-note .fledge-more,
+.fledge-card-note .fledge-reaction,
+.fledge-card-note .fledge-feedback-retry,
+.fledge-card-note .fledge-interaction-note,
+.fledge-card-note .fledge-reply-form,
+.fledge-card-note .fledge-comment-thread {
+  display: none;
+}
+
+.fledge-card-note .fledge-interactions {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.fledge-card-note .fledge-reaction-row {
+  justify-content: flex-end;
+}
+
+.fledge-card-note .fledge-conversation-arrow {
+  width: 1.75rem;
+  height: 1.75rem;
+  color: var(--fledge-dim);
+}
+
 .fledge-why {
   display: flex;
   align-items: baseline;
@@ -743,10 +889,10 @@
   align-items: center;
   gap: .25rem;
   min-height: 2rem;
-  padding: 0 .5625rem;
-  border: .0625rem solid var(--fledge-rule);
+  padding: 0 .5rem;
+  border: 0;
   border-radius: 99rem;
-  color: var(--fledge-muted);
+  color: var(--fledge-dim);
   background: transparent;
   font-family: var(--fledge-mono);
   font-size: .625rem;

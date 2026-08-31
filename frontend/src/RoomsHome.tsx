@@ -32,7 +32,12 @@ function timeUntil(iso: string | null) {
 function snippetLabel(latest: { role: string, text: string } | null) {
   if (!latest) return 'No messages yet'
   const prefix = latest.role === 'user' ? 'you: ' : latest.role === 'notes' ? 'notes: ' : ''
-  return prefix + latest.text
+  const plain = latest.text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/[*_`~#>]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return prefix + plain
 }
 
 function pulseLabel(room: RoomInfo) {
@@ -313,9 +318,15 @@ export default function RoomsHome(props: {
 
   const toggleExpand = (name: string) => setExpanded(expanded() === name ? null : name)
 
+  function openRoom(room: RoomInfo) {
+    const leader = leaderRoomSession(room)
+    if (leader) props.onOpen(leader.id)
+    else toggleExpand(room.name)
+  }
+
   function otherRoomSessions(room: RoomInfo) {
     const residentIds = new Set((room.residents || []).map(resident => resident.sessionId))
-    return room.sessions.filter(session => !residentIds.has(session.id))
+    return room.sessions.filter(session => !residentIds.has(session.id) && !/^Keep working: #/.test(session.title || ''))
   }
 
   const agentColor = (a?: string) => a === 'codex' ? '#c084fc' : a === 'omp' ? '#e0a050' : '#73b8ff'
@@ -344,13 +355,14 @@ export default function RoomsHome(props: {
   return (
     <div style={{ height: '100%', 'overflow-y': 'auto', '-webkit-overflow-scrolling': 'touch' }}>
       <div style={{ 'max-width': '640px', margin: '0 auto', padding: '12px 12px 40px' }}>
-        <div style={{ display: 'flex', 'align-items': 'center', 'justify-content': 'space-between', padding: '10px 4px 14px 44px' }}>
-          <span style={{ 'font-size': '20px', 'font-weight': '700' }}>Rooms</span>
+        <div style={{ display: 'flex', 'align-items': 'center', 'justify-content': 'flex-end', padding: '10px 4px 14px 44px' }}>
           <button onClick={newRoom} disabled={busy()}
             style={{ background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', 'font-size': '13px', 'font-weight': '600', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>+ New room</button>
         </div>
 
-        <div data-testid="new-chat-launcher" style={{ background: '#0d1117', border: '1px solid #262b33', 'border-radius': '12px', padding: '12px', 'margin-bottom': '10px' }}>
+        <details data-testid="new-chat-launcher" style={{ 'margin-bottom': '10px' }}>
+          <summary style={{ color: '#68717d', 'font-size': '11px', cursor: 'pointer', padding: '2px 4px 8px', 'list-style-position': 'inside' }}>New chat outside a Room</summary>
+          <div style={{ background: '#0d1117', border: '1px solid #262b33', 'border-radius': '12px', padding: '12px' }}>
           <div style={{ display: 'flex', 'align-items': 'center', gap: '8px', 'flex-wrap': 'wrap' }}>
             <span style={{ color: '#9aa4b2', 'font-size': '12px', 'font-weight': '700', 'margin-right': '2px' }}>New chat</span>
             <button onClick={() => props.onNewChat('omp', ompModel().trim() || undefined)} disabled={busy() || props.creating}
@@ -383,7 +395,8 @@ export default function RoomsHome(props: {
                 style={{ 'margin-left': 'auto', background: '#24191a', border: '1px solid #5c3336', color: '#e18a8e', 'font-size': '11px', 'font-weight': '700', padding: '4px 9px', 'border-radius': '7px', cursor: 'pointer' }}>Stop all</button>
             </Show>
           </div>
-        </div>
+          </div>
+        </details>
         <Show when={error()}>
           <div style={{ color: '#d45555', 'font-size': '13px', padding: '8px 4px' }}>{error()}</div>
         </Show>
@@ -407,7 +420,7 @@ export default function RoomsHome(props: {
           }>
             <For each={rooms()!}>{(room) => (
               <div data-testid={`room-card-${room.name}`} style={{ background: '#0d1117', border: '1px solid #1e1e1e', 'border-radius': '12px', 'margin-bottom': '10px', overflow: 'hidden' }}>
-                <div onClick={() => toggleExpand(room.name)} style={{ padding: '12px 16px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
+                <div onClick={() => openRoom(room)} style={{ padding: '12px 16px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
                   <div style={{ display: 'flex', 'align-items': 'center', gap: '10px' }}>
                     <span style={{ width: '10px', height: '10px', 'border-radius': '50%', background: room.active ? '#4aba6a' : '#333', 'flex-shrink': '0' }} />
                     <span style={{ 'font-size': '16px', 'font-weight': '700', color: '#e5e5e5' }}>#{room.name}</span>
@@ -415,29 +428,23 @@ export default function RoomsHome(props: {
                       {(leader) => <span style={{ 'font-size': '11px', color: '#69c77f' }}>Leader · {leader().agent || 'omp'} · {room.residents?.length || 1} resident{(room.residents?.length || 1) === 1 ? '' : 's'}</span>}
                     </Show>
                     <span style={{ 'margin-left': 'auto', 'font-size': '11px', color: '#555', 'font-family': 'monospace' }}>{timeAgo(room.updatedAt)}</span>
-                    <button onClick={(e) => { e.stopPropagation(); toggleExpand(room.name) }}
-                      style={{ background: 'none', border: 'none', color: '#666', 'font-size': '14px', cursor: 'pointer', padding: '2px 6px', transform: expanded() === room.name ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s', '-webkit-tap-highlight-color': 'transparent' }}>›</button>
                   </div>
                   <div style={{ 'margin-top': '6px', 'padding-left': '20px', 'font-size': '13px', color: room.latest ? '#999' : '#555', overflow: 'hidden', display: '-webkit-box', '-webkit-line-clamp': '2', '-webkit-box-orient': 'vertical', 'line-height': '1.4' }}>
                     {snippetLabel(room.latest)}
                   </div>
-                  <div style={{ 'margin-top': '9px', 'padding-left': '20px', display: 'flex', 'align-items': 'center', gap: '8px' }}>
-                    <button data-testid={`pulse-${room.name}`} onClick={(event) => togglePulse(room, event)} disabled={busy()}
-                      aria-pressed={room.pulse.enabled}
-                      style={{ background: room.pulse.enabled ? '#152a1c' : 'transparent', border: `1px solid ${room.pulse.enabled ? '#2a4a34' : '#333'}`, color: room.pulse.enabled ? '#69c77f' : '#777', 'font-size': '11px', 'font-weight': '600', padding: '3px 8px', 'border-radius': '999px', cursor: 'pointer' }}>
-                      {room.pulse.enabled ? 'Stop background' : 'Start background'}
+                  <div style={{ 'margin-top': '10px', 'padding-left': '20px', display: 'flex', 'align-items': 'center', gap: '8px' }}>
+                    <button data-testid={`open-room-${room.name}`} onClick={(event) => { event.stopPropagation(); openRoom(room) }}
+                      style={{ background: '#e0a050', border: 'none', color: '#111', 'font-size': '12px', 'font-weight': '800', padding: '7px 12px', 'border-radius': '8px', cursor: 'pointer' }}>
+                      Ask Leader
                     </button>
-                    <span style={{ color: room.pulse.status === 'error' ? '#d48166' : '#666', 'font-size': '11px' }}>{pulseLabel(room)}</span>
-                    <button data-testid={`wiki-${room.name}`} onClick={(event) => openWiki(room, event)}
-                      aria-label={`Wiki for #${room.name}`}
-                      style={{ 'margin-left': 'auto', display: 'flex', 'align-items': 'center', gap: '6px', background: wikiRoom() === room.name ? '#1a1f2e' : 'transparent', border: '1px solid #2a3346', color: '#9aa4b2', 'font-size': '11px', 'font-weight': '600', padding: '3px 9px', 'border-radius': '999px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
-                      Wiki
+                    <button data-testid={`history-${room.name}`} onClick={(event) => { event.stopPropagation(); toggleExpand(room.name) }}
+                      aria-expanded={expanded() === room.name}
+                      style={{ background: 'transparent', border: '1px solid #333', color: '#9aa4b2', 'font-size': '11px', 'font-weight': '700', padding: '6px 10px', 'border-radius': '8px', cursor: 'pointer' }}>
+                      History {otherRoomSessions(room).length}
                     </button>
-                    <button data-testid={`friction-${room.name}`} onClick={(event) => openFriction(room, event)}
-                      aria-label={`Friction from #${room.name}`}
-                      style={{ display: 'flex', 'align-items': 'center', gap: '5px', background: frictionRoom() === room.name ? '#2a2115' : 'transparent', border: '1px solid #3a3328', color: '#b7a27d', 'font-size': '11px', 'font-weight': '600', padding: '3px 8px', 'border-radius': '999px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
-                      Friction <span style={{ color: '#6f6250', 'font-weight': '500' }}>{room.friction?.count || 0}</span>
-                    </button>
+                    <span style={{ 'margin-left': 'auto', color: room.pulse.status === 'error' ? '#d48166' : '#666', 'font-size': '10px' }}>
+                      {room.pulse.enabled ? 'Background on' : 'Background paused'}
+                    </span>
                   </div>
                 </div>
                 <Show when={wikiRoom() === room.name}>
@@ -468,18 +475,14 @@ export default function RoomsHome(props: {
                   </div>
                 </Show>
                 <Show when={expanded() === room.name}>
-                  <div data-testid={`residents-${room.name}`} style={{ 'border-top': '1px solid #16161f', padding: '7px 16px 9px 28px' }}>
-                    <div style={{ color: '#596373', 'font-size': '9px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.06em', 'margin-bottom': '5px' }}>Residents</div>
-                    <For each={room.residents || []}>{(resident) => (
-                      <div data-testid={`resident-${room.name}-${resident.role}`} onClick={() => props.onOpen(resident.sessionId)} style={{ display: 'flex', 'align-items': 'center', gap: '8px', padding: '5px 0', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>
-                        <span style={{ width: '7px', height: '7px', 'border-radius': '50%', background: resident.status === 'working' ? '#4aba6a' : resident.status === 'waiting' ? '#596373' : '#5c3333', 'flex-shrink': '0' }} />
-                        <span style={{ color: resident.role === 'leader' ? '#69c77f' : '#b6bfcc', 'font-size': '12px', 'font-weight': '650', 'text-transform': 'capitalize' }}>{resident.role}</span>
-                        <span style={{ color: agentColor(resident.agent), 'font-size': '9px', 'font-weight': '600' }}>{resident.agent}</span>
-                        <span style={{ color: '#555f6d', 'font-size': '10px', 'margin-left': 'auto' }}>{resident.status}</span>
-                      </div>
-                    )}</For>
+                  <div style={{ 'border-top': '1px solid #16161f', padding: '9px 16px 7px 28px', color: '#76808d', 'font-size': '10px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.06em' }}>
+                    Past chats
                   </div>
-                  <For each={otherRoomSessions(room)}>{(session) => sessionRow(room, session)}</For>
+                  <Show when={otherRoomSessions(room).length > 0} fallback={
+                    <div style={{ color: '#666', 'font-size': '12px', padding: '9px 16px 9px 28px', 'border-top': '1px solid #16161f' }}>No past chats.</div>
+                  }>
+                    <For each={otherRoomSessions(room)}>{(session) => sessionRow(room, session)}</For>
+                  </Show>
                   <div style={{ display: 'flex', 'flex-wrap': 'wrap', gap: '8px', padding: '10px 16px 12px 28px', 'border-top': '1px solid #16161f', position: 'relative' }}>
                     <button onClick={() => leaderRoomSession(room) ? newChat(room) : newChat(room, 'omp', true)} disabled={busy()}
                       style={{ background: roomHarness(room.name) === 'omp' ? '#3a2a1e' : '#15202a', border: `1px solid ${roomHarness(room.name) === 'omp' ? '#68481f' : '#344657'}`, color: roomHarness(room.name) === 'omp' ? '#e0a050' : agentColor(roomHarness(room.name)), 'font-size': '12px', 'font-weight': '700', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>{leaderRoomSession(room) ? `+ New ${agentLabel(roomHarness(room.name))} chat` : '+ Start OMP Leader'}</button>
@@ -492,6 +495,15 @@ export default function RoomsHome(props: {
                             <option value="omp">OMP</option><option value="claude">Claude Code</option><option value="codex">Codex</option>
                           </select>
                         </label>
+                        <button data-testid={`pulse-${room.name}`} onClick={(event) => togglePulse(room, event)} disabled={busy()}
+                          aria-pressed={room.pulse.enabled}
+                          style={{ background: 'none', border: '1px solid #333', color: room.pulse.enabled ? '#69c77f' : '#999', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>
+                          {room.pulse.enabled ? 'Stop background' : 'Start background'}
+                        </button>
+                        <button data-testid={`wiki-${room.name}`} onClick={(event) => openWiki(room, event)}
+                          style={{ background: 'none', border: '1px solid #333', color: '#9aa4b2', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Wiki</button>
+                        <button data-testid={`friction-${room.name}`} onClick={(event) => openFriction(room, event)}
+                          style={{ background: 'none', border: '1px solid #3a3328', color: '#b7a27d', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Friction {room.friction?.count || 0}</button>
                         <div style={{ color: '#666', 'font-size': '10px' }}>Start one fallback chat</div>
                         <button onClick={() => newChat(room, 'claude')} disabled={busy()}
                           style={{ background: 'none', border: '1px solid #29313b', color: '#73b8ff', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Claude Code</button>

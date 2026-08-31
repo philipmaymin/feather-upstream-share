@@ -210,6 +210,7 @@ esac
     const now = Date.now()
     Object.assign(feedTimestamps, {
       finished: new Date(now - 10_000).toISOString(),
+      mediaUpdate: new Date(now - 15_000).toISOString(),
       update: new Date(now - 20_000).toISOString(),
       errored: new Date(now - 30_000).toISOString(),
       staleErrored: new Date(now - 8 * 24 * 60 * 60 * 1000).toISOString(),
@@ -226,7 +227,7 @@ esac
     seedConversation(FEED_IDS.working, feedTimestamps.working, 'Working fixture', 'Working assistant response.')
     seedConversation(FEED_IDS.errored, feedTimestamps.errored, 'Errored fixture', 'API Error: synthetic failure')
     seedConversation(FEED_IDS.staleErrored, feedTimestamps.staleErrored, 'Stale errored fixture', 'API Error: historical synthetic failure')
-    seedConversation(FEED_IDS.finished, feedTimestamps.finished, 'Finished fixture', 'Finished assistant response.')
+    seedConversation(FEED_IDS.finished, feedTimestamps.finished, 'Finished fixture', '## Deployment shipped\n\nThe verified production release completed successfully.\n\n- **100/100 checks passed**\n- immutable release and rollback receipts match\n- every service reports the exact deployed source commit\n- the rollout is approved and ready for the fleet\n\nThis is a material result, not a routine progress acknowledgement.')
     writeFeedSession(testProjectDir, FEED_IDS.normalized, [
       claudeFeedMessage('feed-normalized-user', new Date(Date.parse(feedTimestamps.normalized) - 1_000).toISOString(), 'user', '<file name="/tmp/pulse.md">\nKeep working on this room.'),
       claudeFeedMessage('feed-normalized-visible', feedTimestamps.normalized, 'assistant', [{ type: 'text', text: 'Visible **normalized** answer.' }]),
@@ -251,6 +252,8 @@ esac
     const roomDir = path.join(fixtureHome, 'rooms', 'alpha')
     fs.mkdirSync(roomDir, { recursive: true })
     fs.writeFileSync(path.join(roomDir, 'AGENTS.md'), '# Room: #alpha\n')
+    fs.mkdirSync(path.join(roomDir, 'studio'), { recursive: true })
+    fs.writeFileSync(path.join(roomDir, 'studio', 'clip.mp4'), 'fixture-video')
     fs.writeFileSync(path.join(roomDir, 'updates.jsonl'), [{
       id: 'feed-room-update',
       ts: feedTimestamps.update,
@@ -259,6 +262,16 @@ esac
       id: 'feed-room-update-tie',
       ts: feedTimestamps.update,
       text: 'Second update at the exact same time.',
+    }, {
+      id: 'feed-room-media',
+      ts: feedTimestamps.mediaUpdate,
+      title: 'Delivered film clip',
+      text: 'Delivered the approved film clip: [watch](studio/clip.mp4).',
+    }, {
+      id: 'feed-room-media-older',
+      ts: new Date(Date.parse(feedTimestamps.mediaUpdate) - 1_000).toISOString(),
+      title: 'Earlier film clip delivery',
+      text: 'Delivered an earlier cut of the same film: [watch](studio/clip.mp4).',
     }].map(update => JSON.stringify(update)).join('\n') + '\n')
 
     const created = Math.floor(now / 1000)
@@ -703,6 +716,8 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
     assert.ok(body.counts.working >= 1)
     assert.ok(body.counts.errored >= 1)
     assert.ok(body.counts.finished >= 1)
+    assert.ok(body.counts.important >= 4)
+    assert.ok(body.counts.notes >= 3)
 
     const positions = Object.fromEntries(['waiting', 'errored', 'working', 'finished'].map(status => {
       const id = FEED_IDS[status]
@@ -717,11 +732,22 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
 
     const waiting = body.posts[positions.waiting]
     assert.equal(waiting.status, 'waiting')
+    assert.equal(waiting.importance, 'feature')
     assert.match(waiting.question, /Deploy this result/)
     assert.match(waiting.why, /Waiting for your answer/)
     assert.doesNotMatch(waiting.why, /ETA|minute|hour/i)
-    const staleError = body.posts.find(post => post.sessionId === FEED_IDS.staleErrored)
+    assert.equal(body.posts.some(post => post.sessionId === FEED_IDS.staleErrored), false)
+    const normalizedForYou = body.posts.find(post => post.sessionId === FEED_IDS.normalized && post.kind === 'session')
+    assert.equal(normalizedForYou, undefined, JSON.stringify(normalizedForYou))
+    const alphaFeatures = body.posts.filter(post => post.status === 'finished'
+      && post.importance === 'feature'
+      && post.room === 'alpha')
+    assert.equal(alphaFeatures.length, 1, 'For You repeats important outcomes from one Room')
+    assert.equal(alphaFeatures[0].media?.name, 'clip.mp4')
+    const latest = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
+    const staleError = latest.posts.find(post => post.sessionId === FEED_IDS.staleErrored)
     assert.equal(staleError.status, 'finished')
+    assert.equal(staleError.importance, 'note')
     assert.match(staleError.why, /Historical error/)
   })
 
@@ -748,6 +774,7 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
     assert.equal(normalized.title, '#alpha progress')
     assert.equal(normalized.projectId, '-api-test-project')
     assert.equal(normalized.projectLabel, 'API Test')
+    assert.equal(normalized.importance, 'note')
     assert.equal(posts.some(post => post.sessionId === FEED_IDS.empty), false)
 
     const update = posts.find(post => post.updateText === 'Room update with a human-facing result.')
@@ -759,13 +786,22 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
     assert.equal(update.title, 'Room update with a human-facing result.')
     assert.equal(update.agent, null)
     assert.equal(update.status, 'finished')
+    assert.equal(update.importance, 'note')
+    const media = posts.find(post => post.media?.name === 'clip.mp4')
+    assert.ok(media)
+    assert.equal(media.importance, 'feature')
+    assert.equal(media.media.kind, 'video')
+    assert.equal(media.media.path, path.join(fixtureHome, 'rooms', 'alpha', 'studio', 'clip.mp4'))
+    const mediaResponse = await fetch(`${BASE}/api/files/media?path=${encodeURIComponent(media.media.path)}`)
+    assert.equal(mediaResponse.status, 200)
+    assert.match(mediaResponse.headers.get('content-type') || '', /^video\/mp4/)
     assert.match(update.id, /^feed_[a-f0-9]{32}$/)
     assert.ok(posts.every(post => /^feed_[a-f0-9]{32}$/.test(post.id)))
   })
 
   it('paginates pinned For You posts without skipping or repeating completions', async () => {
-    const latest = await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json()
-    const expectedFinished = latest.posts
+    const editorial = await (await fetch(`${BASE}/api/feed?mode=for-you&limit=50`)).json()
+    const expectedFinished = editorial.posts
       .filter(post => post.status === 'finished')
       .map(post => post.id)
 
@@ -799,18 +835,18 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
   })
 
   it('provides stable timestamp pagination and bounds malformed query values', async () => {
-    const first = await (await fetch(`${BASE}/api/feed?mode=latest&limit=2`)).json()
-    assert.equal(first.posts.length, 2)
+    const first = await (await fetch(`${BASE}/api/feed?mode=latest&limit=4`)).json()
+    assert.equal(first.posts.length, 4)
     assert.match(first.nextBefore, /^f1_/)
     const second = await (await fetch(
-      `${BASE}/api/feed?mode=latest&limit=2&before=${encodeURIComponent(first.nextBefore)}`,
+      `${BASE}/api/feed?mode=latest&limit=4&before=${encodeURIComponent(first.nextBefore)}`,
     )).json()
     assert.ok(second.posts.length > 0)
     assert.equal(second.posts.some(post => first.posts.some(previous => previous.id === post.id)), false)
-    assert.ok(second.posts.some(post => post.timestamp === first.posts[1].timestamp),
+    assert.ok(second.posts.some(post => post.timestamp === first.posts.at(-1).timestamp),
       'opaque cursor skipped a post sharing the boundary timestamp')
 
-    const repeated = await (await fetch(`${BASE}/api/feed?mode=latest&limit=2`)).json()
+    const repeated = await (await fetch(`${BASE}/api/feed?mode=latest&limit=4`)).json()
     assert.deepEqual(repeated.posts.map(post => post.id), first.posts.map(post => post.id))
     const oversized = await (await fetch(`${BASE}/api/feed?limit=999`)).json()
     assert.ok(oversized.posts.length <= 50)
@@ -843,6 +879,7 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
       .posts.find(candidate => candidate.id === post.id)
     assert.equal(liked.reaction, 'like')
     assert.equal(liked.reactionDelivery, 'delivered')
+    assert.equal(liked.importance, 'feature')
     assert.equal(liked.score, post.score + (7 * 24 * 60 * 60))
     assert.match(liked.why, /boosted because you liked this/)
     const deliveriesBeforeRepeat = (fs.readFileSync(path.join(tmuxFixtureDir, 'sent'), 'utf8')
@@ -860,8 +897,11 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
     assert.deepEqual(await response.json(), { reaction: 'less', reactionDelivery: 'delivered', changed: true, delivery: 'delivered' })
     const lowered = (await (await fetch(`${BASE}/api/feed?mode=latest&limit=50`)).json())
       .posts.find(candidate => candidate.id === post.id)
-    assert.equal(lowered.score, post.score - (7 * 24 * 60 * 60))
+    assert.equal(lowered.importance, 'note')
+    assert.equal(lowered.score, post.score - (2 * 5_000_000_000_000) - (7 * 24 * 60 * 60))
     assert.match(lowered.why, /lowered because you asked for less/)
+    const forYouAfterLess = await (await fetch(`${BASE}/api/feed?mode=for-you&limit=50`)).json()
+    assert.equal(forYouAfterLess.posts.some(candidate => candidate.id === post.id), false)
 
     const stored = JSON.parse(fs.readFileSync(interactionFile, 'utf8'))
     assert.equal(stored.schema, 1)

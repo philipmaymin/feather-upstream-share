@@ -75,13 +75,14 @@ test('puts OMP, Claude Code, and Codex on the Rooms home and hides pulse worker 
 
   await page.goto(BASE)
   await expect(page.getByTestId('new-chat-launcher')).toBeVisible()
+  await page.getByText('New chat outside a Room', { exact: true }).click()
   await expect(page.getByRole('button', { name: '+ OMP' })).toBeVisible()
   await expect(page.getByRole('button', { name: '+ Claude Code' }).first()).toBeVisible()
   await expect(page.getByRole('button', { name: '+ Codex' }).first()).toBeVisible()
   await expect(page.getByTestId('background-work-status')).toContainText('all paused')
   await expect(page.getByText('pulse.md')).toHaveCount(0)
   await expect(page.getByText('Keep working: #instant-room')).toHaveCount(0)
-  await page.locator('button:has-text("›")').click()
+  await page.getByTestId('history-instant-room').click()
   await expect(page.getByRole('button', { name: '+ Start OMP Leader' })).toBeVisible()
   await page.getByText('Room options', { exact: true }).click()
   await expect(page.getByRole('button', { name: 'Claude Code', exact: true })).toBeVisible()
@@ -113,6 +114,7 @@ test('stops background work in every enabled room from one visible control', asy
   })
 
   await page.goto(BASE)
+  await page.getByText('New chat outside a Room', { exact: true }).click()
   await expect(page.getByTestId('background-work-status')).toContainText('2 rooms enabled')
   await page.getByTestId('pause-all-background').click()
   await expect.poll(() => stopped.sort()).toEqual(['first-room', 'second-room'])

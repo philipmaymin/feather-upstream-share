@@ -2397,7 +2397,7 @@ const READ_ONLY_API_ROUTES = [
   /^\/api\/push\/subscribe$/,
   /^\/api\/starred$/,
   /^\/api\/starred\/album$/,
-  /^\/api\/files\/(list|raw|html)$/,
+  /^\/api\/files\/(list|raw|html|media)$/,
   /^\/api\/file$/,
 ];
 
@@ -3793,6 +3793,7 @@ app.post('/api/rooms/:name/updates', (req, res) => {
 
 const FEED_DEFAULT_LIMIT = 20;
 const FEED_ERROR_ATTENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const FEED_FOR_YOU_COMPLETION_MS = 3 * 24 * 60 * 60 * 1000;
 const FEED_MAX_LIMIT = 50;
 const FEED_SESSION_MESSAGES = 80;
 const FEED_TRANSCRIPT_BYTES = 4 * 1024 * 1024;
@@ -3800,11 +3801,22 @@ const FEED_MESSAGE_MAX_CHARS = 32 * 1024;
 const FEED_ROOM_LIMIT = 100;
 const FEED_UPDATES_PER_ROOM = 10;
 const FEED_SCORE_BAND = 20_000_000_000_000;
+const FEED_IMPORTANCE_BAND = 5_000_000_000_000;
+const FEED_MEDIA_BONUS = 2_000_000_000_000;
 const FEED_MODES = Object.freeze({ 'for-you': true, latest: true, 'needs-me': true });
 const FEED_REACTIONS = Object.freeze({ like: true, less: true });
 const FEED_DELIVERIES = Object.freeze({ queued: true, delivered: true, failed: true });
 const FEED_POST_KINDS = Object.freeze({ session: true, 'room-update': true });
 const FEED_POST_STATUSES = Object.freeze({ waiting: true, working: true, errored: true, finished: true });
+const FEED_IMPORTANCE = Object.freeze({ feature: true, standard: true, note: true });
+const FEED_MEDIA_KINDS = Object.freeze({ image: true, video: true });
+const FEED_IMAGE_EXTS = new Set(['.avif', '.gif', '.jpeg', '.jpg', '.png', '.svg', '.webp']);
+const FEED_VIDEO_EXTS = new Set(['.mov', '.mp4', '.webm']);
+const FEED_MEDIA_MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const FEED_MEDIA_MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024;
+const FEED_MAJOR_OUTCOME_RE = /\b(?:approved|delivered|deployed|launched|mainnet|milestone|passed|passes decisively|production[- ]live|published|released|revenue|shipped|verified|won)\b|\b\d{1,3}(?:\.\d+)?%\b|\b\d+\/\d+\b|p\s*[=≤<]/i;
+const FEED_LOW_SIGNAL_RE = /^(?:acknowledged|agreed|done|no further|noted|nothing further|ok(?:ay)?|the contract is complete|understood)\b/i;
+const FEED_EXTERNAL_MEDIA_RE = /https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/[^/\s]+\/status\/\d+|https?:\/\/(?:www\.)?tiktok\.com\/@[^/\s]+\/video\/\d+/i;
 const FEED_INTERACTION_MAX_POSTS = 500;
 const FEED_INTERACTION_MAX_COMMENTS = 10;
 const FEED_COMMENT_MAX_BYTES = 4000;
@@ -3832,6 +3844,17 @@ function validFeedSnapshot(snapshot, postId, sessionId) {
     || !Object.hasOwn(FEED_POST_STATUSES, snapshot.status)
     || !Number.isFinite(snapshot.score)
     || typeof snapshot.why !== 'string') return false;
+  if (snapshot.importance !== undefined && !Object.hasOwn(FEED_IMPORTANCE, snapshot.importance)) return false;
+  if (snapshot.media !== undefined && (
+    !isJsonRecord(snapshot.media)
+    || !Object.hasOwn(FEED_MEDIA_KINDS, snapshot.media.kind)
+    || typeof snapshot.media.path !== 'string'
+    || !snapshot.media.path
+    || snapshot.media.path.length > 4096
+    || typeof snapshot.media.name !== 'string'
+    || !snapshot.media.name
+    || snapshot.media.name.length > 256
+  )) return false;
   if (snapshot.question !== undefined && typeof snapshot.question !== 'string') return false;
   if (snapshot.activity !== undefined && typeof snapshot.activity !== 'string') return false;
   if (snapshot.kind === 'session') {
@@ -3999,10 +4022,83 @@ function feedSessionTitle(session, roomName) {
   }
   return title || (roomName ? `#${roomName} dispatch` : 'Agent dispatch');
 }
+function feedPostText(post) {
+  if (typeof post.updateText === 'string') return post.updateText.trim();
+  return post.message?.content
+    ?.filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text.trim())
+    .filter(Boolean)
+    .join('\n\n') || '';
+}
 
-function feedScore(status, timestamp) {
+function feedMediaCandidates(text) {
+  const candidates = [];
+  const seen = new Set();
+  const add = value => {
+    const cleaned = String(value || '').trim().replace(/^<|>$/g, '').replace(/[),.;:]+$/g, '');
+    if (!cleaned || seen.has(cleaned)) return;
+    seen.add(cleaned);
+    candidates.push(cleaned);
+  };
+  for (const match of text.matchAll(/!?\[[^\]]*\]\((<?[^)\s>]+>?)\)/g)) add(match[1]);
+  for (const match of text.matchAll(/(?:^|[\s"'`(])((?:file:\/\/|~\/|\/|(?:[\w.-]+\/)+)[^\s"'`<>()]+\.(?:avif|gif|jpe?g|mov|mp4|png|svg|webm)(?:[?#][^\s"'`<>()]*)?)/gim)) add(match[1]);
+  return candidates;
+}
+
+function feedMediaForText(text, cwd) {
+  for (const candidate of feedMediaCandidates(text)) {
+    if (/^https?:\/\//i.test(candidate)) continue;
+    let requested = candidate.split(/[?#]/, 1)[0];
+    try { requested = decodeURIComponent(requested); } catch {}
+    if (requested.startsWith('file://')) requested = requested.slice(7);
+    const resolved = path.resolve(
+      requested.startsWith('~/') || requested === '~'
+        ? expandTilde(requested)
+        : path.isAbsolute(requested)
+          ? requested
+          : path.resolve(cwd || HOME, requested),
+    );
+    if (!isPathAllowed(resolved)) continue;
+    const ext = path.extname(resolved).toLowerCase();
+    const kind = FEED_IMAGE_EXTS.has(ext) ? 'image' : FEED_VIDEO_EXTS.has(ext) ? 'video' : null;
+    if (!kind) continue;
+    try {
+      const stat = fs.statSync(resolved);
+      const maxBytes = kind === 'image' ? FEED_MEDIA_MAX_IMAGE_BYTES : FEED_MEDIA_MAX_VIDEO_BYTES;
+      if (!stat.isFile() || stat.size <= 0 || stat.size > maxBytes) continue;
+      return { kind, path: resolved, name: path.basename(resolved) };
+    } catch {}
+  }
+  return null;
+}
+
+function feedImportance({ kind, status, text, media }) {
+  if (status === 'waiting' || status === 'errored') return 'feature';
+  if (status === 'working') return 'standard';
+  if (media || FEED_EXTERNAL_MEDIA_RE.test(text)) return 'feature';
+  const trimmed = text.trim();
+  if (kind === 'room-update') {
+    return FEED_MAJOR_OUTCOME_RE.test(trimmed) && trimmed.length >= 220 ? 'standard' : 'note';
+  }
+  if (FEED_LOW_SIGNAL_RE.test(trimmed) || trimmed.length < 180) return 'note';
+  const structured = /(?:^|\n)#{1,4}\s|(?:^|\n)\s*[-*]\s|\|[^|\n]+\|[^|\n]+\|/m.test(trimmed);
+  if (FEED_MAJOR_OUTCOME_RE.test(trimmed) && (structured || trimmed.length >= 240)) return 'feature';
+  return structured || trimmed.length >= 320 ? 'standard' : 'note';
+}
+
+function feedImportanceWhy(importance, fallback) {
+  if (importance === 'feature') return fallback ? `Important result · ${fallback}` : 'Important result';
+  if (importance === 'note') return fallback ? `Quiet note · ${fallback}` : 'Quiet note';
+  return fallback;
+}
+
+function feedScore(status, timestamp, importance = 'standard', hasMedia = false) {
   const priority = { waiting: 4, errored: 3, working: 2, finished: 1 }[status];
-  return priority * FEED_SCORE_BAND + Math.floor(Date.parse(timestamp) / 1000);
+  const editorial = { feature: 2, standard: 1, note: 0 }[importance] ?? 1;
+  return priority * FEED_SCORE_BAND
+    + editorial * FEED_IMPORTANCE_BAND
+    + (hasMedia ? FEED_MEDIA_BONUS : 0)
+    + Math.floor(Date.parse(timestamp) / 1000);
 }
 
 function feedRoomGroups(sessions) {
@@ -4057,6 +4153,10 @@ function buildLiveFeedPosts(generatedAt) {
     const timestamp = message.timestamp;
     const live = feedLiveState(session);
     const status = live.status;
+    const text = feedPostText({ message });
+    const media = feedMediaForText(text, session.cwd);
+    const importance = feedImportance({ kind: 'session', status, text, media });
+    const why = feedImportanceWhy(importance, live.why || feedCompletionWhy(timestamp, generatedAt, 'session'));
     posts.push({
       id: feedStableId('session', session.id, message.uuid || '', timestamp, JSON.stringify(message.content)),
       kind: 'session',
@@ -4068,11 +4168,13 @@ function buildLiveFeedPosts(generatedAt) {
       title: feedSessionTitle(session, roomBySession.get(session.id)),
       agent: SUPPORTED_AGENTS.has(session.agent) ? session.agent : null,
       status,
+      importance,
+      ...(media ? { media } : {}),
       ...(live.question ? { question: live.question } : {}),
       ...(live.activity ? { activity: live.activity } : {}),
       message,
-      score: feedScore(status, timestamp),
-      why: live.why || feedCompletionWhy(timestamp, generatedAt, 'session'),
+      score: feedScore(status, timestamp, importance, !!media),
+      why,
     });
   }
 
@@ -4083,6 +4185,9 @@ function buildLiveFeedPosts(generatedAt) {
       const updateText = update.text.trim().slice(0, ROOM_UPDATE_MAX_CHARS);
       if (!Number.isFinite(timestampMs) || !updateText) continue;
       const timestamp = new Date(timestampMs).toISOString();
+      const media = feedMediaForText(updateText, path.join(ROOMS_HOME_DIR, room.name));
+      const importance = feedImportance({ kind: 'room-update', status: 'finished', text: updateText, media });
+      const why = feedImportanceWhy(importance, feedCompletionWhy(timestamp, generatedAt, 'room-update'));
       posts.push({
         id: feedStableId('room-update', room.name, update.id || '', timestamp, updateText),
         kind: 'room-update',
@@ -4094,9 +4199,11 @@ function buildLiveFeedPosts(generatedAt) {
         title: update.title || `#${room.name} update`,
         agent: null,
         status: 'finished',
+        importance,
+        ...(media ? { media } : {}),
         updateText,
-        score: feedScore('finished', timestamp),
-        why: feedCompletionWhy(timestamp, generatedAt, 'room-update'),
+        score: feedScore('finished', timestamp, importance, !!media),
+        why,
       });
     }
   }
@@ -4117,6 +4224,12 @@ function boundedFeedText(value, maxBytes) {
 function boundedFeedSnapshot(post) {
   if (!post?.id || post.id.length > FEED_POST_ID_MAX_CHARS) throw httpError(413, 'feed post id is too large');
   if (post.sessionId !== null && String(post.sessionId).length > 256) throw httpError(413, 'feed session id is too large');
+  const importance = Object.hasOwn(FEED_IMPORTANCE, post.importance) ? post.importance : feedImportance({
+    kind: post.kind,
+    status: post.status,
+    text: feedPostText(post),
+    media: post.media || null,
+  });
   const snapshot = {
     id: post.id,
     kind: post.kind,
@@ -4128,11 +4241,19 @@ function boundedFeedSnapshot(post) {
     title: boundedFeedText(post.title, 1024),
     agent: post.agent,
     status: post.status,
-    score: feedScore(post.status, post.timestamp),
+    importance,
+    score: feedScore(post.status, post.timestamp, importance, !!post.media),
     why: boundedFeedText(post.why, 1024),
   };
   if (post.question) snapshot.question = boundedFeedText(post.question, 2048);
   if (post.activity) snapshot.activity = boundedFeedText(post.activity, 2048);
+  if (post.media) {
+    snapshot.media = {
+      kind: post.media.kind,
+      path: boundedFeedText(post.media.path, 4096),
+      name: boundedFeedText(post.media.name, 256),
+    };
+  }
   if (post.kind === 'session') {
     let remaining = FEED_MESSAGE_MAX_CHARS;
     const content = [];
@@ -4236,7 +4357,8 @@ function buildFeedPosts(generatedAt) {
     const snapshot = {
       ...record.snapshot,
       status: 'finished',
-      score: feedScore('finished', record.snapshot.timestamp),
+      importance: 'note',
+      score: feedScore('finished', record.snapshot.timestamp, 'note'),
       why: 'Archived interacted dispatch',
     };
     delete snapshot.question;
@@ -4250,12 +4372,17 @@ function buildFeedPosts(generatedAt) {
       : reaction === 'less' ? -FEED_REACTION_SCORE : 0;
     const feedbackWhy = reaction === 'like' ? '; boosted because you liked this'
       : reaction === 'less' ? '; lowered because you asked for less like this' : '';
+    const baseImportance = Object.hasOwn(FEED_IMPORTANCE, post.importance)
+      ? post.importance
+      : feedImportance({ kind: post.kind, status: post.status, text: feedPostText(post), media: post.media || null });
+    const importance = reaction === 'like' ? 'feature' : reaction === 'less' ? 'note' : baseImportance;
     return {
       ...post,
+      importance,
       reaction,
       reactionDelivery: record?.reactionDelivery?.status || null,
       comments: record?.comments || [],
-      score: feedScore(post.status, post.timestamp) + reactionScore,
+      score: feedScore(post.status, post.timestamp, importance, !!post.media) + reactionScore,
       why: `${post.why}${feedbackWhy}`,
     };
   });
@@ -4363,18 +4490,39 @@ app.get('/api/feed', (req, res) => {
     const generatedAtMs = Date.parse(generatedAt);
     const { mode, limit, before } = feedQuery(req);
     const allPosts = buildFeedPosts(generatedAtMs);
-    const counts = { waiting: 0, working: 0, errored: 0, finished: 0 };
-    for (const post of allPosts) counts[post.status] += 1;
 
     const chronological = (a, b) =>
       Date.parse(b.timestamp) - Date.parse(a.timestamp) || a.id.localeCompare(b.id);
     const forYouRank = (a, b) => b.score - a.score
       || Date.parse(b.timestamp) - Date.parse(a.timestamp)
       || a.id.localeCompare(b.id);
+    const completionCutoff = generatedAtMs - FEED_FOR_YOU_COMPLETION_MS;
+    const seenSources = new Set();
+    const importantFinished = allPosts
+      .filter(post => post.status === 'finished'
+        && post.importance === 'feature'
+        && (post.reaction === 'like' || Date.parse(post.timestamp) >= completionCutoff))
+      .sort(forYouRank)
+      .filter(post => {
+        const sourceKey = post.room ? `room:${post.room}`
+          : post.projectId ? `project:${post.projectId}`
+            : post.projectLabel ? `project-label:${post.projectLabel}`
+              : post.sessionId ? `session:${post.sessionId}`
+                : `post:${post.id}`;
+        if (seenSources.has(sourceKey)) return false;
+        seenSources.add(sourceKey);
+        return true;
+      });
+
+    const counts = { waiting: 0, working: 0, errored: 0, finished: 0, important: 0, notes: 0 };
+    for (const post of allPosts) counts[post.status] += 1;
+    counts.important = allPosts.filter(post => post.status !== 'finished').length + importantFinished.length;
+    counts.notes = Math.max(0, allPosts.length - counts.important);
+
     let posts;
     let nextBefore = null;
     if (mode === 'for-you') {
-      const allFinished = allPosts.filter(post => post.status === 'finished').sort(chronological);
+      const allFinished = [...importantFinished].sort(chronological);
       const inPinnedPhase = before === null || before.phase === 'pinned';
       if (inPinnedPhase) {
         let pinned = allPosts.filter(post => post.status !== 'finished').sort(forYouRank);
@@ -6120,6 +6268,33 @@ app.get(['/api/file', '/api/files/raw'], (req, res) => {
     // Default: download
     res.download(resolved);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/files/media', (req, res) => {
+  try {
+    const requestedPath = req.query.path;
+    if (typeof requestedPath !== 'string' || !requestedPath || requestedPath.includes('\0')) {
+      return res.status(400).json({ error: 'valid path required' });
+    }
+    if (!path.isAbsolute(requestedPath) && !requestedPath.startsWith('~/') && requestedPath !== '~') {
+      return res.status(400).json({ error: 'absolute path required' });
+    }
+    const resolved = path.resolve(expandTilde(requestedPath));
+    if (!isPathAllowed(resolved)) return res.status(403).json({ error: 'Access denied' });
+    if (!fs.existsSync(resolved)) return res.status(404).json({ error: 'Not found' });
+    const stat = fs.statSync(resolved);
+    if (!stat.isFile()) return res.status(400).json({ error: 'Not a file' });
+    const ext = path.extname(resolved).toLowerCase();
+    const kind = FEED_IMAGE_EXTS.has(ext) ? 'image' : FEED_VIDEO_EXTS.has(ext) ? 'video' : null;
+    if (!kind) return res.status(415).json({ error: 'Unsupported media type' });
+    const maxBytes = kind === 'image' ? FEED_MEDIA_MAX_IMAGE_BYTES : FEED_MEDIA_MAX_VIDEO_BYTES;
+    if (stat.size > maxBytes) return res.status(413).json({ error: 'Media file is too large' });
+    res.setHeader('Cache-Control', 'private, no-cache');
+    res.setHeader('Content-Disposition', `inline; filename="${path.basename(resolved).replace(/[\r\n"]/g, '')}"`);
+    return res.sendFile(resolved);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Opt-in HTML artifact preview. Scripts run in an opaque-origin sandbox with

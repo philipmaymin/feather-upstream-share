@@ -376,6 +376,8 @@ export interface FeedPost {
   title: string
   agent: 'claude' | 'codex' | 'omp' | null
   status: 'waiting' | 'working' | 'errored' | 'finished'
+  importance?: 'feature' | 'standard' | 'note'
+  media?: { kind: 'image' | 'video'; path: string; name: string }
   question?: string
   activity?: string
   message?: Message
@@ -390,7 +392,7 @@ export interface FeedPost {
 export interface FeedResponse {
   generatedAt: string
   nextBefore: string | null
-  counts: { waiting: number; working: number; errored: number; finished: number }
+  counts: { waiting: number; working: number; errored: number; finished: number; important?: number; notes?: number }
   posts: FeedPost[]
 }
 

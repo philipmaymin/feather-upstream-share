@@ -55,14 +55,15 @@ const PRIORITY_BY_STATUS: Record<FeedPost['status'], number> = {
 }
 
 const FEED_MODES: Array<{ id: FeedMode; label: string; note: string }> = [
-  { id: 'for-you', label: 'For You', note: 'Priority order' },
-  { id: 'latest', label: 'Latest', note: 'By time' },
+  { id: 'for-you', label: 'For You', note: 'Important only' },
+  { id: 'latest', label: 'Latest', note: 'Everything' },
   { id: 'needs-me', label: 'Needs Me', note: 'Decisions waiting' },
 ]
 const CACHE_PREFIX = 'fledge-last-good-v1:'
 const SCROLL_PREFIX = 'fledge-scroll-v1:'
 const POLL_INTERVAL_MS = 30_000
 const PAGE_SIZE = 24
+const FOR_YOU_COMPLETION_MS = 3 * 24 * 60 * 60 * 1000
 const AFFINITY_KEY = 'fledge-affinity-v1'
 const MAX_AFFINITIES = 24
 const MAX_AFFINITY_SCORE = 12
@@ -145,6 +146,10 @@ function samePost(left: FeedPost, right: FeedPost): boolean {
     && left.question === right.question
     && left.activity === right.activity
     && left.updateText === right.updateText
+    && left.importance === right.importance
+    && left.media?.kind === right.media?.kind
+    && left.media?.path === right.media?.path
+    && left.media?.name === right.media?.name
     && left.why === right.why
     && left.score === right.score
     && left.sessionId === right.sessionId
@@ -225,19 +230,32 @@ function vapidApplicationKey(key: string): Uint8Array {
   const binary = atob((key + padding).replace(/-/g, '+').replace(/_/g, '/'))
   return Uint8Array.from(binary, character => character.charCodeAt(0))
 }
-function statusLabel(status: FeedPost['status']): string {
-  if (status === 'waiting') return 'Your move'
-  if (status === 'working') return 'In motion'
-  if (status === 'errored') return 'Needs review'
-  return 'Filed'
+function postImportance(post: FeedPost, text = messageText(post)): 'feature' | 'standard' | 'note' {
+  if (post.importance) return post.importance
+  if (post.status === 'waiting' || post.status === 'errored') return 'feature'
+  if (post.status === 'working') return 'standard'
+  if (post.media || externalEmbeds(text).length > 0) return 'feature'
+  if (post.kind === 'room-update' || text.length < 180) return 'note'
+  return 'standard'
+}
+
+function statusLabel(post: FeedPost): string {
+  if (post.status === 'waiting') return 'Your move'
+  if (post.status === 'working') return 'In motion'
+  if (post.status === 'errored') return 'Needs review'
+  if (postImportance(post) === 'feature') return 'Highlight'
+  if (postImportance(post) === 'note') return 'Note'
+  return 'Update'
 }
 
 function contentLabel(post: FeedPost): string {
   if (post.status === 'waiting') return 'Decision context'
   if (post.status === 'working') return 'Live dispatch'
   if (post.status === 'errored') return 'Field report'
+  if (postImportance(post) === 'note') return 'Note'
   return post.kind === 'room-update' ? 'Room dispatch' : 'Result'
 }
+
 
 function formatTimestamp(timestamp: string): string {
   const date = new Date(timestamp)
@@ -270,14 +288,10 @@ function isNestedControl(target: EventTarget | null, card: HTMLElement): boolean
   return !!control && control !== card
 }
 
-function hasRichDispatch(text: string): boolean {
-  return externalEmbeds(text).length > 0
-    || /!\[[^\]]*\]\([^)]+\)|(?:^|\s)(?:https?:\/\/|\/|~\/)\S+\.(?:avif|gif|html?|jpe?g|mov|mp4|pdf|png|svg|webm)(?:[?#]\S*)?/im.test(text)
-}
 
 function isExpandableDispatch(post: FeedPost, text: string): boolean {
   return post.status === 'finished'
-    && !hasRichDispatch(text)
+    && postImportance(post, text) !== 'note'
     && (text.length > 360 || text.split('\n').length > 7)
 }
 
@@ -300,8 +314,22 @@ export default function FeedHome(props: FeedHomeProps) {
   const [expandedPosts, setExpandedPosts] = createSignal<Set<string>>(new Set())
   const current = createMemo(() => feeds()[mode()])
   const personalized = createMemo(() => {
-    const raw = current().response?.posts || []
-    if (mode() !== 'for-you') return { posts: raw, reasons: {} as Record<string, string> }
+    const all = current().response?.posts || []
+    if (mode() !== 'for-you') return { posts: all, reasons: {} as Record<string, string> }
+    const completionCutoff = Date.now() - FOR_YOU_COMPLETION_MS
+    const seenSources = new Set<string>()
+    const raw = all.filter(post => {
+      if (post.status !== 'finished') return true
+      if (postImportance(post) !== 'feature' || (post.reaction !== 'like' && Date.parse(post.timestamp) < completionCutoff)) return false
+      const sourceKey = post.room ? `room:${post.room}`
+        : post.projectId ? `project:${post.projectId}`
+          : post.projectLabel ? `project-label:${post.projectLabel}`
+            : post.sessionId ? `session:${post.sessionId}`
+              : `post:${post.id}`
+      if (seenSources.has(sourceKey)) return false
+      seenSources.add(sourceKey)
+      return true
+    })
     const buckets: FeedPost[][] = [[], [], [], []]
     raw.forEach(post => buckets[PRIORITY_BY_STATUS[post.status]].push(post))
     const reasons: Record<string, string> = {}
@@ -655,6 +683,13 @@ export default function FeedHome(props: FeedHomeProps) {
     }
   }
 
+  function toggleReply(postId: string) {
+    const opening = !interactions()[postId]?.replyOpen
+    patchInteraction(postId, { replyOpen: opening, error: null, notice: null })
+    if (!opening) return
+    queueMicrotask(() => document.getElementById(`fledge-reply-${postId}`)?.focus())
+  }
+
   const handleScroll = () => {
     queueScrollSave()
     if (!feedScroller || current().refreshing || !current().response?.nextBefore || !online()) return
@@ -832,11 +867,18 @@ export default function FeedHome(props: FeedHomeProps) {
       <Show when={current().response}>
         {response => (
           <aside class="fledge-pulse" aria-label="Live feed pulse">
-            <span class="fledge-pulse-title">Live pulse</span>
+            <span class="fledge-pulse-title">{mode() === 'for-you' ? 'Signal' : 'Live pulse'}</span>
             <span class="fledge-pulse-item fledge-pulse-waiting" data-testid="fledge-needs-count"><b>{response().counts.waiting}</b> waiting</span>
-            <span class="fledge-pulse-item"><b>{response().counts.working}</b> working</span>
-            <span class="fledge-pulse-item"><b>{response().counts.errored}</b> flagged</span>
-            <span class="fledge-pulse-item"><b>{response().counts.finished}</b> filed</span>
+            <Show when={response().counts.working > 0}>
+              <span class="fledge-pulse-item"><b>{response().counts.working}</b> working</span>
+            </Show>
+            <Show when={response().counts.errored > 0}>
+              <span class="fledge-pulse-item"><b>{response().counts.errored}</b> flagged</span>
+            </Show>
+            <span class="fledge-pulse-item"><b>{mode() === 'for-you' ? response().counts.important ?? posts().length : response().counts.finished}</b> {mode() === 'for-you' ? 'done' : 'filed'}</span>
+            <Show when={mode() === 'for-you' && (response().counts.notes || 0) > 0}>
+              <span class="fledge-pulse-item fledge-pulse-quiet"><b>{response().counts.notes}</b> more in Latest</span>
+            </Show>
           </aside>
         )}
       </Show>
@@ -891,14 +933,22 @@ export default function FeedHome(props: FeedHomeProps) {
           </Show>
 
           <For each={posts()}>{post => {
-            const text = () => messageText(post)
-            const expandable = () => isExpandableDispatch(post, text())
+            const text = messageText(post)
+            const expandable = isExpandableDispatch(post, text)
             const expanded = () => expandedPosts().has(post.id)
+            const importance = postImportance(post, text)
+            const mediaSource = post.media ? appUrl(`/api/files/media?path=${encodeURIComponent(post.media.path)}`) : ''
+            const source = post.room || post.projectLabel || post.agent || 'F'
+            const monogram = source.replace(/^#/, '').trim().charAt(0).toUpperCase() || 'F'
             return (
-              <div class="fledge-slide" data-feed-post-id={post.id} data-post-id={post.id} data-testid="fledge-post">
+              <div class="fledge-slide" data-feed-post-id={post.id} data-post-id={post.id} data-importance={importance} data-testid="fledge-post">
                 <article
                   class="fledge-card"
+                  data-importance={importance}
                   classList={{
+                    'fledge-card-feature': importance === 'feature',
+                    'fledge-card-standard': importance === 'standard',
+                    'fledge-card-note': importance === 'note',
                     'fledge-card-waiting': post.status === 'waiting',
                     'fledge-card-working': post.status === 'working',
                     'fledge-card-errored': post.status === 'errored',
@@ -909,10 +959,12 @@ export default function FeedHome(props: FeedHomeProps) {
                 >
 
                   <div class="fledge-card-main">
+                    <div class="fledge-card-avatar" aria-hidden="true">{monogram}</div>
+                    <div class="fledge-card-content">
                     <div class="fledge-card-topline">
                       <span class="fledge-status" classList={{ 'fledge-status-waiting': post.status === 'waiting' }}>
                         <span class="fledge-status-dot" aria-hidden="true" />
-                        {statusLabel(post.status)}
+                        {statusLabel(post)}
                       </span>
                       <span class="fledge-card-place">{post.room || post.projectLabel || 'Unfiled'}</span>
                       <Show when={post.agent}><span class="fledge-card-agent">{post.agent}</span></Show>
@@ -937,12 +989,23 @@ export default function FeedHome(props: FeedHomeProps) {
                       </div>
                     </Show>
 
-                    <Show when={text()}>
+                    <Show when={text}>
                       <section class="fledge-dispatch-body" aria-label={contentLabel(post)}>
                         <div class="fledge-section-label">{contentLabel(post)}</div>
-                        <div class="fledge-markdown" classList={{ 'fledge-dispatch-collapsed': expandable() && !expanded() }}>
-                          <RichMarkdown text={text()} onOpenFile={props.onOpenFile} allowRemoteImages={false} />
-                          <For each={externalEmbeds(text())}>{embed => (
+                        <div class="fledge-markdown" classList={{ 'fledge-dispatch-collapsed': expandable && !expanded() }}>
+                          <RichMarkdown text={text} onOpenFile={props.onOpenFile} allowRemoteImages={false} />
+                        </div>
+                        <Show when={expandable}>
+                          <button
+                            type="button"
+                            class="fledge-more"
+                            aria-expanded={expanded()}
+                            onClick={event => { event.stopPropagation(); togglePostExpansion(post.id) }}
+                          >
+                            {expanded() ? 'Show less' : 'More'}
+                          </button>
+                        </Show>
+                          <For each={externalEmbeds(text)}>{embed => (
                             <figure class="fledge-external-embed" data-platform={embed.platform.toLowerCase()}>
                               <figcaption>{embed.platform} dispatch</figcaption>
                               <iframe
@@ -955,18 +1018,19 @@ export default function FeedHome(props: FeedHomeProps) {
                               />
                             </figure>
                           )}</For>
-                        </div>
-                        <Show when={expandable()}>
-                          <button
-                            type="button"
-                            class="fledge-more"
-                            aria-expanded={expanded()}
-                            onClick={event => { event.stopPropagation(); togglePostExpansion(post.id) }}
-                          >
-                            {expanded() ? 'Show less' : 'More'}
-                          </button>
-                        </Show>
                       </section>
+                    </Show>
+                    <Show when={importance === 'feature' ? post.media : undefined}>
+                      {media => (
+                        <figure class="fledge-primary-media">
+                          <Show when={media().kind === 'image'} fallback={
+                            <video src={mediaSource} controls playsinline preload="metadata" aria-label={`Play ${media().name}`} />
+                          }>
+                            <img src={mediaSource} alt={media().name} loading="lazy" />
+                          </Show>
+                          <figcaption>{media().name}</figcaption>
+                        </figure>
+                      )}
                     </Show>
 
                     <aside class="fledge-why">
@@ -974,7 +1038,7 @@ export default function FeedHome(props: FeedHomeProps) {
                       <p>{post.why}{personalized().reasons[post.id] ? ` · ${personalized().reasons[post.id]}` : ''}</p>
                     </aside>
 
-                    <section class="fledge-interactions" aria-label={`Respond to ${post.title}`} onClick={event => event.stopPropagation()}>
+                    <section class="fledge-interactions" aria-label={`Ask about ${post.title}`} onClick={event => event.stopPropagation()}>
                       <div class="fledge-reaction-row">
                         <button
                           type="button"
@@ -1016,12 +1080,12 @@ export default function FeedHome(props: FeedHomeProps) {
                             type="button"
                             class="fledge-reaction"
                             aria-expanded={!!interactions()[post.id]?.replyOpen}
-                            aria-label="Reply: respond inline to this dispatch"
-                            title="Reply: respond inline to this dispatch"
-                            onClick={() => patchInteraction(post.id, { replyOpen: !interactions()[post.id]?.replyOpen, error: null, notice: null })}
+                            aria-label="Ask a follow-up"
+                            title="Ask a follow-up"
+                            onClick={() => toggleReply(post.id)}
                           >
                             <span class="fledge-reaction-emoji" aria-hidden="true">💬</span>
-                            Reply
+                            Ask
                           </button>
                         </Show>
                         <Show when={post.reaction && post.reactionDelivery === 'failed'}>
@@ -1050,20 +1114,20 @@ export default function FeedHome(props: FeedHomeProps) {
 
                       <Show when={interactions()[post.id]?.replyOpen}>
                         <form class="fledge-reply-form" onSubmit={event => { event.preventDefault(); void sendComment(post) }}>
-                          <label for={`fledge-reply-${post.id}`}>Reply inside this dispatch</label>
+                          <label for={`fledge-reply-${post.id}`}>Ask about this result</label>
                           <textarea
                             id={`fledge-reply-${post.id}`}
                             value={interactions()[post.id]?.draft || ''}
                             maxLength={2000}
                             rows={3}
-                            placeholder="Add direction, context, or a question…"
+                            placeholder="Ask a question or give direction…"
                             disabled={interactions()[post.id]?.sending}
                             onInput={event => patchInteraction(post.id, { draft: event.currentTarget.value, pendingCommentId: null, error: null })}
                           />
                           <div class="fledge-reply-actions">
                             <span>{(interactions()[post.id]?.draft || '').length}/2000</span>
                             <button type="submit" disabled={interactions()[post.id]?.sending || !(interactions()[post.id]?.draft || '').trim()}>
-                              {interactions()[post.id]?.sending ? 'Sending…' : 'Send reply'}
+                              {interactions()[post.id]?.sending ? 'Sending…' : 'Ask'}
                             </button>
                           </div>
                         </form>
@@ -1092,6 +1156,7 @@ export default function FeedHome(props: FeedHomeProps) {
                         </div>
                       </Show>
                     </section>
+                    </div>
                   </div>
                 </article>
               </div>
