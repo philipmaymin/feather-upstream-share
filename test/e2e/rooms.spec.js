@@ -62,7 +62,7 @@ test('attaches and detaches an existing chat without duplicate Room rows', async
   await expect(page.getByText(candidate.title, { exact: true })).toHaveCount(1)
 })
 
-test('Room card opens its Leader while History reveals only past chats', async ({ page }) => {
+test('Room card opens its Main chat while Organization exposes residents and chats', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 })
   const leader = {
     id: 'leader-human-chat', title: '#feather Leader', updatedAt: '2026-08-23T23:00:00Z',
@@ -99,9 +99,11 @@ test('Room card opens its Leader while History reveals only past chats', async (
   await page.goto(BASE)
   await page.getByTestId('history-feather').click()
   await expect(page).toHaveURL(/#?$/)
-  await expect(page.getByText('Past chats', { exact: true })).toBeVisible()
-  await expect(page.getByTestId('resident-feather-leader')).toHaveCount(0)
-  await expect(page.getByTestId('resident-feather-caretaker')).toHaveCount(0)
+  await expect(page.getByText('Main', { exact: true }).first()).toBeVisible()
+  await expect(page.getByText('People', { exact: true })).toBeVisible()
+  await expect(page.getByText('Chats', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('resident-feather-leader')).toBeVisible()
+  await expect(page.getByTestId('resident-feather-caretaker')).toBeVisible()
   await expect(page.getByText('One-off investigation', { exact: true })).toBeVisible()
   await expect(page.getByText('#feather Leader', { exact: true })).toHaveCount(0)
 
@@ -109,7 +111,7 @@ test('Room card opens its Leader while History reveals only past chats', async (
   await expect(page).toHaveURL(/#other-chat$/)
 })
 
-test('Room without a Leader expands before its OMP Leader is created', async ({ page }) => {
+test('Room without a Main chat expands before its OMP Leader is created', async ({ page }) => {
   let sessionBody = null
   await page.route('**/api/rooms', route => route.fulfill({ json: { rooms: [{
     name: 'new-room', cwd: '/srv/rooms/new-room', active: false, latest: null, updatedAt: null,
@@ -164,7 +166,9 @@ test('failed Room assignment exposes the created ungrouped chat without opening 
 
   await page.goto(BASE)
   await page.getByTestId('history-failure-room').click()
-  await page.getByRole('button', { name: '+ New OMP chat' }).click()
+  const answers = ['Recovery chat', 'omp']
+  page.on('dialog', dialog => dialog.accept(answers.shift() || ''))
+  await page.getByRole('button', { name: '+ Named chat' }).click()
 
   const recovery = page.getByTestId('room-assignment-recovery')
   await expect(recovery).toContainText(createdId)

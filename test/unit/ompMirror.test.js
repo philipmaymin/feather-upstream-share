@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { OMP_CHILD_LIMIT, OMP_WORK_LIMIT, createOmpMirrorState, reduceOmpMirrorState } from '../../frontend/src/lib/ompMirror.js'
+import { OMP_CHILD_LIMIT, OMP_WORK_LIMIT, createOmpMirrorState, reconcileOmpRuntimeJobs, reduceOmpMirrorState } from '../../frontend/src/lib/ompMirror.js'
 
 function reduce(events) {
   return events.reduce(reduceOmpMirrorState, createOmpMirrorState())
@@ -117,5 +117,29 @@ describe('OMP mirror reducer', () => {
     assert.deepEqual(reset.children, {})
     assert.equal(reset.parent.todo, null)
     assert.deepEqual(reset.parent.timeline, [])
+  })
+
+  it('deduplicates replayed parent starts by invocation identity', () => {
+    const started = reduceOmpMirrorState(createOmpMirrorState(), { type: 'agent_start', invocationId: 'run-1' })
+    const withWork = reduceOmpMirrorState(started, {
+      type: 'tool_execution_start', toolCallId: 'read-1', toolName: 'read',
+    })
+    const replayed = reduceOmpMirrorState(withWork, { type: 'agent_start', invocationId: 'run-1' })
+
+    assert.equal(replayed, withWork)
+    assert.equal(replayed.parent.invocationId, 'run-1')
+    assert.equal(replayed.parent.timeline.length, 1)
+  })
+
+  it('settles stale child activity from authoritative runtime jobs', () => {
+    const running = reduce([
+      { type: 'subagent_lifecycle', id: 'job-1', agent: 'task', status: 'running', assignment: 'Inspect rooms' },
+      { type: 'tool_execution_start', subagentId: 'job-1', toolCallId: 'read-1', toolName: 'read' },
+    ])
+    const settled = reconcileOmpRuntimeJobs(running, [{ id: 'job-1', status: 'completed' }])
+
+    assert.equal(settled.children['job-1'].status, 'parked')
+    assert.equal(settled.children['job-1'].runStatus, 'success')
+    assert.equal(settled.children['job-1'].timeline[0].status, 'success')
   })
 })

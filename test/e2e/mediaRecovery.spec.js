@@ -117,7 +117,7 @@ test('a queue failure restores the prior Activity and leaves the draft unsent', 
     type: 'assistant', uuid: `media-prior-todo-${Date.now()}`, timestamp: new Date().toISOString(), isSidechain: false, isMeta: false,
     message: { role: 'assistant', content: [{
       type: 'tool_result', name: 'todo',
-      details: { phases: [{ name: 'Prior turn', tasks: [{ content: 'Preserve on failure', status: 'completed' }] }] },
+      details: { phases: [{ name: 'Prior turn', tasks: [{ content: 'Preserve on failure', status: 'in_progress' }] }] },
     }] },
   }) + '\n')
   await page.addInitScript(() => {
@@ -210,7 +210,7 @@ test('an in-flight attachment send does not block another room and clears the ac
   await expect.poll(() => sendReceived).toBe(true)
 
   await page.locator('button').first().click()
-  await page.getByText('media navigation target', { exact: true }).click()
+  await page.locator(`[data-session-id="${navigationSessionId}"]`).click()
   const secondComposer = page.locator('textarea')
   await expect(secondComposer).toBeEditable()
   await expect(page.locator('button[title="Send"]').last()).toBeEnabled()
@@ -222,7 +222,7 @@ test('an in-flight attachment send does not block another room and clears the ac
   await expect(secondComposer).toHaveValue('work in the second room')
 
   await page.locator('button').first().click()
-  await page.getByText('media recovery test', { exact: true }).click()
+  await page.locator(`[data-session-id="${sessionId}"]`).click()
   await expect(page.locator('textarea')).toHaveValue('')
   await expect(page.locator('img[src^="blob:"]')).toHaveCount(0)
 })

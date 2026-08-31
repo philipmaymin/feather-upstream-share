@@ -23,7 +23,7 @@ import diff from 'highlight.js/lib/languages/diff'
 import sql from 'highlight.js/lib/languages/sql'
 import yaml from 'highlight.js/lib/languages/yaml'
 import markdown from 'highlight.js/lib/languages/markdown'
-import { activityDescription, toolImagePath, toolInputText, toolPresentation } from '../lib/toolPresentation.js'
+import { activityDescription, toolImagePath, toolInputDisplay, toolOutputDisplay, toolPresentation } from '../lib/toolPresentation.js'
 import { localFilePath } from '../lib/localMedia.js'
 import { appUrl } from '../lib/appPath.js'
 import { extractImages } from '../lib/attachments.js'
@@ -667,9 +667,10 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
     const presented = toolPresentation(block.name || 'tool', inp)
     const name = presented.name
     const color = TOOL_COLORS[name] || '#999'
-    const summary = presented.summary
-    const genericInput = SPECIAL_TOOL_DETAILS.has(name) ? '' : toolInputText(inp)
-    const pre = 'white-space:pre-wrap;font-size:10px;font-family:SF Mono,Menlo,monospace;padding:3px 0;max-height:160px;overflow:auto;margin:0;word-break:break-all;'
+    const summary = activityDescription(block.name || '', inp, block.intent || '')
+    const readableInput = toolInputDisplay(block.name || '', inp)
+    const genericInput = SPECIAL_TOOL_DETAILS.has(name) ? '' : readableInput
+    const pre = 'white-space:pre-wrap;font:11px/1.55 SF Mono,Menlo,monospace;padding:8px 10px;max-height:280px;overflow:auto;margin:0;overflow-wrap:anywhere;'
     const isImageFile = (name === 'Read' || name === 'Write') && filePath && IMAGE_EXTS.has((filePath.substring(filePath.lastIndexOf('.')).toLowerCase()))
     const imagePath = toolImagePath(block.name || '', inp) || (isImageFile ? filePath : '')
     const hasDetail = SPECIAL_TOOL_DETAILS.has(name) || !!genericInput || !!imagePath
@@ -677,23 +678,23 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
     return <>
       <details style={{ margin: '3px 0', 'font-size': '11px', 'font-family': "'SF Mono', Menlo, monospace", 'border-top': '1px solid #ffffff0a' }}>
         <summary style={{ padding: '2px 0', cursor: hasDetail ? 'pointer' : 'default', 'list-style': hasDetail ? undefined : 'none', color: '#999' }}>
-          <span style={{ color }}>{name}</span>
-          {summary && <span style={{ color: '#888', 'margin-left': '6px' }}>{summary}</span>}
+          {summary && <span class="execution-tool-intent">{summary}</span>}
+          <span class="execution-tool-name" style={{ color }}>{name}</span>
         </summary>
         {name === 'Edit' && <>
           {inp.old_string && <pre style={`${pre}color:#e07070`}>{inp.old_string}</pre>}
           {inp.new_string && <pre style={`${pre}color:#5cc878`}>{inp.new_string}</pre>}
         </>}
-        {name === 'Bash' && commandText(inp) && <pre style={`${pre}color:#e5a070`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{commandText(inp)}</pre>}
+        {name === 'Bash' && readableInput && <pre style={`${pre}color:#e5a070`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{readableInput}</pre>}
         {name === 'Patch' && patchText(inp) && <pre style={`${pre}color:#c4993a`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{patchText(inp).slice(0, 2000)}{patchText(inp).length > 2000 ? '\n…' : ''}</pre>}
         {name === 'Input' && <pre style={`${pre}color:#73b8ff`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{stdinText(inp).replace(/\u0003/g, '^C') || '(empty stdin)'}{inp.session_id != null ? `\n\nsession: ${inp.session_id}` : ''}</pre>}
-        {name === 'Write' && inp.content && <pre style={`${pre}color:#5cc878`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{(inp.content as string).slice(0, 500)}{(inp.content as string).length > 500 ? '...' : ''}</pre>}
+        {name === 'Write' && readableInput && <pre style={`${pre}color:#5cc878`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{readableInput.slice(0, 2000)}{readableInput.length > 2000 ? '…' : ''}</pre>}
         {name === 'Agent' && <>
           {inp.subagent_type && <div style={{ padding: '2px 0', 'font-size': '10px', color: '#888' }}>Type: <span style={{ color: '#c4993a' }}>{inp.subagent_type}</span></div>}
           {inp.prompt && <pre style={`${pre}color:#88c4ff`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{(inp.prompt as string).slice(0, 800)}{(inp.prompt as string).length > 800 ? '...' : ''}</pre>}
         </>}
-        {name === 'Grep' && inp.pattern && <pre style={`${pre}color:#c4a0c0`}>/{inp.pattern}/{inp.path ? ` in ${inp.path}` : ''}</pre>}
-        {name === 'Read' && filePath && <pre style={`${pre}color:#88c4ff`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{filePath}{inp.offset ? ` (L${inp.offset})` : ''}</pre>}
+        {name === 'Grep' && readableInput && <pre style={`${pre}color:#c4a0c0`}>{readableInput}</pre>}
+        {name === 'Read' && readableInput && <pre style={`${pre}color:#88c4ff`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{readableInput}</pre>}
         {genericInput && <pre style={`${pre}color:#aaa`} ref={(el) => linkifyRef(el, onImageClick, onOpenFile)}>{genericInput}</pre>}
       </details>
       {imagePath && (() => {
@@ -1016,6 +1017,8 @@ div:hover > div > .star-btn { opacity: 0.6 !important; }
 .live-work-disclosure .work-log-summary { width: 100%; min-height: 34px; }
 .work-log-active { min-width: 0; flex: 0 1 auto; max-width: 75%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); font-size: 12px; }
 .work-log-live-dot { width: 7px; height: 7px; flex-shrink: 0; border-radius: 50%; background: var(--info); }
+.work-log-live-dot.is-complete { background: var(--success); }
+.work-log-live-dot.is-error { background: var(--error); }
 .live-work-disclosure .work-log-detail { max-height: min(58vh, 520px); overflow: auto; margin-top: 2px; padding: 8px 10px; border: 0; border-top: 1px solid var(--border-subtle); border-radius: 0; background: transparent; }
 .work-log-detail {
   margin-top: 6px; padding: 10px 12px; border: 1px solid var(--border-subtle);
@@ -1046,9 +1049,9 @@ div:hover > div > .star-btn { opacity: 0.6 !important; }
 .execution-tool > summary { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 38px; padding: 0 10px; cursor: pointer; list-style: none; }
 .execution-tool-name { min-width: 0; max-width: 30%; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font: 500 10px 'SF Mono', Menlo, monospace; }
 .execution-tool-intent { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); font-size: 11px; font-weight: 600; }
-.execution-payload { padding: 8px 10px; border-top: 1px solid var(--border-subtle); }
-.execution-payload-label { margin-bottom: 4px; color: var(--text-faint); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
-.execution-payload pre { max-height: 220px; overflow: auto; margin: 0; color: var(--text-secondary); font: 10px/1.45 'SF Mono', Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.execution-payload { padding: 10px 12px; border-top: 1px solid var(--border-subtle); background: rgba(255,255,255,0.018); }
+.execution-payload-label { margin-bottom: 6px; color: var(--text-muted); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+.execution-payload pre { max-height: 280px; overflow: auto; margin: 0; padding: 8px 10px; border-radius: 6px; background: var(--bg-secondary); color: var(--text-primary); font: 11px/1.55 'SF Mono', Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .execution-status { flex-shrink: 0; color: currentColor; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; }
 .omp-todo-status { position: sticky; top: 0; z-index: 4; display: flex; align-items: center; gap: 5px; width: 100%; max-width: 960px; min-height: 36px; margin: 0 auto 4px; padding: 0 11px; border: 1px solid var(--border-medium); border-radius: 10px; background: var(--bg-surface); box-shadow: 0 6px 18px var(--bg-base); color: var(--text-secondary); cursor: pointer; font-size: 12px; font-weight: 600; text-align: left; box-sizing: border-box; }
 .omp-todo-status-active { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); font-weight: 500; }
@@ -1213,6 +1216,10 @@ type MessageViewProps = {
   sessionId?: string | null
   protocolRuns?: ProtocolRunSnapshot[]
   onOpenFile?: (path: string) => void
+  highLevel?: boolean
+  onOpenAgentHub?: () => void
+  roomRole?: string
+  onOpenRoomRole?: (role: string) => void
 }
 
 export function MessageView(props: MessageViewProps) {
@@ -1313,8 +1320,8 @@ export function MessageView(props: MessageViewProps) {
     const tool = createMemo(() => entryProps.item.kind === 'tool' ? entryProps.item : null)
     const presentation = createMemo(() => tool() ? timelineToolPresentation(tool()!) : null)
     const description = createMemo(() => tool() ? timelineActivityDescription(tool()!) : '')
-    const input = createMemo(() => executionValue(tool()?.args))
-    const output = createMemo(() => executionValue(tool()?.result !== undefined ? tool()?.result : tool()?.partialResult))
+    const input = createMemo(() => tool() ? toolInputDisplay(tool()!.toolName, tool()!.args) : '')
+    const output = createMemo(() => toolOutputDisplay(tool()?.result !== undefined ? tool()?.result : tool()?.partialResult))
     return (
       <li class="execution-item" style={{ color: executionStatusColor(entryProps.item.status) }} data-status={entryProps.item.status}>
         <span class="execution-node" aria-hidden="true" />
@@ -1334,7 +1341,7 @@ export function MessageView(props: MessageViewProps) {
             </Show>
             <Show when={output()}>
               <div class="execution-payload">
-                <div class="execution-payload-label">{tool()?.result !== undefined ? 'Result' : 'Latest output'}</div>
+                <div class="execution-payload-label">{tool()?.result !== undefined ? 'Output' : 'Live output'}</div>
                 <pre ref={(element) => linkifyRef(element, setLightbox, props.onOpenFile)}>{output().slice(0, 3000)}{output().length > 3000 ? '\n… (truncated)' : ''}</pre>
               </div>
             </Show>
@@ -1467,6 +1474,12 @@ export function MessageView(props: MessageViewProps) {
                       ].filter(Boolean).join(' · ') || 'pending'}
                     </div>
                     <Show when={agent().sessionFile}><div>Session · {agent().sessionFile}</div></Show>
+                  <Show when={props.onOpenAgentHub}>
+                    <button type="button" data-testid="open-agent-hub" onClick={() => props.onOpenAgentHub?.()}
+                      style={{ margin: '8px 0 2px', background: 'var(--bg-secondary)', border: '1px solid var(--border-medium)', color: 'var(--link)', padding: '6px 10px', 'border-radius': '6px', 'font-size': '11px', 'font-weight': '650', cursor: 'pointer' }}>
+                      Open Agent Hub to steer
+                    </button>
+                  </Show>
                   </div>
                   <Show when={agent().assistantText}>
                     <section class="agent-answer" data-testid="omp-subagent-answer" aria-live={agent().assistantEnded ? 'off' : 'polite'}>
@@ -1504,10 +1517,13 @@ export function MessageView(props: MessageViewProps) {
       </>
     )
   }
+  const todoNeedsAttention = () => !!props.todo
+    && ((props.todo.active || '') !== '' || props.todo.completed < props.todo.total)
   function renderParentExecution(scope: () => OmpWorkScope) {
     const timeline = createMemo(() => scope().timeline.filter(isParentActivity))
     const visibleScope = () => ({ ...scope(), timeline: timeline() })
     const runningSubagent = () => (props.subagents || []).find(agent => executionStatusLabel(agent.status) === 'Running')
+    const activityId = () => `${props.sessionId || 'session'}:native:${scope().invocationId}`
     const runningJobs = () => (props.jobs || []).filter(job => job.status === 'running')
     const runningJob = () => runningJobs()[0]
     const activityStatus = () => scope().runStatus === 'running' || runningSubagent() || runningJob() ? 'running' : scope().runStatus
@@ -1530,10 +1546,17 @@ export function MessageView(props: MessageViewProps) {
       if ((props.todo?.total || 0) > 0) return `${props.todo!.completed}/${props.todo!.total} planned`
       return 'Complete'
     }
-    const hasWork = () => timeline().length > 0 || (props.todo?.total || 0) > 0 || (props.subagents?.length || 0) > 0 || (props.jobs || []).some(job => job.status === 'running')
+    const hasWork = () => timeline().length > 0 || todoNeedsAttention() || (props.subagents?.length || 0) > 0 || (props.jobs || []).some(job => job.status === 'running')
     return (
       <Show when={hasWork()}>
-        <details class="work-details" data-testid="omp-parent-execution" data-segment={scope().segment}>
+        <details
+          class="work-details"
+          data-testid="omp-parent-execution"
+          data-segment={scope().segment}
+          data-activity-id={activityId()}
+          open={openWorkLogs().has(activityId())}
+          onToggle={(event) => rememberWorkLogOpen(activityId(), event.currentTarget.open)}
+        >
           <summary class="execution-summary" data-testid="omp-parent-execution-summary">
             <span class="execution-chevron">›</span>
             <span class="execution-title">Activity</span>
@@ -1541,7 +1564,7 @@ export function MessageView(props: MessageViewProps) {
             <span class="execution-status" aria-label={executionStatusLabel(activityStatus())} title={executionStatusLabel(activityStatus())} style={{ color: executionStatusColor(activityStatus()) }}>{executionStatusMark(activityStatus())}</span>
           </summary>
           <div class="execution-detail">
-            <Show when={(props.todo?.total || 0) > 0}>{renderTodo(() => props.todo!, 'omp-todo')}</Show>
+            <Show when={todoNeedsAttention()}>{renderTodo(() => props.todo!, 'omp-todo')}</Show>
             <Show when={timeline().length > 0}>
               <div data-testid="omp-parent-execution-timeline">{renderTimelineItems(timeline)}</div>
             </Show>
@@ -1560,6 +1583,21 @@ export function MessageView(props: MessageViewProps) {
   const [actionMenu, setActionMenu] = createSignal<string | null>(null)
   const [actionFeedback, setActionFeedback] = createSignal<string | null>(null)
   const [openWorkLogs, setOpenWorkLogs] = createSignal<Set<string>>(new Set())
+  function rememberWorkLogOpen(id: string, open: boolean) {
+    setOpenWorkLogs(current => {
+      if (current.has(id) === open) return current
+      const next = new Set(current)
+      if (open) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
+  let openWorkLogScope = props.sessionId
+  createEffect(() => {
+    if (props.sessionId === openWorkLogScope) return
+    openWorkLogScope = props.sessionId
+    setOpenWorkLogs(new Set())
+  })
   let prevMsgLen = props.messages.length
   let prevStreamText = props.assistantStream?.text || ''
   let prevWork = props.work
@@ -1726,7 +1764,7 @@ export function MessageView(props: MessageViewProps) {
   const renderItems = createMemo(() => buildRenderItems(props.messages, isPureToolResultMsg))
   const hasCurrentWork = createMemo(() => !!props.work && (
     props.work.timeline.some(isParentActivity) ||
-    (props.todo?.total || 0) > 0 ||
+    todoNeedsAttention() ||
     (props.subagents?.length || 0) > 0 ||
     (props.jobs || []).some(job => job.status === 'running')
   ))
@@ -1749,35 +1787,42 @@ export function MessageView(props: MessageViewProps) {
     // <details> state would therefore reset whenever a later SSE update
     // replaced the DOM node. The first trace message is stable for the life of
     // the execution chain, so keep the user's disclosure choice against it.
-    const disclosureKey = messages[0]?.uuid || messages[0]?.timestamp || 'work-log'
+    const disclosureKey = `${props.sessionId || 'session'}:${messages[0]?.uuid || messages[0]?.timestamp || 'work-log'}`
     const blocks = messages.flatMap(message => message.content || [])
+    const last = messages.at(-1)
     const traceBlocks = blocks.filter(isActivityBlock)
     const renderedToolUseIds = new Set(traceBlocks.filter(block => block.type === 'tool_use' && block.id).map(block => block.id!))
     const errorCount = traceBlocks.filter(block =>
       block.type === 'tool_result' ? !!block.is_error && (!block.tool_use_id || !renderedToolUseIds.has(block.tool_use_id)) :
       block.type === 'tool_use' && block.id ? !!getResult(block.id)?.is_error : false
     ).length
-    const last = messages[messages.length - 1]
-    return <details class="work-log" open={openWorkLogs().has(disclosureKey)} onToggle={(event) => {
-      const open = event.currentTarget.open
-      setOpenWorkLogs(current => {
-        if (current.has(disclosureKey) === open) return current
-        const next = new Set(current)
-        if (open) next.add(disclosureKey)
-        else next.delete(disclosureKey)
-        return next
-      })
+    const toolUses = traceBlocks.filter(block => block.type === 'tool_use')
+    const summary = live && props.statusText
+      ? props.statusText
+      : props.highLevel
+        ? ''
+        : toolUses.length > 0
+          ? activityDescription(toolUses.at(-1)?.name || '', toolUses.at(-1)?.input || {}, toolUses.at(-1)?.intent || '')
+          : ''
+    return <details class="work-log" data-activity-id={disclosureKey} open={openWorkLogs().has(disclosureKey)} onToggle={(event) => {
+      rememberWorkLogOpen(disclosureKey, event.currentTarget.open)
     }}>
       <summary class="work-log-summary" data-testid="work-log-summary">
         <span class="work-log-chevron">›</span>
         <span style={{ color: 'var(--text-muted)', 'font-weight': '600' }}>Activity</span>
-        <Show when={live && props.statusText}><span class="work-log-active">{props.statusText}</span><span class="work-log-live-dot" aria-label="Running" /></Show>
-        <Show when={errorCount > 0}>
+        <Show when={summary}><span class="work-log-active">{summary}</span></Show>
+        <Show when={errorCount > 0} fallback={
+          <span
+            class="work-log-live-dot"
+            classList={{ 'is-complete': !live }}
+            aria-label={live ? 'Running' : 'Complete'}
+          />
+        }>
           <span class="work-log-issue"><span class="work-log-issue-dot" />{errorCount} issue{errorCount === 1 ? '' : 's'}</span>
         </Show>
       </summary>
       <div class="work-log-detail" data-testid="work-log-detail">
-        <div class="work-log-meta">{traceBlocks.length} execution step{traceBlocks.length === 1 ? '' : 's'} · {formatTime(last?.timestamp || '')}</div>
+        <div class="work-log-meta">{toolUses.length} action{toolUses.length === 1 ? '' : 's'} · {formatTime(last?.timestamp || '')}</div>
         <For each={traceBlocks}>{(block) => {
           if (block.type === 'tool_result' && block.tool_use_id && renderedToolUseIds.has(block.tool_use_id)) return null
           return renderBlock(block, (src) => setLightbox(src), openExpandedTable, getResult, props.onOpenFile)
@@ -1872,6 +1917,17 @@ export function MessageView(props: MessageViewProps) {
             {msg.delivery === 'queued' ? 'queued' : msg.delivery === 'delivered' ? '\u2713\u2713' : '\u2713'}
           </span>
         )}
+        <Show when={props.roomRole && msg.roomFrom && msg.roomTo}>
+          {() => {
+            const role = msg.roomFrom === props.roomRole ? msg.roomTo : msg.roomFrom
+            return role && role !== 'human' && role !== props.roomRole
+              ? <button class="msg-action" data-testid={`open-room-role-${role}`} title={`Open ${role.replaceAll('-', ' ')}`} onClick={() => props.onOpenRoomRole?.(role)}
+                  style={{ background: 'none', border: '1px solid var(--border-subtle)', 'border-radius': '5px', cursor: 'pointer', padding: '2px 6px', color: 'var(--link)', 'font-size': '10px', 'font-weight': '650' }}>
+                  Open {role.replaceAll('-', ' ')}
+                </button>
+              : null
+          }}
+        </Show>
         {!msg.uuid.startsWith('optimistic-') && (
           <button onClick={() => props.onToggleStar?.(msg.uuid)}
             style={{ background: 'none', border: 'none', cursor: 'pointer', 'font-size': '12px', padding: '0 2px', color: props.starred?.has(msg.uuid) ? '#c4993a' : '#333', opacity: props.starred?.has(msg.uuid) ? '1' : '0', transition: 'opacity 0.15s' }}

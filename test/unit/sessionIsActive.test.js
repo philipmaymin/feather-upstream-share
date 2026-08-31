@@ -6,6 +6,7 @@ describe('sessionIsRoomPulse', () => {
   it('recognizes explicit and legacy Room pulse metadata', () => {
     assert.equal(sessionIsRoomPulse({ background: 'room-pulse', title: 'anything' }), true)
     assert.equal(sessionIsRoomPulse({ title: 'Keep working: #feather' }), true)
+    assert.equal(sessionIsRoomPulse({ title: 'Status: #feather' }), true)
     assert.equal(sessionIsRoomPulse({ title: 'Keep working on my draft' }), false)
     assert.equal(sessionIsRoomPulse(null), false)
   })
