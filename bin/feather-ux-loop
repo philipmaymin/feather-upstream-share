@@ -173,7 +173,7 @@ def invoke_agent(run_dir: Path, critique: dict, deployed: str, upstream: str) ->
         "--thinking", "high", "--approval-mode", "yolo", "--max-time", "90m",
         "--no-session", "--no-title", "-p", prompt,
     ]
-    result = run(command, cwd=CANDIDATE_DIR, unset_env=("FEATHER_URL",), log=run_dir / "agent.log", timeout=95 * 60, check=False)
+    result = run(command, cwd=CANDIDATE_DIR, env={"FEATHER_CURL": "/bin/false"}, unset_env=("FEATHER_URL",), log=run_dir / "agent.log", timeout=95 * 60, check=False)
     if result.returncode != 0:
         raise LoopError(f"OMP candidate editor failed; log={run_dir / 'agent.log'}")
     if git("rev-parse", "HEAD", cwd=CANDIDATE_DIR) != before_head:
@@ -273,7 +273,7 @@ def validate_candidate(run_dir: Path) -> None:
     unit_files = sorted(str(test) for test in (CANDIDATE_DIR / "test/unit").glob("*.test.js"))
     if not unit_files:
         raise LoopError("candidate has no unit test files")
-    run(["node", "--test", "--test-concurrency=1", *unit_files], cwd=CANDIDATE_DIR, unset_env=("FEATHER_URL",), child_umask=0o022, log=run_dir / "unit.log", timeout=30 * 60)
+    run(["node", "--test", "--test-concurrency=1", *unit_files], cwd=CANDIDATE_DIR, env={"FEATHER_CURL": "/bin/false"}, unset_env=("FEATHER_URL",), child_umask=0o022, log=run_dir / "unit.log", timeout=30 * 60)
     run(["npm", "run", "build"], cwd=CANDIDATE_DIR, unset_env=("FEATHER_URL",), child_umask=0o022, log=run_dir / "build.log", timeout=20 * 60)
     run_browser_suite(CANDIDATE_DIR, "static-test", run_dir, "source")
     run(["git", "diff", "--check"], cwd=CANDIDATE_DIR, log=run_dir / "diff-check.log", timeout=60)
