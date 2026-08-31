@@ -409,6 +409,7 @@ def resume_failed_candidate(state: dict) -> int | None:
             "runs": int(state.get("runs", 0)) + 1, "lastStatus": "succeeded",
             "candidateCommit": candidate_commit, "resumeAttempts": 0,
         })
+        state.pop("lastError", None)
         write_state(state)
         receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
         print(json.dumps({"status": "succeeded", "runDir": str(run_dir), "recovered": True, "release": release}))
@@ -489,6 +490,8 @@ def loop_command(_args: argparse.Namespace) -> int:
                 "lastRun": run_id, "lastStatus": "succeeded", "candidateCommit": candidate_commit,
                 "lastUpstream": upstream,
             })
+            state["resumeAttempts"] = 0
+            state.pop("lastError", None)
             write_state(state)
         except Exception as error:
             receipt.update({"status": "failed", "completedAt": utc_now().isoformat(), "error": str(error)})
