@@ -41,8 +41,11 @@ def utc_now() -> datetime:
 
 
 def run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None,
+        unset_env: tuple[str, ...] = (), child_umask: int | None = None,
         log: Path | None = None, timeout: int | None = None, check: bool = True) -> subprocess.CompletedProcess:
     merged_env = os.environ.copy()
+    for key in unset_env:
+        merged_env.pop(key, None)
     if env:
         merged_env.update(env)
     result = subprocess.run(
@@ -54,6 +57,7 @@ def run(command: list[str], *, cwd: Path | None = None, env: dict[str, str] | No
         stderr=subprocess.STDOUT,
         timeout=timeout,
         check=False,
+        preexec_fn=(lambda: os.umask(child_umask)) if child_umask is not None else None,
     )
     if log:
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -169,7 +173,7 @@ def invoke_agent(run_dir: Path, critique: dict, deployed: str, upstream: str) ->
         "--thinking", "high", "--approval-mode", "yolo", "--max-time", "90m",
         "--no-session", "--no-title", "-p", prompt,
     ]
-    result = run(command, cwd=CANDIDATE_DIR, log=run_dir / "agent.log", timeout=95 * 60, check=False)
+    result = run(command, cwd=CANDIDATE_DIR, unset_env=("FEATHER_URL",), log=run_dir / "agent.log", timeout=95 * 60, check=False)
     if result.returncode != 0:
         raise LoopError(f"OMP candidate editor failed; log={run_dir / 'agent.log'}")
     if git("rev-parse", "HEAD", cwd=CANDIDATE_DIR) != before_head:
@@ -266,8 +270,8 @@ def run_browser_suite(root: Path, static_override: str, run_dir: Path, label: st
 
 
 def validate_candidate(run_dir: Path) -> None:
-    run(["npm", "test"], cwd=CANDIDATE_DIR, log=run_dir / "unit.log", timeout=20 * 60)
-    run(["npm", "run", "build"], cwd=CANDIDATE_DIR, log=run_dir / "build.log", timeout=20 * 60)
+    run(["npm", "test"], cwd=CANDIDATE_DIR, unset_env=("FEATHER_URL",), child_umask=0o022, log=run_dir / "unit.log", timeout=20 * 60)
+    run(["npm", "run", "build"], cwd=CANDIDATE_DIR, unset_env=("FEATHER_URL",), child_umask=0o022, log=run_dir / "build.log", timeout=20 * 60)
     run_browser_suite(CANDIDATE_DIR, "static-test", run_dir, "source")
     run(["git", "diff", "--check"], cwd=CANDIDATE_DIR, log=run_dir / "diff-check.log", timeout=60)
 
@@ -366,6 +370,50 @@ def maybe_release(candidate_commit: str, run_dir: Path) -> dict:
     promote(release, version, run_dir)
     return {"promoted": True, "release": str(release), "version": version}
 
+def resume_failed_candidate(state: dict) -> int | None:
+    if state.get("lastStatus") != "failed" or int(state.get("resumeAttempts", 0)) >= 1:
+        return None
+    if not (CANDIDATE_DIR / ".git").exists() or not changed_paths():
+        return None
+    run_id = state.get("lastRun")
+    if not isinstance(run_id, str):
+        return None
+    run_dir = STATE_DIR / "runs" / run_id
+    decision_path = run_dir / "decision.json"
+    receipt_path = run_dir / "receipt.json"
+    if not decision_path.exists() or not receipt_path.exists():
+        return None
+    decision = json.loads(decision_path.read_text())
+    if decision.get("outcome") != "changed":
+        return None
+    receipt = json.loads(receipt_path.read_text())
+    try:
+        validate_candidate(run_dir)
+        candidate_commit = commit_candidate(run_dir, str(receipt.get("focus", "recovery")))
+        release = maybe_release(candidate_commit, run_dir)
+        receipt.update({
+            "status": "succeeded", "completedAt": utc_now().isoformat(), "recoveredAfterValidationFailure": True,
+            "candidateCommit": candidate_commit, "release": release,
+        })
+        state.update({
+            "focusIndex": (int(state.get("focusIndex", 0)) + 1) % len(FOCUSES),
+            "runs": int(state.get("runs", 0)) + 1, "lastStatus": "succeeded",
+            "candidateCommit": candidate_commit, "resumeAttempts": 0,
+        })
+        write_state(state)
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+        print(json.dumps({"status": "succeeded", "runDir": str(run_dir), "recovered": True, "release": release}))
+        return 0
+    except Exception as error:
+        state.update({"lastStatus": "failed", "lastError": str(error), "resumeAttempts": 1})
+        write_state(state)
+        receipt.update({"status": "failed", "completedAt": utc_now().isoformat(), "recoveryError": str(error)})
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+        print(json.dumps({"status": "failed", "runDir": str(run_dir), "recoveryError": str(error)}))
+        return 1
+
+
+
 
 def loop_command(_args: argparse.Namespace) -> int:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -378,6 +426,9 @@ def loop_command(_args: argparse.Namespace) -> int:
             return 0
 
         state = read_state()
+        resumed = resume_failed_candidate(state)
+        if resumed is not None:
+            return resumed
         focus = FOCUSES[state["focusIndex"] % len(FOCUSES)]
         run_id = utc_now().strftime("%Y%m%dT%H%M%SZ") + f"-{focus}"
         run_dir = STATE_DIR / "runs" / run_id
