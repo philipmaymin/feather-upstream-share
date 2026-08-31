@@ -242,6 +242,68 @@ export function activityDescription(rawName, input, intent = '') {
   }
 }
 
+export function toolInputDisplay(rawName, input) {
+  if (String(rawName || '').toLowerCase() === 'exec' && typeof input?.raw === 'string') {
+    const nested = nestedToolCalls(input.raw)
+    if (nested.length === 1) return toolInputDisplay(nested[0].name, nested[0].input)
+  }
+  if (!input || typeof input !== 'object') return toolInputText(input)
+  const { name } = toolPresentation(rawName, input)
+  const path = textValue(input.path) || textValue(input.file_path)
+  switch (name) {
+    case 'Bash':
+      return commandText(input)
+    case 'Eval':
+    case 'IPython': {
+      const meta = [
+        textValue(input.language) ? `Language: ${textValue(input.language)}` : '',
+        textValue(input.title) ? `Purpose: ${textValue(input.title)}` : '',
+      ].filter(Boolean)
+      const code = textValue(input.code)
+      return [...meta, ...(code ? ['', code] : [])].join('\n')
+    }
+    case 'Grep':
+      return [
+        textValue(input.pattern) ? `Pattern: ${textValue(input.pattern)}` : '',
+        path ? `Path: ${path}` : '',
+      ].filter(Boolean).join('\n')
+    case 'Glob':
+      return [
+        textValue(input.pattern) ? `Pattern: ${textValue(input.pattern)}` : '',
+        path ? `Path: ${path}` : '',
+      ].filter(Boolean).join('\n')
+    case 'Read':
+      return [
+        path ? `Path: ${path}` : '',
+        input.offset != null ? `Start: ${input.offset}` : '',
+        input.limit != null ? `Limit: ${input.limit}` : '',
+      ].filter(Boolean).join('\n')
+    case 'Write':
+      return [path ? `Path: ${path}` : '', textValue(input.content)].filter(Boolean).join('\n\n')
+    default:
+      return toolInputText(input)
+  }
+}
+
+export function toolOutputDisplay(value) {
+  if (value == null) return ''
+  if (typeof value === 'string') return value
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    if (typeof value.details?.displayContent?.text === 'string') return value.details.displayContent.text
+    if (Array.isArray(value.content)) {
+      const text = value.content
+        .filter(item => item && typeof item === 'object' && item.type === 'text' && typeof item.text === 'string')
+        .map(item => item.text)
+        .join('')
+      if (text) return text
+    }
+    for (const key of ['output', 'text', 'content', 'result']) {
+      if (typeof value[key] === 'string') return value[key]
+    }
+  }
+  try { return JSON.stringify(value, null, 2) } catch { return String(value) }
+}
+
 export function toolImagePath(rawName, input) {
   const leaf = String(rawName || '')
     .replace(/^mcp__.+?__/, '')

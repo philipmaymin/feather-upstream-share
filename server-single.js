@@ -314,12 +314,40 @@ function writeMeta(meta) {
 
 const MESSAGE_TAIL_CHUNK_BYTES = 1024 * 1024;
 
+function lastCompleteLineOffset(fd, size) {
+  if (size === 0) return 0;
+  const lastByte = Buffer.allocUnsafe(1);
+  fs.readSync(fd, lastByte, 0, 1, size - 1);
+  if (lastByte[0] === 10) return size;
+  let position = size;
+  while (position > 0) {
+    const length = Math.min(MESSAGE_TAIL_CHUNK_BYTES, position);
+    const start = position - length;
+    const chunk = Buffer.allocUnsafe(length);
+    fs.readSync(fd, chunk, 0, length, start);
+    const newline = chunk.lastIndexOf(10);
+    if (newline >= 0) return start + newline + 1;
+    position = start;
+  }
+  return 0;
+}
+
+function completeFileOffset(fpath) {
+  const fd = fs.openSync(fpath, 'r');
+  try {
+    return lastCompleteLineOffset(fd, fs.fstatSync(fd).size);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function readLatestMessages(fpath, agent, count, maxBytes = Infinity) {
   const wanted = Math.max(1, count);
   const byteLimit = Number.isFinite(maxBytes) ? Math.max(1, maxBytes) : Infinity;
   const reverse = [];
   const fd = fs.openSync(fpath, 'r');
-  let position = fs.fstatSync(fd).size;
+  const cursor = lastCompleteLineOffset(fd, fs.fstatSync(fd).size);
+  let position = cursor;
   let bytesRead = 0;
   let suffix = Buffer.alloc(0);
   try {
@@ -352,13 +380,14 @@ function readLatestMessages(fpath, agent, count, maxBytes = Infinity) {
   return {
     messages: reverse.slice(0, wanted).reverse(),
     hasEarlier: position > 0 || reverse.length > wanted,
+    cursor,
   };
 }
 
 function getMessages(sessionId, limit = 100, before = 0, maxBytes = Infinity) {
   const agent = getAgentForSession(sessionId);
   const fpath = findJsonlPath(sessionId, agent);
-  if (!fpath || !fs.existsSync(fpath)) return { messages: [], hasMore: false };
+  if (!fpath || !fs.existsSync(fpath)) return { messages: [], hasMore: false, cursor: 0, nextBefore: 0 };
   const pageSize = Math.max(1, limit);
   const offset = Math.max(0, before);
   const tail = readLatestMessages(fpath, agent, pageSize + offset, maxBytes);
@@ -367,6 +396,8 @@ function getMessages(sessionId, limit = 100, before = 0, maxBytes = Infinity) {
   return {
     messages: tail.messages.slice(start, end),
     hasMore: tail.hasEarlier || start > 0,
+    cursor: tail.cursor,
+    nextBefore: offset + (end - start),
   };
 }
 
@@ -917,7 +948,7 @@ function spawnOrResume(id, cwd, resume = false, agent = null, { ompModel = '' } 
       }
       sessionCwd = (sessionCwd || HOME).replace(/[^a-zA-Z0-9._\-/]/g, '');
       ensureCodexTrust(sessionCwd);
-      if (fpath) { fileOffsets.set(id, fs.statSync(fpath).size); watchCodexFile(fpath, id); }
+      if (fpath) { fileOffsets.set(id, completeFileOffset(fpath)); watchCodexFile(fpath, id); }
       const resumeArg = codexUuid ? `resume ${codexUuid}` : 'resume --last';
       spawnTmuxCodex(name, `${resumeArg} --cd ${sessionCwd}`, cwd || sessionCwd);
     } else {
@@ -1881,6 +1912,7 @@ function rememberOmpBridgeEvent(sessionId, event) {
     let oldestKey;
     let oldestUpdatedSequence = Infinity;
     for (const [candidateKey, entry] of store.entries) {
+      if (candidateKey === 'run:parent') continue;
       if (entry.updatedSequence < oldestUpdatedSequence) {
         oldestKey = candidateKey;
         oldestUpdatedSequence = entry.updatedSequence;
@@ -2231,7 +2263,7 @@ function initFileOffsets() {
     try {
       for (const f of fs.readdirSync(dp)) {
         if (!f.endsWith('.jsonl')) continue;
-        try { fileOffsets.set(f.replace('.jsonl', ''), fs.statSync(path.join(dp, f)).size); } catch {}
+        try { fileOffsets.set(f.replace('.jsonl', ''), completeFileOffset(path.join(dp, f))); } catch {}
       }
     } catch {}
   }
@@ -2244,18 +2276,25 @@ function processFileChange(filePath, sessionIdOverride) {
   try {
     const stat = fs.statSync(filePath);
     if (!stat || stat.size <= currentOffset) return;
-    const content = readFileChunk(filePath, currentOffset, stat.size - currentOffset);
-    if (!content) return;
-    const lastNL = content.lastIndexOf('\n');
-    if (lastNL < 0) return;
-    const complete = content.substring(0, lastNL + 1);
-    let offset = currentOffset;
-    for (const line of complete.split('\n').filter(Boolean)) {
-      offset += Buffer.byteLength(line + '\n');
-      broadcast(sessionId, line, offset);
-      observeOmpTurnBoundary(sessionId, line);
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(stat.size - currentOffset);
+    fs.readSync(fd, buf, 0, buf.length, currentOffset);
+    fs.closeSync(fd);
+    const lastNewline = buf.lastIndexOf(10);
+    if (lastNewline < 0) return;
+    const complete = buf.subarray(0, lastNewline + 1);
+    let start = 0;
+    while (start < complete.length) {
+      const newline = complete.indexOf(10, start);
+      const line = complete.subarray(start, newline).toString('utf8');
+      const offset = currentOffset + newline + 1;
+      if (line) {
+        broadcast(sessionId, line, offset);
+        observeOmpTurnBoundary(sessionId, line);
+      }
+      start = newline + 1;
     }
-    fileOffsets.set(sessionId, currentOffset + Buffer.byteLength(complete));
+    fileOffsets.set(sessionId, currentOffset + complete.length);
   } catch {}
 }
 
@@ -2342,7 +2381,7 @@ function initOmpWatchers() {
     try {
       if (!fs.statSync(dirPath).isDirectory()) continue;
       const files = fs.readdirSync(dirPath).filter(file => file.endsWith('.jsonl')).sort().reverse();
-      if (files.length > 0) fileOffsets.set(dir, fs.statSync(path.join(dirPath, files[0])).size);
+      if (files.length > 0) fileOffsets.set(dir, completeFileOffset(path.join(dirPath, files[0])));
       watchOmpSessionDir(dirPath, dir);
     } catch {}
   }
@@ -2365,7 +2404,7 @@ function initCodexWatchers() {
   for (const { uuid, fpath } of recent) {
     try {
       const featherId = resolveCodexWatchId(uuid, meta);
-      fileOffsets.set(featherId, fs.statSync(fpath).size);
+      fileOffsets.set(featherId, completeFileOffset(fpath));
       watchCodexFile(fpath, featherId);
     } catch {}
   }
@@ -2781,8 +2820,11 @@ app.post('/api/internal/sessions/:id/events', async (req, res) => {
   const bridgeVersion = Number.isSafeInteger(req.body?.version) ? req.body.version : 0;
   ompBridgeLastSeen.set(id, { seenAt: Date.now(), version: bridgeVersion });
   for (const event of normalized) {
-    rememberOmpBridgeEvent(id, event);
-    broadcastNamedEvent(id, 'omp_event', event);
+    const delivered = event.type === 'agent_start' && !event.subagentId
+      ? { ...event, invocationId: randomUUID() }
+      : event;
+    rememberOmpBridgeEvent(id, delivered);
+    broadcastNamedEvent(id, 'omp_event', delivered);
   }
   try {
     for (const ownerExecutionId of terminalOwners) {
@@ -2924,7 +2966,7 @@ function isRoomPulseState(value) {
   });
 }
 const ROOM_PULSES_STATE = createJsonState({
-  file: ROOM_PULSES_FILE, root: path.dirname(ROOM_PULSES_FILE), document: 'Room keep-working state',
+  file: ROOM_PULSES_FILE, root: path.dirname(ROOM_PULSES_FILE), document: 'Room status state',
   defaultValue: {}, validate: isRoomPulseState,
 });
 
@@ -3421,6 +3463,22 @@ function buildRoomsSnapshot() {
   const rooms = names.map(name => {
     let sessions = byRoom.get(name);
     const pulse = roomPulse(name, Date.now(), pulseState);
+    if (pulse.sessionId && !sessions.some(session => session.id === pulse.sessionId)) {
+      const meta = sessionMeta[pulse.sessionId] || {};
+      let updatedAt = meta.updatedAt || new Date(ROOM_PULSE_STARTED_AT).toISOString();
+      try {
+        updatedAt = fs.statSync(path.join(OMP_SESSIONS, pulse.sessionId)).mtime.toISOString();
+      } catch {}
+      sessions = [{
+        id: pulse.sessionId,
+        title: meta.title || `Status: #${name}`,
+        updatedAt,
+        isActive: tmuxIsActive(pulse.sessionId),
+        agent: 'omp',
+        cwd: meta.cwd || path.join(ROOMS_HOME_DIR, name),
+        roomAssigned: true,
+      }, ...sessions].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+    }
     const requestedLeaderSessionId = leaders[name];
     if (requestedLeaderSessionId
       && !sessions.some(session => session.id === requestedLeaderSessionId)
@@ -3517,8 +3575,24 @@ function roomNameForSession(id) {
   return names.find(name => grouped.get(name).some(candidate => candidate.id === id)) || null;
 }
 
+function roomSessionContext(id) {
+  const room = roomNameForSession(id);
+  if (!room) return { room: null, kind: null, role: null, label: null };
+  const leaderId = ROOM_LEADERS_STATE.read()[room] || null;
+  if (leaderId === id) return { room, kind: 'main', role: 'leader', label: 'Main' };
+  const resident = Object.entries(ROOM_RESIDENTS_STATE.read()[room] || {})
+    .find(([, configured]) => configured.sessionId === id);
+  if (resident) return { room, kind: 'resident', role: resident[0], label: resident[0] };
+  const pulseId = ROOM_PULSES_STATE.read()[room]?.sessionId || null;
+  if (pulseId === id) return { room, kind: 'status', role: 'status', label: 'Status' };
+  const metaTitle = readMeta()[id]?.title;
+  if (metaTitle) return { room, kind: 'chat', role: null, label: metaTitle };
+  const session = discoverSessions(0, null, [id]).find(candidate => candidate.id === id);
+  return { room, kind: 'chat', role: null, label: session?.title || 'Chat' };
+}
+
 app.get('/api/sessions/:id/room', (req, res) => {
-  try { res.json({ room: roomNameForSession(req.params.id) }); }
+  try { res.json(roomSessionContext(req.params.id)); }
   catch (error) { res.status(500).json({ error: error.message }); }
 });
 
@@ -3720,7 +3794,7 @@ app.post('/api/rooms/:name/assign', (req, res) => {
     const pulseRoom = Object.entries(ROOM_PULSES_STATE.read())
       .find(([, pulse]) => pulse?.sessionId === sessionId)?.[0] || null;
     if (pulseRoom && pulseRoom !== targetRoom) {
-      throw httpError(409, `keep-working controller of #${pulseRoom} cannot be moved or detached`);
+      throw httpError(409, `status reporter of #${pulseRoom} cannot be moved or detached`);
     }
     const residentMatch = Object.entries(ROOM_RESIDENTS_STATE.read()).flatMap(([roomName, residents]) =>
       Object.entries(residents).map(([role, resident]) => ({ roomName, role, sessionId: resident.sessionId })))
@@ -4017,7 +4091,7 @@ function feedCompletionWhy(timestamp, generatedAt, kind) {
 
 function feedSessionTitle(session, roomName) {
   const title = String(session.title || '').trim();
-  if (title === String(session.id || '').slice(0, 8) || /^(?:<file name=.*(?:pulse|prompt)\.md|Keep working:\s*#)/i.test(title)) {
+  if (title === String(session.id || '').slice(0, 8) || /^(?:<file name=.*(?:pulse|prompt)\.md|(?:Keep working|Status):\s*#)/i.test(title)) {
     return roomName ? `#${roomName} progress` : 'Agent progress';
   }
   return title || (roomName ? `#${roomName} dispatch` : 'Agent dispatch');
@@ -4758,7 +4832,11 @@ app.post('/api/feed/:postId/comments', async (req, res) => {
   }
 });
 
-const ROOM_PULSE_PROMPT = `Keep working on this room. Read AGENTS.md, notes.md, and the recent chats in this room. Then do the next useful thing fully autonomously. Do not ask the user to choose routine steps. Use tools and agents if useful. Append what you did, the evidence, and any open thread to notes.md. Do not post an Updates feed and do not copy raw source material into the wiki; the Room caretaker will synthesize raw notes and sessions into curated knowledge. If you hit a recurring annoyance, run: room complain "describe it plainly". If this room genuinely has no useful next action, run: room pause. Then stop.`;
+const ROOM_PULSE_PROMPT = `You are the status reporter for this Room. Answer one question: What is everyone working on?
+
+Read AGENTS.md, the Room Wiki, notes.md, and the recent chats assigned to this Room. Produce a concise executive rollup grouped by named chat or resident role. For each group report: current objective, last material progress, blocker or decision needed, next action, and how fresh the evidence is. Distinguish observed facts from inference and say unknown when evidence is stale or absent.
+
+Status collection only. Do not perform project work, edit code, change live systems, launch or delegate agents, make decisions, update the Wiki, append notes, or ask the user routine questions. Your final answer is the durable status report. Then stop.`;
 
 function launchRoomPulse(name) {
   try {
@@ -4778,7 +4856,7 @@ function launchRoomPulse(name) {
       }),
     }));
     const meta = readMeta();
-    meta[id] = { ...(meta[id] || {}), agent: 'omp', cwd, title: `Keep working: #${name}`, background: 'room-pulse' };
+    meta[id] = { ...(meta[id] || {}), agent: 'omp', cwd, title: `Status: #${name}`, background: 'room-pulse' };
     writeMeta(meta);
     ROOM_ASSIGN_STATE.update(current => ({ ...current, [id]: name }));
     watchOmpSessionDir(sessionDir, id);
@@ -4787,6 +4865,7 @@ function launchRoomPulse(name) {
     if (hasTranscript && !ompId) throw new Error(`Cannot resume OMP session ${id}: exact OMP session id not found`);
     const resumeArg = ompId ? `--resume ${ompId}` : '';
     spawnTmuxOmp(tmuxName(id), `${resumeArg} -p --auto-approve @${promptFile} --session-dir ${sessionDir}`.trim(), cwd, { interactive: false });
+    return true;
   } catch (error) {
     ROOM_PULSES_STATE.update(current => ({
       ...current,
@@ -4796,15 +4875,10 @@ function launchRoomPulse(name) {
       }),
     }));
     console.warn(`[room pulse] #${name}:`, error.message);
+    return false;
   }
 }
 
-function hasBlockingRoomActivity(room) {
-  return room.sessions.some(session =>
-    session.isActive
-      && !room.residents.some(resident =>
-        resident.role !== 'leader' && resident.sessionId === session.id));
-}
 
 function checkRoomPulses() {
   if (!ROOM_PULSES_ENABLED) return;
@@ -4832,17 +4906,16 @@ function checkRoomPulses() {
   const rooms = new Map(roomSnapshotCache.refresh().map(room => [room.name, room]));
   for (const { name } of due) {
     const room = rooms.get(name);
-    if (!room || hasBlockingRoomActivity(room)) {
+    if (!room) {
       ROOM_PULSES_STATE.update(current => ({
         ...current,
         [name]: pulseRecord(current[name], { enabled: true, status: 'waiting', nextRunAtMs: now + ROOM_PULSE_INTERVAL_MS }),
       }));
       continue;
     }
-    // Deferred rooms stay due, so later ticks drain a synchronized batch fairly.
+    // Deferred status collectors stay due, so later ticks drain a synchronized batch fairly.
     if (inFlight >= ROOM_PULSE_MAX_CONCURRENT) continue;
-    launchRoomPulse(name);
-    inFlight++;
+    if (launchRoomPulse(name)) inFlight++;
   }
   const latestPulseState = ROOM_PULSES_STATE.read();
   roomSnapshotCache.update(snapshot => snapshot.map(room => ({
@@ -5233,10 +5306,10 @@ app.get('/api/sessions/:id/messages', (req, res) => {
       return res.status(404).json({ error: 'session identity not found', code: 'SESSION_NOT_FOUND' });
     }
     if (identity.pending) {
-      return res.status(202).json({ messages: [], hasMore: false, pending: true, code: 'SESSION_PENDING' });
+      return res.status(202).json({ messages: [], hasMore: false, cursor: 0, nextBefore: 0, pending: true, code: 'SESSION_PENDING' });
     }
-    const { messages, hasMore } = getMessages(req.params.id, parseInt(req.query.limit) || 100, parseInt(req.query.before) || 0);
-    res.json({ messages, hasMore });
+    const { messages, hasMore, cursor, nextBefore } = getMessages(req.params.id, parseInt(req.query.limit) || 100, parseInt(req.query.before) || 0);
+    res.json({ messages, hasMore, cursor, nextBefore });
   } catch (error) {
     res.status(error.status || 500).json({ error: error.message });
   }
@@ -5271,15 +5344,21 @@ app.get('/api/sessions/:id/stream', (req, res) => {
         const stat = fs.statSync(fpath);
         if (stat.size > lastId) {
           const fd = fs.openSync(fpath, 'r');
-          const buf = Buffer.alloc(stat.size - lastId);
-          fs.readSync(fd, buf, 0, buf.length, lastId);
-          fs.closeSync(fd);
-          let offset = lastId;
-          for (const line of buf.toString('utf8').split('\n').filter(Boolean)) {
-            offset += Buffer.byteLength(line + '\n');
-            const parsed = parseMessageForAgent(line, getAgentForSession(sid));
-            if (parsed) writeSse(clients, res, `id: ${offset}\nevent: message\ndata: ${JSON.stringify(parsed)}\n\n`);
+          const replayEnd = lastCompleteLineOffset(fd, stat.size);
+          if (replayEnd > lastId) {
+            const buf = Buffer.alloc(replayEnd - lastId);
+            fs.readSync(fd, buf, 0, buf.length, lastId);
+            let start = 0;
+            while (start < buf.length) {
+              const newline = buf.indexOf(10, start);
+              const line = buf.subarray(start, newline).toString('utf8');
+              const offset = lastId + newline + 1;
+              const parsed = line ? parseMessageForAgent(line, getAgentForSession(sid)) : null;
+              if (parsed) writeSse(clients, res, `id: ${offset}\nevent: message\ndata: ${JSON.stringify(parsed)}\n\n`);
+              start = newline + 1;
+            }
           }
+          fs.closeSync(fd);
         }
       } catch {}
     }
@@ -5366,7 +5445,8 @@ app.post('/api/sessions/:id/send', async (req, res) => {
   catch (e) { res.status(protocolErrorStatus(e)).json({ error: e.message }); }
 });
 
-const TERMINAL_KEYS = new Set(['Enter', 'Escape', 'Up', 'Down', 'Left', 'Right', 'Home', 'End', 'Space', 'Tab']);
+const TERMINAL_KEYS = new Set(['Enter', 'Escape', 'Up', 'Down', 'Left', 'Right', 'Home', 'End', 'Space', 'Tab', 'AgentHub']);
+const TMUX_TERMINAL_KEYS = { AgentHub: 'M-a' };
 
 function validatedTerminalKeys(value) {
   return Array.isArray(value) && value.length > 0 && value.length <= 20 && value.every(key => TERMINAL_KEYS.has(key))
@@ -5378,7 +5458,7 @@ app.post('/api/sessions/:id/keys', (req, res) => {
   const keys = validatedTerminalKeys(req.body?.keys);
   if (!keys) return res.status(400).json({ error: 'invalid terminal keys' });
   try {
-    execFileSync('tmux', ['send-keys', '-t', existingTmuxName(req.params.id), ...keys], { stdio: 'ignore' });
+    execFileSync('tmux', ['send-keys', '-t', existingTmuxName(req.params.id), ...keys.map(key => TMUX_TERMINAL_KEYS[key] || key)], { stdio: 'ignore' });
     res.json({ ok: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -6259,11 +6339,11 @@ app.get(['/api/file', '/api/files/raw'], (req, res) => {
     // .pdf inline (no attachment disposition): iOS standalone PWA renders the
     // attachment variant as garbled bytes in the target=_blank overlay
     if (isImage || ext === '.pdf') {
-      return res.sendFile(resolved);
+      return res.sendFile(resolved, { dotfiles: 'allow' });
     }
     if (isText || ext === '') {
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      return res.sendFile(resolved);
+      return res.sendFile(resolved, { dotfiles: 'allow' });
     }
     // Default: download
     res.download(resolved);
@@ -6291,7 +6371,7 @@ app.get('/api/files/media', (req, res) => {
     if (stat.size > maxBytes) return res.status(413).json({ error: 'Media file is too large' });
     res.setHeader('Cache-Control', 'private, no-cache');
     res.setHeader('Content-Disposition', `inline; filename="${path.basename(resolved).replace(/[\r\n"]/g, '')}"`);
-    return res.sendFile(resolved);
+    return res.sendFile(resolved, { dotfiles: 'allow' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -6316,7 +6396,7 @@ app.get('/api/files/html', (req, res) => {
     res.setHeader('Content-Disposition', 'inline');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' data: blob:; style-src 'unsafe-inline' data: blob:; img-src data: blob:; font-src data: blob:; media-src data: blob:; frame-src data: blob:; worker-src data: blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
-    return res.sendFile(resolved);
+    return res.sendFile(resolved, { dotfiles: 'allow' });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 

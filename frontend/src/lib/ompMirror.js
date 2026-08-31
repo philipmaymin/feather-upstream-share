@@ -11,6 +11,7 @@ function emptyScope() {
     assistantEnded: false,
     continuationPending: false,
     segment: 0,
+    invocationId: '0',
   }
 }
 
@@ -179,7 +180,11 @@ function beginSegment(scope, messageId) {
 
 function reduceScope(scope, event) {
   switch (event.type) {
-    case 'agent_start':
+    case 'agent_start': {
+      const invocationId = typeof event.invocationId === 'string' && event.invocationId
+        ? event.invocationId
+        : String((Number.parseInt(scope.invocationId, 10) || 0) + 1)
+      if (event.invocationId && invocationId === scope.invocationId) return scope
       return {
         ...scope,
         todo: null,
@@ -189,8 +194,10 @@ function reduceScope(scope, event) {
         assistantText: '',
         assistantEnded: false,
         continuationPending: false,
+        invocationId,
         segment: scope.segment + 1,
       }
+    }
     case 'agent_end':
       return { ...settleScope(scope, event.success === false ? 'error' : 'success'), continuationPending: false }
     case 'todo':
@@ -283,6 +290,7 @@ function upsertChildMetadata(state, event) {
     assistantEnded: restarting ? false : previous.assistantEnded,
     continuationPending: restarting ? false : previous.continuationPending,
     segment: restarting ? previous.segment + 1 : previous.segment,
+    invocationId: restarting ? String((Number.parseInt(previous.invocationId, 10) || 0) + 1) : previous.invocationId,
   }
   const settled = workStatus === 'success' || workStatus === 'error' || workStatus === 'cancelled'
     ? { ...next, ...settleScope(next, workStatus) }
@@ -303,6 +311,7 @@ function boundChildren(state) {
 export function reduceOmpMirrorState(state, event) {
   const current = state || createOmpMirrorState()
   if (!event || typeof event.type !== 'string') return current
+  if (!event.subagentId && event.type === 'agent_start' && event.invocationId === current.parent.invocationId) return current
   if (!event.subagentId && event.type === 'agent_start') {
     const childOrder = current.childOrder
       .filter(id => childStatus(current.children[id]?.status) === 'running')
@@ -328,6 +337,49 @@ export function reduceOmpMirrorState(state, event) {
     children: { ...current.children, [childId]: { ...child, ...nextChild } },
     childOrder: current.childOrder.includes(childId) ? current.childOrder : [...current.childOrder, childId],
   })
+}
+
+export function reconcileSubagentRuntime(child, jobs = []) {
+  if (!child || !['running', 'started', 'working'].includes(child.status)) return child
+  const identities = [child.id, child.description, child.intent, child.task, child.assignment]
+    .filter(value => typeof value === 'string' && value.trim())
+    .map(value => value.trim().toLowerCase())
+  const job = jobs.find(candidate => {
+    if (!candidate || candidate.status === 'running') return false
+    const candidates = [candidate.id, candidate.label]
+      .filter(value => typeof value === 'string' && value.trim())
+      .map(value => value.trim().toLowerCase())
+    return candidates.some(value => identities.includes(value))
+  })
+  if (!job) return child
+  const status = job.status === 'completed' || job.status === 'succeeded' ? 'parked' : job.status
+  const scopeStatus = status === 'parked' ? 'success'
+    : status === 'failed' || status === 'error' ? 'error'
+      : status === 'cancelled' || status === 'canceled' || status === 'aborted' ? 'cancelled'
+        : child.runStatus
+  return {
+    ...child,
+    status,
+    activeMessageId: null,
+    runStatus: scopeStatus,
+    assistantEnded: child.assistantText ? true : child.assistantEnded,
+    timeline: (child.timeline || []).map(item => item.status === 'running' ? { ...item, status: scopeStatus } : item),
+  }
+}
+
+export function reconcileOmpRuntimeJobs(state, jobs = []) {
+  if (!state?.childOrder?.length) return state
+  let changed = false
+  const children = { ...state.children }
+  for (const id of state.childOrder) {
+    const current = children[id]
+    const next = reconcileSubagentRuntime(current, jobs)
+    if (next !== current) {
+      children[id] = next
+      changed = true
+    }
+  }
+  return changed ? { ...state, children } : state
 }
 
 export { CHILD_LIMIT as OMP_CHILD_LIMIT, WORK_LIMIT as OMP_WORK_LIMIT }

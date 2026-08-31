@@ -38,6 +38,8 @@ export function mergeRoomThreadMessages(sessionMessages, thread, groupId) {
       timestamp: new Date(message.ts).toISOString(),
       content: [{ type: 'text', text: `**${from} → ${to}**\n\n${message.text}` }],
       passive: true,
+      roomFrom: message.from,
+      roomTo: message.to,
     }
   })
   return [...visibleSessionMessages, ...sidecarMessages].sort((a, b) =>

@@ -572,12 +572,13 @@ describe('GET /api/sessions/:id/messages', () => {
     const response = await fetch(`${BASE}/api/sessions/${id}/messages`)
     assert.equal(response.status, 202)
     assert.deepEqual(await response.json(), {
-      messages: [], hasMore: false, pending: true, code: 'SESSION_PENDING',
+      messages: [], hasMore: false, cursor: 0, nextBefore: 0, pending: true, code: 'SESSION_PENDING',
     })
   })
 
   it('returns correct messages for test session', async () => {
-    const { messages } = await (await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/messages`)).json()
+    const page = await (await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/messages`)).json()
+    const { messages } = page
     assert.equal(messages.length, 4)
 
     // First message: user
@@ -599,14 +600,29 @@ describe('GET /api/sessions/:id/messages', () => {
     // Fourth: tool_result
     assert.equal(messages[3].content[0].type, 'tool_result')
     assert.equal(messages[3].content[0].content, 'forty-two')
+    assert.equal(page.cursor, fs.statSync(path.join(testSessionDir, `${TEST_SESSION_ID}.jsonl`)).size)
+    assert.equal(page.nextBefore, 4)
+  })
+
+  it('holds the snapshot cursor at the last complete JSONL line', async () => {
+    const completeSize = fs.statSync(testSessionPath).size
+    fs.appendFileSync(testSessionPath, '{"partial":')
+    try {
+      const snapshot = await (await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/messages`)).json()
+      assert.equal(snapshot.cursor, completeSize)
+      assert.equal(snapshot.messages.length, 4)
+    } finally {
+      fs.truncateSync(testSessionPath, completeSize)
+    }
   })
 
   it('limit parameter truncates from the front', async () => {
-    const { messages } = await (await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/messages?limit=2`)).json()
-    assert.equal(messages.length, 2)
+    const page = await (await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/messages?limit=2`)).json()
+    assert.equal(page.messages.length, 2)
+    assert.equal(page.nextBefore, 2)
     // Should be the last 2 messages (tool_use, tool_result)
-    assert.equal(messages[0].uuid, 'api-test-0003')
-    assert.equal(messages[1].uuid, 'api-test-0004')
+    assert.equal(page.messages[0].uuid, 'api-test-0003')
+    assert.equal(page.messages[1].uuid, 'api-test-0004')
   })
 
   it('messages preserve timestamps', async () => {
@@ -1168,7 +1184,7 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
 describe('GET /api/sessions/:id/room', () => {
   it('resolves exact Room membership without depending on the capped Room snapshot', async () => {
     const missing = await (await fetch(`${BASE}/api/sessions/no-such-session-ever/room`)).json()
-    assert.equal(missing.room, null)
+    assert.deepEqual(missing, { room: null, kind: null, role: null, label: null })
 
     const roomName = `api-room-${Date.now().toString(36)}`
     const created = await fetch(`${BASE}/api/rooms`, {
@@ -1186,7 +1202,12 @@ describe('GET /api/sessions/:id/room', () => {
 
     const response = await fetch(`${BASE}/api/sessions/${TEST_SESSION_ID}/room`)
     assert.equal(response.status, 200)
-    assert.deepEqual(await response.json(), { room: roomName })
+    assert.deepEqual(await response.json(), {
+      room: roomName,
+      kind: 'chat',
+      role: null,
+      label: 'What is the meaning of life?',
+    })
   })
 })
 
@@ -1578,6 +1599,7 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
       const replay = await readOmpSseEvents(stream.body.getReader(), 14)
       assert.equal(replay.events.length, 14)
       assert.equal(replay.events[0].type, 'agent_start')
+      assert.equal(typeof replay.events[0].invocationId, 'string')
       assert.ok(replay.events.some(event => event.type === 'assistant_snapshot' && event.messageId === 'parent-message'))
       assert.ok(replay.events.some(event => event.type === 'work_snapshot' && !event.subagentId))
       const parentTool = replay.events.find(event => event.toolCallId === 'parent-tool')
@@ -1634,6 +1656,8 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
       const nextTurnStream = await fetch(`${BASE}/api/sessions/${sessionId}/stream`, { signal: nextTurnCtrl.signal })
       const nextTurnReplay = await readOmpSseEvents(nextTurnStream.body.getReader(), 10)
       assert.equal(nextTurnReplay.events[0].type, 'agent_start')
+      assert.equal(typeof nextTurnReplay.events[0].invocationId, 'string')
+      assert.notEqual(nextTurnReplay.events[0].invocationId, replay.events[0].invocationId)
       assert.equal(nextTurnReplay.events.some(event => event.type === 'todo' && !event.subagentId), false)
       nextTurnCtrl.abort()
     } finally {
@@ -1645,6 +1669,69 @@ describe('GET /api/sessions/:id/stream (SSE)', () => {
     }
   })
 
+})
+
+describe('remote server stream parity', () => {
+  it('uses complete byte offsets for live messages after blank JSONL records', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-remote-stream-'))
+    const sessionId = `remote-stream-${Date.now()}`
+    const projectDir = path.join(root, '.claude', 'projects', 'fixture')
+    const sessionPath = path.join(projectDir, `${sessionId}.jsonl`)
+    fs.mkdirSync(projectDir, { recursive: true })
+    fs.writeFileSync(sessionPath, `${JSON.stringify({
+      type: 'user', uuid: 'remote-initial', timestamp: new Date().toISOString(),
+      isSidechain: false, isMeta: false, message: { role: 'user', content: 'Initial' },
+    })}\n`)
+    const port = await allocatePort()
+    const remote = spawn(process.execPath, [path.join(REPO_ROOT, 'remote-server.js')], {
+      cwd: REPO_ROOT,
+      env: { ...process.env, HOME: root, PORT: String(port) },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let output = ''
+    remote.stdout.on('data', chunk => { output += chunk })
+    remote.stderr.on('data', chunk => { output += chunk })
+    const ctrl = new AbortController()
+    try {
+      let ready = false
+      for (let attempt = 0; attempt < 80; attempt++) {
+        try {
+          const response = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(250) })
+          if (response.ok) {
+            ready = true
+            break
+          }
+        } catch {}
+        if (remote.exitCode !== null) throw new Error(`remote server exited early\n${output}`)
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      assert.equal(ready, true, `remote server did not start\n${output}`)
+
+      const response = await fetch(`http://127.0.0.1:${port}/api/sessions/${sessionId}/stream`, { signal: ctrl.signal })
+      const reader = response.body.getReader()
+      await reader.read()
+      const uuid = `remote-live-${Date.now()}`
+      const line = JSON.stringify({
+        type: 'user', uuid, timestamp: new Date().toISOString(),
+        isSidechain: false, isMeta: false, message: { role: 'user', content: 'Remote live' },
+      })
+      fs.appendFileSync(sessionPath, `\n${line}\n`)
+      const expectedOffset = fs.statSync(sessionPath).size
+      const deliveryTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('remote live message was not delivered')), 5000))
+      let payload = ''
+      while (!payload.includes(uuid)) {
+        const { value, done } = await Promise.race([reader.read(), deliveryTimeout])
+        if (done || !value) break
+        payload += new TextDecoder().decode(value)
+      }
+      assert.ok(payload.includes(uuid), payload)
+      assert.match(payload, new RegExp(`id: ${expectedOffset}`))
+    } finally {
+      ctrl.abort()
+      remote.kill()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('POST /api/sessions', () => {

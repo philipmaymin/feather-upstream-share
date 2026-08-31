@@ -14,8 +14,8 @@
 #   room update TEXT|--stdin|--file PATH append legacy evidence
 #   room updates                         list legacy evidence
 #   room complain "<text>"             add an annoyance to #friction
-#   room pause                          stop automatic checks for this room
-#   room wake                           resume automatic checks for this room
+#   room pause                          stop scheduled status reports for this room
+#   room wake                           resume scheduled status reports for this room
 #   room lookup "<question>"           quick Haiku answer (transcripts, memory)
 #   room council "<task>" [-n N]       N sealed attempts (claude+codex) + judge
 #   room second-opinion "<question>"   ask the other harness
@@ -315,9 +315,9 @@ cmd_pulse() {
     curl_args+=(-H "X-Feather-Session-ID: $session_id")
   fi
   curl "${curl_args[@]}" >/dev/null \
-    || die "feather refused to change automatic checks for #$ROOM_NAME"
-  if [ "$enabled" = true ]; then echo "#${ROOM_NAME} will keep working"
-  else echo "#${ROOM_NAME} automatic checks paused"; fi
+    || die "feather refused to change status reports for #$ROOM_NAME"
+  if [ "$enabled" = true ]; then echo "#${ROOM_NAME} status reports resumed"
+  else echo "#${ROOM_NAME} status reports paused"; fi
 }
 
 cmd_lookup() {

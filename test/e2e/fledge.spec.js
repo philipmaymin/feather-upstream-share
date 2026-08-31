@@ -52,7 +52,7 @@ const olderPost = {
   sessionId: 'older', room: 'archive', projectId: 'archive', projectLabel: 'Archive',
   title: 'Earlier dispatch', agent: 'claude', status: 'finished',
   message: { uuid: 'older-result', role: 'assistant', timestamp: '2026-08-28T10:00:00.000Z', content: [{ type: 'text', text: 'The archival audit reconciled every deployment receipt against the immutable release manifest. The service identities, health endpoints, source commit, and tree hash all match the scheduled fleet release. No mutable state lives inside the release directory, every target still defaults to OMP, and the canary remains healthy. The review also checked rollback metadata, capability links, and delayed promotion ownership. The remaining evidence is intentionally long enough to prove that an ordinary completed dispatch becomes a compact preview instead of a presentation poster. This final sentence appears after the compact preview boundary.' }] },
-  score: 40, why: 'Filed earlier',
+  score: 40, why: 'Filed earlier', reaction: 'like',
   importance: 'feature',
 }
 

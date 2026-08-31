@@ -78,20 +78,20 @@ function normalizeRoom(room: RoomInfo): RoomInfo {
     enabled: true, status: 'waiting' as const, lastRunAt: null,
     nextRunAt: null, sessionId: null, error: null,
   }
-  const originalSessions = Array.isArray(room.sessions) ? room.sessions : []
-  const pulseWasNewest = originalSessions[0]
-    && (originalSessions[0].id === pulse.sessionId || /^Keep working: #/.test(originalSessions[0].title || ''))
-  const sessions = originalSessions.filter(session =>
-    session.id !== pulse.sessionId && !/^Keep working: #/.test(session.title || ''))
+  const sessions = Array.isArray(room.sessions) ? room.sessions : []
+  const pulseWasNewest = sessions[0]
+    && (sessions[0].id === pulse.sessionId || /^(Keep working|Status): #/.test(sessions[0].title || ''))
+  const userSessions = sessions.filter(session =>
+    session.id !== pulse.sessionId && !/^(Keep working|Status): #/.test(session.title || ''))
   return {
     ...room,
     leaderSessionId: room.leaderSessionId || null,
     residents: Array.isArray(room.residents) ? room.residents : [],
     sidecarGroupId: room.sidecarGroupId || null,
     sessions,
-    active: sessions.some(session => session.isActive),
+    active: userSessions.some(session => session.isActive),
     latest: pulseWasNewest ? null : room.latest,
-    updatedAt: pulseWasNewest ? (sessions[0]?.updatedAt || room.updates?.latestAt || null) : room.updatedAt,
+    updatedAt: pulseWasNewest ? (userSessions[0]?.updatedAt || room.updates?.latestAt || null) : room.updatedAt,
     updates: room.updates || { count: 0, latestAt: null, latest: null },
     friction: room.friction || { count: 0, latestAt: null, latest: null },
     pulse,
@@ -125,9 +125,25 @@ export async function fetchRooms(maxAgeMs = 0): Promise<RoomInfo[]> {
   try { return await roomsRequest }
   finally { roomsRequest = null }
 }
-export async function fetchSessionRoom(sessionId: string): Promise<string | null> {
+export interface RoomSessionContext {
+  room: string | null
+  kind: 'main' | 'resident' | 'status' | 'chat' | null
+  role: string | null
+  label: string | null
+}
+
+export async function fetchSessionRoomContext(sessionId: string): Promise<RoomSessionContext> {
   const response = await fetch(`${BASE}/api/sessions/${encodeURIComponent(sessionId)}/room`)
-  return (await responseJson<{ room: string | null }>(response)).room || null
+  return responseJson<RoomSessionContext>(response)
+}
+
+export async function fetchSessionRoom(sessionId: string): Promise<string | null> {
+  return (await fetchSessionRoomContext(sessionId)).room
+}
+
+export async function fetchRoomResidents(room: string): Promise<RoomResident[]> {
+  const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/residents`)
+  return (await responseJson<{ residents: RoomResident[] }>(response)).residents || []
 }
 
 export interface RoomWikiPageMeta {
@@ -239,6 +255,8 @@ export interface Message {
   passive?: boolean
   stopReason?: string
   cwd?: string
+  roomFrom?: string
+  roomTo?: string
   model?: string
   usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
   version?: string
@@ -446,26 +464,31 @@ export async function deletePath(path: string): Promise<void> {
 const MESSAGE_PAGE_SIZE = 200
 const INITIAL_MESSAGE_LIMIT = 1000
 
-async function fetchMessagePage(id: string, before: number, signal?: AbortSignal): Promise<{ messages: Message[], hasMore: boolean }> {
-  const params = new URLSearchParams({ limit: String(MESSAGE_PAGE_SIZE) })
+export interface MessagePage {
+  messages: Message[]
+  hasMore: boolean
+  cursor: number
+  nextBefore: number
+}
+
+async function fetchMessagePage(id: string, before: number, signal?: AbortSignal, limit = MESSAGE_PAGE_SIZE): Promise<MessagePage> {
+  const params = new URLSearchParams({ limit: String(limit) })
   if (before > 0) params.set('before', String(before))
   const response = await fetch(`${BASE}/api/sessions/${id}/messages?${params}`, { signal })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
-  return await response.json()
+  const page = await response.json()
+  return {
+    messages: Array.isArray(page.messages) ? page.messages : [],
+    hasMore: !!page.hasMore,
+    cursor: Number.isSafeInteger(page.cursor) && page.cursor >= 0 ? page.cursor : 0,
+    nextBefore: Number.isSafeInteger(page.nextBefore) && page.nextBefore >= 0
+      ? page.nextBefore
+      : before + (Array.isArray(page.messages) ? page.messages.length : 0),
+  }
 }
 
-export async function fetchMessages(id: string, before = 0, signal?: AbortSignal): Promise<{ messages: Message[], hasMore: boolean }> {
-  if (before > 0) return fetchMessagePage(id, before, signal)
-  let result = await fetchMessagePage(id, 0, signal)
-  while (
-    result.hasMore &&
-    result.messages.length < INITIAL_MESSAGE_LIMIT &&
-    !result.messages.some(message => message.role === 'user' && (message.content || []).some(block => block.type === 'text' && block.text?.trim()))
-  ) {
-    const earlier = await fetchMessagePage(id, result.messages.length, signal)
-    result = { messages: [...earlier.messages, ...result.messages], hasMore: earlier.hasMore }
-  }
-  return result
+export async function fetchMessages(id: string, before = 0, signal?: AbortSignal): Promise<MessagePage> {
+  return fetchMessagePage(id, before, signal, before > 0 ? MESSAGE_PAGE_SIZE : INITIAL_MESSAGE_LIMIT)
 }
 
 export async function fetchProtocolRuns(id: string): Promise<{ runs: ProtocolRunSnapshot[] }> {
@@ -545,8 +568,14 @@ export async function transcribeAudio(blob: Blob, signal?: AbortSignal): Promise
 export const deleteSession = (id: string) =>
   fetch(`${BASE}/api/sessions/${id}/delete`, { method: 'POST' }).then(r => r.json())
 
-export const renameSession = (id: string, title: string) =>
-  fetch(`${BASE}/api/sessions/${id}/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }) }).then(r => r.json())
+export async function renameSession(id: string, title: string): Promise<void> {
+  const response = await fetch(`${BASE}/api/sessions/${id}/rename`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  })
+  await responseJson(response)
+}
 
 export const forkSession = (id: string, cwd?: string) =>
   fetch(`${BASE}/api/sessions/${id}/fork`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd }) }).then(r => r.json())
@@ -733,6 +762,7 @@ export interface OmpWorkScope {
   assistantEnded: boolean
   continuationPending: boolean
   segment: number
+  invocationId: string
 }
 
 export interface OmpSubagentState extends OmpWorkScope {
@@ -763,6 +793,7 @@ export interface OmpMirrorState {
 
 
 export interface OmpBridgeEvent {
+  invocationId?: string
   type: string
   messageId?: string
   text?: string
@@ -818,7 +849,7 @@ export interface OmpBridgeEvent {
 }
 
 export interface SubscribeMessagesOptions {
-  onMessage: (message: Message) => void
+  onMessage: (message: Message, offset: number) => void
   onStatus?: (status: 'connected' | 'reconnecting') => void
   onActivity?: (activity: string | null) => void
   onQuestion?: (question: QuestionData | null) => void
@@ -826,18 +857,24 @@ export interface SubscribeMessagesOptions {
   onProtocolRun?: (run: ProtocolRunSnapshot) => void
 }
 
-export function subscribeMessages(id: string, options: SubscribeMessagesOptions): () => void {
+export interface MessageSubscription {
+  connected: Promise<void>
+  close: () => void
+  setCursor: (cursor: number) => void
+}
+
+export function subscribeMessages(id: string, options: SubscribeMessagesOptions): MessageSubscription {
   const { onMessage, onStatus, onActivity, onQuestion, onOmpEvent, onProtocolRun } = options
   let es: EventSource | null = null
   let closed = false
+  let hasConnected = false
   let retries = 0
   let lastEventId = ''
   let generation = 0
   let watchdog: ReturnType<typeof setTimeout> | null = null
   let retryTimer: ReturnType<typeof setTimeout> | null = null
-  // The server sends a heartbeat every 15 seconds. Mobile network changes can
-  // leave EventSource looking open without delivering either data or errors,
-  // so treat 40 quiet seconds as a dead stream and resume from the last offset.
+  let resolveConnected = () => {}
+  const connected = new Promise<void>(resolve => { resolveConnected = resolve })
   const IDLE_TIMEOUT = 40_000
 
   function clearWatchdog() {
@@ -866,6 +903,11 @@ export function subscribeMessages(id: string, options: SubscribeMessagesOptions)
 
   function connect() {
     if (closed) return
+    if (retryTimer) {
+      clearTimeout(retryTimer)
+      retryTimer = null
+    }
+    try { es?.close() } catch {}
     const sourceGeneration = ++generation
     const url = lastEventId
       ? `${BASE}/api/sessions/${id}/stream?lastEventId=${lastEventId}`
@@ -883,24 +925,16 @@ export function subscribeMessages(id: string, options: SubscribeMessagesOptions)
     source.addEventListener('connected', () => {
       if (!alive()) return
       retries = 0
+      hasConnected = true
+      resolveConnected()
       onStatus?.('connected')
-      // Reconcile after every successful stream connection, including the
-      // first. A transcript append can land after the initial GET but before
-      // EventSource is fully registered; replaying the bounded latest page is
-      // safe because App deduplicates messages by UUID.
-      fetch(`${BASE}/api/sessions/${id}/messages`)
-        .then(response => response.ok ? response.json() : null)
-        .then(data => {
-          if (closed || sourceGeneration !== generation || source !== es) return
-          for (const message of data?.messages || []) onMessage(message)
-        })
-        .catch(() => {})
     })
     source.addEventListener('heartbeat', () => { alive() })
     source.addEventListener('message', (event) => {
       if (!alive()) return
-      if (event.lastEventId) lastEventId = event.lastEventId
-      try { onMessage(JSON.parse(event.data)) } catch {}
+      const offset = Number.parseInt(event.lastEventId || '0', 10) || 0
+      if (offset > (Number.parseInt(lastEventId || '0', 10) || 0)) lastEventId = String(offset)
+      try { onMessage(JSON.parse(event.data), offset) } catch {}
     })
     source.addEventListener('activity', (event) => {
       if (!alive()) return
@@ -926,13 +960,25 @@ export function subscribeMessages(id: string, options: SubscribeMessagesOptions)
   }
 
   connect()
-  return () => {
-    closed = true
-    generation++
-    clearWatchdog()
-    clearTimeout(retryTimer)
-    retryTimer = null
-    es?.close()
-    es = null
+  return {
+    connected,
+    close: () => {
+      closed = true
+      resolveConnected()
+      generation++
+      clearWatchdog()
+      clearTimeout(retryTimer)
+      retryTimer = null
+      es?.close()
+      es = null
+    },
+    setCursor: (cursor: number) => {
+      if (!Number.isSafeInteger(cursor) || cursor < 0) return
+      lastEventId = String(Math.max(Number.parseInt(lastEventId || '0', 10) || 0, cursor))
+      if (!hasConnected && !closed) {
+        try { es?.close() } catch {}
+        connect()
+      }
+    },
   }
 }

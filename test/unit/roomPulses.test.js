@@ -17,8 +17,8 @@ function sessionLine(id, cwd, text) {
   }) + '\n'
 }
 
-describe('Room keep-working scheduler', () => {
-  it('runs alongside live residents, skips live user work, and launches due idle rooms', async () => {
+describe('Room status scheduler', () => {
+  it('runs beside active work and residents while reporting launch failures', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-room-pulse-'))
     roots.push(root)
     const home = path.join(root, 'home')
@@ -70,6 +70,7 @@ describe('Room keep-working scheduler', () => {
       env: {
         ...process.env, HOME: home, FEATHER_STATE_DIR: stateDir, PORT: String(port),
         FEATHER_ROOM_PULSE_CHECK_MS: '50', FEATHER_ROOM_PULSE_INTERVAL_MS: '60000',
+        FEATHER_ROOM_PULSE_MAX_CONCURRENT: '4',
         PATH: `${binDir}:${process.env.PATH}`, TMUX_TEST_LOG: tmuxLog, TMUX_REG: tmuxReg,
       },
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -83,22 +84,31 @@ describe('Room keep-working scheduler', () => {
       let state
       for (let attempt = 0; attempt < 100; attempt++) {
         try { state = JSON.parse(fs.readFileSync(path.join(home, '.feather/room-pulses.json'), 'utf8')) } catch {}
-        if (state?.resident?.status === 'working' && state?.idle?.status === 'working' && state?.broken?.status === 'error' && state?.active?.nextRunAtMs > Date.now() && readLaunches().length === 2) break
+        if (state?.active?.status === 'working' && state?.resident?.status === 'working' && state?.idle?.status === 'working' && state?.broken?.status === 'error' && readLaunches().length === 3) break
         await new Promise((resolve) => setTimeout(resolve, 20))
       }
       assert.equal(state?.idle?.status, 'working', stderr)
       assert.equal(state?.resident?.status, 'working', stderr)
       assert.match(state.idle.sessionId, /^[0-9a-f-]{36}$/)
-      assert.equal(state.active.status, 'waiting')
+      assert.equal(state.active.status, 'working')
+      assert.match(state.active.sessionId, /^[0-9a-f-]{36}$/)
       assert.equal(state.broken.status, 'error')
       assert.match(state.broken.error, /Command failed/)
-      assert.ok(state.active.nextRunAtMs > Date.now())
       const launches = readLaunches()
-      assert.equal(launches.length, 2, JSON.stringify({ launches, state }))
+      assert.equal(launches.length, 3, JSON.stringify({ launches, state }))
+      assert.ok(launches.some((launch) => launch.includes('rooms/active')))
       assert.ok(launches.some((launch) => launch.includes('rooms/idle')))
       assert.ok(launches.some((launch) => launch.includes('rooms/resident')))
       assert.ok(launches.every((launch) => /omp --model openai-codex\/gpt-5\.6-sol --thinking xhigh -p --auto-approve .*pulse\.md/.test(launch)))
       assert.equal(JSON.parse(fs.readFileSync(path.join(home, '.feather/room-sessions.json'), 'utf8'))[state.idle.sessionId], 'idle')
+      const prompt = fs.readFileSync(path.join(home, '.feather/omp-sessions', state.active.sessionId, 'pulse.md'), 'utf8')
+      assert.match(prompt, /What is everyone working on/)
+      assert.match(prompt, /Status collection only/)
+      assert.doesNotMatch(prompt, /do the next useful thing/)
+      const meta = JSON.parse(fs.readFileSync(path.join(stateDir, 'session-meta.json'), 'utf8'))
+      assert.equal(meta[state.active.sessionId].title, 'Status: #active')
+      const context = await (await fetch(`http://127.0.0.1:${port}/api/sessions/${state.active.sessionId}/room`)).json()
+      assert.deepEqual(context, { room: 'active', kind: 'status', role: 'status', label: 'Status' })
 
       const pause = await fetch(`http://127.0.0.1:${port}/api/rooms/idle/pulse`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }),
@@ -106,14 +116,14 @@ describe('Room keep-working scheduler', () => {
       assert.equal(pause.status, 200)
       assert.equal((await pause.json()).pulse.status, 'paused')
       assert.equal(fs.readFileSync(tmuxReg, 'utf8').split('\n').includes(`f-${state.idle.sessionId}`), false,
-        'pausing a Room must stop its running background tmux session immediately')
+        'pausing a Room must stop its running status tmux session immediately')
     } finally {
       child.kill('SIGTERM')
       await new Promise((resolve) => child.once('exit', resolve))
     }
   })
 
-  it('caps simultaneous autonomous runs and defers the rest of a synchronized batch', async () => {
+  it('caps simultaneous status runs and defers the rest of a synchronized batch', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-room-pulse-cap-'))
     roots.push(root)
     const home = path.join(root, 'home')

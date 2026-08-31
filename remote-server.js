@@ -46,6 +46,32 @@ function parseMessage(line) {
 }
 
 // ── JSONL helpers ──────────────────────────────────────────────────────────
+const TAIL_CHUNK_BYTES = 1024 * 1024;
+
+function completeFileOffset(fpath) {
+  const fd = fs.openSync(fpath, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (size === 0) return 0;
+    const lastByte = Buffer.allocUnsafe(1);
+    fs.readSync(fd, lastByte, 0, 1, size - 1);
+    if (lastByte[0] === 10) return size;
+    let position = size;
+    while (position > 0) {
+      const length = Math.min(TAIL_CHUNK_BYTES, position);
+      const start = position - length;
+      const chunk = Buffer.allocUnsafe(length);
+      fs.readSync(fd, chunk, 0, length, start);
+      const newline = chunk.lastIndexOf(10);
+      if (newline >= 0) return start + newline + 1;
+      position = start;
+    }
+    return 0;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 
 function findJsonlPath(sessionId) {
   if (!fs.existsSync(CLAUDE_PROJECTS)) return null;
@@ -58,20 +84,25 @@ function findJsonlPath(sessionId) {
 
 function getMessages(sessionId, limit = 100, before = 0) {
   const fpath = findJsonlPath(sessionId);
-  if (!fpath || !fs.existsSync(fpath)) return { messages: [], hasMore: false };
-  const lines = fs.readFileSync(fpath, 'utf8').split('\n').filter(Boolean);
+  if (!fpath || !fs.existsSync(fpath)) return { messages: [], hasMore: false, cursor: 0, nextBefore: 0 };
+  const bytes = fs.readFileSync(fpath);
+  const lastNewline = bytes.lastIndexOf(10);
+  const cursor = lastNewline < 0 ? 0 : lastNewline + 1;
+  const lines = bytes.subarray(0, cursor).toString('utf8').split('\n').filter(Boolean);
   const msgs = [];
   for (const line of lines) {
-    const m = parseMessage(line);
-    if (m) msgs.push(m);
+    const message = parseMessage(line);
+    if (message) msgs.push(message);
   }
-  if (before > 0) {
-    const end = Math.max(0, msgs.length - before);
-    const start = Math.max(0, end - limit);
-    return { messages: msgs.slice(start, end), hasMore: start > 0 };
-  }
-  const start = Math.max(0, msgs.length - limit);
-  return { messages: msgs.slice(start), hasMore: start > 0 };
+  const offset = Math.max(0, before);
+  const end = Math.max(0, msgs.length - offset);
+  const start = Math.max(0, end - Math.max(1, limit));
+  return {
+    messages: msgs.slice(start, end),
+    hasMore: start > 0,
+    cursor,
+    nextBefore: offset + (end - start),
+  };
 }
 
 // ── Tmux management ───────────────────────────────────────────────────────
@@ -168,16 +199,18 @@ function processFileChange(filePath) {
     const buf = Buffer.alloc(stat.size - currentOffset);
     fs.readSync(fd, buf, 0, buf.length, currentOffset);
     fs.closeSync(fd);
-    const content = buf.toString('utf8');
-    const lastNL = content.lastIndexOf('\n');
-    if (lastNL < 0) return;
-    const complete = content.substring(0, lastNL + 1);
-    let offset = currentOffset;
-    for (const line of complete.split('\n').filter(Boolean)) {
-      offset += Buffer.byteLength(line + '\n');
-      broadcast(sessionId, line, offset);
+    const lastNewline = buf.lastIndexOf(10);
+    if (lastNewline < 0) return;
+    const complete = buf.subarray(0, lastNewline + 1);
+    let start = 0;
+    while (start < complete.length) {
+      const newline = complete.indexOf(10, start);
+      const line = complete.subarray(start, newline).toString('utf8');
+      const offset = currentOffset + newline + 1;
+      if (line) broadcast(sessionId, line, offset);
+      start = newline + 1;
     }
-    fileOffsets.set(sessionId, currentOffset + Buffer.byteLength(complete));
+    fileOffsets.set(sessionId, currentOffset + complete.length);
   } catch {}
 }
 
@@ -188,7 +221,7 @@ function initWatchers() {
     const dp = path.join(CLAUDE_PROJECTS, dir);
     try {
       for (const f of fs.readdirSync(dp)) {
-        if (f.endsWith('.jsonl')) fileOffsets.set(f.replace('.jsonl', ''), fs.statSync(path.join(dp, f)).size);
+        if (f.endsWith('.jsonl')) fileOffsets.set(f.replace('.jsonl', ''), completeFileOffset(path.join(dp, f)));
       }
       fs.watch(dp, (event, filename) => {
         if (filename?.endsWith('.jsonl')) {
@@ -285,37 +318,40 @@ app.get('/api/sessions', (req, res) => {
 });
 
 app.get('/api/sessions/:id/messages', (req, res) => {
-  const { messages, hasMore } = getMessages(req.params.id, parseInt(req.query.limit) || 100, parseInt(req.query.before) || 0);
-  res.json({ messages, hasMore });
+  const { messages, hasMore, cursor, nextBefore } = getMessages(req.params.id, parseInt(req.query.limit) || 100, parseInt(req.query.before) || 0);
+  res.json({ messages, hasMore, cursor, nextBefore });
 });
 
 app.get('/api/sessions/:id/stream', (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-  res.write('event: connected\ndata: {}\n\n');
   const sid = req.params.id;
+  if (!sseClients.has(sid)) sseClients.set(sid, new Set());
+  sseClients.get(sid).add(res);
+  res.write('event: connected\ndata: {}\n\n');
   const lastId = parseInt(req.query.lastEventId || req.headers['last-event-id'] || '0');
   if (lastId > 0) {
     const fpath = findJsonlPath(sid);
     if (fpath) {
       try {
-        const stat = fs.statSync(fpath);
-        if (stat.size > lastId) {
+        const replayEnd = completeFileOffset(fpath);
+        if (replayEnd > lastId) {
           const fd = fs.openSync(fpath, 'r');
-          const buf = Buffer.alloc(stat.size - lastId);
+          const buf = Buffer.alloc(replayEnd - lastId);
           fs.readSync(fd, buf, 0, buf.length, lastId);
-          fs.closeSync(fd);
-          let offset = lastId;
-          for (const line of buf.toString('utf8').split('\n').filter(Boolean)) {
-            offset += Buffer.byteLength(line + '\n');
-            const parsed = parseMessage(line);
+          let start = 0;
+          while (start < buf.length) {
+            const newline = buf.indexOf(10, start);
+            const line = buf.subarray(start, newline).toString('utf8');
+            const offset = lastId + newline + 1;
+            const parsed = line ? parseMessage(line) : null;
             if (parsed) res.write(`id: ${offset}\nevent: message\ndata: ${JSON.stringify(parsed)}\n\n`);
+            start = newline + 1;
           }
+          fs.closeSync(fd);
         }
       } catch {}
     }
   }
-  if (!sseClients.has(sid)) sseClients.set(sid, new Set());
-  sseClients.get(sid).add(res);
   const hb = setInterval(() => { try { res.write('event: heartbeat\ndata: {}\n\n'); } catch { clearInterval(hb); } }, 15000);
   res.on('close', () => { clearInterval(hb); sseClients.get(sid)?.delete(res); });
 });

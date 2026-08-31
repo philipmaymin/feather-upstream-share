@@ -7,22 +7,22 @@ import { SidecarThread } from './components/Sidecar'
 import { RoomWikiView } from './components/RoomWikiView'
 import RoomsHome from './RoomsHome'
 import FeedHome from './FeedHome'
-import type { SessionMeta, Message, QuestionData, SidecarGroup, SidecarMessage, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot, ProtocolRunSnapshot } from './api'
-import { fetchSessions, fetchRooms, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, answerQuestion, fetchAgents, fetchSidecars, fetchSidecar, subscribeSidecar, createSidecar, fetchSessionRoom } from './api'
+import type { SessionMeta, Message, MessagePage, MessageSubscription, QuestionData, SidecarGroup, SidecarMessage, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot, ProtocolRunSnapshot, RoomSessionContext } from './api'
+import { fetchSessions, fetchRooms, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, answerQuestion, fetchAgents, fetchSidecars, fetchSidecar, subscribeSidecar, createSidecar, fetchSessionRoom, fetchSessionRoomContext, fetchRoomResidents } from './api'
 import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
 import { listPendingMessages, putPendingMessage, patchPendingMessage, deletePendingMessage } from './lib/messageOutbox.js'
 import { appUrl } from './lib/appPath.js'
 import { deriveToolIntentState, isFinalAssistantMessage, toolIntentTransition } from './lib/toolIntentStatus.js'
 import { deriveTodoSnapshot, reduceTodoSnapshot, todoSnapshotFromDetails } from './lib/ompTodo.js'
-import { createOmpMirrorState, reduceOmpMirrorState } from './lib/ompMirror.js'
+import { createOmpMirrorState, reconcileOmpRuntimeJobs, reconcileSubagentRuntime, reduceOmpMirrorState } from './lib/ompMirror.js'
 import { mergeRoomThreadMessages } from './lib/roomThread.js'
 import { createProtocolRunsState, orderedProtocolRuns, reduceProtocolRunSnapshot, replaceProtocolRuns } from './lib/protocolRuns.js'
 
 interface QuickLink { label: string; url: string }
 type AgentId = 'claude' | 'codex' | 'omp'
 
-const isRoomPulseSession = (session: Pick<SessionMeta, 'title'>) => /^Keep working: #/.test(session.title || '')
+const isRoomPulseSession = (session: Pick<SessionMeta, 'title'>) => /^(Keep working|Status): #/.test(session.title || '')
 const agentBadgeLabel = (agent?: AgentId) => agent === 'omp' ? 'OMP' : agent === 'codex' ? 'Codex' : 'Claude'
 const agentBadgeColors = (agent?: AgentId) => agent === 'omp'
   ? { background: '#3a2a1e', color: '#e0a050' }
@@ -194,6 +194,7 @@ export default function App() {
   const [wikiRetry, setWikiRetry] = createSignal(0)
   const [roomSidecarId, setRoomSidecarId] = createSignal<string | null>(null)
   const [roomThread, setRoomThread] = createSignal<SidecarMessage[]>([])
+  const [roomContext, setRoomContext] = createSignal<RoomSessionContext | null>(null)
   const [filesMode, setFilesMode] = createSignal<'changed' | 'browse'>('browse')
   const TEXT_EXTS: Record<string, true> = { '.txt': true, '.md': true, '.js': true, '.ts': true, '.tsx': true, '.jsx': true, '.json': true, '.css': true, '.py': true, '.rb': true, '.go': true, '.rs': true, '.sh': true, '.yml': true, '.yaml': true, '.toml': true, '.cfg': true, '.conf': true, '.ini': true, '.env': true, '.sql': true, '.csv': true, '.xml': true, '.log': true, '.jsonl': true, '.svelte': true, '.vue': true, '.astro': true, '.mjs': true, '.cjs': true }
   const IMAGE_EXTS: Record<string, true> = { '.png': true, '.jpg': true, '.jpeg': true, '.gif': true, '.webp': true, '.svg': true, '.bmp': true, '.ico': true }
@@ -332,6 +333,7 @@ export default function App() {
   const transcribing = () => voiceMemos().some(memo => memo.status === 'transcribing')
   const [audioLevel, setAudioLevel] = createSignal(0)
   const [hasMore, setHasMore] = createSignal(false)
+  const [messageBefore, setMessageBefore] = createSignal(0)
   const [loadingMore, setLoadingMore] = createSignal(false)
   const [renaming, setRenaming] = createSignal(false)
   const [renameText, setRenameText] = createSignal('')
@@ -426,7 +428,8 @@ export default function App() {
   const [showChangelog, setShowChangelog] = createSignal(false)
   const currentJsFile = document.querySelector<HTMLScriptElement>('script[src*="index-"]')?.src.match(/index-[^.]+\.js/)?.[0] || null
 
-  let cleanupSSE: (() => void) | null = null
+  let cleanupSSE: MessageSubscription | null = null
+  let paginationStreamOffsets = new Set<number>()
   let selectionGeneration = 0
   let lifecycleRevision = 0
   let messagesAbortController: AbortController | null = null
@@ -443,7 +446,7 @@ export default function App() {
     selectionGeneration++
     messagesAbortController?.abort()
     messagesAbortController = null
-    cleanupSSE?.()
+    cleanupSSE?.close()
     cleanupSSE = null
     clearTimeout(workingTimer)
     clearTimeout(assistantDoneTimer)
@@ -769,11 +772,15 @@ export default function App() {
   })
 
   function handleOmpEvent(event: OmpBridgeEvent) {
-    lifecycleRevision++
     if (!event.subagentId && event.type === 'agent_start') {
-      resetOmpTurn(reduceOmpMirrorState(ompMirror(), event))
+      const current = ompMirror()
+      const next = reduceOmpMirrorState(current, event)
+      if (next === current) return
+      lifecycleRevision++
+      resetOmpTurn(next)
       return
     }
+    lifecycleRevision++
     setOmpMirror(current => reduceOmpMirrorState(current, event))
 
     if (event.type === 'subagent_lifecycle' || event.type === 'subagent_progress') return
@@ -800,7 +807,9 @@ export default function App() {
     }
     if (event.type === 'async_jobs' && event.running && event.recent) {
       const seen = new Set(event.running.map(job => job.id))
-      setOmpJobs([...event.running, ...event.recent.filter(job => !seen.has(job.id))].slice(0, 20))
+      const jobs = [...event.running, ...event.recent.filter(job => !seen.has(job.id))].slice(0, 20)
+      setOmpJobs(jobs)
+      setOmpMirror(current => reconcileOmpRuntimeJobs(current, jobs))
       return
     }
     if (event.type === 'session_state') {
@@ -899,6 +908,7 @@ export default function App() {
     setSidebar(false)
     setLoading(true)
     setLoadingMore(false)
+    setMessageBefore(0)
     setMessages([])
     setHasMore(false)
     setToolIntentStatus('')
@@ -930,67 +940,26 @@ export default function App() {
         if (found) setLastSession(found)
       })
     }
-    let result: Awaited<ReturnType<typeof fetchMessages>>
-    try {
-      result = await fetchMessages(id, 0, abortController.signal)
-    } catch (error: any) {
+    type BufferedStreamEvent =
+      | { kind: 'message'; message: Message; offset: number }
+      | { kind: 'activity'; activity: string | null }
+      | { kind: 'question'; question: QuestionData | null }
+      | { kind: 'omp'; event: OmpBridgeEvent }
+      | { kind: 'protocol'; run: ProtocolRunSnapshot }
+    const buffered: BufferedStreamEvent[] = []
+    let snapshotInstalled = false
+    paginationStreamOffsets = new Set<number>()
+    let snapshotCursor = 0
+    let paginationInstalled = false
+
+    const applyMessage = (msg: Message, offset = 0) => {
       if (!isCurrentSelection(id, generation)) return
-      messagesAbortController = null
-      setLoading(false)
-      setChatLoadError(error?.name === 'AbortError' ? '' : 'This chat could not be loaded. Sending is locked to protect the wrong chat.')
-      return
-    }
-    if (!isCurrentSelection(id, generation)) return
-    messagesAbortController = null
-    setMessages(result.messages)
-    setHasMore(result.hasMore)
-    // Determine working state from loaded messages.
-    // Only mark as working if the session is actually active (has a running tmux process).
-    // Inactive/timed-out sessions should never show as working.
-    const [sessionMeta, runResult] = await Promise.all([sessionMetaPromise, protocolRunsPromise])
-    if (!isCurrentSelection(id, generation)) return
-    const isActive = sessionMeta?.isActive ?? false
-    setProtocolRunsState(replaceProtocolRuns(runResult.runs))
-    const msgs = result.messages
-    if (msgs.length > 0) {
-      const last = msgs[msgs.length - 1]
-      const toolIntentState = deriveToolIntentState(msgs)
-      const turnEnded = last.stopReason === 'end_turn' || last.stopReason === 'stop_sequence'
-      setToolIntentStatus(!isActive || turnEnded ? '' : toolIntentState.status)
-      setTodoSnapshot(deriveTodoSnapshot(msgs))
-      if (!isActive || turnEnded) setWorking(false)
-      else if (last.role === 'user' || toolIntentState.working) setWorking(true)
-      else setWorking(false) // assistant mid-stream but no new SSE yet; let SSE update it
-      // Extract cwd from last user message and update header
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        if (msgs[i].cwd) {
-          const ls = lastSession()
-          if (ls && ls.id === id && !ls.cwd) setLastSession({ ...ls, cwd: msgs[i].cwd })
-          break
-        }
+      if (paginationInstalled && offset > snapshotCursor && !paginationStreamOffsets.has(offset)) {
+        paginationStreamOffsets.add(offset)
+        setMessageBefore(current => current + 1)
       }
-    } else {
-      setToolIntentStatus('')
-      setTodoSnapshot(null)
-      setWorking(isActive)
-    }
-    appendPendingMessages(id)
-    setLoadedSessionId(id)
-    setLoading(false)
-    // Restore scroll position if we have one saved
-    const savedScroll = scrollPositions.get(id)
-    if (savedScroll !== undefined) {
-      requestAnimationFrame(() => {
-        if (isCurrentSelection(id, generation) && messageScrollRef) messageScrollRef.scrollTop = savedScroll
-      })
-    }
-    setSSEStatus('connected')
-    const unsubscribe = subscribeMessages(id, { onMessage: (msg) => {
-      if (!isCurrentSelection(id, generation) || loadedSessionId() !== id) return
       if (messages().some(existing => existing.uuid === msg.uuid)) return
-      // Clear assistant-done debounce on any incoming message
       clearTimeout(assistantDoneTimer)
-      // If new content arrives while a question is showing, it was a false positive
       if (question() && msg.role === 'assistant' && !msg.stopReason) setQuestion(null)
       const wasWorking = working()
       if (msg.role === 'user' && !wasWorking) {
@@ -1006,15 +975,13 @@ export default function App() {
         setTodoSnapshot(current => reduceTodoSnapshot(current, msg))
       }
       if (isFinalAssistantMessage(msg)) clearAssistantStream()
-      // Use stop_reason to accurately track working state
       if (msg.stopReason === 'end_turn' || msg.stopReason === 'stop_sequence') {
         setWorking(false)
         setToolIntentStatus('')
         clearTimeout(workingTimer)
-        // Refresh session list to pick up auto-generated title
-        const cur = sessions().find(s => s.id === id)
-        if (cur && (cur.title === 'New session' || cur.title === id.slice(0, 8))) {
-          setTimeout(() => fetchSessions().then(s => updateSessions(s)).catch(() => {}), 3000)
+        const currentSession = sessions().find(session => session.id === id)
+        if (currentSession && (currentSession.title === 'New session' || currentSession.title === id.slice(0, 8))) {
+          setTimeout(() => fetchSessions().then(next => updateSessions(next)).catch(() => {}), 3000)
         }
       } else if (msg.role === 'user') {
         setWorking(true)
@@ -1023,8 +990,6 @@ export default function App() {
         setWorking(true)
         startWorkingTimeout()
       } else if (msg.role === 'assistant' && !msg.stopReason) {
-        // Assistant message without stop_reason: JSONL may never get end_turn.
-        // Debounce: if no more messages arrive in 5s, assume the turn is done.
         assistantDoneTimer = window.setTimeout(() => {
           if (isCurrentSelection(id, generation) && working()) {
             setWorking(false)
@@ -1033,53 +998,165 @@ export default function App() {
           }
         }, 5000)
       }
-      // Update session cwd from incoming user messages
       if (msg.cwd && msg.role === 'user') {
-        setSessions(prev => prev.map(s => s.id === id ? { ...s, cwd: msg.cwd } : s))
-        // Also update lastSession directly in case session isn't in the filtered list
-        const ls = lastSession()
-        if (ls && ls.id === id && ls.cwd !== msg.cwd) {
-          setLastSession({ ...ls, cwd: msg.cwd })
-        }
+        setSessions(previous => previous.map(session => session.id === id ? { ...session, cwd: msg.cwd } : session))
+        const selected = lastSession()
+        if (selected && selected.id === id && selected.cwd !== msg.cwd) setLastSession({ ...selected, cwd: msg.cwd })
       }
-      // Keep lastSeen fresh so the current session doesn't go unread on next poll
       lastSeenUpdatedAt.set(id, new Date().toISOString())
       let deliveredPendingId: string | undefined
-      setMessages(prev => {
-        if (prev.some(m => m.uuid === msg.uuid)) return prev
+      setMessages(previous => {
+        if (previous.some(message => message.uuid === msg.uuid)) return previous
         if (msg.role === 'user') {
-          const msgText = msg.content?.find(b => b.type === 'text')?.text || ''
-          const idx = prev.findIndex(m =>
-            m.uuid.startsWith('optimistic-') &&
-            m.content?.[0]?.text === msgText &&
-            Math.abs(new Date(m.timestamp).getTime() - new Date(msg.timestamp).getTime()) < 30000
-          )
-          if (idx >= 0) {
-            const updated = [...prev]
-            deliveredPendingId = prev[idx].uuid.slice('optimistic-'.length)
-            updated[idx] = { ...msg, delivery: 'delivered' }
+          const msgText = msg.content?.find(block => block.type === 'text')?.text || ''
+          const optimisticIndex = previous.findIndex(message =>
+            message.uuid.startsWith('optimistic-')
+            && message.content?.[0]?.text === msgText
+            && Math.abs(new Date(message.timestamp).getTime() - new Date(msg.timestamp).getTime()) < 30000)
+          if (optimisticIndex >= 0) {
+            const updated = [...previous]
+            deliveredPendingId = previous[optimisticIndex].uuid.slice('optimistic-'.length)
+            updated[optimisticIndex] = { ...msg, delivery: 'delivered' }
             return updated
           }
         }
-        return [...prev, msg]
+        return [...previous, msg]
       })
       if (deliveredPendingId) {
         deletePendingMessage(deliveredPendingId)
         refreshPendingMessages()
       }
-    },
+    }
+
+    const subscription = subscribeMessages(id, {
+      onMessage: (message, offset) => {
+        if (!isCurrentSelection(id, generation)) return
+        if (!snapshotInstalled) {
+          buffered.push({ kind: 'message', message, offset })
+          return
+        }
+        applyMessage(message, offset)
+      },
       onStatus: status => {
-      if (!isCurrentSelection(id, generation)) return
-      setSSEStatus(status)
-      if (status === 'reconnecting') clearAssistantStream()
-    },
-      onActivity: nextActivity => { if (isCurrentSelection(id, generation)) setActivity(nextActivity) },
-      onQuestion: nextQuestion => { if (isCurrentSelection(id, generation)) setQuestion(nextQuestion) },
-      onOmpEvent: event => { if (isCurrentSelection(id, generation) && loadedSessionId() === id) handleOmpEvent(event) },
-      onProtocolRun: run => { if (isCurrentSelection(id, generation) && loadedSessionId() === id) applyProtocolRun(run) },
+        if (!isCurrentSelection(id, generation)) return
+        setSSEStatus(status)
+        if (status === 'reconnecting') clearAssistantStream()
+      },
+      onActivity: nextActivity => {
+        if (!isCurrentSelection(id, generation)) return
+        if (!snapshotInstalled) buffered.push({ kind: 'activity', activity: nextActivity })
+        else setActivity(nextActivity)
+      },
+      onQuestion: nextQuestion => {
+        if (!isCurrentSelection(id, generation)) return
+        if (!snapshotInstalled) buffered.push({ kind: 'question', question: nextQuestion })
+        else setQuestion(nextQuestion)
+      },
+      onOmpEvent: event => {
+        if (!isCurrentSelection(id, generation)) return
+        if (!snapshotInstalled) buffered.push({ kind: 'omp', event })
+        else handleOmpEvent(event)
+      },
+      onProtocolRun: run => {
+        if (!isCurrentSelection(id, generation)) return
+        if (!snapshotInstalled) buffered.push({ kind: 'protocol', run })
+        else applyProtocolRun(run)
+      },
     })
-    if (!isCurrentSelection(id, generation)) unsubscribe()
-    else cleanupSSE = unsubscribe
+    cleanupSSE = subscription
+
+    let connectionTimeout: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([
+      subscription.connected,
+      new Promise<void>(resolve => { connectionTimeout = setTimeout(resolve, 5000) }),
+    ])
+    clearTimeout(connectionTimeout)
+    if (!isCurrentSelection(id, generation)) {
+      subscription.close()
+      return
+    }
+
+    let result: MessagePage
+    try {
+      result = await fetchMessages(id, 0, abortController.signal)
+    } catch (error: unknown) {
+      if (!isCurrentSelection(id, generation)) return
+      subscription.close()
+      cleanupSSE = null
+      messagesAbortController = null
+      setLoading(false)
+      setChatLoadError(error instanceof Error && error.name === 'AbortError' ? '' : 'This chat could not be loaded. Sending is locked to protect the wrong chat.')
+      return
+    }
+    if (!isCurrentSelection(id, generation)) {
+      subscription.close()
+      return
+    }
+    messagesAbortController = null
+    const [sessionMeta, runResult] = await Promise.all([sessionMetaPromise, protocolRunsPromise])
+    if (!isCurrentSelection(id, generation)) {
+      subscription.close()
+      return
+    }
+
+    const snapshotIds = new Set(result.messages.map(message => message.uuid))
+    const messagesBeforeSnapshot: Message[] = []
+    for (const event of buffered) {
+      if (event.kind !== 'message' || event.offset > result.cursor || snapshotIds.has(event.message.uuid)) continue
+      snapshotIds.add(event.message.uuid)
+      paginationStreamOffsets.add(event.offset)
+      messagesBeforeSnapshot.push(event.message)
+    }
+    snapshotCursor = result.cursor
+    paginationInstalled = true
+    const initialMessages = [...messagesBeforeSnapshot, ...result.messages]
+    const isActive = sessionMeta?.isActive ?? false
+    const last = initialMessages.at(-1)
+    const toolIntentState = deriveToolIntentState(initialMessages)
+    const turnEnded = last?.stopReason === 'end_turn' || last?.stopReason === 'stop_sequence'
+    batch(() => {
+      setMessages(initialMessages)
+      setHasMore(result.hasMore)
+      setMessageBefore(result.nextBefore + messagesBeforeSnapshot.length)
+      setProtocolRunsState(replaceProtocolRuns(runResult.runs))
+      setToolIntentStatus(!isActive || turnEnded ? '' : toolIntentState.status)
+      setTodoSnapshot(deriveTodoSnapshot(initialMessages))
+      setWorking(!isActive || turnEnded ? false : !!last && (last.role === 'user' || toolIntentState.working))
+    })
+    for (let index = initialMessages.length - 1; index >= 0; index--) {
+      if (!initialMessages[index].cwd) continue
+      const selected = lastSession()
+      if (selected && selected.id === id && !selected.cwd) setLastSession({ ...selected, cwd: initialMessages[index].cwd })
+      break
+    }
+    subscription.setCursor(result.cursor)
+    snapshotInstalled = true
+
+    for (const event of buffered) {
+      if (!isCurrentSelection(id, generation)) break
+      if (event.kind === 'message') {
+        if (event.offset > result.cursor) applyMessage(event.message, event.offset)
+      } else if (event.kind === 'activity') {
+        setActivity(event.activity)
+      } else if (event.kind === 'question') {
+        setQuestion(event.question)
+      } else if (event.kind === 'omp') {
+        handleOmpEvent(event.event)
+      } else {
+        applyProtocolRun(event.run)
+      }
+    }
+    buffered.length = 0
+    if (!isCurrentSelection(id, generation)) return
+    appendPendingMessages(id)
+    setLoadedSessionId(id)
+    setLoading(false)
+    const savedScroll = scrollPositions.get(id)
+    if (savedScroll !== undefined) {
+      requestAnimationFrame(() => {
+        if (isCurrentSelection(id, generation) && messageScrollRef) messageScrollRef.scrollTop = savedScroll
+      })
+    }
     queueMicrotask(() => { if (isCurrentSelection(id, generation)) retryPendingMessages(id) })
   }
 
@@ -1266,6 +1343,9 @@ export default function App() {
   async function doRename(id: string, title: string) {
     if (!title.trim()) { setRenaming(false); setSidebarRenaming(null); return }
     await renameSession(id, title.trim())
+    if (currentId() === id) {
+      setRoomContext(current => current?.kind === 'chat' ? { ...current, label: title.trim() } : current)
+    }
     setRenaming(false)
     setMenuOpen(false)
     setSidebarRenaming(null)
@@ -1276,26 +1356,33 @@ export default function App() {
     const id = currentId()
     const generation = selectionGeneration
     if (!id || loadedSessionId() !== id || loadingMore()) return
+    const before = messageBefore()
     setLoadingMore(true)
-    // Capture viewport anchor so prepending older messages doesn't jump the
-    // view. After setMessages resolves on the next frame, we restore by
-    // shifting scrollTop by the grown height delta.
     const anchor = messageScrollRef
       ? { scrollTop: messageScrollRef.scrollTop, scrollHeight: messageScrollRef.scrollHeight }
       : null
     try {
-      const result = await fetchMessages(id, messages().length)
+      const result = await fetchMessages(id, before)
       if (!isCurrentSelection(id, generation) || loadedSessionId() !== id) return
-      setMessages(prev => [...result.messages, ...prev])
+      setMessages(previous => {
+        const existing = new Set(previous.map(message => message.uuid))
+        return [...result.messages.filter(message => !existing.has(message.uuid)), ...previous]
+      })
       setHasMore(result.hasMore)
+      let liveRowsAfterPage = 0
+      for (const offset of paginationStreamOffsets) {
+        if (offset > result.cursor) liveRowsAfterPage++
+      }
+      setMessageBefore(result.nextBefore + liveRowsAfterPage)
       if (anchor && messageScrollRef) {
-        const el = messageScrollRef
+        const element = messageScrollRef
         requestAnimationFrame(() => {
-          el.scrollTop = anchor.scrollTop + (el.scrollHeight - anchor.scrollHeight)
+          element.scrollTop = anchor.scrollTop + (element.scrollHeight - anchor.scrollHeight)
         })
       }
-    } catch {}
-    if (isCurrentSelection(id, generation)) setLoadingMore(false)
+    } catch {} finally {
+      if (isCurrentSelection(id, generation)) setLoadingMore(false)
+    }
   }
 
   async function toggleStar(sessionId: string, msgUuid: string) {
@@ -1792,10 +1879,36 @@ export default function App() {
         actions: [...actions].sort((a, b) => (actionOrder.indexOf(a) === -1 ? 99 : actionOrder.indexOf(a)) - (actionOrder.indexOf(b) === -1 ? 99 : actionOrder.indexOf(b))),
       }))
       .sort((a, b) => b.lastSeen.localeCompare(a.lastSeen))
-
   })
   const activeTodo = () => ompMirror().parent.todo || todoSnapshot()
-  const activeSubagents = () => ompMirror().childOrder.map(id => ompMirror().children[id]).filter(Boolean)
+  const activeSubagents = () => {
+    const jobs = ompJobs()
+    return ompMirror().childOrder
+      .map(id => ompMirror().children[id])
+      .filter(Boolean)
+      .map(child => reconcileSubagentRuntime(child, jobs))
+  }
+
+  function openAgentHub() {
+    const id = currentId()
+    if (!id) return
+    setTab('terminal')
+    sendSessionKeys(id, ['AgentHub']).catch(error => console.error('Could not open Agent Hub', error))
+  }
+
+  async function openRoomRole(role: string) {
+    const sourceId = currentId()
+    const generation = selectionGeneration
+    const context = roomContext()
+    if (!sourceId || !context?.room || role === 'human') return
+    try {
+      const resident = (await fetchRoomResidents(context.room)).find(candidate => candidate.role === role)
+      if (generation !== selectionGeneration || currentId() !== sourceId || roomContext()?.room !== context.room) return
+      if (resident) select(resident.sessionId)
+    } catch (error) {
+      console.error('Could not open Room resident', error)
+    }
+  }
 
   function mergeRoomThreadMessage(message: SidecarMessage) {
     setRoomThread((current) => {
@@ -1808,6 +1921,17 @@ export default function App() {
       return [...current, message].sort((a, b) => a.seq - b.seq)
     })
   }
+
+  let roomContextGeneration = 0
+  createEffect(() => {
+    const id = currentId()
+    const generation = ++roomContextGeneration
+    setRoomContext(null)
+    if (!id) return
+    fetchSessionRoomContext(id).then(context => {
+      if (generation === roomContextGeneration) setRoomContext(context)
+    }).catch(() => {})
+  })
 
   let roomThreadGeneration = 0
   createEffect(() => {
@@ -2007,9 +2131,7 @@ export default function App() {
               </div>
               <div style={{ display: 'flex', gap: '8px' }}>
                 <button onClick={() => handleNew(false, 'claude')} disabled={creating()} style={{ flex: '1', padding: '7px 9px', background: '#15202a', border: '1px solid #344657', color: '#73b8ff', 'border-radius': '7px', cursor: 'pointer', 'font-size': '12px', 'font-weight': '700' }}>+ Claude Code</button>
-                <Show when={codexAvailable()}>
-                  <button onClick={() => handleNew(false, 'codex')} disabled={creating()} style={{ flex: '1', padding: '7px 9px', background: '#251b31', border: '1px solid #49345e', color: '#c084fc', 'border-radius': '7px', cursor: 'pointer', 'font-size': '12px', 'font-weight': '700' }}>+ Codex</button>
-                </Show>
+                <button onClick={() => handleNew(false, 'codex')} disabled={creating() || !codexAvailable()} title={codexAvailable() ? undefined : 'Codex is unavailable on this server'} style={{ flex: '1', padding: '7px 9px', background: '#251b31', border: '1px solid #49345e', color: '#c084fc', 'border-radius': '7px', cursor: codexAvailable() ? 'pointer' : 'not-allowed', opacity: codexAvailable() ? '1' : '0.55', 'font-size': '12px', 'font-weight': '700' }}>+ Codex</button>
               </div>
             </div>
             {/* Search input */}
@@ -2190,6 +2312,12 @@ export default function App() {
               <Show when={s().isActive}><span style={{ width: '8px', height: '8px', 'border-radius': '50%', background: '#4aba6a', 'flex-shrink': '0' }} /></Show>
               <Show when={renaming()} fallback={
                 <div style={{ overflow: 'hidden', 'min-width': '0' }}>
+                  <Show when={roomContext()?.room}>
+                    <button data-testid="room-chat-breadcrumb" onClick={goHome}
+                      style={{ display: 'block', background: 'none', border: 'none', padding: '0', color: '#8792a2', 'font-size': '10px', 'font-weight': '650', cursor: 'pointer', 'text-align': 'left', 'text-transform': 'capitalize' }}>
+                      #{roomContext()!.room} / {roomContext()!.label?.replaceAll('-', ' ') || 'Chat'}
+                    </button>
+                  </Show>
                   <div style={{ 'font-size': '10px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', display: 'flex', 'align-items': 'center', gap: '4px' }}>
                     <Show when={s().projectLabel}>
                       {(label) => <span style={{ color: '#666' }}>{label()}</span>}
@@ -2304,6 +2432,10 @@ export default function App() {
                 messages={roomChatMessages()}
                 loading={loading()}
                 hasMore={hasMore()}
+                highLevel={roomContext()?.kind === 'main'}
+                onOpenAgentHub={openAgentHub}
+                roomRole={roomContext()?.role || undefined}
+                onOpenRoomRole={openRoomRole}
                 loadingMore={loadingMore()}
                 onLoadEarlier={loadEarlier}
                 onAnswer={(answer) => { if (composerReady()) sendInput(currentId()!, answer) }}

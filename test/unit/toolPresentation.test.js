@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { activityDescription, toolImagePath, toolPresentation } from '../../frontend/src/lib/toolPresentation.js'
+import { activityDescription, toolImagePath, toolInputDisplay, toolOutputDisplay, toolPresentation } from '../../frontend/src/lib/toolPresentation.js'
 
 describe('Codex tool presentation', () => {
   it('identifies web weather calls even when Codex stores the tool as run', () => {
@@ -70,5 +70,19 @@ describe('Codex tool presentation', () => {
       activityDescription('bash', { command: 'git status' }, 'Checking repository state'),
       'Checking repository state',
     )
+  })
+
+  it('formats tool inputs as readable execution details', () => {
+    assert.equal(toolInputDisplay('grep', { pattern: 'TODO', path: 'src' }), 'Pattern: TODO\nPath: src')
+    assert.equal(toolInputDisplay('read', { path: 'src/state.js', offset: 20, limit: 40 }), 'Path: src/state.js\nStart: 20\nLimit: 40')
+    assert.equal(
+      toolInputDisplay('eval', { language: 'py', title: 'Count rows', code: 'len(rows)' }),
+      'Language: py\nPurpose: Count rows\n\nlen(rows)',
+    )
+  })
+
+  it('extracts human-readable text from structured tool outputs', () => {
+    assert.equal(toolOutputDisplay({ details: { displayContent: { text: 'visible result' } } }), 'visible result')
+    assert.equal(toolOutputDisplay({ content: [{ type: 'text', text: 'first' }, { type: 'text', text: ' second' }] }), 'first second')
   })
 })

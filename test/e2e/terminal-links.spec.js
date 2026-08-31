@@ -289,6 +289,8 @@ test('a silent zombie event stream reconnects from its last event id', async ({ 
   })
 
   await page.goto(`${BASE}/#${SESSION_ID}`)
+  const snapshot = await page.request.get(`${BASE}/api/sessions/${SESSION_ID}/messages?limit=1000`)
+  const snapshotCursor = (await snapshot.json()).cursor
   await expect.poll(() => page.evaluate(() => {
     // @ts-ignore test observation hook
     return window.__fakeEventSources?.length || 0
@@ -311,5 +313,5 @@ test('a silent zombie event stream reconnects from its last event id', async ({ 
     return { firstClosed: window.__fakeEventSources[0].closed, secondUrl: window.__fakeEventSources[1].url }
   })
   expect(state.firstClosed).toBe(true)
-  expect(state.secondUrl).toContain('lastEventId=123')
+  expect(state.secondUrl).toContain(`lastEventId=${Math.max(123, snapshotCursor)}`)
 })
