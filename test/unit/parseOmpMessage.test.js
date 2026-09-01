@@ -226,6 +226,13 @@ describe('parseOmpMessage: filtering', () => {
     assert.equal(parseOmpMessage(omp({ message: { role: 'user', content: '' } })), null)
     assert.equal(parseOmpMessage(omp({ message: { role: 'user', content: '   ' } })), null)
   })
+  it('filters internal Room Sidecar delivery envelopes', () => {
+    const msg = parseOmpMessage(omp({
+      message: { role: 'user', content: '[feather-sidecar room-trading 9 risk-operator] "internal coordination"' },
+    }))
+    assert.equal(msg, null)
+  })
+
 
   it('filters invisible-only blocks', () => {
     // A message with only an unknown block type should be filtered

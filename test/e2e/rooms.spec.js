@@ -281,3 +281,62 @@ test('shows friction only on the Room that reported it', async ({ page }) => {
   await expect(panel).toContainText('OAuth callback returned 401')
   await expect(page.getByTestId('friction-panel-family')).toHaveCount(0)
 })
+
+test('forks a local chat into an isolated named workspace', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  const sourceId = '11111111-2222-4333-8444-555555555555'
+  const forkedId = '66666666-7777-4888-8999-aaaaaaaaaaaa'
+  let forkBody = null
+  let forked = false
+  const listedSessions = () => [
+    { id: sourceId, title: 'Inventory review', updatedAt: '2026-08-31T20:00:00Z', isActive: true, agent: 'omp' },
+    ...(forked ? [{ id: forkedId, title: 'Inventory review branch', updatedAt: '2026-08-31T20:01:00Z', isActive: true, agent: 'omp' }] : []),
+  ]
+  await page.route('**/api/sessions?*', route => route.fulfill({ json: { sessions: listedSessions() } }))
+  await page.route('**/api/sessions/*/messages?*', route => route.fulfill({
+    json: { messages: [], hasMore: false, cursor: 0, nextBefore: 0 },
+  }))
+  await page.route('**/api/sessions/*/protocol-runs', route => route.fulfill({ json: { runs: [] } }))
+  await page.route('**/api/sessions/*/stream', route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: 'event: connected\ndata: {}\n\n',
+  }))
+  await page.route(`**/api/sessions/${sourceId}/room`, route => route.fulfill({
+    json: {
+      room: null, kind: 'chat', role: null, label: 'Inventory review',
+      forkOf: null, forkSourceTitle: null, workspaceMode: null, forkBranch: null,
+    },
+  }))
+  await page.route(`**/api/sessions/${forkedId}/room`, route => route.fulfill({
+    json: {
+      room: null, kind: 'chat', role: null, label: 'Inventory review branch',
+      forkOf: sourceId, forkSourceTitle: 'Inventory review', workspaceMode: 'isolated', forkBranch: 'feather/fork-66666666',
+    },
+  }))
+  await page.route(`**/api/sessions/${sourceId}/fork`, async route => {
+    forkBody = JSON.parse(route.request().postData() || '{}')
+    forked = true
+    await route.fulfill({ json: {
+      id: forkedId,
+      status: 'starting',
+      room: null,
+      workspaceMode: forkBody.workspaceMode,
+      workspacePath: '/tmp/fork-worktree',
+      notice: null,
+    } })
+  })
+
+  await page.goto(`${BASE}/#${sourceId}`)
+  await expect(page.getByTestId('session-header')).toContainText('Inventory review')
+  await page.getByTestId('session-header').locator('button').filter({ hasText: '⋮' }).click()
+  await page.getByTestId('fork-chat').click()
+  await expect(page.getByTestId('fork-dialog')).toBeVisible()
+  await expect(page.getByTestId('fork-workspace-isolated')).toHaveAttribute('aria-pressed', 'true')
+  await page.getByTestId('fork-title').fill('Inventory review branch')
+  await page.getByTestId('fork-submit').click()
+
+  await expect(page).toHaveURL(new RegExp(`#${forkedId}$`))
+  expect(forkBody).toEqual({ title: 'Inventory review branch', workspaceMode: 'isolated' })
+  await expect(page.getByTestId('fork-lineage')).toContainText('Forked from Inventory review')
+})

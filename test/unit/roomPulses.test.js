@@ -108,7 +108,10 @@ describe('Room status scheduler', () => {
       const meta = JSON.parse(fs.readFileSync(path.join(stateDir, 'session-meta.json'), 'utf8'))
       assert.equal(meta[state.active.sessionId].title, 'Status: #active')
       const context = await (await fetch(`http://127.0.0.1:${port}/api/sessions/${state.active.sessionId}/room`)).json()
-      assert.deepEqual(context, { room: 'active', kind: 'status', role: 'status', label: 'Status' })
+      assert.deepEqual(context, {
+        room: 'active', kind: 'status', role: 'status', label: 'Status',
+        forkOf: null, forkSourceTitle: null, workspaceMode: null, forkBranch: null,
+      })
 
       const pause = await fetch(`http://127.0.0.1:${port}/api/rooms/idle/pulse`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }),

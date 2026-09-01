@@ -130,6 +130,10 @@ export interface RoomSessionContext {
   kind: 'main' | 'resident' | 'status' | 'chat' | null
   role: string | null
   label: string | null
+  forkOf: string | null
+  forkSourceTitle: string | null
+  workspaceMode: 'isolated' | 'shared' | null
+  forkBranch: string | null
 }
 
 export async function fetchSessionRoomContext(sessionId: string): Promise<RoomSessionContext> {
@@ -141,10 +145,6 @@ export async function fetchSessionRoom(sessionId: string): Promise<string | null
   return (await fetchSessionRoomContext(sessionId)).room
 }
 
-export async function fetchRoomResidents(room: string): Promise<RoomResident[]> {
-  const response = await fetch(`${BASE}/api/rooms/${encodeURIComponent(room)}/residents`)
-  return (await responseJson<{ residents: RoomResident[] }>(response)).residents || []
-}
 
 export interface RoomWikiPageMeta {
   name: string
@@ -255,8 +255,6 @@ export interface Message {
   passive?: boolean
   stopReason?: string
   cwd?: string
-  roomFrom?: string
-  roomTo?: string
   model?: string
   usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
   version?: string
@@ -577,8 +575,21 @@ export async function renameSession(id: string, title: string): Promise<void> {
   await responseJson(response)
 }
 
-export const forkSession = (id: string, cwd?: string) =>
-  fetch(`${BASE}/api/sessions/${id}/fork`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cwd }) }).then(r => r.json())
+export async function forkSession(id: string, options: { title: string, workspaceMode: 'isolated' | 'shared' }): Promise<{
+  id: string
+  status: 'starting'
+  room: string | null
+  workspaceMode: 'isolated' | 'shared'
+  workspacePath: string | null
+  notice: string | null
+}> {
+  const response = await fetch(`${BASE}/api/sessions/${id}/fork`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(options),
+  })
+  return responseJson(response)
+}
 
 export const fetchStarred = (): Promise<Record<string, string[]>> =>
   fetch(`${BASE}/api/starred`).then(r => r.json())

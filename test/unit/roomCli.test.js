@@ -68,6 +68,57 @@ describe('room assignment CLI', () => {
     }
   })
 
+  it('sends literal stdin to another Room and prints the success receipt', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-room-send-'))
+    roots.push(root)
+    const roomsDir = path.join(root, 'rooms')
+    const sourceDir = path.join(roomsDir, 'feather')
+    fs.mkdirSync(sourceDir, { recursive: true })
+    fs.mkdirSync(path.join(roomsDir, 'trading'))
+    const requests = []
+    const server = http.createServer((request, response) => {
+      const chunks = []
+      request.on('data', chunk => chunks.push(chunk))
+      request.on('end', () => {
+        requests.push({
+          url: request.url,
+          messageId: request.headers['x-feather-message-id'],
+          body: JSON.parse(Buffer.concat(chunks).toString()),
+        })
+        response.writeHead(200, { 'Content-Type': 'application/json' })
+        response.end('{"ok":true,"fromRoom":"feather","room":"trading","sentAt":"2026-08-31T22:00:00Z"}')
+      })
+    })
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    const cli = path.resolve(import.meta.dirname, '../../bin/room')
+    const env = {
+      ...process.env,
+      HOME: root,
+      ROOMS_DIR: roomsDir,
+      FEATHER_URL: `http://127.0.0.1:${server.address().port}`,
+    }
+    try {
+      const result = await runWithInput(
+        cli,
+        ['send', '#trading', '--stdin'],
+        { cwd: sourceDir, env },
+        'Check the live risk limit.\nInclude evidence.',
+      )
+      assert.deepEqual(JSON.parse(result.stdout), {
+        ok: true, fromRoom: 'feather', room: 'trading', sentAt: '2026-08-31T22:00:00Z',
+      })
+      assert.equal(requests.length, 1)
+      assert.equal(requests[0].url, '/api/rooms/trading/send')
+      assert.match(requests[0].messageId, /^[a-f0-9]{32}$/)
+      assert.deepEqual(requests[0].body, {
+        fromRoom: 'feather',
+        text: 'Check the live risk limit.\nInclude evidence.',
+      })
+    } finally {
+      await new Promise(resolve => server.close(resolve))
+    }
+  })
+
   it('records complaints in #friction and lets a room pause or wake itself', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-room-feedback-'))
     roots.push(root)

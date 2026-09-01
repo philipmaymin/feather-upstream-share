@@ -16,6 +16,7 @@
 #   room complain "<text>"             add an annoyance to #friction
 #   room pause                          stop scheduled status reports for this room
 #   room wake                           resume scheduled status reports for this room
+#   room send <room> TEXT|--stdin|--file PATH send tagged cross-Room chat
 #   room lookup "<question>"           quick Haiku answer (transcripts, memory)
 #   room council "<task>" [-n N]       N sealed attempts (claude+codex) + judge
 #   room second-opinion "<question>"   ask the other harness
@@ -320,6 +321,29 @@ cmd_pulse() {
   else echo "#${ROOM_NAME} status reports paused"; fi
 }
 
+cmd_send() {
+  local target="${1:-}"
+  [ -n "$target" ] || die "usage: room send <room> TEXT | --stdin | --file PATH"
+  shift
+  target="${target#\#}"
+  case "$target" in *[!a-z0-9-]*|'') die "room send: invalid target room: $target" ;; esac
+  resolve_room
+  [ "$target" != "$ROOM_NAME" ] || die "room send: source and target rooms are the same"
+  [ -d "$ROOMS_DIR/$target" ] || die "room send: no such target room: $target"
+  read_room_text send "$@"
+  ensure_feather_url
+  local message_id body response
+  message_id="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')" || die "room send: could not create message id"
+  body="$(python3 -c 'import json,sys; print(json.dumps({"fromRoom":sys.argv[1],"text":sys.argv[2]}))' "$ROOM_NAME" "$ROOM_TEXT")" \
+    || die "room send: could not encode message"
+  response="$(curl -sS -X POST "$FEATHER_URL/api/rooms/$target/send" \
+    -H 'Content-Type: application/json' -H "X-Feather-Message-ID: $message_id" -d "$body")" \
+    || die "room send: Feather request failed"
+  python3 -c 'import json,sys; data=json.loads(sys.argv[1]); raise SystemExit(0 if data.get("ok") is True else 1)' "$response" \
+    || die "room send: Feather did not acknowledge delivery: $response"
+  printf '%s\n' "$response"
+}
+
 cmd_lookup() {
   [ -n "${1:-}" ] || die 'usage: room lookup "<question>"'
   new_run_dir lookup
@@ -505,6 +529,7 @@ case "$cmd" in
   complain|friction) cmd_complain "$@" ;;
   pause) cmd_pulse false ;;
   wake) cmd_pulse true ;;
+  send) cmd_send "$@" ;;
   lookup) cmd_lookup "$@" ;;
   council) cmd_council "$@" ;;
   second-opinion|so) cmd_second_opinion "$@" ;;

@@ -7,8 +7,8 @@ import { SidecarThread } from './components/Sidecar'
 import { RoomWikiView } from './components/RoomWikiView'
 import RoomsHome from './RoomsHome'
 import FeedHome from './FeedHome'
-import type { SessionMeta, Message, MessagePage, MessageSubscription, QuestionData, SidecarGroup, SidecarMessage, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot, ProtocolRunSnapshot, RoomSessionContext } from './api'
-import { fetchSessions, fetchRooms, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, answerQuestion, fetchAgents, fetchSidecars, fetchSidecar, subscribeSidecar, createSidecar, fetchSessionRoom, fetchSessionRoomContext, fetchRoomResidents } from './api'
+import type { SessionMeta, Message, MessagePage, MessageSubscription, QuestionData, SidecarGroup, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot, ProtocolRunSnapshot, RoomSessionContext } from './api'
+import { fetchSessions, fetchRooms, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, answerQuestion, fetchAgents, fetchSidecars, createSidecar, fetchSessionRoom, fetchSessionRoomContext } from './api'
 import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
 import { putMediaRecord, patchMediaRecord, deleteMediaRecord, listMediaRecords, isTerminalMediaRecord, withMediaRecordClaim } from './lib/mediaOutbox.js'
 import { listPendingMessages, putPendingMessage, patchPendingMessage, deletePendingMessage } from './lib/messageOutbox.js'
@@ -16,7 +16,6 @@ import { appUrl } from './lib/appPath.js'
 import { deriveToolIntentState, isFinalAssistantMessage, toolIntentTransition } from './lib/toolIntentStatus.js'
 import { deriveTodoSnapshot, reduceTodoSnapshot, todoSnapshotFromDetails } from './lib/ompTodo.js'
 import { createOmpMirrorState, reconcileOmpRuntimeJobs, reconcileSubagentRuntime, reduceOmpMirrorState } from './lib/ompMirror.js'
-import { mergeRoomThreadMessages } from './lib/roomThread.js'
 import { createProtocolRunsState, orderedProtocolRuns, reduceProtocolRunSnapshot, replaceProtocolRuns } from './lib/protocolRuns.js'
 
 interface QuickLink { label: string; url: string }
@@ -192,8 +191,6 @@ export default function App() {
   const [wikiRoomName, setWikiRoomName] = createSignal<string | undefined>()
   const [wikiLookupState, setWikiLookupState] = createSignal<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [wikiRetry, setWikiRetry] = createSignal(0)
-  const [roomSidecarId, setRoomSidecarId] = createSignal<string | null>(null)
-  const [roomThread, setRoomThread] = createSignal<SidecarMessage[]>([])
   const [roomContext, setRoomContext] = createSignal<RoomSessionContext | null>(null)
   const [filesMode, setFilesMode] = createSignal<'changed' | 'browse'>('browse')
   const TEXT_EXTS: Record<string, true> = { '.txt': true, '.md': true, '.js': true, '.ts': true, '.tsx': true, '.jsx': true, '.json': true, '.css': true, '.py': true, '.rb': true, '.go': true, '.rs': true, '.sh': true, '.yml': true, '.yaml': true, '.toml': true, '.cfg': true, '.conf': true, '.ini': true, '.env': true, '.sql': true, '.csv': true, '.xml': true, '.log': true, '.jsonl': true, '.svelte': true, '.vue': true, '.astro': true, '.mjs': true, '.cjs': true }
@@ -323,6 +320,11 @@ export default function App() {
 
 
   const [menuOpen, setMenuOpen] = createSignal(false)
+  const [forkOpen, setForkOpen] = createSignal(false)
+  const [forkTitle, setForkTitle] = createSignal('')
+  const [forkWorkspaceMode, setForkWorkspaceMode] = createSignal<'isolated' | 'shared'>('isolated')
+  const [forkBusy, setForkBusy] = createSignal(false)
+  const [forkError, setForkError] = createSignal('')
   const [historyIdx, setHistoryIdx] = createSignal(-1)
   const [sseStatus, setSSEStatus] = createSignal<'connected' | 'reconnecting'>('connected')
   const [activity, setActivity] = createSignal<string | null>(null)
@@ -1397,10 +1399,43 @@ export default function App() {
     saveStarred(s).catch(() => {})
   }
 
-  async function handleFork(id: string) {
+  function openForkDialog(title: string) {
+    const source = roomContext()?.label || title || 'Chat'
+    setForkTitle(`${source} branch`)
+    setForkWorkspaceMode('isolated')
+    setForkError('')
     setMenuOpen(false)
-    await forkSession(id)
-    updateSessions(await fetchSessions())
+    setForkOpen(true)
+  }
+
+  async function submitFork() {
+    const id = currentId()
+    const title = forkTitle().trim()
+    if (!id || !title || forkBusy()) return
+    setForkBusy(true)
+    setForkError('')
+    try {
+      const forked = await forkSession(id, { title, workspaceMode: forkWorkspaceMode() })
+      setForkOpen(false)
+      updateSessions(await fetchSessions())
+      select(forked.id)
+      if (forked.notice) setTimeout(() => alert(forked.notice!), 0)
+    } catch (error) {
+      setForkError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setForkBusy(false)
+    }
+  }
+
+  function shareForkOutcome() {
+    const sourceId = roomContext()?.forkOf
+    if (!sourceId) return
+    const outcome = prompt('Outcome to bring back to the source chat:')
+    if (outcome === null || !outcome.trim()) return
+    const label = roomContext()?.label || sessions().find(session => session.id === currentId())?.title || 'Fork'
+    saveDraft(sourceId, `[Outcome from ${label}]\n\n${outcome.trim()}`)
+    setMenuOpen(false)
+    select(sourceId)
   }
 
   function stopVoice() {
@@ -1896,31 +1931,6 @@ export default function App() {
     sendSessionKeys(id, ['AgentHub']).catch(error => console.error('Could not open Agent Hub', error))
   }
 
-  async function openRoomRole(role: string) {
-    const sourceId = currentId()
-    const generation = selectionGeneration
-    const context = roomContext()
-    if (!sourceId || !context?.room || role === 'human') return
-    try {
-      const resident = (await fetchRoomResidents(context.room)).find(candidate => candidate.role === role)
-      if (generation !== selectionGeneration || currentId() !== sourceId || roomContext()?.room !== context.room) return
-      if (resident) select(resident.sessionId)
-    } catch (error) {
-      console.error('Could not open Room resident', error)
-    }
-  }
-
-  function mergeRoomThreadMessage(message: SidecarMessage) {
-    setRoomThread((current) => {
-      const existing = current.findIndex((candidate) => candidate.seq === message.seq)
-      if (existing >= 0) {
-        const next = [...current]
-        next[existing] = message
-        return next
-      }
-      return [...current, message].sort((a, b) => a.seq - b.seq)
-    })
-  }
 
   let roomContextGeneration = 0
   createEffect(() => {
@@ -1933,34 +1943,6 @@ export default function App() {
     }).catch(() => {})
   })
 
-  let roomThreadGeneration = 0
-  createEffect(() => {
-    const id = currentId()
-    const generation = ++roomThreadGeneration
-    let unsubscribe: (() => void) | undefined
-    let disposed = false
-    setRoomSidecarId(null)
-    setRoomThread([])
-    onCleanup(() => {
-      disposed = true
-      unsubscribe?.()
-    })
-    if (!id) return
-    fetchSessionRoom(id).then((roomName) => {
-      if (!roomName || disposed || generation !== roomThreadGeneration) return
-      const groupId = `room-${roomName}`
-      return fetchSidecar(groupId).then(({ group, thread }) => {
-        if (disposed || generation !== roomThreadGeneration || group?.kind !== 'room') return
-        if (group.members.find((member) => member.role === 'leader')?.sessionId !== id) return
-        setRoomSidecarId(groupId)
-        setRoomThread(thread)
-        unsubscribe = subscribeSidecar(groupId, mergeRoomThreadMessage)
-      })
-    }).catch(() => {})
-  })
-
-  const roomChatMessages = createMemo<Message[]>(() =>
-    mergeRoomThreadMessages(messages(), roomThread(), roomSidecarId()) as Message[])
   // The Wiki is Room-owned. Resolve the current session's Room only when the
   // tab opens; RoomWikiView then reads curated pages, never raw updates/traces.
   let wikiRoomGeneration = 0
@@ -2301,6 +2283,47 @@ export default function App() {
         </div>
       </Show>
 
+      <Show when={forkOpen()}>
+        <style>{`.fork-dialog-backdrop{align-items:flex-end}@media (min-width:700px){.fork-dialog-backdrop{align-items:center}}`}</style>
+        <div class="fork-dialog-backdrop" data-testid="fork-dialog-backdrop" role="presentation" onClick={() => !forkBusy() && setForkOpen(false)}
+          style={{ position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.68)', 'z-index': '240', display: 'flex', 'justify-content': 'center', padding: '16px' }}>
+          <section data-testid="fork-dialog" role="dialog" aria-modal="true" aria-label="Fork chat" onClick={(event) => event.stopPropagation()}
+            style={{ width: 'min(480px, 100%)', background: '#11151d', border: '1px solid #2b3442', 'border-radius': '14px', padding: '16px', 'box-shadow': '0 18px 60px rgba(0,0,0,0.55)' }}>
+            <div style={{ 'font-size': '16px', 'font-weight': '750', color: '#edf1f6' }}>Fork this chat</div>
+            <div style={{ 'font-size': '12px', color: '#7f8996', 'line-height': '1.45', margin: '4px 0 14px' }}>
+              Copy the saved conversation into a new independent chat. Future messages do not sync.
+            </div>
+            <label style={{ display: 'block', color: '#aeb6c2', 'font-size': '11px', 'font-weight': '650', 'margin-bottom': '5px' }}>Name</label>
+            <input data-testid="fork-title" value={forkTitle()} onInput={(event) => setForkTitle(event.currentTarget.value)}
+              onKeyDown={(event) => { if (event.key === 'Enter') submitFork(); if (event.key === 'Escape') setForkOpen(false) }}
+              ref={(element) => setTimeout(() => element.focus(), 0)}
+              style={{ width: '100%', 'box-sizing': 'border-box', background: '#090d12', border: '1px solid #343d4b', color: '#edf1f6', padding: '9px 10px', 'border-radius': '8px', 'font-size': '14px', outline: 'none' }} />
+            <div style={{ color: '#aeb6c2', 'font-size': '11px', 'font-weight': '650', margin: '14px 0 6px' }}>Workspace</div>
+            <div style={{ display: 'grid', 'grid-template-columns': '1fr 1fr', gap: '8px' }}>
+              <button data-testid="fork-workspace-isolated" type="button" onClick={() => setForkWorkspaceMode('isolated')}
+                aria-pressed={forkWorkspaceMode() === 'isolated'}
+                style={{ background: forkWorkspaceMode() === 'isolated' ? '#17281d' : '#0c1016', border: `1px solid ${forkWorkspaceMode() === 'isolated' ? '#3d7550' : '#29313d'}`, color: '#d6dde7', padding: '9px', 'border-radius': '8px', cursor: 'pointer', 'text-align': 'left' }}>
+                <strong style={{ display: 'block', 'font-size': '12px' }}>Isolated</strong><span style={{ color: '#7f8996', 'font-size': '10px' }}>New Git worktree</span>
+              </button>
+              <button data-testid="fork-workspace-shared" type="button" onClick={() => setForkWorkspaceMode('shared')}
+                aria-pressed={forkWorkspaceMode() === 'shared'}
+                style={{ background: forkWorkspaceMode() === 'shared' ? '#272117' : '#0c1016', border: `1px solid ${forkWorkspaceMode() === 'shared' ? '#78643b' : '#29313d'}`, color: '#d6dde7', padding: '9px', 'border-radius': '8px', cursor: 'pointer', 'text-align': 'left' }}>
+                <strong style={{ display: 'block', 'font-size': '12px' }}>Shared</strong><span style={{ color: '#7f8996', 'font-size': '10px' }}>Same files, edit carefully</span>
+              </button>
+            </div>
+            <Show when={forkError()}><div role="alert" style={{ color: '#df7b72', 'font-size': '11px', margin: '10px 0 0' }}>{forkError()}</div></Show>
+            <div style={{ display: 'flex', 'justify-content': 'flex-end', gap: '8px', margin: '16px 0 0' }}>
+              <button type="button" onClick={() => setForkOpen(false)} disabled={forkBusy()}
+                style={{ background: 'transparent', border: '1px solid #333c49', color: '#9ca7b5', padding: '7px 12px', 'border-radius': '7px', cursor: 'pointer' }}>Cancel</button>
+              <button data-testid="fork-submit" type="button" onClick={submitFork} disabled={forkBusy() || !forkTitle().trim()}
+                style={{ background: '#4aba6a', border: 'none', color: '#07110a', padding: '7px 13px', 'border-radius': '7px', 'font-weight': '750', cursor: 'pointer' }}>
+                {forkBusy() ? 'Forking…' : 'Fork and open'}
+              </button>
+            </div>
+          </section>
+        </div>
+      </Show>
+
       {/* Main */}
       <div style={{ flex: '1', display: 'flex', 'flex-direction': 'column', 'min-width': '0', height: '100%', position: 'relative' }}>
         <Show when={currentId() || !isFledgeHost || homeView() === 'rooms'}>
@@ -2316,6 +2339,13 @@ export default function App() {
                     <button data-testid="room-chat-breadcrumb" onClick={goHome}
                       style={{ display: 'block', background: 'none', border: 'none', padding: '0', color: '#8792a2', 'font-size': '10px', 'font-weight': '650', cursor: 'pointer', 'text-align': 'left', 'text-transform': 'capitalize' }}>
                       #{roomContext()!.room} / {roomContext()!.label?.replaceAll('-', ' ') || 'Chat'}
+                    </button>
+                  </Show>
+                  <Show when={roomContext()?.forkOf}>
+                    <button data-testid="fork-lineage" onClick={() => select(roomContext()!.forkOf!)}
+                      style={{ display: 'block', background: 'none', border: 'none', padding: '1px 0 0', color: '#6f7b8b', 'font-size': '9px', cursor: 'pointer', 'text-align': 'left' }}>
+                      Forked from {roomContext()!.forkSourceTitle || roomContext()!.forkOf!.slice(0, 8)}
+                      {roomContext()!.workspaceMode === 'isolated' ? ` · ${roomContext()!.forkBranch || 'isolated'}` : ' · shared workspace'}
                     </button>
                   </Show>
                   <div style={{ 'font-size': '10px', overflow: 'hidden', 'text-overflow': 'ellipsis', 'white-space': 'nowrap', display: 'flex', 'align-items': 'center', gap: '4px' }}>
@@ -2360,8 +2390,12 @@ export default function App() {
                     </Show>
                     <button onClick={() => { setRenameText(s().title); setRenaming(true); setMenuOpen(false) }}
                       style={{ display: 'block', width: '100%', padding: '10px 16px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#e5e5e5', 'font-size': '13px', 'text-align': 'left', cursor: 'pointer' }}>Rename</button>
-                    <button onClick={() => handleFork(s().id)}
-                      style={{ display: 'block', width: '100%', padding: '10px 16px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#e5e5e5', 'font-size': '13px', 'text-align': 'left', cursor: 'pointer' }}>Fork</button>
+                    <button data-testid="fork-chat" onClick={() => openForkDialog(s().title)}
+                      style={{ display: 'block', width: '100%', padding: '10px 16px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#e5e5e5', 'font-size': '13px', 'text-align': 'left', cursor: 'pointer' }}>Fork chat</button>
+                    <Show when={roomContext()?.forkOf}>
+                      <button data-testid="share-fork-outcome" onClick={shareForkOutcome}
+                        style={{ display: 'block', width: '100%', padding: '10px 16px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#8bc99c', 'font-size': '13px', 'text-align': 'left', cursor: 'pointer' }}>Bring outcome back…</button>
+                    </Show>
                     <a href={exportUrl(s().id)} download="" style={{ display: 'block', width: '100%', padding: '10px 16px', background: 'none', border: 'none', 'border-bottom': '1px solid #222', color: '#e5e5e5', 'font-size': '13px', 'text-align': 'left', cursor: 'pointer', 'text-decoration': 'none' }} onClick={() => setMenuOpen(false)}>Export MD</a>
                     <button onClick={() => handleDelete(s().id)}
                       style={{ display: 'block', width: '100%', padding: '10px 16px', background: 'none', border: 'none', color: '#d45555', 'font-size': '13px', 'text-align': 'left', cursor: 'pointer' }}>Delete</button>
@@ -2429,13 +2463,11 @@ export default function App() {
           }>
             <div data-testid="chat-panel" style={{ display: tab() === 'chat' ? 'block' : 'none', height: '100%' }}>
               <MessageView
-                messages={roomChatMessages()}
+                messages={messages()}
                 loading={loading()}
                 hasMore={hasMore()}
                 highLevel={roomContext()?.kind === 'main'}
                 onOpenAgentHub={openAgentHub}
-                roomRole={roomContext()?.role || undefined}
-                onOpenRoomRole={openRoomRole}
                 loadingMore={loadingMore()}
                 onLoadEarlier={loadEarlier}
                 onAnswer={(answer) => { if (composerReady()) sendInput(currentId()!, answer) }}

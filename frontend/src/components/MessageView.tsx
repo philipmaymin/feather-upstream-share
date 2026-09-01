@@ -652,9 +652,9 @@ function renderBlock(block: ContentBlock, onImageClick?: (src: string) => void, 
           <span style={{ color: '#c084fc' }}>Reasoning</span>
           <span style={{ 'margin-left': 'auto', color: 'var(--text-ghost)', 'font-size': '10px' }}>▸</span>
         </summary>
-        <div style={{ 'margin-top': '6px', 'margin-left': '4px', padding: '10px 14px', background: 'rgba(168,85,247,0.04)', border: '1px solid rgba(168,85,247,0.12)', 'border-radius': '10px', color: 'var(--text-secondary)', 'font-size': '12px', 'white-space': 'pre-wrap', 'max-height': '400px', 'overflow-y': 'auto', 'line-height': '1.55', 'box-shadow': '0 1px 3px rgba(0,0,0,0.15)' }}>
-          {block.thinking}
-        </div>
+        <div class="markdown" style={{ 'margin-top': '6px', 'margin-left': '4px', padding: '10px 14px', background: 'rgba(168,85,247,0.04)', border: '1px solid rgba(168,85,247,0.12)', 'border-radius': '10px', color: 'var(--text-secondary)', 'font-size': '12px', 'max-height': '400px', 'overflow-y': 'auto', 'line-height': '1.55', 'box-shadow': '0 1px 3px rgba(0,0,0,0.15)' }}
+          innerHTML={renderLiveMarkdown(block.thinking)}
+          ref={(element) => queueMicrotask(() => enhanceMarkdown(element, onImageClick, onExpandTable, onOpenFile))} />
       </details>
     )
   }
@@ -1218,8 +1218,6 @@ type MessageViewProps = {
   onOpenFile?: (path: string) => void
   highLevel?: boolean
   onOpenAgentHub?: () => void
-  roomRole?: string
-  onOpenRoomRole?: (role: string) => void
 }
 
 export function MessageView(props: MessageViewProps) {
@@ -1749,8 +1747,17 @@ export function MessageView(props: MessageViewProps) {
       && message.content.some(block => block.type === 'tool_result')
       && message.content.filter(block => block.type === 'tool_result').every(block => !!block.tool_use_id && toolUseIds().has(block.tool_use_id))
   }
+  const mirroredThinking = createMemo(() => {
+    const texts = new Set<string>()
+    for (const item of props.work?.timeline || []) {
+      if (item.kind === 'thinking' && item.text) texts.add(item.text)
+    }
+    return texts
+  })
   function isActivityBlock(block: ContentBlock) {
-    return block.type === 'tool_result' || (block.type === 'tool_use' && !isQuestionBlock(block))
+    return (block.type === 'thinking' && !!block.thinking && !mirroredThinking().has(block.thinking))
+      || block.type === 'tool_result'
+      || (block.type === 'tool_use' && !isQuestionBlock(block))
   }
   function messageHasActivity(message: Message) {
     return (message.content || []).some(isActivityBlock)
@@ -1797,6 +1804,7 @@ export function MessageView(props: MessageViewProps) {
       block.type === 'tool_use' && block.id ? !!getResult(block.id)?.is_error : false
     ).length
     const toolUses = traceBlocks.filter(block => block.type === 'tool_use')
+    const reasoning = traceBlocks.filter(block => block.type === 'thinking' && block.thinking)
     const summary = live && props.statusText
       ? props.statusText
       : props.highLevel
@@ -1822,7 +1830,11 @@ export function MessageView(props: MessageViewProps) {
         </Show>
       </summary>
       <div class="work-log-detail" data-testid="work-log-detail">
-        <div class="work-log-meta">{toolUses.length} action{toolUses.length === 1 ? '' : 's'} · {formatTime(last?.timestamp || '')}</div>
+        <div class="work-log-meta">
+          {toolUses.length} action{toolUses.length === 1 ? '' : 's'}
+          {reasoning.length > 0 ? ` · ${reasoning.length} reasoning` : ''}
+          {' · '}{formatTime(last?.timestamp || '')}
+        </div>
         <For each={traceBlocks}>{(block) => {
           if (block.type === 'tool_result' && block.tool_use_id && renderedToolUseIds.has(block.tool_use_id)) return null
           return renderBlock(block, (src) => setLightbox(src), openExpandedTable, getResult, props.onOpenFile)
@@ -1917,17 +1929,6 @@ export function MessageView(props: MessageViewProps) {
             {msg.delivery === 'queued' ? 'queued' : msg.delivery === 'delivered' ? '\u2713\u2713' : '\u2713'}
           </span>
         )}
-        <Show when={props.roomRole && msg.roomFrom && msg.roomTo}>
-          {() => {
-            const role = msg.roomFrom === props.roomRole ? msg.roomTo : msg.roomFrom
-            return role && role !== 'human' && role !== props.roomRole
-              ? <button class="msg-action" data-testid={`open-room-role-${role}`} title={`Open ${role.replaceAll('-', ' ')}`} onClick={() => props.onOpenRoomRole?.(role)}
-                  style={{ background: 'none', border: '1px solid var(--border-subtle)', 'border-radius': '5px', cursor: 'pointer', padding: '2px 6px', color: 'var(--link)', 'font-size': '10px', 'font-weight': '650' }}>
-                  Open {role.replaceAll('-', ' ')}
-                </button>
-              : null
-          }}
-        </Show>
         {!msg.uuid.startsWith('optimistic-') && (
           <button onClick={() => props.onToggleStar?.(msg.uuid)}
             style={{ background: 'none', border: 'none', cursor: 'pointer', 'font-size': '12px', padding: '0 2px', color: props.starred?.has(msg.uuid) ? '#c4993a' : '#333', opacity: props.starred?.has(msg.uuid) ? '1' : '0', transition: 'opacity 0.15s' }}
