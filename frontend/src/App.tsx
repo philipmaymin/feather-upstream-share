@@ -7,6 +7,7 @@ import { SidecarThread } from './components/Sidecar'
 import { RoomWikiView } from './components/RoomWikiView'
 import RoomsHome from './RoomsHome'
 import FeedHome from './FeedHome'
+import ChannelsHome from './ChannelsHome'
 import type { SessionMeta, Message, MessagePage, MessageSubscription, QuestionData, SidecarGroup, OmpBridgeEvent, OmpAsyncJob, OmpMirrorState, OmpTodoSnapshot, ProtocolRunSnapshot, RoomSessionContext } from './api'
 import { fetchSessions, fetchRooms, fetchMessages, fetchProtocolRuns, subscribeMessages, sendInput, sendSessionKeys, createSession, resumeSession, interruptSession, uploadFileWithId, transcribeAudio, deleteSession, renameSession, forkSession, fetchStarred, saveStarred, exportUrl, deletePath, checkAuth, login, logout, answerQuestion, fetchAgents, fetchSidecars, createSidecar, fetchSessionRoom, fetchSessionRoomContext } from './api'
 import { MEDIA_ATTEMPTS, MAX_UPLOAD_BYTES, MAX_AUDIO_BYTES, retryMediaOperation, runMediaOperationOnce, isRetryableVoiceMemo } from './lib/mediaRetry.js'
@@ -163,8 +164,9 @@ function setFavicon(color: string) {
 
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
 
-const isFledgeHost = location.hostname === 'app.feather.plus' || new URLSearchParams(location.search).get('app') === 'fledge'
-type HomeView = 'feed' | 'rooms'
+const isSharedAppHost = location.hostname === 'app.feather.plus'
+const isFledgeHost = isSharedAppHost || new URLSearchParams(location.search).get('app') === 'fledge'
+type HomeView = 'feed' | 'channels' | 'rooms'
 
 export default function App() {
   const [authUser, setAuthUser] = createSignal<{ username: string; admin: boolean } | null>({ username: 'philip', admin: true })
@@ -172,7 +174,9 @@ export default function App() {
   const [loginError, setLoginError] = createSignal('')
   const [loginLoading, setLoginLoading] = createSignal(false)
 
-  const [homeView, setHomeView] = createSignal<HomeView>(isFledgeHost ? 'feed' : 'rooms')
+  const requestedSurface = new URLSearchParams(location.search).get('surface')
+  const initialFledgeView: HomeView = requestedSurface === 'channels' || (isSharedAppHost && requestedSurface !== 'feed') ? 'channels' : 'feed'
+  const [homeView, setHomeView] = createSignal<HomeView>(isFledgeHost ? initialFledgeView : 'rooms')
   const [sessions, setSessions] = createSignal<SessionMeta[]>([])
   const [currentId, setCurrentId] = createSignal<string | null>(null)
   const [messages, setMessages] = createSignal<Message[]>([])
@@ -695,17 +699,21 @@ export default function App() {
     }
     window.addEventListener('popstate', onFledgePopState)
 
-    // The reverse proxy has already authenticated anyone who can load the app.
-    // Warm Rooms alongside /api/me so the first render costs one round trip,
-    // not two; fetchRooms coalesces this with RoomsHome's own refresh.
-    fetchRooms().catch(() => {})
+    // Legacy Rooms remain in personal Feather. The shared app mounts Channels
+    // directly and must not pay for or expose the old Room directory.
+    if (!isFledgeHost) fetchRooms().catch(() => {})
     // Caddy/Authelia is the authentication boundary. Direct loopback access is
     // intentionally the Philip instance, so informational identity lookup must
     // never block the UI from mounting.
     setAuthUser({ username: 'philip', admin: true })
     setAuthChecked(true)
-    void checkAuth().then(user => { if (user) setAuthUser(user) })
-    void initApp()
+    void checkAuth().then(user => {
+      const authenticated = user || { username: 'philip', admin: true }
+      setAuthUser(authenticated)
+      if (!isFledgeHost || authenticated.username === 'philip') return initApp()
+    }).catch(() => {
+      if (!isFledgeHost) void initApp()
+    })
     // Check for updates every 30 seconds
     async function checkForUpdate() {
       try {
@@ -1342,6 +1350,17 @@ export default function App() {
     clearSelectionForHome(true)
   }
 
+
+  function openFledgeSurface(view: 'feed' | 'channels') {
+    setHomeView(view)
+    const url = new URL(location.href)
+    if (view === 'channels') {
+      url.searchParams.set('surface', 'channels')
+    } else {
+      for (const key of ['surface', 'view', 'channel', 'thread']) url.searchParams.delete(key)
+    }
+    history.replaceState({ fledgeHome: true }, '', `${url.pathname}${url.search}`)
+  }
   async function doRename(id: string, title: string) {
     if (!title.trim()) { setRenaming(false); setSidebarRenaming(null); return }
     await renameSession(id, title.trim())
@@ -2058,7 +2077,7 @@ export default function App() {
       style={{ display: 'flex', height: 'calc(var(--vh, 1vh) * 100)', width: '100%', 'font-family': "-apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif", position: 'relative', 'overscroll-behavior': 'none' }}>
 
       {/* Hamburger */}
-      <Show when={!sidebar() && !(isFledgeHost && !currentId() && homeView() === 'feed')}>
+      <Show when={!sidebar() && !(isFledgeHost && !currentId() && homeView() === 'feed') && (!isFledgeHost || authUser()?.username === 'philip')}>
         <button onClick={() => setSidebar(true)} style={{ position: 'fixed', top: 'max(12px, env(safe-area-inset-top))', left: 'max(12px, env(safe-area-inset-left))', 'z-index': '50', background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', width: '36px', height: '36px', 'border-radius': '8px', 'font-size': '18px', cursor: 'pointer', display: 'flex', 'align-items': 'center', 'justify-content': 'center', '-webkit-tap-highlight-color': 'transparent' }}>&#9776;</button>
         <Show when={currentId()}>
           <button onClick={goHome} title={isFledgeHost ? 'Fledge home' : 'Rooms home'} style={{ position: 'fixed', top: 'max(12px, env(safe-area-inset-top))', left: 'calc(max(12px, env(safe-area-inset-left)) + 44px)', 'z-index': '50', background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', width: '36px', height: '36px', 'border-radius': '8px', 'font-size': '20px', cursor: 'pointer', display: 'flex', 'align-items': 'center', 'justify-content': 'center', '-webkit-tap-highlight-color': 'transparent' }}>&#8249;</button>
@@ -2433,7 +2452,7 @@ export default function App() {
         <div style={{ flex: '1', overflow: 'hidden' }}>
           <Show when={currentId()} fallback={
             <Show when={isFledgeHost && homeView() === 'feed'} fallback={
-              <div style={{ position: 'relative', height: '100%' }}>
+              <Show when={isFledgeHost && homeView() === 'channels'} fallback={
                 <RoomsHome
                   onOpen={select}
                   onNewChat={(agent, model) => handleNew(false, agent, model)}
@@ -2441,21 +2460,19 @@ export default function App() {
                   creating={creating()}
                   codexAvailable={codexAvailable()}
                 />
-                <Show when={isFledgeHost}>
-                  <button
-                    data-testid="fledge-feed-return"
-                    onClick={() => setHomeView('feed')}
-                    style={{ position: 'fixed', right: 'max(14px, env(safe-area-inset-right))', bottom: 'max(18px, env(safe-area-inset-bottom))', 'z-index': '55', border: '1px solid #d8ff5770', background: '#111a15', color: '#e9f6c5', padding: '10px 15px', 'border-radius': '999px', 'font-size': '12px', 'font-weight': '700', 'letter-spacing': '0.04em', cursor: 'pointer', 'box-shadow': '0 8px 30px rgba(0,0,0,.35)' }}
-                  >
-                    Return to feed
-                  </button>
-                </Show>
-              </div>
+              }>
+                <ChannelsHome
+                  onFeed={() => openFledgeSurface('feed')}
+                  onMenu={() => setSidebar(true)}
+                  onNewChat={() => handleNew(false, 'omp')}
+                  showPersonal={authUser()?.username === 'philip'}
+                />
+              </Show>
             }>
               <FeedHome
                 onOpen={select}
                 onMenu={() => setSidebar(true)}
-                onRooms={() => setHomeView('rooms')}
+                onChannels={() => openFledgeSurface('channels')}
                 onNewChat={() => handleNew(false, 'omp')}
                 onOpenFile={openFile}
               />

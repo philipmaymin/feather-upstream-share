@@ -6,7 +6,7 @@ import './fledge.css'
 
 export interface FeedHomeProps {
   onOpen: (sessionId: string) => void
-  onRooms: () => void
+  onChannels: () => void
   onMenu: () => void
   onNewChat: () => void
   onOpenFile: (path: string) => void
@@ -601,7 +601,7 @@ export default function FeedHome(props: FeedHomeProps) {
     saveScroll()
     adjustAffinity(post, 1)
     if (post.sessionId) props.onOpen(post.sessionId)
-    else props.onRooms()
+    else props.onChannels()
   }
 
   const reactToPost = async (post: FeedPost, selected: FeedReaction) => {
@@ -924,10 +924,10 @@ export default function FeedHome(props: FeedHomeProps) {
             <div class="fledge-state fledge-empty">
               <span class="fledge-state-index">Nothing queued</span>
               <h1>{mode() === 'needs-me' ? 'No decisions are waiting on you' : 'The journal is caught up'}</h1>
-              <p>{mode() === 'needs-me' ? 'Active agents can keep moving. Check the wider feed for results and work in progress.' : 'Start a conversation or visit Rooms to put new work in motion.'}</p>
+              <p>{mode() === 'needs-me' ? 'Active agents can keep moving. Check the wider feed for results and work in progress.' : 'Start a conversation or open Channels to put shared work in motion.'}</p>
               <div class="fledge-state-actions">
                 <button type="button" class="fledge-state-action" onClick={props.onNewChat}>Start a conversation</button>
-                <button type="button" class="fledge-state-action fledge-state-action-secondary" onClick={props.onRooms}>Open Rooms</button>
+                <button type="button" class="fledge-state-action fledge-state-action-secondary" onClick={props.onChannels}>Open Channels</button>
               </div>
             </div>
           </Show>
@@ -1179,9 +1179,9 @@ export default function FeedHome(props: FeedHomeProps) {
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M5 12h10M5 19h7" /></svg>
           <span>Feed</span>
         </button>
-        <button type="button" class="fledge-bottom-item" onClick={props.onRooms}>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9ZM4 7.5l8 4.5m8-4.5L12 12m0 9v-9" /></svg>
-          <span>Rooms</span>
+        <button type="button" class="fledge-bottom-item" onClick={props.onChannels}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 4-2 16m10-16-2 16M4 9h16M3 15h16" /></svg>
+          <span>Channels</span>
         </button>
         <button type="button" class="fledge-bottom-item fledge-bottom-new" onClick={props.onNewChat}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>

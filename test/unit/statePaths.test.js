@@ -59,10 +59,12 @@ describe('state path classification', () => {
     assert.equal(paths.coordination.roomLeadersFile, '/home/zak/.feather/room-mains.json')
     assert.equal(paths.coordination.roomResidentsFile, '/home/zak/.feather/room-residents.json')
     assert.equal(paths.coordination.roomPulsesFile, '/home/zak/.feather/room-pulses.json')
+    assert.equal(paths.coordination.channelsDbFile, '/home/zak/.feather/channels-v1.sqlite3')
     assert.equal(paths.harness.claudeProjectsDir, '/home/zak/.claude/projects')
     assert.equal(paths.harness.ompSessionsDir, '/home/zak/.feather/omp-sessions')
     assert.equal(paths.harness.codexSessionsDir, '/home/zak/.codex/sessions')
     assert.equal(paths.workspace.roomsDir, '/home/zak/rooms')
+    assert.equal(paths.workspace.channelWorkspacesDir, '/home/zak/.feather/channel-workspaces')
     assert.deepEqual(paths.runtime, { managedExternally: ['process', 'tmux', 'temporary-files'] })
   })
 

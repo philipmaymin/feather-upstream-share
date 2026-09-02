@@ -168,6 +168,194 @@ export async function fetchRoomWikiPage(room: string, page: string): Promise<Roo
   return responseJson<RoomWikiPage>(response)
 }
 
+export interface ChannelPrincipal {
+  id: string
+  kind: 'human' | 'agent' | 'service'
+  username: string
+  displayName: string
+  avatarSeed: string
+  agentBackend?: string | null
+  createdAt: string
+  role?: 'owner' | 'member' | 'agent'
+  notificationLevel?: 'all' | 'mentions' | 'mute'
+}
+
+export interface ChannelInfo {
+  id: string
+  slug: string | null
+  title: string
+  description: string
+  type: 'channel' | 'dm'
+  defaultAgentId: string | null
+  createdAt: string
+  archivedAt: string | null
+  unread: number
+  members: ChannelPrincipal[]
+}
+
+export interface ChannelMessage {
+  id: string
+  channelId: string
+  seq: number
+  threadRootId: string
+  replyToId: string | null
+  messageType: 'human' | 'agent' | 'system' | 'progress'
+  content: string
+  createdAt: string
+  editedAt: string | null
+  author: ChannelPrincipal
+  metadata: Record<string, unknown>
+  thread?: {
+    title: string
+    state: 'open' | 'working' | 'needs_you' | 'resolved'
+    replyCount: number
+    updatedAt: string
+    unread: boolean
+    following: boolean
+    doneAt: string | null
+    snoozedUntil: string | null
+  }
+  replies?: ChannelMessage[]
+}
+
+export interface ChannelExecution {
+  id: string
+  state: 'queued' | 'running' | 'done' | 'error' | 'killed'
+  agent: Pick<ChannelPrincipal, 'id' | 'username' | 'displayName'>
+  triggerMessageId: string
+  finalMessageId: string | null
+  depth: number
+  startedAt: string
+  completedAt: string | null
+  error: string | null
+}
+
+export interface ChannelThread {
+  id: string
+  channelId: string
+  title: string
+  state: 'open' | 'working' | 'needs_you' | 'resolved'
+  following: boolean
+  doneAt: string | null
+  snoozedUntil: string | null
+  messages: ChannelMessage[]
+  executions: ChannelExecution[]
+}
+
+export interface ChannelActivityItem {
+  id: string
+  kind: string
+  reason: string
+  createdAt: string
+  readAt: string | null
+  doneAt: string | null
+  channel: Pick<ChannelInfo, 'id' | 'slug' | 'title'>
+  thread: Pick<ChannelThread, 'id' | 'title' | 'state'> | null
+  messageId: string | null
+  preview: string
+  actor: Pick<ChannelPrincipal, 'id' | 'kind' | 'username' | 'displayName'> | null
+  updates?: number
+}
+
+export async function fetchChannels(): Promise<{ channels: ChannelInfo[]; dms: ChannelInfo[]; principal: ChannelPrincipal }> {
+  return responseJson(await fetch(`${BASE}/api/channels`))
+}
+
+export async function fetchChannelMessages(channelId: string): Promise<ChannelMessage[]> {
+  const data = await responseJson<{ messages: ChannelMessage[] }>(await fetch(`${BASE}/api/channels/${encodeURIComponent(channelId)}/messages`))
+  return data.messages
+}
+
+export async function fetchChannelThread(channelId: string, rootId: string): Promise<ChannelThread> {
+  const data = await responseJson<{ thread: ChannelThread }>(await fetch(`${BASE}/api/channels/${encodeURIComponent(channelId)}/threads/${encodeURIComponent(rootId)}`))
+  return data.thread
+}
+
+export async function fetchChannelActivity(): Promise<{ items: ChannelActivityItem[]; unread: number; needsYou: number }> {
+  return responseJson(await fetch(`${BASE}/api/channels/activity`))
+}
+
+export async function fetchChannelPrincipals(): Promise<ChannelPrincipal[]> {
+  const data = await responseJson<{ principals: ChannelPrincipal[] }>(await fetch(`${BASE}/api/channels/principals`))
+  return data.principals
+}
+
+export async function createChannel(input: { slug: string; title: string; description?: string }): Promise<ChannelInfo> {
+  const data = await responseJson<{ channel: ChannelInfo }>(await fetch(`${BASE}/api/channels`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify(input),
+  }))
+  return data.channel
+}
+
+export async function bootstrapFilms7(): Promise<ChannelInfo> {
+  const data = await responseJson<{ channel: ChannelInfo }>(await fetch(`${BASE}/api/channels/bootstrap-films7`, { method: 'POST' }))
+  return data.channel
+}
+
+export async function addChannelMember(channelId: string, username: string): Promise<ChannelPrincipal> {
+  const data = await responseJson<{ member: { principal: ChannelPrincipal } }>(await fetch(`${BASE}/api/channels/${encodeURIComponent(channelId)}/members`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username }),
+  }))
+  return data.member.principal
+}
+
+export async function postChannelMessage(channelId: string, content: string, threadRootId?: string, replyToId?: string): Promise<ChannelMessage> {
+  const data = await responseJson<{ message: ChannelMessage }>(await fetch(`${BASE}/api/channels/${encodeURIComponent(channelId)}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify({ content, threadRootId, replyToId }),
+  }))
+  return data.message
+}
+
+export async function updateChannelThread(channelId: string, rootId: string, patch: { title?: string; state?: ChannelThread['state'] }): Promise<ChannelThread> {
+  const data = await responseJson<{ thread: ChannelThread }>(await fetch(`${BASE}/api/channels/${encodeURIComponent(channelId)}/threads/${encodeURIComponent(rootId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  }))
+  return data.thread
+}
+
+export async function updateChannelAttention(channelId: string, rootId: string, action: 'read' | 'follow' | 'done' | 'snooze', value = true, until?: string | null): Promise<ChannelThread> {
+  const data = await responseJson<{ thread: ChannelThread }>(await fetch(`${BASE}/api/channels/${encodeURIComponent(channelId)}/threads/${encodeURIComponent(rootId)}/attention`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, value, until }),
+  }))
+  return data.thread
+}
+
+export async function createChannelDm(principalId: string): Promise<ChannelInfo> {
+  const data = await responseJson<{ channel: ChannelInfo }>(await fetch(`${BASE}/api/channels/dms`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ principalId }),
+  }))
+  return data.channel
+}
+
+export async function cancelChannelExecution(executionId: string): Promise<void> {
+  await responseJson(await fetch(`${BASE}/api/channels/executions/${encodeURIComponent(executionId)}/cancel`, { method: 'POST' }))
+}
+
+export function subscribeChannels(onChange: (event: { channelId: string | null; type: string }) => void): () => void {
+  const source = new EventSource(`${BASE}/api/channels/stream`)
+  for (const type of ['message', 'thread', 'attention', 'channel', 'execution']) {
+    source.addEventListener(type, event => {
+      try {
+        const data = JSON.parse((event as MessageEvent).data)
+        onChange({ channelId: data.channelId || null, type })
+      } catch {}
+    })
+  }
+  return () => source.close()
+}
+
 
 export interface RoomUpdate { id: string | null; ts: string | null; title?: string; text: string }
 

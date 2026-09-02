@@ -112,6 +112,10 @@ async function installFixtureRoutes(page, state = { failFeed: false }) {
     if (path === '/api/starred') return route.fulfill({ json: {} })
     if (path === '/api/sidecar') return route.fulfill({ json: { groups: [] } })
     if (path === '/api/quick-links') return route.fulfill({ json: [] })
+    if (path === '/api/channels') return route.fulfill({ json: { channels: [], dms: [], principal: { id: 'human:philip', kind: 'human', username: 'philip', displayName: 'Philip', avatarSeed: 'philip', createdAt: GENERATED_AT } } })
+    if (path === '/api/channels/activity') return route.fulfill({ json: { items: [], unread: 0, needsYou: 0 } })
+    if (path === '/api/channels/principals') return route.fulfill({ json: { principals: [{ id: 'human:philip', kind: 'human', username: 'philip', displayName: 'Philip', avatarSeed: 'philip', createdAt: GENERATED_AT }] } })
+    if (path === '/api/channels/stream') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'event: connected\ndata: {}\n\n' })
     if (path === '/api/version') return route.fulfill({ json: {} })
     if (path === '/api/files/media') {
       return route.fulfill({ status: 200, contentType: 'video/mp4', body: 'media' })
@@ -174,9 +178,10 @@ test('Fledge is a feed-first complete interface with internal chat navigation', 
 
   await page.getByTitle('Fledge home').click()
   await expect(page.getByTestId('fledge-home')).toBeVisible()
-  await page.locator('.fledge-bottom-nav').getByRole('button', { name: 'Rooms' }).click()
-  await expect(page.getByText('#launch', { exact: true })).toBeVisible()
-  await page.getByTestId('fledge-feed-return').click()
+  await page.locator('.fledge-bottom-nav').getByRole('button', { name: 'Channels' }).click()
+  await expect(page.getByTestId('channels-home')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Rooms' })).toHaveCount(0)
+  await page.locator('.channels-mobile-nav').getByRole('button', { name: 'Runs' }).click()
   await expect(page.getByTestId('fledge-home')).toBeVisible()
 
   await page.getByText('Needs Me', { exact: true }).click()
