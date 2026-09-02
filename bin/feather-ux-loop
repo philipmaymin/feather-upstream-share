@@ -286,8 +286,8 @@ def validate_candidate(run_dir: Path) -> None:
 
 
 def publish_candidate(run_dir: Path) -> None:
-    run(["git", "push", "-u", "fork", CANDIDATE_BRANCH], cwd=CANDIDATE_DIR, log=run_dir / "push.log", timeout=180)
-
+    run(["git", "push", "fork", CANDIDATE_BRANCH], cwd=CANDIDATE_DIR, log=run_dir / "push.log", timeout=180)
+    run(["git", "branch", "--set-upstream-to", f"fork/{CANDIDATE_BRANCH}", CANDIDATE_BRANCH], cwd=CANDIDATE_DIR, log=run_dir / "tracking.log", timeout=60)
 
 def commit_candidate(run_dir: Path, focus: str) -> str:
     run(["git", "add", "-A"], cwd=CANDIDATE_DIR)

@@ -2,36 +2,38 @@
 import { test, expect } from '@playwright/test'
 
 const BASE = process.env.FEATHER_URL || 'http://localhost:4870'
-const GENERATED_AT = '2026-08-30T16:00:00.000Z'
+const FIXTURE_NOW = Date.now()
+const fixtureTime = minutesAgo => new Date(FIXTURE_NOW - minutesAgo * 60_000).toISOString()
+const GENERATED_AT = fixtureTime(0)
 
 test.use({ viewport: { width: 390, height: 844 } })
 
 const waitingPost = {
-  id: 'session:waiting:answer', kind: 'session', timestamp: '2026-08-30T15:59:00.000Z',
+  id: 'session:waiting:answer', kind: 'session', timestamp: fixtureTime(1),
   sessionId: 'waiting', room: 'launch', projectId: 'launch', projectLabel: 'Launch',
   title: 'Deployment decision', agent: 'omp', status: 'waiting',
   question: 'Choose the release channel before deployment can continue.',
-  message: { uuid: 'answer', role: 'assistant', timestamp: '2026-08-30T15:59:00.000Z', content: [{ type: 'text', text: 'The release is ready once you choose the channel.' }] },
+  message: { uuid: 'answer', role: 'assistant', timestamp: fixtureTime(1), content: [{ type: 'text', text: 'The release is ready once you choose the channel.' }] },
   score: 400, why: 'Waiting for your decision',
   importance: 'feature',
 }
 
 const richPost = {
-  id: 'session:rich:result', kind: 'session', timestamp: '2026-08-30T15:40:00.000Z',
+  id: 'session:rich:result', kind: 'session', timestamp: fixtureTime(20),
   sessionId: 'rich', room: 'research', projectId: 'research', projectLabel: 'Research',
   title: 'Field research packet', agent: 'omp', status: 'finished',
   message: {
-    uuid: 'result', role: 'assistant', timestamp: '2026-08-30T15:40:00.000Z',
+    uuid: 'result', role: 'assistant', timestamp: fixtureTime(20),
     content: [{ type: 'text', text: '## Research packet\n\nThe useful files are [report](/tmp/fledge-report.pdf), [interactive](/tmp/fledge-demo.html), and [clip](/tmp/fledge-clip.mp4).\n\n![tracking pixel](https://tracker.example/pixel.png)\n\nhttps://x.com/example/status/1234567890123456789' }],
   },
   score: 100, why: 'Completed recently', reaction: null,
   importance: 'feature',
   media: { kind: 'video', path: '/tmp/fledge-clip.mp4', name: 'fledge-clip.mp4' },
-  comments: [{ id: 'existing-comment', text: 'Can you narrow this to the strongest example?', createdAt: '2026-08-30T15:45:00.000Z', delivery: 'delivered', reply: { text: 'Yes. The report is the strongest example because it contains the complete evidence chain.', timestamp: '2026-08-30T15:46:00.000Z' } }],
+  comments: [{ id: 'existing-comment', text: 'Can you narrow this to the strongest example?', createdAt: fixtureTime(15), delivery: 'delivered', reply: { text: 'Yes. The report is the strongest example because it contains the complete evidence chain.', timestamp: fixtureTime(14) } }],
 }
 
 const updatePost = {
-  id: 'room-update:films:curated', kind: 'room-update', timestamp: '2026-08-30T15:20:00.000Z',
+  id: 'room-update:films:curated', kind: 'room-update', timestamp: fixtureTime(40),
   sessionId: 'films', room: 'films', projectId: 'films', projectLabel: 'Films',
   title: '#films update', agent: null, status: 'finished',
   updateText: '### Worth watching\n\nA Feather curated this for the stream: https://www.tiktok.com/@example/video/7412345678901234567',
@@ -40,7 +42,7 @@ const updatePost = {
 }
 
 const quietPost = {
-  id: 'room-update:films:routine', kind: 'room-update', timestamp: '2026-08-30T15:10:00.000Z',
+  id: 'room-update:films:routine', kind: 'room-update', timestamp: fixtureTime(50),
   sessionId: 'films', room: 'films', projectId: 'films', projectLabel: 'Films',
   title: 'Routine production note', agent: null, status: 'finished', importance: 'note',
   updateText: 'Receipt filenames were normalized for the next internal pass.',
@@ -48,10 +50,10 @@ const quietPost = {
 }
 
 const olderPost = {
-  id: 'session:older:result', kind: 'session', timestamp: '2026-08-28T10:00:00.000Z',
+  id: 'session:older:result', kind: 'session', timestamp: fixtureTime(2 * 24 * 60),
   sessionId: 'older', room: 'archive', projectId: 'archive', projectLabel: 'Archive',
   title: 'Earlier dispatch', agent: 'claude', status: 'finished',
-  message: { uuid: 'older-result', role: 'assistant', timestamp: '2026-08-28T10:00:00.000Z', content: [{ type: 'text', text: 'The archival audit reconciled every deployment receipt against the immutable release manifest. The service identities, health endpoints, source commit, and tree hash all match the scheduled fleet release. No mutable state lives inside the release directory, every target still defaults to OMP, and the canary remains healthy. The review also checked rollback metadata, capability links, and delayed promotion ownership. The remaining evidence is intentionally long enough to prove that an ordinary completed dispatch becomes a compact preview instead of a presentation poster. This final sentence appears after the compact preview boundary.' }] },
+  message: { uuid: 'older-result', role: 'assistant', timestamp: fixtureTime(2 * 24 * 60), content: [{ type: 'text', text: 'The archival audit reconciled every deployment receipt against the immutable release manifest. The service identities, health endpoints, source commit, and tree hash all match the scheduled fleet release. No mutable state lives inside the release directory, every target still defaults to OMP, and the canary remains healthy. The review also checked rollback metadata, capability links, and delayed promotion ownership. The remaining evidence is intentionally long enough to prove that an ordinary completed dispatch becomes a compact preview instead of a presentation poster. This final sentence appears after the compact preview boundary.' }] },
   score: 40, why: 'Filed earlier', reaction: 'like',
   importance: 'feature',
 }
@@ -70,7 +72,7 @@ function feedResponse(mode, before) {
       : [waitingPost, richPost, updatePost]
   return {
     generatedAt: GENERATED_AT,
-    nextBefore: mode === 'needs-me' ? null : '2026-08-29T00:00:00.000Z',
+    nextBefore: mode === 'needs-me' ? null : fixtureTime(3 * 24 * 60),
     counts: { waiting: 1, working: 0, errored: 0, finished: 4, important: 4, notes: 1 },
     posts: all,
   }

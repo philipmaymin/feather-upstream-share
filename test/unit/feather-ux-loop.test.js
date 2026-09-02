@@ -43,7 +43,10 @@ module["publish_candidate"](Path("/tmp/feather-ux-run"))
 print(json.dumps(calls))
 `
   const calls = JSON.parse(execFileSync('python3', ['-c', command], { cwd: ROOT, encoding: 'utf8' }))
-  assert.deepEqual(calls, [['git', 'push', '-u', 'fork', 'auto/feather-ux']])
+  assert.deepEqual(calls, [
+    ['git', 'push', 'fork', 'auto/feather-ux'],
+    ['git', 'branch', '--set-upstream-to', 'fork/auto/feather-ux', 'auto/feather-ux'],
+  ])
 })
 
 test('Gemini critic rejects recordings that are not explicitly synthetic', () => {
