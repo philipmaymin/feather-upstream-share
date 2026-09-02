@@ -258,6 +258,21 @@ backup_conflicts() {
   note "conflicts preserved at $backup_root; existing destinations were not changed"
 }
 
+prepare_capability_dir() {
+  local dir="$1" owner current
+  mkdir -p "$dir"
+  [ "$(id -u)" -eq 0 ] || return 0
+  case "$dir/" in "$HOME"/*) ;; *) return 0 ;; esac
+  owner="$(stat -c '%u:%g' "$HOME")"
+  current="$dir"
+  while [ "$current" != "$HOME" ]; do
+    [ ! -L "$current" ] || die "capability directory is a symlink: $current"
+    chown "$owner" "$current"
+    current="$(dirname "$current")"
+    case "$current" in "$HOME"|"$HOME"/*) ;; *) die "capability directory escapes HOME: $dir" ;; esac
+  done
+}
+
 install_capabilities_impl() {
   local release="$1" target_root="$2" claude_dir="$3" codex_dir="$4" omp_skills_dir="$5"
   local omp_extensions_dir="$6" bin_dir="$7" backup_dir="$8"
@@ -315,7 +330,9 @@ install_capabilities_impl() {
     done
   done
 
-  mkdir -p "$claude_dir" "$codex_dir" "$omp_skills_dir" "$omp_extensions_dir" "$bin_dir"
+  for dest in "$claude_dir" "$codex_dir" "$omp_skills_dir" "$omp_extensions_dir" "$bin_dir"; do
+    prepare_capability_dir "$dest"
+  done
   for ((index=0; index<${#destinations[@]}; index++)); do
     dest="${destinations[$index]}"; target="${targets[$index]}"
     if [ -L "$dest" ]; then
