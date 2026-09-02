@@ -4,9 +4,9 @@ import path from 'path'
 import fs from 'fs'
 import os from 'os'
 import net from 'net'
-import { spawn } from 'child_process'
+import { execFileSync, spawn } from 'child_process'
 import { fileURLToPath } from 'url'
-import { createHash } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..', '..')
@@ -164,8 +164,9 @@ case "$1" in
       previous="$argument"
     done
     [ -n "$target" ] || exit 1
-    printf '❯\n' > "$state/pane-$target"
+    printf '❯\n╭── π  > Fixture\n╰─\n' > "$state/pane-$target"
     printf '%s\n' "$target" >> "$state/resumed"
+    printf '%s\n' "$*" >> "$state/launched"
     ;;
   list-panes)
     printf 'claude\n'
@@ -1184,7 +1185,10 @@ describe('GET /api/feed', { skip: EXTERNAL_SERVER }, () => {
 describe('GET /api/sessions/:id/room', () => {
   it('resolves exact Room membership without depending on the capped Room snapshot', async () => {
     const missing = await (await fetch(`${BASE}/api/sessions/no-such-session-ever/room`)).json()
-    assert.deepEqual(missing, { room: null, kind: null, role: null, label: null })
+    assert.deepEqual(missing, {
+      room: null, kind: null, role: null, label: null,
+      forkOf: null, forkSourceTitle: null, workspaceMode: null, forkBranch: null,
+    })
 
     const roomName = `api-room-${Date.now().toString(36)}`
     const created = await fetch(`${BASE}/api/rooms`, {
@@ -1207,7 +1211,72 @@ describe('GET /api/sessions/:id/room', () => {
       kind: 'chat',
       role: null,
       label: 'What is the meaning of life?',
+      forkOf: null,
+      forkSourceTitle: null,
+      workspaceMode: null,
+      forkBranch: null,
     })
+  })
+})
+
+describe('POST /api/rooms/:name/send', { skip: EXTERNAL_SERVER }, () => {
+  it('resumes the target Leader and idempotently delivers a tagged cross-Room message', async () => {
+    const suffix = Date.now().toString(36)
+    const sourceRoom = `source-${suffix}`
+    const targetRoom = `target-${suffix}`
+    let targetCwd = ''
+    for (const name of [sourceRoom, targetRoom]) {
+      const created = await fetch(`${BASE}/api/rooms`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      assert.equal(created.status, 200)
+      const createdRoom = await created.json()
+      if (name === targetRoom) targetCwd = createdRoom.cwd
+    }
+    const leaderId = randomUUID()
+    const leader = await fetch(`${BASE}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: leaderId,
+        cwd: targetCwd,
+        agent: 'omp',
+        roomName: targetRoom,
+        roomRole: 'leader',
+      }),
+    })
+    assert.equal(leader.status, 200, await leader.text())
+    fs.writeFileSync(
+      path.join(fixtureHome, '.feather', 'omp-sessions', leaderId, 'resume.jsonl'),
+      `${JSON.stringify({ type: 'session', id: `omp-${leaderId}`, cwd: targetCwd })}\n`,
+    )
+    fs.rmSync(path.join(tmuxFixtureDir, `pane-f-${leaderId}`))
+    const messageId = 'cross-room-message-0001'
+    const deliver = () => fetch(`${BASE}/api/rooms/${targetRoom}/send`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Feather-Message-ID': messageId,
+      },
+      body: JSON.stringify({ fromRoom: sourceRoom, text: 'Check the live risk limit.' }),
+    })
+    const first = await deliver()
+    const retry = await deliver()
+    assert.equal(first.status, 200)
+    assert.equal(retry.status, 200)
+    assert.deepEqual(await retry.json(), await first.json())
+    assert.equal(
+      fs.readFileSync(path.join(tmuxFixtureDir, 'resumed'), 'utf8')
+        .split('\n')
+        .filter(name => name === `f-${leaderId}`).length,
+      2,
+    )
+    const delivered = fs.readFileSync(path.join(tmuxFixtureDir, 'sent'), 'utf8')
+    assert.equal(delivered.split(`[Cross-Room · #${sourceRoom} → #${targetRoom}]`).length - 1, 1)
+    assert.match(delivered, /Check the live risk limit\./)
+    assert.match(delivered, new RegExp(`room send ${sourceRoom} --stdin`))
   })
 })
 
@@ -1754,6 +1823,140 @@ describe('POST /api/sessions', () => {
     assert.equal(response.status, 200)
     const trust = JSON.parse(fs.readFileSync(path.join(fixtureHome, '.claude.json'), 'utf8'))
     assert.equal(trust.projects[fixtureHome].hasTrustDialogAccepted, true)
+  })
+})
+
+describe('POST /api/sessions/:id/fork', { skip: EXTERNAL_SERVER }, () => {
+  const writeClaudeSource = (id, cwd, title) => {
+    fs.writeFileSync(path.join(testSessionDir, `${id}.jsonl`), `${JSON.stringify({
+      type: 'user',
+      uuid: `${id}-message`,
+      cwd,
+      timestamp: new Date().toISOString(),
+      isMeta: false,
+      isSidechain: false,
+      message: { role: 'user', content: title },
+    })}\n`)
+  }
+
+  const createClaudeSource = async (id, cwd, title) => {
+    const created = await fetch(`${BASE}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, cwd, agent: 'claude' }),
+    })
+    assert.equal(created.status, 200)
+    writeClaudeSource(id, cwd, title)
+  }
+
+  it('launches a distinct Claude fork and preserves Room lineage', async () => {
+    const sourceId = '30000000-0000-4000-8000-000000000001'
+    await createClaudeSource(sourceId, fixtureHome, 'Meaning source')
+    const roomName = `fork-room-${Date.now().toString(36)}`
+    assert.equal((await fetch(`${BASE}/api/rooms`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: roomName }),
+    })).status, 200)
+    assert.equal((await fetch(`${BASE}/api/rooms/${roomName}/assign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: sourceId }),
+    })).status, 200)
+
+    const response = await fetch(`${BASE}/api/sessions/${sourceId}/fork`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Meaning branch', workspaceMode: 'shared' }),
+    })
+    assert.equal(response.status, 200)
+    const forked = await response.json()
+    assert.match(forked.id, /^[0-9a-f-]{36}$/)
+    assert.notEqual(forked.id, sourceId)
+    assert.equal(forked.room, roomName)
+    assert.equal(forked.workspaceMode, 'shared')
+    const context = await (await fetch(`${BASE}/api/sessions/${forked.id}/room`)).json()
+    assert.equal(context.kind, 'chat')
+    assert.equal(context.label, 'Meaning branch')
+    assert.equal(context.forkOf, sourceId)
+    assert.equal(context.workspaceMode, 'shared')
+    const launches = fs.readFileSync(path.join(tmuxFixtureDir, 'launched'), 'utf8')
+    assert.match(launches, /--fork-session/)
+    assert.match(launches, new RegExp(`--session-id ${forked.id}`))
+  })
+
+  it('creates an isolated Git worktree by default', async () => {
+    const repo = path.join(fixtureRoot, 'fork-repo')
+    fs.mkdirSync(repo)
+    execFileSync('git', ['init'], { cwd: repo, stdio: 'ignore' })
+    execFileSync('git', ['config', 'user.email', 'fork@test.invalid'], { cwd: repo })
+    execFileSync('git', ['config', 'user.name', 'Fork Test'], { cwd: repo })
+    fs.writeFileSync(path.join(repo, 'README.txt'), 'base\n')
+    execFileSync('git', ['add', 'README.txt'], { cwd: repo })
+    execFileSync('git', ['commit', '-m', 'base'], { cwd: repo, stdio: 'ignore' })
+    const sourceId = '30000000-0000-4000-8000-000000000002'
+    await createClaudeSource(sourceId, repo, 'Isolated source')
+
+    const response = await fetch(`${BASE}/api/sessions/${sourceId}/fork`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Isolated branch', workspaceMode: 'isolated' }),
+    })
+    assert.equal(response.status, 200)
+    const forked = await response.json()
+    assert.equal(forked.workspaceMode, 'isolated')
+    assert.ok(forked.workspacePath.startsWith(path.join(fixtureHome, '.feather', 'fork-worktrees')))
+    assert.equal(fs.readFileSync(path.join(forked.workspacePath, 'README.txt'), 'utf8'), 'base\n')
+    const context = await (await fetch(`${BASE}/api/sessions/${forked.id}/room`)).json()
+    assert.equal(context.workspaceMode, 'isolated')
+    assert.match(context.forkBranch, /^feather\/fork-/)
+  })
+
+  it('uses OMP native --fork with a distinct session directory', async () => {
+    const sourceId = '30000000-0000-4000-8000-000000000003'
+    const internalId = '40000000-0000-4000-8000-000000000003'
+    const sourceDir = path.join(fixtureHome, '.feather', 'omp-sessions', sourceId)
+    fs.mkdirSync(sourceDir, { recursive: true })
+    fs.writeFileSync(path.join(sourceDir, 'source.jsonl'), [
+      JSON.stringify({ type: 'session', version: 3, id: internalId, cwd: fixtureHome }),
+      JSON.stringify({ type: 'message', id: 'source-message', timestamp: new Date().toISOString(), message: { role: 'user', content: 'Fork OMP' } }),
+      '',
+    ].join('\n'))
+
+    const response = await fetch(`${BASE}/api/sessions/${sourceId}/fork`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'OMP branch', workspaceMode: 'shared' }),
+    })
+    assert.equal(response.status, 200)
+    const forked = await response.json()
+    const launches = fs.readFileSync(path.join(tmuxFixtureDir, 'launched'), 'utf8')
+    assert.match(launches, new RegExp(`--fork [^\\n]*${internalId}`))
+    assert.match(launches, new RegExp(`--session-dir [^\\n]*${forked.id}`))
+    assert.ok(fs.existsSync(path.join(fixtureHome, '.feather', 'omp-sessions', forked.id, '.feather-bridge.json')))
+  })
+
+  it('uses Codex native fork with the source UUID', async () => {
+    const sourceId = '30000000-0000-4000-8000-000000000004'
+    const codexDir = path.join(fixtureHome, '.codex', 'sessions', '2099', '12', '31')
+    fs.mkdirSync(codexDir, { recursive: true })
+    fs.writeFileSync(path.join(codexDir, `rollout-source-${sourceId}.jsonl`), [
+      JSON.stringify({ timestamp: new Date().toISOString(), type: 'session_meta', payload: { id: sourceId, cwd: fixtureHome } }),
+      JSON.stringify({ timestamp: new Date().toISOString(), type: 'response_item', payload: { type: 'message', id: 'codex-source', role: 'user', content: [{ type: 'input_text', text: 'Fork Codex' }] } }),
+      '',
+    ].join('\n'))
+
+    const response = await fetch(`${BASE}/api/sessions/${sourceId}/fork`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Codex branch', workspaceMode: 'shared' }),
+    })
+    assert.equal(response.status, 200)
+    const forked = await response.json()
+    const launches = fs.readFileSync(path.join(tmuxFixtureDir, 'launched'), 'utf8')
+    assert.match(launches, new RegExp(`fork [^\\n]*${sourceId}`))
+    const context = await (await fetch(`${BASE}/api/sessions/${forked.id}/room`)).json()
+    assert.equal(context.forkOf, sourceId)
   })
 })
 

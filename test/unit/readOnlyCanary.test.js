@@ -261,6 +261,7 @@ describe('server-enforced read-only canary', () => {
       ['POST', '/api/rooms/test-room/assign', { sessionId: fx.sessionId }],
       ['POST', '/api/rooms/reconcile', { apply: true }],
       ['POST', '/api/rooms/test-room/pulse', { enabled: false }],
+      ['POST', '/api/rooms/test-room/send', { fromRoom: 'source-room', text: 'no' }],
       ['POST', '/api/rooms/test-room/updates', { text: 'forbidden' }],
       ['POST', '/api/upload', 'bytes'], ['POST', '/api/transcribe', 'bytes'],
       ['DELETE', `/api/files/delete?path=${encodeURIComponent(fx.sessionFile)}`],
