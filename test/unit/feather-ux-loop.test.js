@@ -30,6 +30,22 @@ test('UX loop requires both a settled fleet and a 24-hour Philip canary', () => 
   assert.equal(gate('failed', 30).allowed, true)
 })
 
+test('candidate publication tracks the branch it pushes before release staging', () => {
+  const command = `
+import json
+import runpy
+from pathlib import Path
+
+module = runpy.run_path(${JSON.stringify(LOOP)})
+calls = []
+module["publish_candidate"].__globals__["run"] = lambda args, **kwargs: calls.append(args)
+module["publish_candidate"](Path("/tmp/feather-ux-run"))
+print(json.dumps(calls))
+`
+  const calls = JSON.parse(execFileSync('python3', ['-c', command], { cwd: ROOT, encoding: 'utf8' }))
+  assert.deepEqual(calls, [['git', 'push', '-u', 'fork', 'auto/feather-ux']])
+})
+
 test('Gemini critic rejects recordings that are not explicitly synthetic', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-ux-privacy-'))
   try {

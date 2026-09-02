@@ -286,11 +286,7 @@ def validate_candidate(run_dir: Path) -> None:
 
 
 def publish_candidate(run_dir: Path) -> None:
-    upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", cwd=CANDIDATE_DIR, check=False)
-    if not upstream:
-        run(["git", "push", "-u", "fork", CANDIDATE_BRANCH], cwd=CANDIDATE_DIR, log=run_dir / "push.log", timeout=180)
-    else:
-        run(["git", "push", "fork", CANDIDATE_BRANCH], cwd=CANDIDATE_DIR, log=run_dir / "push.log", timeout=180)
+    run(["git", "push", "-u", "fork", CANDIDATE_BRANCH], cwd=CANDIDATE_DIR, log=run_dir / "push.log", timeout=180)
 
 
 def commit_candidate(run_dir: Path, focus: str) -> str:
