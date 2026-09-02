@@ -73,9 +73,6 @@ function leaderRoomSession(room: RoomInfo) {
   return room.sessions.find(session => session.id === room.leaderSessionId) || null
 }
 
-function roleLabel(role: string) {
-  return role.split('-').map(part => part ? part[0].toUpperCase() + part.slice(1) : '').join(' ')
-}
 
 export default function RoomsHome(props: {
   onOpen: (id: string) => void
@@ -342,9 +339,6 @@ export default function RoomsHome(props: {
     else toggleExpand(room.name)
   }
 
-  function pulseRoomSession(room: RoomInfo) {
-    return room.pulse.sessionId ? room.sessions.find(session => session.id === room.pulse.sessionId) || null : null
-  }
 
   function otherRoomSessions(room: RoomInfo) {
     const residentIds = new Set((room.residents || []).map(resident => resident.sessionId))
@@ -447,8 +441,8 @@ export default function RoomsHome(props: {
                   <div style={{ display: 'flex', 'align-items': 'center', gap: '10px' }}>
                     <span style={{ width: '10px', height: '10px', 'border-radius': '50%', background: room.active ? '#4aba6a' : '#333', 'flex-shrink': '0' }} />
                     <span style={{ 'font-size': '16px', 'font-weight': '700', color: '#e5e5e5' }}>#{room.name}</span>
-                    <Show when={leaderRoomSession(room)} fallback={<span style={{ 'font-size': '11px', color: '#806f55' }}>No Main chat</span>}>
-                      {(leader) => <span style={{ 'font-size': '11px', color: '#69c77f' }}>Main · {leader().agent || 'omp'} · {room.residents?.length || 1} resident{(room.residents?.length || 1) === 1 ? '' : 's'}</span>}
+                    <Show when={leaderRoomSession(room)} fallback={<span style={{ 'font-size': '11px', color: '#806f55' }}>No Leader</span>}>
+                      {(leader) => <span style={{ 'font-size': '11px', color: '#69c77f' }}>Leader · {leader().agent || 'omp'} · {room.residents?.length || 1} resident{(room.residents?.length || 1) === 1 ? '' : 's'}</span>}
                     </Show>
                     <span style={{ 'margin-left': 'auto', 'font-size': '11px', color: '#555', 'font-family': 'monospace' }}>{timeAgo(room.updatedAt)}</span>
                   </div>
@@ -458,12 +452,12 @@ export default function RoomsHome(props: {
                   <div style={{ 'margin-top': '10px', 'padding-left': '20px', display: 'flex', 'align-items': 'center', gap: '8px' }}>
                     <button data-testid={`open-room-${room.name}`} onClick={(event) => { event.stopPropagation(); openRoom(room) }}
                       style={{ background: '#e0a050', border: 'none', color: '#111', 'font-size': '12px', 'font-weight': '800', padding: '7px 12px', 'border-radius': '8px', cursor: 'pointer' }}>
-                      Open Main
+                      Ask Leader
                     </button>
                     <button data-testid={`history-${room.name}`} onClick={(event) => { event.stopPropagation(); toggleExpand(room.name) }}
                       aria-expanded={expanded() === room.name}
                       style={{ background: 'transparent', border: '1px solid #333', color: '#9aa4b2', 'font-size': '11px', 'font-weight': '700', padding: '6px 10px', 'border-radius': '8px', cursor: 'pointer' }}>
-                      Organization
+                      History {otherRoomSessions(room).length}
                     </button>
                     <span style={{ 'margin-left': 'auto', color: room.pulse.status === 'error' ? '#d48166' : '#666', 'font-size': '10px' }}>
                       {room.pulse.enabled ? 'Background on' : 'Background paused'} · {pulseLabel(room)}
@@ -498,77 +492,57 @@ export default function RoomsHome(props: {
                   </div>
                 </Show>
                 <Show when={expanded() === room.name}>
-                  <div data-testid={`room-organization-${room.name}`} style={{ 'border-top': '1px solid #16161f' }}>
-                    <div style={{ color: '#596373', 'font-size': '9px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.06em', padding: '8px 16px 2px 28px' }}>Main</div>
-                    <Show when={leaderRoomSession(room)} fallback={
+                  <div data-testid={`room-history-${room.name}`} style={{ 'border-top': '1px solid #16161f' }}>
+                    <Show when={!leaderRoomSession(room)}>
                       <button onClick={() => newChat(room, 'omp', true)} disabled={busy()}
-                        style={{ margin: '7px 28px', background: '#3a2a1e', border: '1px solid #68481f', color: '#e0a050', 'font-size': '12px', 'font-weight': '700', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer' }}>
+                        style={{ margin: '9px 28px', background: '#3a2a1e', border: '1px solid #68481f', color: '#e0a050', 'font-size': '12px', 'font-weight': '700', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer' }}>
                         + Start OMP Leader
                       </button>
+                    </Show>
+
+                    <Show when={otherRoomSessions(room).length > 0} fallback={
+                      <div style={{ color: '#596373', 'font-size': '11px', padding: '10px 28px' }}>No past chats.</div>
                     }>
-                      {(leader) => <div data-testid={`resident-${room.name}-leader`}>{sessionRow(room, leader(), 'Main', 'Main')}</div>}
-                    </Show>
-
-                    <Show when={(room.residents || []).some(resident => resident.role !== 'leader')}>
-                      <div style={{ color: '#596373', 'font-size': '9px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.06em', padding: '10px 16px 2px 28px' }}>People</div>
-                      <For each={(room.residents || []).filter(resident => resident.role !== 'leader')}>{(resident) => {
-                        const session = room.sessions.find(candidate => candidate.id === resident.sessionId)
-                        return session
-                          ? <div data-testid={`resident-${room.name}-${resident.role}`}>{sessionRow(room, session, roleLabel(resident.role))}</div>
-                          : <div data-testid={`resident-${room.name}-${resident.role}`} style={{ display: 'flex', gap: '8px', padding: '7px 28px', color: '#666', 'font-size': '12px' }}>
-                              <span>{roleLabel(resident.role)}</span><span style={{ 'margin-left': 'auto' }}>offline</span>
-                            </div>
-                      }}</For>
-                    </Show>
-
-                    <Show when={otherRoomSessions(room).length > 0}>
-                      <div style={{ color: '#596373', 'font-size': '9px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.06em', padding: '10px 16px 2px 28px' }}>Chats</div>
+                      <div style={{ color: '#596373', 'font-size': '9px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.06em', padding: '9px 16px 2px 28px' }}>Past chats</div>
                       <For each={otherRoomSessions(room)}>{(session) => sessionRow(room, session, session.title, undefined, true)}</For>
                     </Show>
 
-                    <Show when={pulseRoomSession(room)}>
-                      {(status) => <>
-                        <div style={{ color: '#596373', 'font-size': '9px', 'font-weight': '700', 'text-transform': 'uppercase', 'letter-spacing': '0.06em', padding: '10px 16px 2px 28px' }}>Status</div>
-                        {sessionRow(room, status(), 'What everyone is working on')}
-                      </>}
-                    </Show>
-
-                    <div style={{ display: 'flex', 'flex-wrap': 'wrap', gap: '8px', padding: '10px 16px 12px 28px', 'border-top': '1px solid #16161f', position: 'relative' }}>
-                      <button onClick={() => newNamedChat(room)} disabled={busy()}
-                        style={{ background: '#152a1c', border: '1px solid #2a4a34', color: '#4aba6a', 'font-size': '12px', 'font-weight': '600', padding: '5px 12px', 'border-radius': '8px', cursor: 'pointer' }}>+ Named chat</button>
-                      <button onClick={() => newNamedChat(room, 'codex')} disabled={busy()}
-                        style={{ background: 'none', border: '1px solid #333', color: '#c084fc', 'font-size': '12px', padding: '5px 12px', 'border-radius': '8px', cursor: 'pointer' }}>+ Codex chat</button>
-                      <details style={{ position: 'relative' }}>
-                        <summary style={{ 'list-style': 'none', background: 'none', border: '1px solid #2b3038', color: '#777', 'font-size': '11px', padding: '6px 9px', 'border-radius': '8px', cursor: 'pointer' }}>Room options</summary>
-                        <div style={{ position: 'absolute', top: '34px', left: '0', width: '180px', padding: '8px', background: '#11151c', border: '1px solid #333', 'border-radius': '9px', 'box-shadow': '0 8px 24px rgba(0,0,0,.45)', 'z-index': '20', display: 'flex', 'flex-direction': 'column', gap: '7px' }}>
-                          <label style={{ color: '#777', 'font-size': '10px', display: 'flex', 'flex-direction': 'column', gap: '4px' }}>Default harness
-                            <select aria-label={`Default harness for #${room.name}`} value={roomHarness(room.name)} onChange={(event) => setRoomHarness(room.name, event.currentTarget.value as AgentId)}
-                              style={{ background: '#0c1016', border: '1px solid #333', color: '#ddd', padding: '6px', 'border-radius': '6px' }}>
-                              <option value="omp">OMP</option><option value="claude">Claude Code</option><option value="codex">Codex</option>
-                            </select>
-                          </label>
-                          <button data-testid={`pulse-${room.name}`} onClick={(event) => togglePulse(room, event)} disabled={busy()} aria-pressed={room.pulse.enabled}
-                            style={{ background: 'none', border: '1px solid #333', color: room.pulse.enabled ? '#69c77f' : '#999', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>
-                            {room.pulse.enabled ? 'Stop background' : 'Start background'}
-                          </button>
-                          <button data-testid={`wiki-${room.name}`} onClick={(event) => openWiki(room, event)}
-                            style={{ background: 'none', border: '1px solid #333', color: '#9aa4b2', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Wiki</button>
-                          <button data-testid={`friction-${room.name}`} onClick={(event) => openFriction(room, event)}
-                            style={{ background: 'none', border: '1px solid #3a3328', color: '#b7a27d', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Friction {room.friction?.count || 0}</button>
-                          <div style={{ color: '#666', 'font-size': '10px' }}>Start one fallback chat</div>
-                          <button onClick={() => newChat(room, 'claude')} disabled={busy()}
-                            style={{ background: 'none', border: '1px solid #29313b', color: '#73b8ff', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Claude Code</button>
-                          <button onClick={() => newChat(room, 'codex')} disabled={busy() || !props.codexAvailable}
-                            style={{ background: 'none', border: '1px solid #332a3d', color: '#c084fc', opacity: props.codexAvailable ? '1' : '0.55', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: props.codexAvailable ? 'pointer' : 'not-allowed', 'text-align': 'left' }}>Codex</button>
-                          <button onClick={() => doRenameRoom(room)} disabled={busy()}
-                            style={{ background: 'none', border: 'none', 'border-top': '1px solid #292d34', color: '#999', 'font-size': '11px', padding: '7px 2px 2px', cursor: 'pointer', 'text-align': 'left' }}>Rename room…</button>
-                        </div>
-                      </details>
-                      <button data-testid={`attach-existing-${room.name}`} onClick={() => showAttach(room)} disabled={busy()}
-                        style={{ 'margin-left': 'auto', background: 'none', border: '1px solid #333', color: '#9aa4b2', 'font-size': '12px', padding: '5px 10px', 'border-radius': '8px', cursor: 'pointer' }}>
-                        {attachingRoom() === room.name ? 'Close' : 'Attach existing'}
-                      </button>
-                    </div>
+                    <details style={{ 'border-top': '1px solid #16161f', padding: '8px 16px 10px 28px' }}>
+                      <summary style={{ color: '#697482', 'font-size': '11px', cursor: 'pointer' }}>Room options</summary>
+                      <div style={{ display: 'flex', 'flex-wrap': 'wrap', gap: '8px', padding: '10px 0 2px', position: 'relative' }}>
+                        <button onClick={() => newNamedChat(room)} disabled={busy()}
+                          style={{ background: '#152a1c', border: '1px solid #2a4a34', color: '#4aba6a', 'font-size': '12px', 'font-weight': '600', padding: '5px 12px', 'border-radius': '8px', cursor: 'pointer' }}>+ Named chat</button>
+                        <button onClick={() => newNamedChat(room, 'codex')} disabled={busy() || !props.codexAvailable}
+                          style={{ background: 'none', border: '1px solid #333', color: '#c084fc', opacity: props.codexAvailable ? '1' : '0.55', 'font-size': '12px', padding: '5px 12px', 'border-radius': '8px', cursor: props.codexAvailable ? 'pointer' : 'not-allowed' }}>+ Codex chat</button>
+                        <button data-testid={`attach-existing-${room.name}`} onClick={() => showAttach(room)} disabled={busy()}
+                          style={{ background: 'none', border: '1px solid #333', color: '#9aa4b2', 'font-size': '12px', padding: '5px 10px', 'border-radius': '8px', cursor: 'pointer' }}>
+                          {attachingRoom() === room.name ? 'Close attach' : 'Attach existing'}
+                        </button>
+                      </div>
+                      <div style={{ display: 'flex', 'flex-direction': 'column', gap: '7px', padding: '8px 0 2px' }}>
+                        <label style={{ color: '#777', 'font-size': '10px', display: 'flex', 'flex-direction': 'column', gap: '4px' }}>Default harness
+                          <select aria-label={`Default harness for #${room.name}`} value={roomHarness(room.name)} onChange={(event) => setRoomHarness(room.name, event.currentTarget.value as AgentId)}
+                            style={{ background: '#0c1016', border: '1px solid #333', color: '#ddd', padding: '6px', 'border-radius': '6px' }}>
+                            <option value="omp">OMP</option><option value="claude">Claude Code</option><option value="codex">Codex</option>
+                          </select>
+                        </label>
+                        <button data-testid={`pulse-${room.name}`} onClick={(event) => togglePulse(room, event)} disabled={busy()} aria-pressed={room.pulse.enabled}
+                          style={{ background: 'none', border: '1px solid #333', color: room.pulse.enabled ? '#69c77f' : '#999', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>
+                          {room.pulse.enabled ? 'Stop background' : 'Start background'}
+                        </button>
+                        <button data-testid={`wiki-${room.name}`} onClick={(event) => openWiki(room, event)}
+                          style={{ background: 'none', border: '1px solid #333', color: '#9aa4b2', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Wiki</button>
+                        <button data-testid={`friction-${room.name}`} onClick={(event) => openFriction(room, event)}
+                          style={{ background: 'none', border: '1px solid #3a3328', color: '#b7a27d', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Friction {room.friction?.count || 0}</button>
+                        <div style={{ color: '#666', 'font-size': '10px' }}>Start one fallback chat</div>
+                        <button onClick={() => newChat(room, 'claude')} disabled={busy()}
+                          style={{ background: 'none', border: '1px solid #29313b', color: '#73b8ff', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: 'pointer', 'text-align': 'left' }}>Claude Code</button>
+                        <button onClick={() => newChat(room, 'codex')} disabled={busy() || !props.codexAvailable}
+                          style={{ background: 'none', border: '1px solid #332a3d', color: '#c084fc', opacity: props.codexAvailable ? '1' : '0.55', 'font-size': '11px', padding: '6px 8px', 'border-radius': '7px', cursor: props.codexAvailable ? 'pointer' : 'not-allowed', 'text-align': 'left' }}>Codex</button>
+                        <button onClick={() => doRenameRoom(room)} disabled={busy()}
+                          style={{ background: 'none', border: 'none', 'border-top': '1px solid #292d34', color: '#999', 'font-size': '11px', padding: '7px 2px 2px', cursor: 'pointer', 'text-align': 'left' }}>Rename room…</button>
+                      </div>
+                    </details>
                   </div>
                   <Show when={attachingRoom() === room.name}>
                     <div data-testid={`attach-picker-${room.name}`} style={{ 'border-top': '1px solid #16161f', padding: '6px 16px 10px 28px' }}>
