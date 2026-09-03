@@ -444,9 +444,20 @@ export default function App() {
   let audioChunks: Blob[] = []
   let voiceSendAfterStop = false
   let textareaRef: HTMLTextAreaElement | undefined
+  let composerResizeFrame: number | undefined
   let fileInputRef: HTMLInputElement | undefined
   let dragCounter = 0
   let mediaRestoreGeneration = 0
+
+  function queueComposerResize() {
+    cancelAnimationFrame(composerResizeFrame)
+    composerResizeFrame = requestAnimationFrame(() => {
+      const textarea = textareaRef
+      if (!textarea) return
+      textarea.style.height = '0px'
+      textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`
+    })
+  }
 
   function cancelSelectionWork() {
     selectionGeneration++
@@ -633,9 +644,7 @@ export default function App() {
       const s = cur()
       if (s?.isActive) handleInterrupt(s.id)
     }
-    // After Send the composer is blurred (dismissing the keyboard/iPad floating bar).
-    // The first printable keystroke on a hardware keyboard re-focuses it and captures
-    // the character, so typing resumes seamlessly without tapping the field again.
+    // Keep hardware-keyboard typing continuous after a toolbar interaction.
     if (tab() === 'chat' && currentId() && textareaRef &&
         document.activeElement !== textareaRef &&
         e.key.length === 1 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.isComposing) {
@@ -645,8 +654,7 @@ export default function App() {
         e.preventDefault()
         textareaRef.focus()
         setText(text() + e.key)
-        textareaRef.style.height = 'auto'
-        textareaRef.style.height = Math.min(textareaRef.scrollHeight, 120) + 'px'
+        queueComposerResize()
       }
     }
   }
@@ -679,10 +687,19 @@ export default function App() {
     // making stale-client checks testable, this avoids learning a misleading
     // "baseline" from a server that may already have advanced.
     document.documentElement.dataset.buildVersion = __BUILD_VERSION__
-    // Set --vh for iOS keyboard handling
+    // Coalesce the burst of visualViewport events emitted while iOS opens,
+    // closes, or adjusts its keyboard. Rewriting --vh for identical samples
+    // forced the entire chat layout to reflow while the user was typing.
+    let viewportFrame: number | undefined
+    let lastViewportHeight = 0
     function setVh() {
-      const vh = (window.visualViewport?.height || window.innerHeight) * 0.01
-      document.documentElement.style.setProperty('--vh', `${vh}px`)
+      const height = window.visualViewport?.height || window.innerHeight
+      if (Math.abs(height - lastViewportHeight) < 0.5) return
+      lastViewportHeight = height
+      cancelAnimationFrame(viewportFrame)
+      viewportFrame = requestAnimationFrame(() => {
+        document.documentElement.style.setProperty('--vh', `${height * 0.01}px`)
+      })
     }
     setVh()
     window.visualViewport?.addEventListener('resize', setVh)
@@ -765,22 +782,16 @@ export default function App() {
       window.removeEventListener('popstate', onFledgePopState)
       window.visualViewport?.removeEventListener('resize', setVh)
       window.removeEventListener('resize', setVh)
+      cancelAnimationFrame(viewportFrame)
     })
   })
-  onCleanup(() => { if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer); if (pendingRetryTimer) clearTimeout(pendingRetryTimer); clearAssistantStream(); clearPendingMedia(); cancelSelectionWork(); document.removeEventListener('keydown', onGlobalKeyDown) })
+  onCleanup(() => { if (mediaNoticeTimer) clearTimeout(mediaNoticeTimer); if (pendingRetryTimer) clearTimeout(pendingRetryTimer); cancelAnimationFrame(composerResizeFrame); clearAssistantStream(); clearPendingMedia(); cancelSelectionWork(); document.removeEventListener('keydown', onGlobalKeyDown) })
 
-  // Autoresize textarea on programmatic text changes (draft restore on session
-  // select, voice dictation, history navigation). The onInput handler covers
-  // typing/pasting; this effect covers the rest. Without it the textarea stays
-  // pinned at rows=1 and long restored text scrolls behind a 1-line viewport.
+  // One animation-frame resize owns both direct typing and programmatic draft
+  // changes. The prior onInput + microtask pair forced two layouts per key.
   createEffect(() => {
-    text() // subscribe
-    if (!textareaRef) return
-    queueMicrotask(() => {
-      if (!textareaRef) return
-      textareaRef.style.height = 'auto'
-      textareaRef.style.height = Math.min(textareaRef.scrollHeight, 120) + 'px'
-    })
+    text()
+    queueComposerResize()
   })
 
   function handleOmpEvent(event: OmpBridgeEvent) {
@@ -1783,7 +1794,7 @@ export default function App() {
     for (const file of pending) URL.revokeObjectURL(file.dataUrl)
     if (targetIsCurrent) {
       setFiles(current => current.filter(file => !pending.some(sent => sent.id === file.id)))
-      if (textareaRef) { textareaRef.style.height = 'auto'; textareaRef.blur() }
+      queueComposerResize()
     }
     // The server has durably acknowledged the prompt. IndexedDB cleanup can
     // finish behind the now-empty composer instead of blocking navigation.
@@ -1815,7 +1826,7 @@ export default function App() {
         if (target === currentId() && text() === rawText) {
           setText('')
           saveDraft(target, '')
-          if (textareaRef) textareaRef.style.height = 'auto'
+          queueComposerResize()
         }
       })
       acknowledgeComposedMessage(target, rawText, pending)
@@ -2935,10 +2946,10 @@ export default function App() {
             <div style={{ flex: '1', position: 'relative', 'min-width': '0', display: 'flex', 'flex-direction': 'column', 'justify-content': 'flex-end' }}>
               <textarea ref={textareaRef} value={text()}
                 disabled={!composerReady()}
-                onInput={(e) => { const value = e.target.value; setText(value); if (currentId()) saveDraft(currentId()!, value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px' }}
+                onInput={(e) => { const value = e.target.value; setText(value); if (currentId()) saveDraft(currentId()!, value) }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
-                  if (e.key === 'ArrowUp' && textareaRef?.selectionStart === 0) {
+                  if (e.key === 'ArrowUp' && text().length === 0 && textareaRef?.selectionStart === 0) {
                     const h = getHistory(); if (h.length === 0) return
                     const idx = historyIdx() === -1 ? h.length - 1 : Math.max(0, historyIdx() - 1)
                     setHistoryIdx(idx); setText(h[idx]); e.preventDefault()
@@ -2950,8 +2961,31 @@ export default function App() {
                     e.preventDefault()
                   }
                 }}
-                onPaste={(e) => { const items = e.clipboardData?.items; if (!items) return; const imgs = [...items].filter(i => i.type.startsWith('image/')); if (imgs.length) { e.preventDefault(); addFiles(imgs.map(i => new File([i.getAsFile()!], 'pasted-image.png', { type: i.type }))) } if (isMobile) { const ta = e.currentTarget; setTimeout(() => { ta.blur(); ta.focus() }, 50) } }}
-                onFocus={() => { if (messageScrollRef) setTimeout(() => messageScrollRef!.scrollTo({ top: messageScrollRef!.scrollHeight }), 300) }}
+                onPaste={(e) => {
+                  const items = e.clipboardData?.items
+                  if (!items) return
+                  const images = [...items]
+                    .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+                    .map(item => item.getAsFile())
+                    .filter((file): file is File => !!file)
+                  if (!images.length) return
+                  e.preventDefault()
+                  const pastedText = e.clipboardData.getData('text/plain')
+                  if (pastedText) {
+                    const start = e.currentTarget.selectionStart ?? text().length
+                    const end = e.currentTarget.selectionEnd ?? start
+                    const next = `${text().slice(0, start)}${pastedText}${text().slice(end)}`
+                    setText(next)
+                    if (currentId()) saveDraft(currentId()!, next)
+                    queueMicrotask(() => e.currentTarget.setSelectionRange(start + pastedText.length, start + pastedText.length))
+                  }
+                  void addFiles(images)
+                }}
+                onFocus={() => {
+                  const scroll = messageScrollRef
+                  if (!scroll || scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight >= 120) return
+                  requestAnimationFrame(() => scroll.scrollTo({ top: scroll.scrollHeight }))
+                }}
                 enterkeyhint="send"
                 placeholder={composerReady() ? 'Send a message...' : chatLoadError() ? 'Chat unavailable' : 'Loading chat…'} rows={1}
                 style={{ width: '100%', background: '#1a1a2e', border: '1px solid #333', 'border-radius': '12px', padding: '10px 14px', color: '#e5e5e5', opacity: composerReady() ? '1' : '0.65', 'font-size': '16px', 'font-family': 'inherit', resize: 'none', outline: 'none', 'line-height': '1.4', 'max-height': '120px', '-webkit-appearance': 'none', 'box-sizing': 'border-box', overflow: 'auto', 'scrollbar-width': 'none' }} />

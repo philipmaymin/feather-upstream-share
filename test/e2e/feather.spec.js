@@ -631,6 +631,51 @@ test.describe('Chat input', () => {
     await page.waitForTimeout(300)
     const afterSend = await textarea.inputValue()
     expect(afterSend).toBe('')
+    await expect(textarea).toBeFocused()
+  })
+
+  test('active transcript updates preserve the focused draft', async ({ page }) => {
+    const textarea = page.locator('textarea[placeholder="Send a message..."]')
+    await textarea.fill('Keep this Films6 thought intact')
+    await textarea.focus()
+    writeLine({
+      type: 'assistant',
+      uuid: `composer-stream-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      isSidechain: false,
+      isMeta: false,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'A background Films6 update arrived.' }] },
+    })
+
+    await expect(page.getByText('A background Films6 update arrived.', { exact: true })).toBeVisible()
+    await expect(textarea).toBeFocused()
+    await expect(textarea).toHaveValue('Keep this Films6 thought intact')
+  })
+
+  test('pasting an image keeps focus and accompanying text', async ({ page }) => {
+    const textarea = page.locator('textarea[placeholder="Send a message..."]')
+    await textarea.focus()
+    await textarea.evaluate(element => {
+      const file = new File(['pixels'], 'films6-frame.png', { type: 'image/png' })
+      const clipboard = {
+        items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }],
+        getData: type => type === 'text/plain' ? 'Look at this frame' : '',
+      }
+      const event = new Event('paste', { bubbles: true, cancelable: true })
+      Object.defineProperty(event, 'clipboardData', { value: clipboard })
+      element.dispatchEvent(event)
+    })
+
+    await expect(textarea).toBeFocused()
+    await expect(textarea).toHaveValue('Look at this frame')
+  })
+
+  test('ArrowUp never replaces a nonempty draft with history', async ({ page }) => {
+    const textarea = page.locator('textarea[placeholder="Send a message..."]')
+    await textarea.fill('Do not replace this draft')
+    await textarea.evaluate(element => element.setSelectionRange(0, 0))
+    await textarea.press('ArrowUp')
+    await expect(textarea).toHaveValue('Do not replace this draft')
   })
 })
 
