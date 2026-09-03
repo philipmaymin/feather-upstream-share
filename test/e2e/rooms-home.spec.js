@@ -2,6 +2,7 @@
 import { test, expect } from '@playwright/test'
 
 const BASE = process.env.FEATHER_URL || 'http://localhost:4870'
+const NOW = new Date().toISOString()
 
 const ROOM_FIXTURE = {
   rooms: [{
@@ -47,6 +48,96 @@ test('renders the last Rooms snapshot while its refresh is still pending', async
 
   releaseRefresh()
   await refreshed
+})
+
+test('shows Room agent staffing while creation is pending and reveals staffing when ready', async ({ page }) => {
+  let created = false
+  let releaseStaffing = () => {}
+  const staffingGate = new Promise(resolve => { releaseStaffing = resolve })
+  await page.route('**/api/rooms', async route => {
+    if (route.request().method() === 'POST') {
+      await staffingGate
+      created = true
+      return route.fulfill({
+        status: 201,
+        json: {
+          name: 'staffed-room',
+          cwd: '/home/user/rooms/staffed-room',
+          staffing: {
+            status: 'ready',
+            agents: [
+              { role: 'leader', sessionId: 'leader-session', agent: 'omp' },
+              { role: 'caretaker', sessionId: 'caretaker-session', agent: 'omp' },
+            ],
+          },
+        },
+      })
+    }
+    return route.fulfill({
+      json: {
+        rooms: created ? [{
+          name: 'staffed-room',
+          cwd: '/home/user/rooms/staffed-room',
+          sessions: [
+            { id: 'leader-session', title: '#staffed-room Leader', updatedAt: NOW, isActive: true, agent: 'omp' },
+            { id: 'caretaker-session', title: '#staffed-room Caretaker', updatedAt: NOW, isActive: true, agent: 'omp' },
+          ],
+          leaderSessionId: 'leader-session',
+          residents: [
+            { role: 'leader', sessionId: 'leader-session', agent: 'omp', title: '#staffed-room Leader', status: 'working' },
+            { role: 'caretaker', sessionId: 'caretaker-session', agent: 'omp', title: '#staffed-room Caretaker', status: 'working' },
+          ],
+          sidecarGroupId: 'room-staffed-room',
+          active: true,
+          latest: null,
+          updatedAt: NOW,
+          updates: { count: 0, latestAt: null, latest: null },
+          friction: { count: 0, latestAt: null, latest: null },
+          pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null },
+        }] : [],
+      },
+    })
+  })
+  page.on('dialog', dialog => dialog.accept('staffed-room'))
+
+  await page.goto(BASE)
+  await page.getByRole('button', { name: '+ New room' }).click()
+  await expect(page.getByRole('button', { name: 'Adding Leader + Caretaker…' })).toBeVisible()
+  releaseStaffing()
+  await expect(page.getByText('#staffed-room', { exact: true })).toBeVisible()
+  await expect(page.getByText('Leader · omp · 2 residents', { exact: true })).toBeVisible()
+})
+
+test('reports a Room staffing failure without hiding the created Room', async ({ page }) => {
+  let created = false
+  await page.route('**/api/rooms', async route => {
+    if (route.request().method() === 'POST') {
+      created = true
+      return route.fulfill({
+        status: 201,
+        json: {
+          name: 'partial-room',
+          cwd: '/home/user/rooms/partial-room',
+          staffing: { status: 'failed', agents: [], error: 'OMP unavailable' },
+        },
+      })
+    }
+    return route.fulfill({ json: { rooms: created ? [{
+      name: 'partial-room', cwd: '/home/user/rooms/partial-room', sessions: [], leaderSessionId: null,
+      residents: [], sidecarGroupId: null, active: false, latest: null, updatedAt: null,
+      updates: { count: 0, latestAt: null, latest: null }, friction: { count: 0, latestAt: null, latest: null },
+      pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null },
+    }] : [] } })
+  })
+  page.on('dialog', dialog => {
+    if (dialog.type() === 'prompt') return dialog.accept('partial-room')
+    expect(dialog.message()).toContain('Room created, but its agents could not start: OMP unavailable')
+    return dialog.accept()
+  })
+
+  await page.goto(BASE)
+  await page.getByRole('button', { name: '+ New room' }).click()
+  await expect(page.getByText('#partial-room', { exact: true })).toBeVisible()
 })
 
 test('serves fingerprinted frontend assets as immutable', async ({ page }) => {

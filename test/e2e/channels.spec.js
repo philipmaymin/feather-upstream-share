@@ -84,11 +84,17 @@ async function installChannels(page, state) {
         body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZP0kAAAAASUVORK5CYII=', 'base64'),
       })
     }
-    if (pathname === '/api/channels' && request.method() === 'GET') return route.fulfill({ json: { channels: [channel], dms: [], principal: state.principal || philip } })
+    if (pathname === '/api/channels' && request.method() === 'GET') return route.fulfill({ json: { channels: state.channels || [channel], dms: [], principal: state.principal || philip } })
+    if (pathname === '/api/channels' && request.method() === 'POST' && state.createdChannel) {
+      if (state.channelCreateGate) await state.channelCreateGate
+      state.channels = [channel, state.createdChannel]
+      return route.fulfill({ status: 201, json: { channel: state.createdChannel, staffing: state.staffing || { status: 'ready', agents: state.createdChannel.members.filter(member => member.kind === 'agent') } } })
+    }
     if (pathname === '/api/channels/activity') return route.fulfill({ json: { items: state.activity, unread: state.activity.filter(item => !item.readAt && !item.doneAt).length, needsYou: 0 } })
-    if (pathname === '/api/channels/principals') return route.fulfill({ json: { principals: [philip, coordinator, caretaker] } })
+    if (pathname === '/api/channels/principals') return route.fulfill({ json: { principals: state.createdChannel ? [...state.createdChannel.members, coordinator, caretaker] : [philip, coordinator, caretaker] } })
     if (pathname === '/api/channels/stream') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'event: connected\ndata: {}\n\n' })
     if (pathname === `/api/channels/${channel.id}/messages` && request.method() === 'GET') return route.fulfill({ json: { messages: state.roots } })
+    if (state.createdChannel && pathname === `/api/channels/${state.createdChannel.id}/messages` && request.method() === 'GET') return route.fulfill({ json: { messages: [] } })
     if (pathname === `/api/channels/${channel.id}/messages` && request.method() === 'POST') {
       const body = JSON.parse(request.postData() || '{}')
       const id = `posted-${state.posts.length + 1}`
@@ -219,6 +225,59 @@ test.describe('Channels PWA', () => {
     await expect(page.getByText('Agent · #films7')).toBeVisible()
     await page.getByRole('button', { name: 'Done', exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Nothing is waiting on you' })).toBeVisible()
+  })
+
+  test('shows channel agent staffing while creation is pending and opens the staffed channel', async ({ page }) => {
+    const state = fixtureState()
+    const fairfieldCoordinator = { ...coordinator, id: 'agent:fairfield:coordinator', username: 'fairfield-coordinator' }
+    const fairfieldCaretaker = { ...caretaker, id: 'agent:fairfield:caretaker', username: 'fairfield-caretaker' }
+    state.createdChannel = {
+      ...channel,
+      id: 'channel-fairfield',
+      slug: 'fairfield',
+      title: 'Fairfield',
+      defaultAgentId: fairfieldCoordinator.id,
+      unread: 0,
+      members: [philip, fairfieldCoordinator, fairfieldCaretaker],
+    }
+    let releaseStaffing = () => {}
+    state.channelCreateGate = new Promise(resolve => { releaseStaffing = resolve })
+    await installChannels(page, state)
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    await page.getByRole('button', { name: 'Create channel', exact: true }).click()
+    await page.getByRole('textbox', { name: 'Channel name' }).fill('Fairfield')
+    await page.locator('.channel-dialog-submit').click()
+    await expect(page.getByRole('button', { name: 'Adding agents…' })).toBeVisible()
+    releaseStaffing()
+
+    await expect(page.getByRole('heading', { name: '#fairfield' })).toBeVisible()
+    await expect(page.getByLabel('3 members')).toBeVisible()
+    await expect(page.locator('[title="Coordinator · agent"]')).toBeVisible()
+    await expect(page.locator('[title="Caretaker · agent"]')).toBeVisible()
+  })
+
+  test('keeps a created channel visible when agent staffing fails', async ({ page }) => {
+    const state = fixtureState()
+    state.createdChannel = {
+      ...channel,
+      id: 'channel-partial',
+      slug: 'partial',
+      title: 'Partial',
+      defaultAgentId: null,
+      unread: 0,
+      members: [philip],
+    }
+    state.staffing = { status: 'failed', agents: [], error: 'OMP unavailable' }
+    await installChannels(page, state)
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    await page.getByRole('button', { name: 'Create channel', exact: true }).click()
+    await page.getByRole('textbox', { name: 'Channel name' }).fill('Partial')
+    await page.locator('.channel-dialog-submit').click()
+
+    await expect(page.getByRole('heading', { name: '#partial' })).toBeVisible()
+    await expect(page.getByText('Channel created, but its agents could not start: OMP unavailable')).toBeVisible()
   })
 
   test('dialogs, empty DMs, and Escape behavior match their labels', async ({ page }) => {

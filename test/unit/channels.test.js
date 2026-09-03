@@ -68,6 +68,55 @@ describe('channel event store', () => {
     assert.equal(mode, 0o600)
   })
 
+  it('keeps agent sessions stable and dispatches only the latest unanswered thread after staffing', () => {
+    const { store, philip, channel, coordinator } = setup()
+    const replay = store.addAgent({
+      channelId: channel.id,
+      actorId: philip.id,
+      username: coordinator.username,
+      displayName: 'Coordinator',
+      sessionId: 'must-not-replace-the-original-session',
+    }).principal
+    assert.equal(replay.id, coordinator.id)
+    assert.equal(replay.sessionId, coordinator.sessionId)
+
+    const fresh = store.createChannel({
+      slug: 'fairfield',
+      title: 'Fairfield',
+      creatorId: philip.id,
+      idempotencyKey: 'pilot:fairfield',
+    })
+    const freshCoordinator = store.addAgent({
+      channelId: fresh.id,
+      actorId: philip.id,
+      username: 'fairfield-coordinator',
+      displayName: 'Coordinator',
+      sessionId: 'channel-fairfield-coordinator',
+    }).principal
+    const first = store.postMessage({
+      channelId: fresh.id,
+      authorId: philip.id,
+      content: 'First unanswered request.',
+      messageType: 'human',
+      idempotencyKey: 'client:fairfield:first',
+    })
+    const latest = store.postMessage({
+      channelId: fresh.id,
+      authorId: philip.id,
+      content: 'Are any agents here?',
+      messageType: 'human',
+      idempotencyKey: 'client:fairfield:latest',
+    })
+
+    store.setDefaultAgent({ channelId: fresh.id, actorId: philip.id, agentId: freshCoordinator.id })
+    assert.equal(store.enqueueLatestUnansweredThread({ channelId: fresh.id, actorId: philip.id }), true)
+    const dispatch = store.claimDispatch()
+    assert.equal(dispatch.agent.id, freshCoordinator.id)
+    assert.equal(dispatch.threadRootId, latest.id)
+    assert.notEqual(dispatch.threadRootId, first.id)
+    assert.equal(store.enqueueLatestUnansweredThread({ channelId: fresh.id, actorId: philip.id }), false)
+  })
+
   it('models flat threads, explicit agent mentions, and bounded agent dispatch', () => {
     const { store, philip, channel, coordinator, caretaker } = setup()
     const root = store.postMessage({

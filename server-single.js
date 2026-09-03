@@ -167,6 +167,7 @@ const channels = new ChannelStore({
 if (!READ_ONLY_MODE) {
   channels.retryAbandonedExecutions();
   channels.reconcileAgentAttentionSignals();
+  staffExistingPhilipChannels();
 }
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -3448,6 +3449,79 @@ function syncAllRoomSidecars(options) {
   }
 }
 
+function ensureRoomStaffing(name) {
+  if (!listRoomDirs().includes(name)) throw httpError(404, 'no such room');
+  const roomDir = path.join(ROOMS_HOME_DIR, name);
+  const before = {
+    assignments: ROOM_ASSIGN_STATE.read(),
+    leaders: ROOM_LEADERS_STATE.read(),
+    residents: ROOM_RESIDENTS_STATE.read(),
+    meta: readMeta(),
+  };
+  const created = [];
+  try {
+    let leaderId = ROOM_LEADERS_STATE.read()[name] || null;
+    if (!leaderId || !validRoomLeaderDesignation(name, leaderId)) {
+      const staleLeaderId = leaderId;
+      if (staleLeaderId) ROOM_ASSIGN_STATE.update(current => {
+        const next = { ...current };
+        if (next[staleLeaderId] === name) delete next[staleLeaderId];
+        return next;
+      });
+      leaderId = randomUUID();
+      created.push(leaderId);
+      appointRoomLeader(name, leaderId, { assign: true, replaceStale: staleLeaderId });
+      spawnOrResume(leaderId, roomDir, false, 'omp');
+      const meta = readMeta();
+      meta[leaderId] = { ...(meta[leaderId] || {}), title: `#${name} Leader`, updatedAt: new Date().toISOString() };
+      writeMeta(meta);
+    }
+
+    let caretakerId = ROOM_RESIDENTS_STATE.read()[name]?.caretaker?.sessionId || null;
+    if (!caretakerId || !sessionIdentityStatus(caretakerId).known) {
+      const staleCaretakerId = caretakerId;
+      caretakerId = randomUUID();
+      created.push(caretakerId);
+      ROOM_ASSIGN_STATE.update(current => {
+        const next = { ...current, [caretakerId]: name };
+        if (staleCaretakerId && next[staleCaretakerId] === name) delete next[staleCaretakerId];
+        return next;
+      });
+      ROOM_RESIDENTS_STATE.update(current => ({
+        ...current,
+        [name]: { ...(current[name] || {}), caretaker: { sessionId: caretakerId } },
+      }));
+      spawnOrResume(caretakerId, roomDir, false, 'omp');
+      const meta = readMeta();
+      meta[caretakerId] = { ...(meta[caretakerId] || {}), title: `#${name} Caretaker`, updatedAt: new Date().toISOString() };
+      writeMeta(meta);
+    }
+
+    syncRoomSidecar(name, { primeNewResidents: true });
+    sessionsSnapshotCache.invalidate();
+    roomSnapshotCache.invalidate();
+    return {
+      status: 'ready',
+      agents: [
+        { role: 'leader', sessionId: leaderId, agent: 'omp' },
+        { role: 'caretaker', sessionId: caretakerId, agent: 'omp' },
+      ],
+    };
+  } catch (error) {
+    for (const sessionId of created) {
+      killTmuxSessions(sessionId);
+      try { fs.rmSync(path.join(OMP_SESSIONS, sessionId), { recursive: true, force: true }); } catch {}
+    }
+    ROOM_ASSIGN_STATE.update(() => before.assignments);
+    ROOM_LEADERS_STATE.update(() => before.leaders);
+    ROOM_RESIDENTS_STATE.update(() => before.residents);
+    writeMeta(before.meta);
+    sessionsSnapshotCache.invalidate();
+    roomSnapshotCache.invalidate();
+    throw error;
+  }
+}
+
 function ensureRoomsDoctrine() {
   fs.mkdirSync(ROOMS_HOME_DIR, { recursive: true });
   const doctrinePath = path.join(ROOMS_HOME_DIR, '_doctrine.md');
@@ -3885,8 +3959,11 @@ app.post('/api/rooms', (req, res) => {
     fs.symlinkSync('AGENTS.md', path.join(dir, 'CLAUDE.md'));
     fs.writeFileSync(path.join(dir, 'notes.md'),
       `# #${name} — notes\n\nWorking memory for this room. Sessions append decisions and open\nthreads as they happen (\`room note "..."\`). Newest at the bottom.\n`);
+    let staffing;
+    try { staffing = ensureRoomStaffing(name); }
+    catch (error) { staffing = { status: 'failed', error: error.message, agents: [] }; }
     roomSnapshotCache.refresh();
-    res.json({ name, cwd: dir });
+    res.status(201).json({ name, cwd: dir, staffing });
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
@@ -5505,6 +5582,62 @@ function channelRequester(req) {
   return channels.ensureHuman({ username, displayName });
 }
 
+function scopedChannelAgentUsername(channel, role) {
+  const scope = String(channel.slug || channel.id).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30);
+  return `${scope || 'channel'}-${role}`;
+}
+
+function ensureChannelStaffing(channelId, actorId, { dispatchLatest = false } = {}) {
+  let channel = channels.getChannel(channelId, actorId);
+  let coordinator = channel.members.find(member =>
+    member.kind === 'agent' && member.displayName.toLowerCase() === 'coordinator');
+  if (!coordinator) {
+    coordinator = channels.addAgent({
+      channelId,
+      actorId,
+      username: scopedChannelAgentUsername(channel, 'coordinator'),
+      displayName: 'Coordinator',
+      sessionId: randomUUID(),
+      makeDefault: true,
+    }).principal;
+  } else if (!channel.defaultAgentId) {
+    channels.setDefaultAgent({ channelId, actorId, agentId: coordinator.id });
+  }
+  channel = channels.getChannel(channelId, actorId);
+  let caretaker = channel.members.find(member =>
+    member.kind === 'agent' && member.displayName.toLowerCase() === 'caretaker');
+  if (!caretaker) {
+    caretaker = channels.addAgent({
+      channelId,
+      actorId,
+      username: scopedChannelAgentUsername(channel, 'caretaker'),
+      displayName: 'Caretaker',
+      sessionId: randomUUID(),
+    }).principal;
+  }
+  channel = channels.getChannel(channelId, actorId);
+  const dispatched = dispatchLatest
+    ? channels.enqueueLatestUnansweredThread({ channelId, actorId })
+    : false;
+  return {
+    status: 'ready',
+    agents: channel.members.filter(member => member.kind === 'agent')
+      .map(member => ({ id: member.id, username: member.username, displayName: member.displayName })),
+    dispatched,
+    channel,
+  };
+}
+
+function staffExistingPhilipChannels() {
+  const owner = channels.ensureHuman({ username: 'philip', displayName: 'Philip' });
+  if (!owner) return;
+  for (const channel of channels.listChannels(owner.id)) {
+    if (channel.type !== 'channel' || channel.members.filter(member => member.kind === 'agent').length >= 2) continue;
+    try { ensureChannelStaffing(channel.id, owner.id, { dispatchLatest: true }); }
+    catch (error) { console.warn(`[channels] could not staff #${channel.slug || channel.id}:`, error.message); }
+  }
+}
+
 function channelErrorStatus(error) {
   if (error?.status) return error.status;
   if (/not an active channel member|only a channel owner|not allowed/.test(error?.message || '')) return 403;
@@ -5606,15 +5739,23 @@ app.get('/api/channels', (req, res) => {
 app.post('/api/channels', (req, res) => {
   try {
     const principal = channelRequester(req);
-    const channel = channels.createChannel({
+    const created = channels.createChannel({
       slug: req.body?.slug,
       title: req.body?.title,
       description: req.body?.description,
       creatorId: principal.id,
       idempotencyKey: String(req.headers['idempotency-key'] || req.body?.idempotencyKey || randomUUID()).slice(0, 200),
     });
+    let staffing;
+    try {
+      staffing = ensureChannelStaffing(created.id, principal.id);
+    } catch (error) {
+      staffing = { status: 'failed', error: error.message, agents: [] };
+    }
+    const channel = staffing.channel || channels.getChannel(created.id, principal.id);
+    delete staffing.channel;
     emitChannelChange(channel.id, 'channel');
-    res.status(201).json({ channel });
+    res.status(201).json({ channel, staffing });
   } catch (error) {
     res.status(channelErrorStatus(error)).json({ error: error.message });
   }

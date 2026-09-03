@@ -87,6 +87,7 @@ export default function RoomsHome(props: {
   const [error, setError] = createSignal<string | null>(null)
   const [expanded, setExpanded] = createSignal<string | null>(null)
   const [busy, setBusy] = createSignal(false)
+  const [creatingRoom, setCreatingRoom] = createSignal(false)
   const [attachLoading, setAttachLoading] = createSignal(false)
   const [attachingRoom, setAttachingRoom] = createSignal<string | null>(null)
   const [attachCandidates, setAttachCandidates] = createSignal<SessionMeta[]>([])
@@ -124,9 +125,20 @@ export default function RoomsHome(props: {
     const name = prompt('Room name (lowercase, digits, dashes):')?.trim()
     if (!name) return
     setBusy(true)
-    try { await createRoom(name); await refresh(); setExpanded(name) }
-    catch (e: any) { alert(e.message) }
-    finally { setBusy(false) }
+    setCreatingRoom(true)
+    try {
+      const created = await createRoom(name)
+      await refresh()
+      setExpanded(name)
+      if (created.staffing.status === 'failed') {
+        alert(`Room created, but its agents could not start: ${created.staffing.error || 'unknown error'}`)
+      }
+    } catch (cause: unknown) {
+      alert(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setCreatingRoom(false)
+      setBusy(false)
+    }
   }
 
   const roomHarness = (name: string): AgentId => roomHarnesses()[name] || 'omp'
@@ -376,7 +388,7 @@ export default function RoomsHome(props: {
       <div style={{ 'max-width': '640px', margin: '0 auto', padding: '12px 12px 40px' }}>
         <div style={{ display: 'flex', 'align-items': 'center', 'justify-content': 'flex-end', padding: '10px 4px 14px 44px' }}>
           <button onClick={newRoom} disabled={busy()}
-            style={{ background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', 'font-size': '13px', 'font-weight': '600', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>+ New room</button>
+            style={{ background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', 'font-size': '13px', 'font-weight': '600', padding: '6px 12px', 'border-radius': '8px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>{creatingRoom() ? 'Adding Leader + Caretaker…' : '+ New room'}</button>
         </div>
 
         <details data-testid="new-chat-launcher" style={{ 'margin-bottom': '10px' }}>

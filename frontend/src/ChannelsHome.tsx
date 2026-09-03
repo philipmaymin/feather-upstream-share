@@ -519,9 +519,12 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     try {
       if (kind === 'channel') {
         const slug = value.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '')
-        const channel = await createChannel({ slug, title: dialogTitle().trim() || value })
+        const result = await createChannel({ slug, title: dialogTitle().trim() || value })
         await refresh()
-        await chooseChannel(channel)
+        await chooseChannel(result.channel)
+        if (result.staffing.status === 'failed') {
+          setError(`Channel created, but its agents could not start: ${result.staffing.error || 'unknown error'}`)
+        }
       } else if (kind === 'members') {
         const channel = selectedChannel()
         if (!channel) return
@@ -1038,7 +1041,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                 <label>{dialog() === 'channel' ? 'Channel name' : 'Username'}<input value={dialogValue()} onInput={event => setDialogValue(event.currentTarget.value)} placeholder={dialog() === 'channel' ? 'Film launch' : 'maya'} autofocus /></label>
                 <Show when={dialog() === 'channel'}><label>Display title <input value={dialogTitle()} onInput={event => setDialogTitle(event.currentTarget.value)} placeholder="Film Launch" /></label></Show>
                 <Show when={dialogError()}><p class="channel-dialog-error">{dialogError()}</p></Show>
-                <button type="submit" class="channel-dialog-submit" disabled={!dialogValue().trim() || dialogBusy()}>{dialogBusy() ? 'Working…' : dialog() === 'channel' ? 'Create channel' : 'Send invite'}</button>
+                <button type="submit" class="channel-dialog-submit" disabled={!dialogValue().trim() || dialogBusy()}>{dialogBusy() ? dialog() === 'channel' ? 'Adding agents…' : 'Inviting…' : dialog() === 'channel' ? 'Create channel' : 'Send invite'}</button>
               </form>
             }>
               <div class="channel-person-list">

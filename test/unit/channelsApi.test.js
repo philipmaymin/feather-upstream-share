@@ -18,13 +18,21 @@ afterEach(async () => {
   while (roots.length) fs.rmSync(roots.pop(), { recursive: true, force: true })
 })
 
-async function startServer() {
+async function startServer({ failTmuxSpawn = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-channels-api-'))
   roots.push(root)
   const home = path.join(root, 'home')
   const state = path.join(root, 'state')
+  const bin = path.join(root, 'bin')
   fs.mkdirSync(home)
   fs.mkdirSync(state)
+  fs.mkdirSync(bin)
+  fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh
+[ "$1" = "has-session" ] && exit 1
+${failTmuxSpawn ? '[ "$1" = "new-session" ] && exit 1' : ''}
+exit 0
+`)
+  fs.chmodSync(path.join(bin, 'tmux'), 0o755)
   const port = 47_000 + Math.floor(Math.random() * 1_000)
   const base = `http://127.0.0.1:${port}`
   const child = spawn(process.execPath, ['server-single.js'], {
@@ -37,6 +45,7 @@ async function startServer() {
       FEATHER_PUSH_POLL: '0',
       FEATHER_ROOM_PULSES: '0',
       PORT: String(port),
+      PATH: `${bin}:${process.env.PATH}`,
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   })
@@ -84,6 +93,77 @@ describe('shared channels API', () => {
     assert.equal(messages.messages.length, 1)
     assert.equal(messages.messages[0].messageType, 'system')
     assert.equal(messages.messages[0].metadata.access, 'read-only')
+  })
+
+  it('creates channels with a stable Coordinator and Caretaker', async () => {
+    const { base, stderr } = await startServer()
+    const requestHeaders = { ...headers(), 'Idempotency-Key': 'api:create:fairfield' }
+    const firstResponse = await fetch(`${base}/api/channels`, {
+      method: 'POST',
+      headers: requestHeaders,
+      body: JSON.stringify({ slug: 'fairfield', title: 'Fairfield' }),
+    })
+    assert.equal(firstResponse.status, 201, stderr())
+    const first = await body(firstResponse)
+    assert.equal(first.staffing.status, 'ready')
+    assert.deepEqual(first.staffing.agents.map(agent => agent.username).sort(), ['fairfield-caretaker', 'fairfield-coordinator'])
+    assert.deepEqual(first.channel.members.filter(member => member.kind === 'agent').map(member => member.displayName).sort(), ['Caretaker', 'Coordinator'])
+    const coordinator = first.channel.members.find(member => member.displayName === 'Coordinator')
+    assert.equal(first.channel.defaultAgentId, coordinator.id)
+    assert.ok(first.channel.members.every(member => !('sessionId' in member)))
+    assert.ok(first.staffing.agents.every(agent => !('sessionId' in agent)))
+
+    const replayResponse = await fetch(`${base}/api/channels`, {
+      method: 'POST',
+      headers: requestHeaders,
+      body: JSON.stringify({ slug: 'fairfield', title: 'Fairfield' }),
+    })
+    assert.equal(replayResponse.status, 201, stderr())
+    const replay = await body(replayResponse)
+    assert.equal(replay.channel.id, first.channel.id)
+    assert.deepEqual(replay.channel.members.map(member => member.id).sort(), first.channel.members.map(member => member.id).sort())
+  })
+
+  it('creates Rooms with an assigned OMP Leader and Caretaker', async () => {
+    const { base, stderr } = await startServer()
+    const response = await fetch(`${base}/api/rooms`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ name: 'staffed-room' }),
+    })
+    assert.equal(response.status, 201, stderr())
+    const created = await body(response)
+    assert.equal(created.staffing.status, 'ready')
+    assert.deepEqual(created.staffing.agents.map(agent => agent.role), ['leader', 'caretaker'])
+    assert.ok(created.staffing.agents.every(agent => agent.agent === 'omp'))
+    assert.equal(new Set(created.staffing.agents.map(agent => agent.sessionId)).size, 2)
+
+    const listed = await body(await fetch(`${base}/api/rooms`, { headers: headers() }))
+    const room = listed.rooms.find(candidate => candidate.name === 'staffed-room')
+    assert.equal(room.leaderSessionId, created.staffing.agents[0].sessionId)
+    const caretakerResident = room.residents.find(resident => resident.role === 'caretaker')
+    assert.ok(caretakerResident)
+    assert.equal(caretakerResident.sessionId, created.staffing.agents[1].sessionId)
+  })
+
+  it('keeps a new Room visible but rolls back agent registries when staffing fails', async () => {
+    const { base, stderr } = await startServer({ failTmuxSpawn: true })
+    const response = await fetch(`${base}/api/rooms`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ name: 'partial-room' }),
+    })
+    assert.equal(response.status, 201, stderr())
+    const created = await body(response)
+    assert.equal(created.staffing.status, 'failed')
+    assert.match(created.staffing.error, /tmux/)
+    assert.deepEqual(created.staffing.agents, [])
+
+    const listed = await body(await fetch(`${base}/api/rooms`, { headers: headers() }))
+    const room = listed.rooms.find(candidate => candidate.name === 'partial-room')
+    assert.ok(room)
+    assert.equal(room.leaderSessionId, null)
+    assert.deepEqual(room.residents, [])
   })
 
   it('keeps shared membership and Activity isolated from personal Feather APIs', async () => {

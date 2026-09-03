@@ -180,6 +180,13 @@ export interface ChannelPrincipal {
   notificationLevel?: 'all' | 'mentions' | 'mute'
 }
 
+export interface WorkspaceStaffing {
+  status: 'ready' | 'failed'
+  agents: Array<{ id?: string; sessionId?: string; username?: string; displayName?: string; role?: string; agent?: string }>
+  error?: string
+  dispatched?: boolean
+}
+
 export interface ChannelInfo {
   id: string
   slug: string | null
@@ -305,13 +312,12 @@ export async function uploadChannelImage(channelId: string, file: File, uploadId
   }
 }
 
-export async function createChannel(input: { slug: string; title: string; description?: string }): Promise<ChannelInfo> {
-  const data = await responseJson<{ channel: ChannelInfo }>(await fetch(`${BASE}/api/channels`, {
+export async function createChannel(input: { slug: string; title: string; description?: string }): Promise<{ channel: ChannelInfo; staffing: WorkspaceStaffing }> {
+  return responseJson<{ channel: ChannelInfo; staffing: WorkspaceStaffing }>(await fetch(`${BASE}/api/channels`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
     body: JSON.stringify(input),
   }))
-  return data.channel
 }
 
 export async function bootstrapFilms7(): Promise<ChannelInfo> {
@@ -402,7 +408,7 @@ export async function fetchRoomFriction(room: string): Promise<FrictionComplaint
   return (await responseJson<{ complaints: FrictionComplaint[] }>(response)).complaints
 }
 
-export async function createRoom(name: string): Promise<{ name: string; cwd: string }> {
+export async function createRoom(name: string): Promise<{ name: string; cwd: string; staffing: WorkspaceStaffing }> {
   const response = await fetch(`${BASE}/api/rooms`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
