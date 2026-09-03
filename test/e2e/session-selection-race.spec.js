@@ -13,6 +13,8 @@ const FILM_TITLE = `Film selection race ${RUN_ID}`
 const TARGET_TITLE = `Compelle selection target ${RUN_ID}`
 const FILM_MESSAGE = `FILM_CONTEXT_MUST_NOT_LEAK_${RUN_ID}`
 const TARGET_MESSAGE = `COMPELLE_CONTEXT_MUST_STAY_${RUN_ID}`
+const LONG_ID = `e2e-selection-long-${RUN_ID}`
+const LONG_LATEST = `BITTENSOR_LONG_CHAT_LATEST_${RUN_ID}`
 /** @type {string[]} */
 let fixturePaths = []
 
@@ -32,20 +34,65 @@ function writeSession(file, title, assistantMessage) {
   fs.writeFileSync(file, lines.map(line => JSON.stringify(line)).join('\n') + '\n')
 }
 
+function writeLongSession(file) {
+  const lines = [{
+    type: 'user', uuid: `${LONG_ID}-user`, timestamp: '2026-08-23T13:00:00Z',
+    isSidechain: false, isMeta: false,
+    message: { role: 'user', content: `Bittensor long Main ${RUN_ID}` },
+  }]
+  for (let index = 1; index < 1000; index++) {
+    lines.push({
+      type: 'assistant',
+      uuid: `${LONG_ID}-${index}`,
+      timestamp: new Date(Date.UTC(2026, 7, 23, 13, 0, index)).toISOString(),
+      isSidechain: false,
+      isMeta: false,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: index === 999 ? LONG_LATEST : `Bittensor transcript item ${index}` }],
+        stopReason: 'stop',
+      },
+    })
+  }
+  fs.writeFileSync(file, lines.map(line => JSON.stringify(line)).join('\n') + '\n')
+}
+
 test.beforeAll(() => {
   const projectDir = fs.readdirSync(CLAUDE_PROJECTS)
     .map(name => path.join(CLAUDE_PROJECTS, name))
     .find(candidate => fs.statSync(candidate).isDirectory())
   if (!projectDir) throw new Error('No project dirs in ~/.claude/projects/')
-  fixturePaths = [path.join(projectDir, `${FILM_ID}.jsonl`), path.join(projectDir, `${TARGET_ID}.jsonl`)]
+  fixturePaths = [
+    path.join(projectDir, `${FILM_ID}.jsonl`),
+    path.join(projectDir, `${TARGET_ID}.jsonl`),
+    path.join(projectDir, `${LONG_ID}.jsonl`),
+  ]
   writeSession(fixturePaths[0], FILM_TITLE, FILM_MESSAGE)
   writeSession(fixturePaths[1], TARGET_TITLE, TARGET_MESSAGE)
+  writeLongSession(fixturePaths[2])
 })
 
 test.afterAll(() => {
   for (const file of fixturePaths) {
     try { fs.unlinkSync(file) } catch {}
   }
+})
+
+test('long chats request and render only the bounded recent window', async ({ page }) => {
+  let requestedLimit = null
+  await page.route(`**/api/sessions/${LONG_ID}/messages*`, async route => {
+    requestedLimit = new URL(route.request().url()).searchParams.get('limit')
+    await route.continue()
+  })
+  const started = Date.now()
+  await page.goto(`${BASE}/#${LONG_ID}`)
+
+  await expect(page.getByText(LONG_LATEST, { exact: true })).toBeVisible({ timeout: 5000 })
+  await expect(page.locator('textarea[placeholder="Send a message..."]')).toBeEnabled()
+  expect(requestedLimit).toBe('80')
+  expect(await page.locator('.msg-row').count()).toBeLessThanOrEqual(80)
+  await expect(page.getByText('Bittensor transcript item 1', { exact: true })).toHaveCount(0)
+  expect(Date.now() - started).toBeLessThan(5000)
 })
 
 test('late transcript responses cannot cross chat identity or receive a send', async ({ page }) => {

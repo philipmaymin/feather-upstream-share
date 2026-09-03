@@ -672,8 +672,8 @@ export async function deletePath(path: string): Promise<void> {
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`)
 }
 
-const MESSAGE_PAGE_SIZE = 200
-const INITIAL_MESSAGE_LIMIT = 1000
+const MESSAGE_PAGE_SIZE = 100
+const INITIAL_MESSAGE_LIMIT = 80
 
 export interface MessagePage {
   messages: Message[]
