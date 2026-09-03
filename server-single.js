@@ -165,7 +165,7 @@ const channels = new ChannelStore({
   readOnly: READ_ONLY_MODE,
 });
 if (!READ_ONLY_MODE) {
-  channels.retryAbandonedExecutions();
+  if (process.env.FEATHER_CHANNEL_RUNTIME !== '0') channels.retryAbandonedExecutions();
   channels.reconcileAgentAttentionSignals();
   staffExistingPhilipChannels();
 }
@@ -1078,15 +1078,18 @@ async function sendText(name, text) {
     await new Promise(r => setTimeout(r, 300));
   }
 
-  // Re-send Enter only while the exact text remains in the input box. Once the
-  // box clears, the message has either submitted or queued and must not be sent
-  // again.
+  // A long OMP paste first collapses into a file card; that card no longer
+  // exposes the original marker even though it still needs a second Enter.
+  // Short prompts retain marker-based duplicate protection.
   const marker = terminalText.replace(/\s+/g, ' ').trim().slice(0, 40);
   for (let attempt = 0; attempt < 2; attempt++) {
     try { execFileSync('tmux', ['send-keys', '-t', name, 'Enter'], { stdio: 'ignore' }); } catch {}
     await new Promise(r => setTimeout(r, 500));
     const box = inputBoxText(name);
-    if (!box || !marker || !box.replace(/\s+/g, ' ').includes(marker)) return;
+    if (!box || !marker || !box.replace(/\s+/g, ' ').includes(marker)) {
+      if (isLong && attempt === 0) continue;
+      return;
+    }
   }
 }
 
@@ -1220,9 +1223,12 @@ function channelAgentWorkspace(item) {
   const dir = path.join(STATE_PATHS.workspace.channelWorkspacesDir, name);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const promptFile = path.join(dir, 'AGENTS.md');
-  const role = item.agent.username === 'caretaker'
+  const roleName = item.agent.displayName.toLowerCase();
+  const role = roleName === 'caretaker'
     ? 'Preserve decisions, continuity, provenance, and unresolved risks. Correct drift directly.'
-    : 'Coordinate the work, answer the human, and involve another agent only when its distinct expertise changes the result.';
+    : roleName === 'btw'
+      ? 'Act as overflow triage only when Coordinator is already busy. If the latest message can be answered completely, safely, and without tools in at most 120 words, answer it directly. Otherwise respond exactly HANDOFF_TO_COORDINATOR: followed by one short reason. Never perform substantial work yourself.'
+      : 'Coordinate substantial work, answer the human, and involve another agent only when its distinct expertise changes the result.';
   const prompt = `# Shared channel agent: @${item.agent.username}\n\n`
     + `You are ${item.agent.displayName}, an agent member of #${item.channel.slug || item.channel.title}.\n\n`
     + `${role}\n\n`
@@ -1317,12 +1323,17 @@ function observeChannelAgentMessage(sessionId, parsed) {
   if (READ_ONLY_MODE || parsed?.role !== 'assistant' || !['stop', 'end_turn'].includes(parsed.stopReason)) return;
   const execution = channels.activeExecutionForSession(sessionId);
   if (!execution) return;
-  const text = (parsed.content || [])
+  let text = (parsed.content || [])
     .filter(block => block?.type === 'text' && typeof block.text === 'string')
     .map(block => block.text.trim())
     .filter(Boolean)
     .join('\n\n')
     .slice(0, 48 * 1024);
+  if (execution.agent_display_name?.toLowerCase() === 'btw' && /^HANDOFF_TO_COORDINATOR\s*:/i.test(text)) {
+    const coordinator = channels.listMembers(execution.channel_id, execution.agent_principal_id)
+      .find(member => member.kind === 'agent' && member.displayName.toLowerCase() === 'coordinator');
+    if (coordinator) text = `👀 Read. @${coordinator.username} is taking this.`;
+  }
   if (!text) return;
   try {
     const message = channels.completeExecution({ executionId: execution.id, content: text, timestamp: parsed.timestamp });
@@ -5636,6 +5647,17 @@ function ensureChannelStaffing(channelId, actorId, { dispatchLatest = false } = 
       sessionId: randomUUID(),
     }).principal;
   }
+  let btw = channel.members.find(member =>
+    member.kind === 'agent' && member.displayName.toLowerCase() === 'btw');
+  if (!btw) {
+    btw = channels.addAgent({
+      channelId,
+      actorId,
+      username: scopedChannelAgentUsername(channel, 'btw'),
+      displayName: 'Btw',
+      sessionId: randomUUID(),
+    }).principal;
+  }
   channel = channels.getChannel(channelId, actorId);
   const dispatched = dispatchLatest
     ? channels.enqueueLatestUnansweredThread({ channelId, actorId })
@@ -5832,6 +5854,7 @@ app.post('/api/channels/bootstrap-films7', (req, res) => {
         displayName: username.charAt(0).toUpperCase() + username.slice(1),
       });
     }
+    channel = ensureChannelStaffing(channel.id, principal.id).channel;
     if (!channels.listChannelRoots(channel.id, principal.id).length) {
       channels.postMessage({
         channelId: channel.id,
@@ -6105,6 +6128,18 @@ app.get('/api/channels/executions/:executionId/peek', (req, res) => {
       try { activity = extractActivity(capturePaneLines(existingTmuxName(execution.sessionId)).lines); } catch {}
     }
     const seenAt = ompBridgeLastSeen.get(execution.sessionId)?.seenAt;
+    const processActive = tmuxIsActive(execution.sessionId);
+    const observableAt = Number.isFinite(seenAt) ? seenAt : Date.parse(execution.startedAt);
+    const noReportedProgress = !activity && tools.size === 0;
+    const stalled = execution.state === 'running'
+      && (!processActive || (noReportedProgress && Date.now() - observableAt > 60_000));
+    const stalledReason = !processActive && execution.state === 'running'
+      ? 'The agent process stopped before completing this turn.'
+      : stalled
+        ? 'The agent is still marked running but has not reported observable progress.'
+        : execution.state === 'error' || execution.state === 'killed'
+          ? execution.error || 'This turn did not complete.'
+          : null;
     res.json({
       execution: {
         id: execution.id,
@@ -6113,10 +6148,39 @@ app.get('/api/channels/executions/:executionId/peek', (req, res) => {
         startedAt: execution.startedAt,
         completedAt: execution.completedAt,
       },
-      activity: activity || (execution.state === 'running' ? 'Starting the next action…' : 'No longer running'),
+      activity: activity || (processActive && execution.state === 'running'
+        ? 'The agent is running but has not reported a tool action yet.'
+        : execution.state === 'running'
+          ? 'Agent process stopped.'
+          : 'No longer running'),
       steps: [...tools.values()].slice(-8),
       updatedAt: Number.isFinite(seenAt) ? new Date(seenAt).toISOString() : null,
+      processActive,
+      stalled,
+      stalledReason,
+      canRestart: ['running', 'error', 'killed'].includes(execution.state),
     });
+  } catch (error) {
+    res.status(channelErrorStatus(error)).json({ error: error.message });
+  }
+});
+
+app.post('/api/channels/executions/:executionId/restart', (req, res) => {
+  try {
+    const principal = channelRequester(req);
+    const result = channels.restartExecution({
+      executionId: req.params.executionId,
+      principalId: principal.id,
+    });
+    if (!result) throw httpError(409, 'turn could not be restarted');
+    clearTimeout(channelAgentTimers.get(req.params.executionId));
+    channelAgentTimers.delete(req.params.executionId);
+    killTmuxSessions(result.sessionId);
+    emitChannelChange(result.channelId, 'execution');
+    if (process.env.FEATHER_CHANNEL_RUNTIME !== '0') {
+      setTimeout(() => void channelRuntimeTick(), 0).unref();
+    }
+    res.status(202).json({ ok: true, state: result.state });
   } catch (error) {
     res.status(channelErrorStatus(error)).json({ error: error.message });
   }
@@ -7238,6 +7302,7 @@ function reapIdleSessions() {
   const now = Date.now();
   const active = getActiveTmuxSessions();
   if (active.size === 0) return;
+  const protectedChannelSessions = channels.activeExecutionSessionIds();
 
   // Reap codex sessions
   try {
@@ -7245,6 +7310,7 @@ function reapIdleSessions() {
     for (const { uuid, fpath, mtime } of listCodexJsonlFiles()) {
       const id = resolveCodexWatchId(uuid, meta);
       if (!activeTmuxHas(active, id)) continue;
+      if (protectedChannelSessions.has(id)) continue;
       const activity = latestSessionActivityMs(
         lastActivityMs(fpath, 'codex', mtime.getTime()),
         activeTmuxCreatedAt(active, id),
@@ -7261,6 +7327,7 @@ function reapIdleSessions() {
   try {
     for (const id of fs.readdirSync(OMP_SESSIONS)) {
       if (!activeTmuxHas(active, id)) continue;
+      if (protectedChannelSessions.has(id)) continue;
       const dirPath = path.join(OMP_SESSIONS, id);
       const files = fs.readdirSync(dirPath).filter(file => file.endsWith('.jsonl')).sort().reverse();
       if (!files.length) continue;
@@ -7286,6 +7353,7 @@ function reapIdleSessions() {
         if (!file.endsWith('.jsonl')) continue;
         const id = file.replace('.jsonl', '');
         if (!activeTmuxHas(active, id)) continue;
+        if (protectedChannelSessions.has(id)) continue;
         const fpath = path.join(dirPath, file);
         const activity = latestSessionActivityMs(
           lastActivityMs(fpath, 'claude', fs.statSync(fpath).mtimeMs),

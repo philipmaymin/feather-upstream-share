@@ -40,7 +40,14 @@ function setup() {
     displayName: 'Caretaker',
     sessionId: 'channel-films7-caretaker',
   }).principal
-  return { root, store, philip, channel, coordinator, caretaker }
+  const btw = store.addAgent({
+    channelId: channel.id,
+    actorId: philip.id,
+    username: 'btw',
+    displayName: 'Btw',
+    sessionId: 'channel-films7-btw',
+  }).principal
+  return { root, store, philip, channel, coordinator, caretaker, btw }
 }
 
 describe('channel event store', () => {
@@ -69,7 +76,7 @@ describe('channel event store', () => {
   })
 
   it('keeps agent sessions stable and dispatches only the latest unanswered thread after staffing', () => {
-    const { store, philip, channel, coordinator, caretaker } = setup()
+    const { store, philip, channel, coordinator, caretaker, btw } = setup()
     const replay = store.addAgent({
       channelId: channel.id,
       actorId: philip.id,
@@ -79,7 +86,7 @@ describe('channel event store', () => {
     }).principal
     assert.equal(replay.id, coordinator.id)
     assert.equal(replay.sessionId, coordinator.sessionId)
-    assert.deepEqual([...store.agentSessionIds()].sort(), [caretaker.sessionId, coordinator.sessionId].sort())
+    assert.deepEqual([...store.agentSessionIds()].sort(), [btw.sessionId, caretaker.sessionId, coordinator.sessionId].sort())
 
     const fresh = store.createChannel({
       slug: 'fairfield',
@@ -119,7 +126,14 @@ describe('channel event store', () => {
     assert.equal(store.executionForMember({ executionId: dispatch.executionId, principalId: philip.id }).sessionId, freshCoordinator.sessionId)
     const outsider = store.ensureHuman({ username: 'outsider', displayName: 'Outsider' })
     assert.throws(() => store.executionForMember({ executionId: dispatch.executionId, principalId: outsider.id }), /not an active channel member/)
-    store.completeExecution({ executionId: dispatch.executionId, content: 'Coordinator is here.' })
+    assert.equal(store.activeExecutionSessionIds().has(freshCoordinator.sessionId), true)
+    assert.throws(() => store.restartExecution({ executionId: dispatch.executionId, principalId: outsider.id }), /not an active channel member/)
+    assert.equal(store.restartExecution({ executionId: dispatch.executionId, principalId: philip.id }).state, 'queued')
+    const restartedDispatch = store.claimDispatch()
+    assert.notEqual(restartedDispatch.executionId, dispatch.executionId)
+    assert.equal(restartedDispatch.triggerMessageId, latest.id)
+    assert.equal(store.getThread(latest.id, philip.id).executions.find(execution => execution.id === dispatch.executionId).error, 'Restarted by a channel member')
+    store.completeExecution({ executionId: restartedDispatch.executionId, content: 'Coordinator is here.' })
     const followUp = store.postMessage({
       channelId: fresh.id,
       authorId: philip.id,
@@ -132,6 +146,113 @@ describe('channel event store', () => {
     const followUpDispatch = store.claimDispatch()
     assert.equal(followUpDispatch.agent.id, freshCoordinator.id)
     assert.equal(followUpDispatch.triggerMessageId, followUp.id)
+  })
+
+  it('queues later human replies until the same agent finishes its active turn', () => {
+    const { store, philip, channel, coordinator } = setup()
+    const root = store.postMessage({
+      channelId: channel.id,
+      authorId: philip.id,
+      content: 'Start the first task.',
+      messageType: 'human',
+      idempotencyKey: 'client:serial:first',
+    })
+    const first = store.claimDispatch()
+    assert.equal(first.agent.id, coordinator.id)
+
+    const followUp = store.postMessage({
+      channelId: channel.id,
+      authorId: philip.id,
+      content: '@coordinator Add this while you are still working.',
+      threadRootId: root.id,
+      replyToId: root.id,
+      messageType: 'human',
+      idempotencyKey: 'client:serial:follow-up',
+    })
+    assert.equal(store.claimDispatch(), null, 'the same persistent agent must have only one active turn')
+    const waiting = store.getThread(root.id, philip.id).delivery
+    assert.equal(waiting.activeCount, 1)
+    assert.equal(waiting.queuedCount, 1)
+    assert.deepEqual(waiting.activeAgents.map(agent => agent.id), [coordinator.id])
+    assert.deepEqual(waiting.queuedAgents.map(agent => agent.id), [coordinator.id])
+    store.completeExecution({ executionId: first.executionId, content: 'First task complete.' })
+
+    const second = store.claimDispatch()
+    assert.equal(second.agent.id, coordinator.id)
+    assert.equal(second.triggerMessageId, followUp.id)
+    assert.notEqual(second.executionId, first.executionId)
+  })
+
+  it('uses Btw only while Coordinator is busy and queues substantial handoffs', () => {
+    const { store, philip, channel, coordinator, btw } = setup()
+    store.postMessage({
+      channelId: channel.id,
+      authorId: philip.id,
+      content: 'Begin the substantial work.',
+      messageType: 'human',
+      idempotencyKey: 'client:btw:main',
+    })
+    const main = store.claimDispatch()
+    assert.equal(main.agent.id, coordinator.id)
+
+    store.postMessage({
+      channelId: channel.id,
+      authorId: philip.id,
+      content: 'What does BTW stand for?',
+      messageType: 'human',
+      idempotencyKey: 'client:btw:quick',
+    })
+    const quick = store.claimDispatch()
+    assert.equal(quick.agent.id, btw.id)
+    store.completeExecution({ executionId: quick.executionId, content: 'By the way.' })
+
+    store.postMessage({
+      channelId: channel.id,
+      authorId: philip.id,
+      content: 'Also audit all of the gradebooks.',
+      messageType: 'human',
+      idempotencyKey: 'client:btw:handoff',
+    })
+    const triage = store.claimDispatch()
+    assert.equal(triage.agent.id, btw.id)
+    const acknowledgement = store.completeExecution({
+      executionId: triage.executionId,
+      content: '👀 Read. @coordinator is taking this.',
+    })
+    assert.equal(store.claimDispatch(), null, 'Coordinator handoff waits behind Coordinator’s active turn')
+
+    store.completeExecution({ executionId: main.executionId, content: 'Initial work complete.' })
+    const handoff = store.claimDispatch()
+    assert.equal(handoff.agent.id, coordinator.id)
+    assert.equal(handoff.triggerMessageId, acknowledgement.id)
+  })
+
+  it('continues answering human follow-ups beyond the agent handoff loop cap', () => {
+    const { store, philip, channel, coordinator } = setup()
+    const root = store.postMessage({
+      channelId: channel.id,
+      authorId: philip.id,
+      content: 'Begin a long-lived human conversation.',
+      messageType: 'human',
+      idempotencyKey: 'client:long-human:root',
+    })
+    let dispatch = store.claimDispatch()
+    for (let round = 0; round < 13; round++) {
+      store.completeExecution({ executionId: dispatch.executionId, content: `Agent answer ${round + 1}.` })
+      const followUp = store.postMessage({
+        channelId: channel.id,
+        authorId: philip.id,
+        content: `Human follow-up ${round + 1}.`,
+        threadRootId: root.id,
+        replyToId: root.id,
+        messageType: 'human',
+        idempotencyKey: `client:long-human:${round + 1}`,
+      })
+      dispatch = store.claimDispatch()
+      assert.ok(dispatch, `human follow-up ${round + 1} must dispatch`)
+      assert.equal(dispatch.agent.id, coordinator.id)
+      assert.equal(dispatch.triggerMessageId, followUp.id)
+    }
   })
 
   it('models flat threads, explicit agent mentions, and bounded agent dispatch', () => {

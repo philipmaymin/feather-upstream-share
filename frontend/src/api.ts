@@ -200,6 +200,13 @@ export interface ChannelInfo {
   members: ChannelPrincipal[]
 }
 
+export interface ChannelDelivery {
+  queuedAgents: Array<Pick<ChannelPrincipal, 'id' | 'username' | 'displayName'>>
+  activeAgents: Array<Pick<ChannelPrincipal, 'id' | 'username' | 'displayName'>>
+  queuedCount: number
+  activeCount: number
+}
+
 export interface ChannelMessage {
   id: string
   channelId: string
@@ -221,6 +228,7 @@ export interface ChannelMessage {
     following: boolean
     doneAt: string | null
     snoozedUntil: string | null
+    delivery: ChannelDelivery
   }
   replies?: ChannelMessage[]
 }
@@ -235,6 +243,7 @@ export interface ChannelExecution {
   startedAt: string
   completedAt: string | null
   error: string | null
+  canRestart: boolean
 }
 
 export interface ChannelExecutionPeek {
@@ -242,6 +251,10 @@ export interface ChannelExecutionPeek {
   activity: string
   steps: Array<{ id: string; tool: string; intent: string | null; status: 'working' | 'completed' | 'failed' }>
   updatedAt: string | null
+  processActive: boolean
+  stalled: boolean
+  stalledReason: string | null
+  canRestart: boolean
 }
 
 export interface ChannelThread {
@@ -252,6 +265,7 @@ export interface ChannelThread {
   following: boolean
   doneAt: string | null
   snoozedUntil: string | null
+  delivery: ChannelDelivery
   messages: ChannelMessage[]
   executions: ChannelExecution[]
 }
@@ -379,6 +393,10 @@ export async function createChannelDm(principalId: string): Promise<ChannelInfo>
 
 export async function fetchChannelExecutionPeek(executionId: string): Promise<ChannelExecutionPeek> {
   return responseJson(await fetch(`${BASE}/api/channels/executions/${encodeURIComponent(executionId)}/peek`))
+}
+
+export async function restartChannelExecution(executionId: string): Promise<void> {
+  await responseJson(await fetch(`${BASE}/api/channels/executions/${encodeURIComponent(executionId)}/restart`, { method: 'POST' }))
 }
 
 export async function cancelChannelExecution(executionId: string): Promise<void> {

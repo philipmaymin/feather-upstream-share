@@ -1980,6 +1980,32 @@ describe('POST /api/sessions/:id/send', () => {
     assert.equal(typeof body.error, 'string')
     assert.ok(body.error.length > 0)
   })
+  it('submits a long OMP file-card prompt with the required second Enter', { skip: EXTERNAL_SERVER }, async () => {
+    const id = randomUUID()
+    const sessionDir = path.join(fixtureHome, '.feather', 'omp-sessions', id)
+    const pane = path.join(tmuxFixtureDir, `pane-f-${id}`)
+    fs.mkdirSync(sessionDir, { recursive: true })
+    fs.writeFileSync(path.join(sessionDir, 'session.jsonl'), `${JSON.stringify({
+      type: 'session', version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd: fixtureHome,
+    })}\n`)
+    fs.writeFileSync(pane, '❯\n╭── π  > Fixture\n╰─\n')
+    const sentPath = path.join(tmuxFixtureDir, 'sent')
+    const before = fs.existsSync(sentPath) ? fs.readFileSync(sentPath, 'utf8').length : 0
+    try {
+      const response = await fetch(`${BASE}/api/sessions/${id}/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Feather-Message-ID': 'long-file-card-submit-0001' },
+        body: JSON.stringify({ text: 'Long channel turn. '.repeat(40) }),
+      })
+      assert.equal(response.status, 200, await response.text())
+      const sent = fs.readFileSync(sentPath, 'utf8').slice(before)
+      assert.equal((sent.match(new RegExp(`send-keys -t f-${id} Enter`, 'g')) || []).length, 2)
+    } finally {
+      fs.rmSync(sessionDir, { recursive: true, force: true })
+      fs.rmSync(pane, { force: true })
+    }
+  })
+
 })
 
 describe('POST /api/sessions/:id/interrupt', () => {

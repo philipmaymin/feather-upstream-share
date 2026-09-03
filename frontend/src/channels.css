@@ -546,6 +546,19 @@
 .channel-root-footer button:hover { text-decoration: underline; }
 .channel-unread-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--channel-brass); }
 
+.channel-delivery-status {
+  margin-top: 3px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 9px;
+  color: #7a6650;
+  font-size: 9px;
+  line-height: 1.35;
+}
+.channel-delivery-status span { padding: 3px 6px; background: rgba(185, 120, 52, .08); }
+.channel-delivery-status .channel-delivery-active { color: #2d644f; background: rgba(56, 103, 86, .09); }
+.channel-thread-pane > .channel-delivery-status { margin: 7px 18px 0; }
+
 .channel-state {
   padding: 3px 6px;
   border-radius: 2px;
@@ -1020,6 +1033,39 @@
 .channel-execution button { align-self: center; padding: 4px 7px; border: 1px solid rgba(153, 67, 53, .4); color: var(--channel-danger); background: transparent; font: inherit; font-size: 9px; cursor: pointer; }
 .channel-execution-actions { display: flex; align-items: center; gap: 5px; }
 .channel-execution .channel-peek-action { color: var(--channel-sage); border-color: rgba(56, 103, 86, .4); }
+.channel-execution .channel-restart-action { color: #81521d; border-color: rgba(185, 120, 52, .45); }
+.channel-execution button:disabled { opacity: .5; cursor: default; }
+
+.channel-turn-recovery {
+  margin: 13px 0 3px 40px;
+  padding: 10px 11px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid rgba(165, 74, 58, .28);
+  border-left: 3px solid var(--channel-danger);
+  background: rgba(165, 74, 58, .055);
+}
+.channel-turn-recovery b,
+.channel-turn-recovery span { display: block; }
+.channel-turn-recovery b { color: #73382e; font-size: 11px; }
+.channel-turn-recovery span { margin-top: 2px; color: var(--channel-muted); font-size: 9px; }
+.channel-turn-recovery button,
+.channel-peek-recovery button {
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 3px;
+  color: #fff;
+  background: #8c493d;
+  font: inherit;
+  font-size: 9px;
+  font-weight: 750;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.channel-turn-recovery button:disabled,
+.channel-peek-recovery button:disabled { opacity: .5; cursor: default; }
 
 .channel-agent-peek {
   position: absolute;
@@ -1061,6 +1107,12 @@
 .channel-peek-current .channel-worklog-pulse { margin-top: 4px; }
 .channel-peek-current small { color: var(--channel-muted); font-size: 8px; font-weight: 750; text-transform: uppercase; letter-spacing: .07em; }
 .channel-peek-current p { margin: 4px 0 0; color: #36423c; font-size: 12px; line-height: 1.5; }
+.channel-peek-current.stalled { border-color: rgba(165, 74, 58, .28); }
+.channel-peek-current.stalled small,
+.channel-peek-stalled { color: var(--channel-danger); }
+.channel-peek-stalled { margin: 0; padding: 11px 0 0; font-size: 10px; line-height: 1.45; }
+.channel-peek-recovery { padding: 12px 0 4px; display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--channel-line); }
+.channel-peek-recovery span { color: var(--channel-muted); font-size: 9px; line-height: 1.35; }
 .channel-peek-steps { margin: 0; padding: 5px 0; list-style: none; }
 .channel-peek-steps li { padding: 9px 0; display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 8px; border-bottom: 1px solid rgba(36, 47, 42, .08); }
 .channel-peek-steps li > span { color: var(--channel-muted); font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 8px; text-transform: uppercase; }

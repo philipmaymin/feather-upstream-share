@@ -90,7 +90,7 @@ describe('shared channels API', () => {
     assert.equal(response.status, 200, stderr())
     const payload = await body(response)
     assert.equal(payload.channel.slug, 'films7')
-    assert.deepEqual(payload.channel.members.filter(member => member.kind === 'agent').map(member => member.username), ['caretaker', 'coordinator'])
+    assert.deepEqual(payload.channel.members.filter(member => member.kind === 'agent').map(member => member.username), ['films7-btw', 'caretaker', 'coordinator'])
     assert.ok(payload.channel.members.every(member => !('sessionId' in member)))
     assert.equal(fs.existsSync(path.join(home, 'rooms', 'films7')), false)
     assert.equal(fs.statSync(path.join(home, '.feather', 'channels-v1.sqlite3')).mode & 0o777, 0o600)
@@ -101,7 +101,7 @@ describe('shared channels API', () => {
     assert.equal(messages.messages[0].metadata.access, 'read-only')
   })
 
-  it('creates channels with a stable Coordinator and Caretaker', async () => {
+  it('creates channels with stable Coordinator, Caretaker, and Btw agents', async () => {
     const { base, stderr } = await startServer()
     const requestHeaders = { ...headers(), 'Idempotency-Key': 'api:create:fairfield' }
     const firstResponse = await fetch(`${base}/api/channels`, {
@@ -112,8 +112,8 @@ describe('shared channels API', () => {
     assert.equal(firstResponse.status, 201, stderr())
     const first = await body(firstResponse)
     assert.equal(first.staffing.status, 'ready')
-    assert.deepEqual(first.staffing.agents.map(agent => agent.username).sort(), ['fairfield-caretaker', 'fairfield-coordinator'])
-    assert.deepEqual(first.channel.members.filter(member => member.kind === 'agent').map(member => member.displayName).sort(), ['Caretaker', 'Coordinator'])
+    assert.deepEqual(first.staffing.agents.map(agent => agent.username).sort(), ['fairfield-btw', 'fairfield-caretaker', 'fairfield-coordinator'])
+    assert.deepEqual(first.channel.members.filter(member => member.kind === 'agent').map(member => member.displayName).sort(), ['Btw', 'Caretaker', 'Coordinator'])
     const coordinator = first.channel.members.find(member => member.displayName === 'Coordinator')
     assert.equal(first.channel.defaultAgentId, coordinator.id)
     assert.ok(first.channel.members.every(member => !('sessionId' in member)))
@@ -130,8 +130,8 @@ describe('shared channels API', () => {
     assert.deepEqual(replay.channel.members.map(member => member.id).sort(), first.channel.members.map(member => member.id).sort())
   })
 
-  it('exposes a membership-scoped read-only peek without leaking agent session ids', async () => {
-    const { base, home } = await startServer()
+  it('exposes membership-scoped stalled state and safely restarts the same turn', async () => {
+    const { base, home, root } = await startServer()
     const created = await body(await fetch(`${base}/api/channels`, {
       method: 'POST',
       headers: { ...headers(), 'Idempotency-Key': 'api:create:peek' },
@@ -149,15 +149,32 @@ describe('shared channels API', () => {
       })
       const dispatch = store.claimDispatch()
       assert.ok(dispatch)
+      await startServer({ sharedRoot: root })
+      assert.equal(store.executionForMember({ executionId: dispatch.executionId, principalId: owner.id }).state, 'running',
+        'a non-runtime observer must not abandon another server’s active channel execution')
 
       const response = await fetch(`${base}/api/channels/executions/${dispatch.executionId}/peek`, { headers: headers() })
       assert.equal(response.status, 200)
       const peek = await body(response)
       assert.equal(peek.execution.id, dispatch.executionId)
       assert.equal(peek.execution.state, 'running')
-      assert.match(peek.activity, /Starting/)
+      assert.match(peek.activity, /stopped/)
+      assert.equal(peek.processActive, false)
+      assert.equal(peek.stalled, true)
+      assert.equal(peek.canRestart, true)
+      assert.match(peek.stalledReason, /process stopped/)
       assert.equal(JSON.stringify(peek).includes(dispatch.agent.sessionId), false)
       assert.equal((await fetch(`${base}/api/channels/executions/${dispatch.executionId}/peek`, { headers: headers('maya') })).status, 403)
+
+      const restarted = await fetch(`${base}/api/channels/executions/${dispatch.executionId}/restart`, {
+        method: 'POST',
+        headers: headers(),
+      })
+      assert.equal(restarted.status, 202)
+      const retry = store.claimDispatch()
+      assert.ok(retry)
+      assert.notEqual(retry.executionId, dispatch.executionId)
+      assert.equal(retry.triggerMessageId, dispatch.triggerMessageId)
     } finally {
       store.close()
     }

@@ -7,11 +7,12 @@ const NOW = new Date().toISOString()
 const philip = { id: 'human:philip', kind: 'human', username: 'philip', displayName: 'Philip', avatarSeed: 'philip', createdAt: NOW, role: 'owner', notificationLevel: 'all' }
 const coordinator = { id: 'agent:films7:coordinator', kind: 'agent', username: 'coordinator', displayName: 'Coordinator', avatarSeed: 'coordinator', agentBackend: 'omp', createdAt: NOW, role: 'agent', notificationLevel: 'mentions' }
 const caretaker = { id: 'agent:films7:caretaker', kind: 'agent', username: 'caretaker', displayName: 'Caretaker', avatarSeed: 'caretaker', agentBackend: 'omp', createdAt: NOW, role: 'agent', notificationLevel: 'mentions' }
+const btw = { id: 'agent:films7:btw', kind: 'agent', username: 'films7-btw', displayName: 'Btw', avatarSeed: 'films7-btw', agentBackend: 'omp', createdAt: NOW, role: 'agent', notificationLevel: 'mentions' }
 const channel = {
   id: 'channel-films7', slug: 'films7', title: 'Films 7',
   description: 'A human-and-agent studio for making the next film together.',
   type: 'channel', defaultAgentId: coordinator.id, createdAt: NOW, archivedAt: null,
-  unread: 1, members: [philip, coordinator, caretaker],
+  unread: 1, members: [philip, coordinator, caretaker, btw],
 }
 
 function message(id, author, content, rootId = id, type = author.kind === 'agent' ? 'agent' : 'human') {
@@ -21,12 +22,12 @@ function message(id, author, content, rootId = id, type = author.kind === 'agent
 function fixtureState() {
   const bridge = {
     ...message('bridge', philip, 'Continuity bridge: the #films6 Wiki remains read-only historical context.', 'bridge', 'system'),
-    thread: { title: 'Continuity bridge', state: 'open', replyCount: 0, updatedAt: NOW, unread: false, following: true, doneAt: null, snoozedUntil: null },
+    thread: { title: 'Continuity bridge', state: 'open', replyCount: 0, updatedAt: NOW, unread: false, following: true, doneAt: null, snoozedUntil: null, delivery: { queuedAgents: [], activeAgents: [], queuedCount: 0, activeCount: 0 } },
     replies: [],
   }
   const root = {
     ...message('root-1', philip, 'What dramatic question should the opening make impossible to ignore?'),
-    thread: { title: 'The dramatic question in the opening', state: 'working', replyCount: 2, updatedAt: NOW, unread: true, following: true, doneAt: null, snoozedUntil: null },
+    thread: { title: 'The dramatic question in the opening', state: 'working', replyCount: 2, updatedAt: NOW, unread: true, following: true, doneAt: null, snoozedUntil: null, delivery: { queuedAgents: [btw], activeAgents: [coordinator], queuedCount: 1, activeCount: 1 } },
     replies: [
       message('reply-1', coordinator, 'The opening should ask whether she will trade the truth for belonging.', 'root-1'),
       message('reply-2', caretaker, 'Continuity holds if the unopened letter remains visible in both shots.', 'root-1'),
@@ -36,8 +37,9 @@ function fixtureState() {
     ['bridge', { id: 'bridge', channelId: channel.id, title: 'Continuity bridge', state: 'open', following: true, doneAt: null, snoozedUntil: null, messages: [bridge], executions: [] }],
     ['root-1', {
       id: 'root-1', channelId: channel.id, title: 'The dramatic question in the opening', state: 'working', following: true, doneAt: null, snoozedUntil: null,
+      delivery: { queuedAgents: [btw], activeAgents: [coordinator], queuedCount: 1, activeCount: 1 },
       messages: [root, ...root.replies],
-      executions: [{ id: 'execution-1', state: 'running', agent: coordinator, triggerMessageId: 'root-1', finalMessageId: null, depth: 0, startedAt: NOW, completedAt: null, error: null }],
+      executions: [{ id: 'execution-1', state: 'running', agent: coordinator, triggerMessageId: 'root-1', finalMessageId: null, depth: 0, startedAt: NOW, completedAt: null, error: null, canRestart: true }],
     }],
   ])
   return {
@@ -55,6 +57,10 @@ function fixtureState() {
       activity: 'Opening the Blackboard gradebook…',
       steps: [{ id: 'tool-browser', tool: 'browser', intent: 'Open Homework 1 submissions', status: 'working' }],
       updatedAt: NOW,
+      processActive: true,
+      stalled: false,
+      stalledReason: null,
+      canRestart: true,
     },
     posts: [],
     attachments: [],
@@ -90,14 +96,17 @@ async function installChannels(page, state) {
         body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZP0kAAAAASUVORK5CYII=', 'base64'),
       })
     }
-    if (pathname === '/api/channels' && request.method() === 'GET') return route.fulfill({ json: { channels: state.channels || [channel], dms: [], principal: state.principal || philip } })
+    if (pathname === '/api/channels' && request.method() === 'GET') {
+      state.channelGets = (state.channelGets || 0) + 1
+      return route.fulfill({ json: { channels: state.channels || [channel], dms: [], principal: state.principal || philip } })
+    }
     if (pathname === '/api/channels' && request.method() === 'POST' && state.createdChannel) {
       if (state.channelCreateGate) await state.channelCreateGate
       state.channels = [channel, state.createdChannel]
       return route.fulfill({ status: 201, json: { channel: state.createdChannel, staffing: state.staffing || { status: 'ready', agents: state.createdChannel.members.filter(member => member.kind === 'agent') } } })
     }
     if (pathname === '/api/channels/activity') return route.fulfill({ json: { items: state.activity, unread: state.activity.filter(item => !item.readAt && !item.doneAt).length, needsYou: 0 } })
-    if (pathname === '/api/channels/principals') return route.fulfill({ json: { principals: state.createdChannel ? [...state.createdChannel.members, coordinator, caretaker] : [philip, coordinator, caretaker] } })
+    if (pathname === '/api/channels/principals') return route.fulfill({ json: { principals: state.createdChannel ? [...state.createdChannel.members, coordinator, caretaker, btw] : [philip, coordinator, caretaker, btw] } })
     if (pathname === '/api/channels/stream') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'event: connected\ndata: {}\n\n' })
     if (pathname === `/api/channels/${channel.id}/messages` && request.method() === 'GET') return route.fulfill({ json: { messages: state.roots } })
     if (state.createdChannel && pathname === `/api/channels/${state.createdChannel.id}/messages` && request.method() === 'GET') return route.fulfill({ json: { messages: [] } })
@@ -123,7 +132,10 @@ async function installChannels(page, state) {
       return route.fulfill({ status: 201, json: { message: posted } })
     }
     const threadMatch = pathname.match(/^\/api\/channels\/channel-films7\/threads\/([^/]+)$/)
-    if (threadMatch && request.method() === 'GET') return route.fulfill({ json: { thread: state.threads.get(threadMatch[1]) } })
+    if (threadMatch && request.method() === 'GET') {
+      if (state.threadDelays?.[threadMatch[1]]) await new Promise(resolve => setTimeout(resolve, state.threadDelays[threadMatch[1]]))
+      return route.fulfill({ json: { thread: state.threads.get(threadMatch[1]) } })
+    }
     if (threadMatch && request.method() === 'PATCH') {
       state.threadPatches = (state.threadPatches || 0) + 1
       const current = state.threads.get(threadMatch[1])
@@ -145,6 +157,14 @@ async function installChannels(page, state) {
     }
     if (pathname === '/api/channels/executions/execution-1/peek' && request.method() === 'GET') {
       return route.fulfill({ json: state.peek })
+    }
+    if (pathname === '/api/channels/executions/execution-1/restart' && request.method() === 'POST') {
+      const execution = state.threads.get('root-1').executions.find(candidate => candidate.id === 'execution-1')
+      execution.state = 'error'
+      execution.completedAt = NOW
+      execution.error = 'Restarted by a channel member'
+      state.restarted = (state.restarted || 0) + 1
+      return route.fulfill({ status: 202, json: { ok: true, state: 'queued' } })
     }
     if (pathname === '/api/channels/executions/execution-1/cancel' && request.method() === 'POST') {
       const execution = state.threads.get('root-1').executions.find(candidate => candidate.id === 'execution-1')
@@ -186,10 +206,12 @@ test.describe('Channels PWA', () => {
     await expect(page.getByRole('heading', { name: '#films7' })).toBeVisible()
     await expect(page.getByText('What dramatic question should the opening make impossible to ignore?')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Rooms', exact: true })).toBeVisible()
-    await expect(page.locator('.channels-root')).not.toHaveClass(/channel-thread-open/)
-    await page.getByRole('button', { name: '3 members' }).click()
-    await expect(page.getByText('Agents wake when messaged—no restart needed.')).toBeVisible()
-    await page.getByRole('button', { name: /Coordinator.*Answers by default/ }).click()
+    await expect(page.getByText('👀 Coordinator is working', { exact: true })).toBeVisible()
+    await expect(page.getByText('1 reply queued for Btw', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: '4 members' }).click()
+    await expect(page.getByText('Coordinator owns substantial work. Btw answers overflow while Coordinator is busy.')).toBeVisible()
+    await expect(page.getByRole('button', { name: /Btw.*Helps while Coordinator is busy/ })).toBeVisible()
+    await page.getByRole('button', { name: /Coordinator.*Main agent/ }).click()
     await expect(page.getByLabel('New channel message')).toBeFocused()
     await expect(page.getByLabel('New channel message')).toHaveValue('@coordinator ')
     await page.getByLabel('New channel message').fill('')
@@ -261,6 +283,39 @@ test.describe('Channels PWA', () => {
     expect(state.posts).toHaveLength(2)
   })
 
+  test('the last thread click wins when earlier thread data arrives late', async ({ page }) => {
+    const state = fixtureState()
+    state.threadDelays = { 'root-1': 300, bridge: 10 }
+    await installChannels(page, state)
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
+    await page.getByRole('button', { name: 'Focus thread: Continuity bridge' }).click()
+    const focused = page.getByRole('complementary', { name: 'Focused thread' })
+    await expect(focused.getByTitle('Edit thread title')).toHaveText('Continuity bridge')
+    await page.waitForTimeout(400)
+    await expect(focused.getByTitle('Edit thread title')).toHaveText('Continuity bridge')
+    await expect(page).toHaveURL(/thread=bridge/)
+    const beforeVisibilityRefresh = state.channelGets
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+
+    await expect.poll(() => state.channelGets).toBeGreaterThan(beforeVisibilityRefresh)
+  })
+
+  test('a closed deep-linked thread stays closed after live refreshes', async ({ page }) => {
+    const state = fixtureState()
+    await installChannels(page, state)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&channel=${channel.id}&thread=root-1`)
+    await expect(page.getByRole('complementary', { name: 'Focused thread' })).toBeVisible()
+
+    await page.getByRole('button', { name: 'Close focused thread' }).click()
+    await expect(page).not.toHaveURL(/thread=/)
+    const beforeVisibilityRefresh = state.channelGets
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+    await expect.poll(() => state.channelGets).toBeGreaterThan(beforeVisibilityRefresh)
+    await expect(page.getByRole('complementary', { name: 'Focused thread' })).toHaveCount(0)
+  })
+
   test('Activity behaves as a triage inbox rather than another feed', async ({ page }) => {
     const state = fixtureState()
     await installChannels(page, state)
@@ -280,9 +335,37 @@ test.describe('Channels PWA', () => {
     await expect(page.getByRole('heading', { name: 'Nothing is waiting on you' })).toBeVisible()
   })
 
+  test('blank Peek identifies a stopped process and restarts the same turn', async ({ page }) => {
+    const state = fixtureState()
+    state.peek = {
+      ...state.peek,
+      activity: 'Agent process stopped.',
+      steps: [],
+      updatedAt: null,
+      processActive: false,
+      stalled: true,
+      stalledReason: 'The agent process stopped before completing this turn.',
+      canRestart: true,
+    }
+    await installChannels(page, state)
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
+    await page.getByRole('button', { name: 'Peek', exact: true }).click()
+    const livePeek = page.getByRole('complementary', { name: 'Live agent peek' })
+    await expect(livePeek).toContainText('Attention needed')
+    await expect(livePeek).toContainText('The agent process stopped before completing this turn.')
+    await livePeek.getByRole('button', { name: 'Restart turn', exact: true }).click()
+
+    await expect.poll(() => state.restarted).toBe(1)
+    await expect(livePeek).toHaveCount(0)
+    await expect(page.locator('.channel-sr-only')).toContainText('Agent turn restarted')
+  })
+
   test('shows channel agent staffing while creation is pending and opens the staffed channel', async ({ page }) => {
     const state = fixtureState()
     const fairfieldCoordinator = { ...coordinator, id: 'agent:fairfield:coordinator', username: 'fairfield-coordinator' }
+    const fairfieldBtw = { ...btw, id: 'agent:fairfield:btw', username: 'fairfield-btw' }
     const fairfieldCaretaker = { ...caretaker, id: 'agent:fairfield:caretaker', username: 'fairfield-caretaker' }
     state.createdChannel = {
       ...channel,
@@ -290,8 +373,7 @@ test.describe('Channels PWA', () => {
       slug: 'fairfield',
       title: 'Fairfield',
       defaultAgentId: fairfieldCoordinator.id,
-      unread: 0,
-      members: [philip, fairfieldCoordinator, fairfieldCaretaker],
+      members: [philip, fairfieldCoordinator, fairfieldCaretaker, fairfieldBtw],
     }
     let releaseStaffing = () => {}
     state.channelCreateGate = new Promise(resolve => { releaseStaffing = resolve })
@@ -304,10 +386,11 @@ test.describe('Channels PWA', () => {
     await expect(page.getByRole('button', { name: 'Adding agents…' })).toBeVisible()
     releaseStaffing()
 
-    await expect(page.getByRole('heading', { name: '#fairfield' })).toBeVisible()
-    await expect(page.getByLabel('3 members')).toBeVisible()
-    await expect(page.locator('[title="Coordinator · agent"]')).toBeVisible()
-    await expect(page.locator('[title="Caretaker · agent"]')).toBeVisible()
+    const memberCluster = page.getByLabel('4 members')
+    await expect(memberCluster).toBeVisible()
+    await expect(memberCluster.locator('[title="Coordinator · agent"]')).toBeVisible()
+    await expect(memberCluster.locator('[title="Btw · agent"]')).toBeVisible()
+    await expect(memberCluster.locator('[title="Caretaker · agent"]')).toBeVisible()
   })
 
   test('keeps a created channel visible when agent staffing fails', async ({ page }) => {

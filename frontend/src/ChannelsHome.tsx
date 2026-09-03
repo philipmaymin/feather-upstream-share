@@ -11,11 +11,13 @@ import {
   fetchChannelThread,
   fetchChannels,
   postChannelMessage,
+  restartChannelExecution,
   subscribeChannels,
   updateChannelAttention,
   updateChannelThread,
   uploadChannelImage,
   type ChannelActivityItem,
+  type ChannelDelivery,
   type ChannelExecution,
   type ChannelExecutionPeek,
   type ChannelInfo,
@@ -159,6 +161,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [executionPeek, setExecutionPeek] = createSignal<ChannelExecutionPeek | null>(null)
   const [peekLoading, setPeekLoading] = createSignal(false)
   const [peekError, setPeekError] = createSignal('')
+  const [restartingExecutionId, setRestartingExecutionId] = createSignal<string | null>(null)
   const [attentionAction, setAttentionAction] = createSignal<'follow' | 'done' | 'snooze' | null>(null)
   const [dialog, setDialog] = createSignal<DialogKind>(null)
   const [dialogValue, setDialogValue] = createSignal('')
@@ -188,6 +191,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     } catch {}
   }
   let loadGeneration = 0
+  let threadLoadRequest = 0
   const readMessageByThread = new Map<string, string>()
 
   const allChannels = createMemo(() => [...snapshot().channels, ...snapshot().dms])
@@ -218,7 +222,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     else url.searchParams.delete('channel')
     if (rootId) url.searchParams.set('thread', rootId)
     else url.searchParams.delete('thread')
-    const state = { channels: true, view: nextSection, channelId, channelThread: rootId }
+    const state = { channels: true, view: nextSection, channelId, channelThread: rootId, channelThreadPushed: mode === 'push' }
     if (mode === 'push') history.pushState(state, '', `${url.pathname}${url.search}`)
     else history.replaceState(state, '', `${url.pathname}${url.search}`)
   }
@@ -239,9 +243,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     return inlineThreads()[message.threadRootId]?.messages.slice(1) || message.replies || []
   }
 
-  async function loadThread(channelId: string, rootId: string, generation = loadGeneration) {
+  async function loadThread(channelId: string, rootId: string, generation = loadGeneration, request = threadLoadRequest) {
     const next = await fetchChannelThread(channelId, rootId)
-    if (generation !== loadGeneration || selectedChannelId() !== channelId) return
+    if (generation !== loadGeneration || request !== threadLoadRequest || selectedChannelId() !== channelId) return
     const openingThread = thread()?.id !== rootId
     const pinnedToLatest = !threadScroller
       || threadScroller.scrollHeight - threadScroller.scrollTop - threadScroller.clientHeight < 96
@@ -287,7 +291,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         ? nextSnapshot.dms[0]?.id || null
         : nextSnapshot.channels[0]?.id || nextSnapshot.dms[0]?.id || null
       const channelId = [...nextSnapshot.channels, ...nextSnapshot.dms].some(item => item.id === requested) ? requested : fallback
-      const rootId = channelId ? thread()?.id || query.get('thread') : null
+      const rootId = channelId ? thread()?.id || new URLSearchParams(location.search).get('thread') : null
       setSelectedChannelId(channelId)
       if (channelId !== requested) setRootDraft(loadChannelDraft(channelId))
       if (channelId) {
@@ -323,6 +327,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   async function chooseChannel(channel: ChannelInfo, nextSection: ChannelSection = channel.type === 'dm' ? 'dms' : 'channels') {
     setRootDraft(loadChannelDraft(channel.id))
     ++loadGeneration
+    ++threadLoadRequest
     setSelectedChannelId(channel.id)
     setSection(nextSection)
     setThread(null)
@@ -343,20 +348,24 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
   async function openThread(rootId: string, channelId = selectedChannelId()) {
     if (!channelId) return
+    const request = ++threadLoadRequest
     setError('')
     try {
-      await loadThread(channelId, rootId)
-      updateLocation(section(), channelId, rootId, 'push')
+      await loadThread(channelId, rootId, loadGeneration, request)
+      if (request === threadLoadRequest && selectedChannelId() === channelId && thread()?.id === rootId) {
+        updateLocation(section(), channelId, rootId, 'push')
+      }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Thread could not be loaded')
+      if (request === threadLoadRequest) setError(reason instanceof Error ? reason.message : 'Thread could not be loaded')
     }
   }
 
   function closeThread() {
+    ++threadLoadRequest
     const rootId = thread()?.id
     setThread(null)
     setEditingTitle(false)
-    if (rootId && history.state?.channelThread === rootId && history.length > 1) history.back()
+    if (rootId && history.state?.channelThread === rootId && history.state?.channelThreadPushed && history.length > 1) history.back()
     else updateLocation(section(), selectedChannelId(), null, 'replace')
   }
   function addImages(inReply: boolean, images: File[]) {
@@ -558,6 +567,23 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setPeekLoading(false)
   }
 
+  async function restartExecution(executionId: string) {
+    if (restartingExecutionId()) return
+    setRestartingExecutionId(executionId)
+    try {
+      await restartChannelExecution(executionId)
+      closeExecutionPeek()
+      queueRefresh()
+      setAnnouncement('Agent turn restarted. A new Working now attempt will appear.')
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : 'Agent turn could not be restarted'
+      if (peekExecutionId() === executionId) setPeekError(message)
+      else setError(message)
+    } finally {
+      setRestartingExecutionId(null)
+    }
+  }
+
   function startThreadTitleEdit() {
     const current = thread()
     if (!current) return
@@ -748,6 +774,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const rootId = params.get('thread')
     const changedChannel = channelId !== selectedChannelId()
     const generation = ++loadGeneration
+    const request = ++threadLoadRequest
     setSection(nextSection)
     setSelectedChannelId(channelId)
     if (changedChannel) {
@@ -766,7 +793,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         setRoots([])
         await loadRoots(channelId, generation)
       }
-      if (rootId) await loadThread(channelId, rootId, generation)
+      if (rootId) await loadThread(channelId, rootId, generation, request)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Navigation could not be restored')
     } finally {
@@ -777,6 +804,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   onMount(() => {
     void refresh({ initial: true })
     const onPopState = () => { void restoreLocation() }
+    const onVisibilityChange = () => { if (!document.hidden) queueRefresh() }
     const onEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return
       if (peekExecutionId()) {
@@ -795,6 +823,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     }
     window.addEventListener('popstate', onPopState)
     window.addEventListener('keydown', onEscape)
+    document.addEventListener('visibilitychange', onVisibilityChange)
     const unsubscribe = subscribeChannels(queueRefresh)
     if ('Notification' in window && Notification.permission === 'granted' && 'serviceWorker' in navigator) {
       navigator.serviceWorker.ready
@@ -808,6 +837,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       clearInterval(peekTimer)
       window.removeEventListener('popstate', onPopState)
       window.removeEventListener('keydown', onEscape)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
       for (const image of [...rootImages(), ...replyImages()]) URL.revokeObjectURL(image.previewUrl)
     })
   })
@@ -899,6 +929,22 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     )
   }
 
+  const renderDelivery = (delivery?: ChannelDelivery) => {
+    if (!delivery || (!delivery.activeCount && !delivery.queuedCount)) return null
+    const activeNames = delivery.activeAgents.map(agent => agent.displayName).join(' + ')
+    const queuedNames = delivery.queuedAgents.map(agent => agent.displayName).join(' + ')
+    return (
+      <div class="channel-delivery-status" aria-label="Agent delivery status">
+        <Show when={delivery.activeCount > 0}>
+          <span class="channel-delivery-active">👀 {activeNames || 'Agent'} {delivery.activeCount === 1 ? 'is' : 'are'} working</span>
+        </Show>
+        <Show when={delivery.queuedCount > 0}>
+          <span>{delivery.activeCount ? `${delivery.queuedCount} ${delivery.queuedCount === 1 ? 'reply' : 'replies'} queued for ${queuedNames || 'agent'}` : `Queued for ${queuedNames || 'agent'}`}</span>
+        </Show>
+      </div>
+    )
+  }
+
   const renderExecution = (execution: ChannelExecution) => (
     <div class="channel-execution">
       <PersonMark person={{ ...execution.agent, kind: 'agent' }} small />
@@ -910,6 +956,11 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       <Show when={execution.state === 'running'}>
         <div class="channel-execution-actions">
           <button type="button" class="channel-peek-action" onClick={() => openExecutionPeek(execution)}>Peek</button>
+          <Show when={execution.canRestart}>
+            <button type="button" class="channel-restart-action" disabled={restartingExecutionId() === execution.id} onClick={() => void restartExecution(execution.id)}>
+              {restartingExecutionId() === execution.id ? 'Restarting…' : 'Restart turn'}
+            </button>
+          </Show>
           <button type="button" onClick={async () => { await cancelChannelExecution(execution.id); queueRefresh() }}>Stop</button>
         </div>
       </Show>
@@ -946,6 +997,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             </Show>
             <Show when={message.thread!.unread}><span class="channel-unread-dot" title="Unread replies" /></Show>
           </div>
+          {renderDelivery(message.thread!.delivery)}
           <Show when={!expandedThreadIds().has(message.threadRootId) && (message.replies || []).length > 0}>
             <button class="channel-reply-preview" type="button" onClick={() => toggleInlineThread(message)}>
               <PersonMark person={message.replies!.at(-1)!.author} small />
@@ -1160,7 +1212,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                   <Show when={currentHumanIsOwner()}><button type="button" onClick={() => openDialog('members')}>Invite</button></Show>
                   <Show when={rosterOpen()}>
                     <section class="channel-roster-popover" aria-label="Channel members">
-                      <header><b>Who’s here</b><span>Agents wake when messaged—no restart needed.</span></header>
+                      <header><b>Who’s here</b><span>Coordinator owns substantial work. Btw answers overflow while Coordinator is busy.</span></header>
                       <For each={channel().members}>{member => (
                         <Show when={member.kind === 'agent'} fallback={
                           <div class="channel-roster-member"><PersonMark person={member} /><Identity person={member} compact /></div>
@@ -1168,7 +1220,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                           <button type="button" class="channel-roster-member" onClick={() => { mention(member, false); setRosterOpen(false) }}>
                             <PersonMark person={member} />
                             <Identity person={member} compact />
-                            <small>{channel().defaultAgentId === member.id ? 'Answers by default' : 'Mention to involve'}</small>
+                            <small>{member.displayName.toLowerCase() === 'btw' ? 'Helps while Coordinator is busy' : channel().defaultAgentId === member.id ? 'Main agent' : 'Mention to involve'}</small>
                           </button>
                         </Show>
                       )}</For>
@@ -1179,7 +1231,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
               <section class="channel-timeline" aria-label={`${channel().title} messages`} aria-busy={loading()}>
                 <Show when={loading()}><div class="channel-loading"><span /><span /><span /></div></Show>
                 <Show when={!loading() && roots().length === 0}>
-                  <div class="channel-empty"><small>The first note</small><h2>Set the work in motion</h2><p>Ask plainly. The default agent will answer in a thread; mention another agent when its perspective matters.</p></div>
+                  <div class="channel-empty"><small>The first note</small><h2>Set the work in motion</h2><p>Coordinator answers directly when free. While Coordinator is busy, Btw handles quick questions or queues substantial work behind it.</p></div>
                 </Show>
                 <Index each={roots()}>{message => renderMessage(message())}</Index>
               </section>
@@ -1221,6 +1273,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
               <button type="button" disabled={!!attentionAction()} classList={{ active: activeSnooze(current().snoozedUntil) }} aria-pressed={activeSnooze(current().snoozedUntil)} onClick={() => void setAttention('snooze', !activeSnooze(current().snoozedUntil))}>{activeSnooze(current().snoozedUntil) ? 'Snoozed 1h' : 'Snooze'}</button>
               <button type="button" disabled={!!attentionAction()} class="channel-done" classList={{ active: !!current().doneAt }} aria-pressed={!!current().doneAt} onClick={() => void setAttention('done', !current().doneAt)}>{current().doneAt ? 'Reopen' : 'Done'}</button>
             </div>
+            {renderDelivery(current().delivery)}
 
             <section class="channel-thread-messages" ref={threadScroller}>
               <Index each={current().messages}>{message => renderMessage(message(), true)}</Index>
@@ -1230,6 +1283,17 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                   <For each={current().executions.filter(execution => execution.state === 'running')}>{renderExecution}</For>
                 </section>
               </Show>
+              <Show when={(() => {
+                const latest = current().executions.at(-1)
+                return latest?.canRestart && (latest.state === 'error' || latest.state === 'killed') ? latest : null
+              })()}>{failed => (
+                <section class="channel-turn-recovery" role="alert">
+                  <div><b>This agent turn stopped.</b><span>{failed().error || 'It did not complete.'}</span></div>
+                  <button type="button" disabled={restartingExecutionId() === failed().id} onClick={() => void restartExecution(failed().id)}>
+                    {restartingExecutionId() === failed().id ? 'Restarting…' : 'Restart turn'}
+                  </button>
+                </section>
+              )}</Show>
               <Show when={current().executions.some(execution => execution.state !== 'running')}>
                 <details class="channel-worklog">
                   <summary>Past agent activity · {current().executions.filter(execution => execution.state !== 'running').length}</summary>
@@ -1251,11 +1315,12 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
           <Show when={peekError()}><div class="channel-peek-error">{peekError()}</div></Show>
           <Show when={executionPeek()}>{peek => (
             <div class="channel-peek-body">
-              <div class="channel-peek-current">
-                <span class="channel-worklog-pulse" classList={{ running: peek().execution.state === 'running' }} />
-                <div><small>{peek().execution.state === 'running' ? 'Working now' : 'Finished'}</small><p>{peek().activity}</p></div>
+              <div class="channel-peek-current" classList={{ stalled: peek().stalled }}>
+                <span class="channel-worklog-pulse" classList={{ running: peek().execution.state === 'running' && peek().processActive }} />
+                <div><small>{peek().stalled ? 'Attention needed' : peek().execution.state === 'running' ? 'Working now' : 'Finished'}</small><p>{peek().activity}</p></div>
               </div>
-              <Show when={peek().steps.length > 0} fallback={<p class="channel-peek-empty">The agent is working, but has not started a tool action yet.</p>}>
+              <Show when={peek().stalledReason && peek().steps.length > 0}><p class="channel-peek-stalled">{peek().stalledReason}</p></Show>
+              <Show when={peek().steps.length > 0} fallback={<p class="channel-peek-empty">{peek().stalledReason || 'No tool activity has been reported yet.'}</p>}>
                 <ol class="channel-peek-steps">
                   <For each={peek().steps}>{step => (
                     <li classList={{ working: step.status === 'working', failed: step.status === 'failed' }}>
@@ -1265,7 +1330,15 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                   )}</For>
                 </ol>
               </Show>
-              <footer>{peek().updatedAt ? `Updated ${relativeTime(peek().updatedAt!)}` : 'Waiting for the next live update'}</footer>
+              <Show when={peek().canRestart}>
+                <div class="channel-peek-recovery">
+                  <button type="button" disabled={restartingExecutionId() === peek().execution.id} onClick={() => void restartExecution(peek().execution.id)}>
+                    {restartingExecutionId() === peek().execution.id ? 'Restarting turn…' : 'Restart turn'}
+                  </button>
+                  <span>Replays the latest request in this thread.</span>
+                </div>
+              </Show>
+              <footer>{peek().updatedAt ? `Progress updated ${relativeTime(peek().updatedAt!)}` : `Started ${relativeTime(peek().execution.startedAt)} · no live progress heartbeat yet`}</footer>
             </div>
           )}</Show>
         </aside>
