@@ -154,7 +154,8 @@ async function installChannels(page, state) {
       state.cancelled = (state.cancelled || 0) + 1
       return route.fulfill({ json: { ok: true, state: 'killed' } })
     }
-    if (pathname === '/api/sessions' && request.method() === 'GET') return route.fulfill({ json: { sessions: [] } })
+    if (pathname === '/api/rooms' && request.method() === 'GET') return route.fulfill({ json: state.roomSnapshot || { rooms: [] } })
+    if (pathname === '/api/sessions' && request.method() === 'GET') return route.fulfill({ json: { sessions: state.sessions || [] } })
     if (pathname === '/api/agents') return route.fulfill({ json: { agents: [{ id: 'omp', label: 'oh-my-pi', available: true, default: true }] } })
     if (pathname === '/api/starred') return route.fulfill({ json: {} })
     if (pathname === '/api/quick-links') return route.fulfill({ json: [] })
@@ -184,7 +185,7 @@ test.describe('Channels PWA', () => {
     await expect(page.getByTestId('channels-home')).toBeVisible()
     await expect(page.getByRole('heading', { name: '#films7' })).toBeVisible()
     await expect(page.getByText('What dramatic question should the opening make impossible to ignore?')).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Rooms' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Rooms', exact: true })).toBeVisible()
     await expect(page.locator('.channels-root')).not.toHaveClass(/channel-thread-open/)
     await page.getByRole('button', { name: '3 members' }).click()
     await expect(page.getByText('Agents wake when messaged—no restart needed.')).toBeVisible()
@@ -269,6 +270,12 @@ test.describe('Channels PWA', () => {
     await expect(page.getByRole('heading', { name: 'Activity' })).toBeVisible()
     await expect(page.getByText('Coordinator replied as an agent')).toBeVisible()
     await expect(page.getByText('Agent · #films7')).toBeVisible()
+    await page.locator('.channel-activity-open').click()
+    await expect(page.getByRole('complementary', { name: 'Focused thread' })).toBeVisible()
+    await expect(page).toHaveURL(/channel=channel-films7.*thread=root-1/)
+    await page.getByRole('button', { name: 'Close focused thread' }).click()
+    await page.locator('.channels-primary-nav button').first().click()
+    await expect(page.getByRole('heading', { name: 'Activity' })).toBeVisible()
     await page.getByRole('button', { name: 'Done', exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Nothing is waiting on you' })).toBeVisible()
   })
@@ -365,6 +372,59 @@ test.describe('Channels PWA', () => {
     await expect(page.getByTestId('channels-home')).toBeVisible()
     await expect(page.locator('.channels-root')).not.toHaveClass(/channels-root-personal/)
     await expect(page.locator('.channels-mobile-nav').getByRole('button', { name: 'Runs' })).toHaveCount(0)
+  })
+
+  test('mobile exposes channel creation and primary workspace destinations', async ({ page }) => {
+    const state = fixtureState()
+    state.roomSnapshot = {
+      rooms: [{
+        name: 'navigation-room',
+        cwd: '/home/user/rooms/navigation-room',
+        sessions: [{ id: 'leader-navigation', title: '#navigation-room Leader', updatedAt: NOW, isActive: true, agent: 'omp' }],
+        leaderSessionId: 'leader-navigation',
+        residents: [
+          { role: 'leader', sessionId: 'leader-navigation', agent: 'omp', title: '#navigation-room Leader', status: 'working' },
+          { role: 'caretaker', sessionId: 'caretaker-navigation', agent: 'omp', title: '#navigation-room Caretaker', status: 'waiting' },
+        ],
+        sidecarGroupId: 'room-navigation-room',
+        active: true,
+        latest: null,
+        updatedAt: NOW,
+        updates: { count: 0, latestAt: null, latest: null },
+        friction: { count: 0, latestAt: null, latest: null },
+        pulse: { enabled: false, status: 'paused', lastRunAt: null, nextRunAt: null, sessionId: null },
+      }],
+    }
+    state.sessions = [
+      { id: 'user-chat', title: 'Visible user chat', updatedAt: NOW, isActive: false, agent: 'omp', cwd: '/home/user/rooms/navigation-room' },
+      { id: 'channel-agent-chat', title: '<channel-turn execution=\"internal\">', updatedAt: NOW, isActive: true, agent: 'omp', cwd: '/home/user/.feather/channel-workspaces/films7-coordinator' },
+    ]
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    await page.getByRole('button', { name: 'New channel', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Create a channel' })).toBeVisible()
+    await page.getByRole('button', { name: 'Close', exact: true }).click()
+    await page.getByLabel('New channel message').fill('Draft survives workspace navigation')
+    await expect(page.locator('.channels-mobile-nav').getByRole('button', { name: 'Rooms', exact: true })).toBeVisible()
+
+    await page.getByRole('button', { name: 'Open Fledge navigation' }).click()
+    const destinations = page.getByRole('navigation', { name: 'Fledge destinations' })
+    await expect(destinations.getByRole('button', { name: 'Channels', exact: true })).toHaveAttribute('aria-current', 'page')
+    await expect(page.getByText('Visible user chat', { exact: true })).toBeVisible()
+    await expect(page.getByText(/channel-turn execution/)).toHaveCount(0)
+    await expect(destinations.getByRole('button', { name: 'Rooms', exact: true })).toBeVisible()
+    await expect(destinations.getByRole('button', { name: 'Runs', exact: true })).toBeVisible()
+    await destinations.getByRole('button', { name: 'Rooms', exact: true }).click()
+    await expect(page).toHaveURL(/surface=rooms/)
+    await expect(page.getByText('#navigation-room', { exact: true })).toBeVisible()
+
+    await page.getByRole('button', { name: 'Open Fledge navigation' }).click()
+    await page.getByRole('navigation', { name: 'Fledge destinations' }).getByRole('button', { name: 'Channels', exact: true }).click()
+    await expect(page).toHaveURL(/surface=channels/)
+    await expect(page.getByRole('heading', { name: '#films7' })).toBeVisible()
+    await expect(page.getByLabel('New channel message')).toHaveValue('Draft survives workspace navigation')
   })
 
   test('notification denial becomes an honest disabled state', async ({ page }) => {

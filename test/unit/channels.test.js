@@ -69,7 +69,7 @@ describe('channel event store', () => {
   })
 
   it('keeps agent sessions stable and dispatches only the latest unanswered thread after staffing', () => {
-    const { store, philip, channel, coordinator } = setup()
+    const { store, philip, channel, coordinator, caretaker } = setup()
     const replay = store.addAgent({
       channelId: channel.id,
       actorId: philip.id,
@@ -79,6 +79,7 @@ describe('channel event store', () => {
     }).principal
     assert.equal(replay.id, coordinator.id)
     assert.equal(replay.sessionId, coordinator.sessionId)
+    assert.deepEqual([...store.agentSessionIds()].sort(), [caretaker.sessionId, coordinator.sessionId].sort())
 
     const fresh = store.createChannel({
       slug: 'fairfield',

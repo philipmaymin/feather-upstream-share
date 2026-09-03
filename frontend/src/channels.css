@@ -353,6 +353,19 @@
 }
 
 .channel-conversation-header { min-height: 88px; padding-bottom: 14px; }
+.channel-title-row { display: flex; align-items: center; gap: 10px; }
+.channel-new-button {
+  padding: 5px 8px;
+  border: 1px solid rgba(56, 103, 86, .32);
+  border-radius: 3px;
+  color: var(--channel-sage);
+  background: rgba(255, 255, 255, .4);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 750;
+  cursor: pointer;
+  white-space: nowrap;
+}
 .channel-conversation-header h1 { font-size: 28px; }
 .channel-conversation-header p { margin-top: 5px; }
 
@@ -1145,7 +1158,17 @@
   .channels-root-personal .channel-view-header { padding-left: 58px; }
   .channel-view-header h1 { font-size: 27px; }
   .channel-view-header p { display: none; }
-  .channel-conversation-header { min-height: 76px; padding-left: 16px; }
+  .channel-conversation-header {
+    min-height: 112px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-content: end;
+    align-items: end;
+    gap: 7px;
+    padding-right: 14px;
+  }
+  .channel-conversation-header > div:first-child { min-width: 0; }
+  .channel-conversation-header .channel-member-cluster { justify-self: end; }
   .channel-conversation-header h1 { font-size: 23px; }
   .channel-member-cluster .channel-avatar:nth-of-type(n+4) { display: none; }
   .channel-member-cluster button { padding: 6px 8px; }
@@ -1187,9 +1210,8 @@
     border-top: 1px solid rgba(255, 255, 255, .08);
     backdrop-filter: blur(14px);
   }
-  .channels-mobile-nav.personal { grid-template-columns: repeat(5, 1fr); }
+  .channels-mobile-nav.personal { grid-template-columns: repeat(6, 1fr); }
   .channels-mobile-nav button {
-    position: relative;
     display: flex;
     flex-direction: column;
     align-items: center;

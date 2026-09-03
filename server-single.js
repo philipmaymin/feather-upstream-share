@@ -1270,6 +1270,16 @@ function emitChannelChange(channelId, type = 'changed') {
 async function runChannelDispatch(item) {
   try {
     const workspace = channelAgentWorkspace(item);
+    const meta = readMeta();
+    meta[item.agent.sessionId] = {
+      ...(meta[item.agent.sessionId] || {}),
+      agent: 'omp',
+      cwd: workspace,
+      title: `#${item.channel.slug || item.channel.title} ${item.agent.displayName}`,
+      background: 'channel-agent',
+      updatedAt: new Date().toISOString(),
+    };
+    writeMeta(meta);
     if (!tmuxSessionExists(existingTmuxName(item.agent.sessionId))) {
       spawnOrResume(item.agent.sessionId, workspace, !!getOmpSessionId(item.agent.sessionId), 'omp');
     }
@@ -5419,6 +5429,10 @@ app.get('/api/sessions', (req, res) => {
           .slice(0, limit)
           .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
     }
+    const channelWorkspaceRoot = path.resolve(STATE_PATHS.workspace.channelWorkspacesDir) + path.sep;
+    const channelAgentSessionIds = channels.agentSessionIds();
+    sessions = sessions.filter(session => !channelAgentSessionIds.has(session.id)
+      && !String(session.cwd || '').startsWith(channelWorkspaceRoot));
     res.json({ sessions });
   }
   catch (e) { res.status(500).json({ error: e.message }); }

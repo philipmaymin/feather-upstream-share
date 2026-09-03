@@ -1,7 +1,6 @@
 import { For, Index, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import {
   addChannelMember,
-  bootstrapFilms7,
   cancelChannelExecution,
   createChannel,
   createChannelDm,
@@ -35,6 +34,16 @@ const CHANNEL_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'im
 const MAX_CHANNEL_IMAGE_BYTES = 15 * 1024 * 1024
 const MAX_CHANNEL_IMAGES = 6
 
+
+function channelDraftKey(channelId: string) {
+  return `feather:channel-draft:${channelId}`
+}
+
+function loadChannelDraft(channelId: string | null) {
+  if (!channelId) return ''
+  try { return localStorage.getItem(channelDraftKey(channelId)) || '' }
+  catch { return '' }
+}
 type ChannelsSnapshot = {
   channels: ChannelInfo[]
   dms: ChannelInfo[]
@@ -43,6 +52,7 @@ type ChannelsSnapshot = {
 
 export interface ChannelsHomeProps {
   onFeed: () => void
+  onRooms: () => void
   onMenu: () => void
   onNewChat: () => void
   showPersonal: boolean
@@ -135,7 +145,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [loading, setLoading] = createSignal(true)
   const [refreshing, setRefreshing] = createSignal(false)
   const [error, setError] = createSignal('')
-  const [rootDraft, setRootDraft] = createSignal('')
+  const [rootDraft, setRootDraft] = createSignal(loadChannelDraft(query.get('channel')))
   const [replyDraft, setReplyDraft] = createSignal('')
   const [rootImages, setRootImages] = createSignal<PendingChannelImage[]>([])
   const [replyImages, setReplyImages] = createSignal<PendingChannelImage[]>([])
@@ -167,6 +177,16 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   let replyComposer: HTMLTextAreaElement | undefined
   const inlineComposers = new Map<string, HTMLTextAreaElement>()
   let cancellingTitleEdit = false
+
+  function updateRootDraft(value: string) {
+    setRootDraft(value)
+    const channelId = selectedChannelId()
+    if (!channelId) return
+    try {
+      if (value) localStorage.setItem(channelDraftKey(channelId), value)
+      else localStorage.removeItem(channelDraftKey(channelId))
+    } catch {}
+  }
   let loadGeneration = 0
   const readMessageByThread = new Map<string, string>()
 
@@ -269,6 +289,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       const channelId = [...nextSnapshot.channels, ...nextSnapshot.dms].some(item => item.id === requested) ? requested : fallback
       const rootId = channelId ? thread()?.id || query.get('thread') : null
       setSelectedChannelId(channelId)
+      if (channelId !== requested) setRootDraft(loadChannelDraft(channelId))
       if (channelId) {
         await loadRoots(channelId, generation)
         await Promise.all([...expandedThreadIds()].map(expandedId =>
@@ -300,6 +321,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   }
 
   async function chooseChannel(channel: ChannelInfo, nextSection: ChannelSection = channel.type === 'dm' ? 'dms' : 'channels') {
+    setRootDraft(loadChannelDraft(channel.id))
     ++loadGeneration
     setSelectedChannelId(channel.id)
     setSection(nextSection)
@@ -382,7 +404,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const pastedText = clipboard.getData('text/plain')
     if (pastedText) {
       const value = inReply ? replyDraft() : rootDraft()
-      const setter = inReply ? setReplyDraft : setRootDraft
+      const setter = inReply ? setReplyDraft : updateRootDraft
       const start = event.currentTarget.selectionStart ?? value.length
       const end = event.currentTarget.selectionEnd ?? start
       setter(`${value.slice(0, start)}${pastedText}${value.slice(end)}`)
@@ -412,7 +434,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     try {
       const content = await contentWithImages(channelId, draft, images)
       const message = await postChannelMessage(channelId, content)
-      setRootDraft('')
+      updateRootDraft('')
       clearImages(false)
       await loadRoots(channelId)
       setExpandedThreadIds(current => new Set(current).add(message.threadRootId))
@@ -496,7 +518,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   }
 
   function mention(agent: ChannelPrincipal, inReply: boolean) {
-    const setter = inReply ? setReplyDraft : setRootDraft
+    const setter = inReply ? setReplyDraft : updateRootDraft
     const current = inReply ? replyDraft() : rootDraft()
     setter(`${current}${current && !/\s$/.test(current) ? ' ' : ''}@${agent.username} `)
     queueMicrotask(() => (inReply ? replyComposer : rootComposer)?.focus())
@@ -668,18 +690,6 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     }
   }
 
-  async function createPilot() {
-    setLoading(true)
-    try {
-      const channel = await bootstrapFilms7()
-      await refresh()
-      await chooseChannel(channel)
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'The Films 7 pilot could not be opened')
-    } finally {
-      setLoading(false)
-    }
-  }
 
   async function enableNotifications() {
     if (pushState() !== 'idle' && pushState() !== 'error') return
@@ -821,7 +831,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
   const renderComposer = (inReply = false) => {
     const value = inReply ? replyDraft : rootDraft
-    const setter = inReply ? setReplyDraft : setRootDraft
+    const setter = inReply ? setReplyDraft : updateRootDraft
     const images = inReply ? replyImages : rootImages
     let imageInput: HTMLInputElement | undefined
     return (
@@ -1044,6 +1054,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             <span>{notificationLabel()}</span>
           </button>
           <Show when={props.showPersonal}>
+            <button type="button" onClick={props.onRooms}>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l2 2h8v10H4V6Z" /></svg><span>Rooms</span>
+            </button>
             <button type="button" onClick={props.onFeed}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M5 12h10M5 19h7" /></svg><span>Run feed</span>
             </button>
@@ -1094,7 +1107,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
         <Show when={section() === 'threads'}>
           <header class="channel-view-header">
-            <div><small>Across the studio</small><h1>Threads</h1><p>Long-lived conversations, without a second hierarchy.</p></div>
+            <div><small>{selectedChannel()?.slug ? `#${selectedChannel()!.slug}` : 'Current conversation'}</small><h1>Threads</h1><p>Every thread in this channel, ordered by its latest update.</p></div>
           </header>
           <section class="channel-thread-index">
             <For each={[...roots()].sort((a, b) => Date.parse(b.thread?.updatedAt || b.createdAt) - Date.parse(a.thread?.updatedAt || a.createdAt))}>{root => (
@@ -1116,10 +1129,10 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             }>
               <div class="channel-empty channel-empty-full">
                 <span class="channel-empty-rule" /><small>Fresh workspace</small>
-                <h1>{section() === 'dms' ? 'No direct messages yet' : snapshot().principal?.username === 'philip' ? 'Open the Films 7 studio' : 'No shared channels yet'}</h1>
-                <p>{section() === 'dms' ? 'Start a private line with any human or agent who shares a channel with you.' : 'One timeline for humans and agents. Work branches into flat, readable threads.'}</p>
+                <h1>{section() === 'dms' ? 'No direct messages yet' : 'Create your first channel'}</h1>
+                <p>{section() === 'dms' ? 'Start a private line with any human or agent who shares a channel with you.' : 'Channels keep human and agent work together in one shared timeline.'}</p>
                 <Show when={section() === 'dms'}><button type="button" onClick={() => openDialog('dm')}>Start a direct message</button></Show>
-                <Show when={section() !== 'dms' && snapshot().principal?.username === 'philip'}><button type="button" onClick={() => void createPilot()}>Create #films7</button></Show>
+                <Show when={section() !== 'dms'}><button type="button" onClick={() => openDialog('channel')}>New channel</button></Show>
               </div>
             </Show>
           }>{channel => (
@@ -1127,7 +1140,10 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
               <header class="channel-view-header channel-conversation-header">
                 <div>
                   <small>{channel().type === 'dm' ? 'Direct message' : 'Channel'}</small>
-                  <h1>{channel().type === 'dm' ? dmName(channel(), snapshot().principal?.id) : `#${channel().slug}`}</h1>
+                  <div class="channel-title-row">
+                    <h1>{channel().type === 'dm' ? dmName(channel(), snapshot().principal?.id) : `#${channel().slug}`}</h1>
+                    <Show when={channel().type === 'channel'}><button type="button" class="channel-new-button" onClick={() => openDialog('channel')}>New channel</button></Show>
+                  </div>
                   <p>{channel().description || (channel().type === 'dm' ? 'A private conversation between members.' : '')}</p>
                 </div>
                 <div class="channel-member-cluster">
@@ -1260,6 +1276,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         <button type="button" classList={{ active: section() === 'channels' }} onClick={() => navigate('channels')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 4-2 16m10-16-2 16M4 9h16M3 15h16" /></svg><span>Channels</span></button>
         <button type="button" classList={{ active: section() === 'threads' }} onClick={() => navigate('threads')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4V5Z" /></svg><span>Threads</span></button>
         <button type="button" classList={{ active: section() === 'dms' }} onClick={() => navigate('dms')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4zM7 9h10M7 13h7" /></svg><span>DMs</span></button>
+        <Show when={props.showPersonal}><button type="button" onClick={props.onRooms}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l2 2h8v10H4V6Z" /></svg><span>Rooms</span></button></Show>
         <Show when={props.showPersonal}><button type="button" onClick={props.onFeed}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M5 12h10M5 19h7" /></svg><span>Runs</span></button></Show>
       </nav>
 

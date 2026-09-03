@@ -23,6 +23,8 @@ interface QuickLink { label: string; url: string }
 type AgentId = 'claude' | 'codex' | 'omp'
 
 const isRoomPulseSession = (session: Pick<SessionMeta, 'title'>) => /^(Keep working|Status): #/.test(session.title || '')
+const isChannelAgentSession = (session: Pick<SessionMeta, 'cwd'>) => /\/\.feather\/channel-workspaces(?:\/|$)/.test(session.cwd || '')
+const isUserVisibleSession = (session: SessionMeta) => !isRoomPulseSession(session) && !isChannelAgentSession(session)
 const agentBadgeLabel = (agent?: AgentId) => agent === 'omp' ? 'OMP' : agent === 'codex' ? 'Codex' : 'Claude'
 const agentBadgeColors = (agent?: AgentId) => agent === 'omp'
   ? { background: '#3a2a1e', color: '#e0a050' }
@@ -175,7 +177,7 @@ export default function App() {
   const [loginLoading, setLoginLoading] = createSignal(false)
 
   const requestedSurface = new URLSearchParams(location.search).get('surface')
-  const initialFledgeView: HomeView = requestedSurface === 'channels' || (isSharedAppHost && requestedSurface !== 'feed') ? 'channels' : 'feed'
+  const initialFledgeView: HomeView = requestedSurface === 'rooms' ? 'rooms' : requestedSurface === 'channels' || (isSharedAppHost && requestedSurface !== 'feed') ? 'channels' : 'feed'
   const [homeView, setHomeView] = createSignal<HomeView>(isFledgeHost ? initialFledgeView : 'rooms')
   const [sessions, setSessions] = createSignal<SessionMeta[]>([])
   const [currentId, setCurrentId] = createSignal<string | null>(null)
@@ -486,7 +488,7 @@ export default function App() {
 
   // Update sessions and detect unread changes
   function updateSessions(newSessions: SessionMeta[], acknowledgedActiveId?: string) {
-    const visibleSessions = newSessions.filter(session => !isRoomPulseSession(session))
+    const visibleSessions = newSessions.filter(isUserVisibleSession)
     const active = currentId()
     const unread = new Set(unreadSessions())
     for (const s of visibleSessions) {
@@ -1192,7 +1194,7 @@ export default function App() {
       try {
         const results = await fetchSessions(null, query, 300)
         if (generation !== searchGeneration) return
-        setSearchResults(results.filter(result => !isRoomPulseSession(result)))
+        setSearchResults(results.filter(isUserVisibleSession))
       } catch {
         if (generation !== searchGeneration) return
         setSearchResults([])
@@ -1347,15 +1349,20 @@ export default function App() {
   }
 
 
-  function openFledgeSurface(view: 'feed' | 'channels') {
+  function openFledgeSurface(view: HomeView) {
     setHomeView(view)
     const url = new URL(location.href)
-    if (view === 'channels') {
-      url.searchParams.set('surface', 'channels')
-    } else {
-      for (const key of ['surface', 'view', 'channel', 'thread']) url.searchParams.delete(key)
-    }
-    history.replaceState({ fledgeHome: true }, '', `${url.pathname}${url.search}`)
+    for (const key of ['view', 'channel', 'thread']) url.searchParams.delete(key)
+    if (view === 'feed') url.searchParams.delete('surface')
+    else url.searchParams.set('surface', view)
+    url.hash = ''
+    history.replaceState({ fledgeHome: true, surface: view }, '', `${url.pathname}${url.search}`)
+  }
+
+  function navigateFledgeHome(view: HomeView) {
+    clearSelectionForHome(false)
+    openFledgeSurface(view)
+    setSidebar(false)
   }
   async function doRename(id: string, title: string) {
     if (!title.trim()) { setRenaming(false); setSidebarRenaming(null); return }
@@ -2074,7 +2081,7 @@ export default function App() {
 
       {/* Hamburger */}
       <Show when={!sidebar() && !(isFledgeHost && !currentId() && homeView() === 'feed') && (!isFledgeHost || authUser()?.username === 'philip')}>
-        <button onClick={() => setSidebar(true)} style={{ position: 'fixed', top: 'max(12px, env(safe-area-inset-top))', left: 'max(12px, env(safe-area-inset-left))', 'z-index': '50', background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', width: '36px', height: '36px', 'border-radius': '8px', 'font-size': '18px', cursor: 'pointer', display: 'flex', 'align-items': 'center', 'justify-content': 'center', '-webkit-tap-highlight-color': 'transparent' }}>&#9776;</button>
+        <button onClick={() => setSidebar(true)} aria-label={isFledgeHost ? 'Open Fledge navigation' : 'Open chats and links'} title={isFledgeHost ? 'Open Fledge navigation' : 'Open chats and links'} style={{ position: 'fixed', top: 'max(12px, env(safe-area-inset-top))', left: 'max(12px, env(safe-area-inset-left))', 'z-index': '50', background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', width: '36px', height: '36px', 'border-radius': '8px', 'font-size': '18px', cursor: 'pointer', display: 'flex', 'align-items': 'center', 'justify-content': 'center', '-webkit-tap-highlight-color': 'transparent' }}>&#9776;</button>
         <Show when={currentId()}>
           <button onClick={goHome} title={isFledgeHost ? 'Fledge home' : 'Rooms home'} style={{ position: 'fixed', top: 'max(12px, env(safe-area-inset-top))', left: 'calc(max(12px, env(safe-area-inset-left)) + 44px)', 'z-index': '50', background: '#1a1a2e', border: '1px solid #333', color: '#e5e5e5', width: '36px', height: '36px', 'border-radius': '8px', 'font-size': '20px', cursor: 'pointer', display: 'flex', 'align-items': 'center', 'justify-content': 'center', '-webkit-tap-highlight-color': 'transparent' }}>&#8249;</button>
         </Show>
@@ -2103,9 +2110,19 @@ export default function App() {
               <button onClick={() => setSidebar(false)} style={{ background: 'none', border: 'none', color: '#666', 'font-size': '20px', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent', padding: '4px 8px' }}>&times;</button>
             </div>
           </div>
+          <Show when={isFledgeHost && authUser()?.username === 'philip'}>
+            <nav aria-label="Fledge destinations" data-testid="fledge-primary-navigation" style={{ padding: '10px 12px', display: 'grid', 'grid-template-columns': 'repeat(3, 1fr)', gap: '7px', 'border-bottom': '1px solid #1e1e1e' }}>
+              <button onClick={() => navigateFledgeHome('channels')} aria-current={homeView() === 'channels' ? 'page' : undefined}
+                style={{ padding: '9px 4px', border: homeView() === 'channels' ? '1px solid #4f8d72' : '1px solid #29313b', 'border-radius': '7px', background: homeView() === 'channels' ? '#173126' : '#111820', color: homeView() === 'channels' ? '#bde3cf' : '#9aa4b2', 'font-size': '11px', 'font-weight': '700', cursor: 'pointer' }}>Channels</button>
+              <button onClick={() => navigateFledgeHome('rooms')} aria-current={homeView() === 'rooms' ? 'page' : undefined}
+                style={{ padding: '9px 4px', border: homeView() === 'rooms' ? '1px solid #4f8d72' : '1px solid #29313b', 'border-radius': '7px', background: homeView() === 'rooms' ? '#173126' : '#111820', color: homeView() === 'rooms' ? '#bde3cf' : '#9aa4b2', 'font-size': '11px', 'font-weight': '700', cursor: 'pointer' }}>Rooms</button>
+              <button onClick={() => navigateFledgeHome('feed')} aria-current={homeView() === 'feed' ? 'page' : undefined}
+                style={{ padding: '9px 4px', border: homeView() === 'feed' ? '1px solid #4f8d72' : '1px solid #29313b', 'border-radius': '7px', background: homeView() === 'feed' ? '#173126' : '#111820', color: homeView() === 'feed' ? '#bde3cf' : '#9aa4b2', 'font-size': '11px', 'font-weight': '700', cursor: 'pointer' }}>Runs</button>
+            </nav>
+          </Show>
           {/* Sidebar tabs */}
           <div style={{ display: 'flex', 'border-bottom': '1px solid #1e1e1e' }}>
-            <button onClick={() => setSidebarTab('sessions')} style={{ flex: '1', padding: '8px', border: 'none', 'border-bottom': sidebarTab() === 'sessions' ? '2px solid #4aba6a' : '2px solid transparent', background: 'none', color: sidebarTab() === 'sessions' ? '#e5e5e5' : '#666', 'font-size': '12px', 'font-weight': '600', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Sessions</button>
+            <button onClick={() => setSidebarTab('sessions')} style={{ flex: '1', padding: '8px', border: 'none', 'border-bottom': sidebarTab() === 'sessions' ? '2px solid #4aba6a' : '2px solid transparent', background: 'none', color: sidebarTab() === 'sessions' ? '#e5e5e5' : '#666', 'font-size': '12px', 'font-weight': '600', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Chats</button>
             <button onClick={() => setSidebarTab('links')} style={{ flex: '1', padding: '8px', border: 'none', 'border-bottom': sidebarTab() === 'links' ? '2px solid #4aba6a' : '2px solid transparent', background: 'none', color: sidebarTab() === 'links' ? '#e5e5e5' : '#666', 'font-size': '12px', 'font-weight': '600', cursor: 'pointer', '-webkit-tap-highlight-color': 'transparent' }}>Links</button>
           </div>
           {/* Sessions tab */}
@@ -2461,6 +2478,7 @@ export default function App() {
                   {user => (
                     <ChannelsHome
                       onFeed={() => openFledgeSurface('feed')}
+                      onRooms={() => navigateFledgeHome('rooms')}
                       onMenu={() => setSidebar(true)}
                       onNewChat={() => handleNew(false, 'omp')}
                       showPersonal={user().username === 'philip'}
