@@ -280,6 +280,31 @@ export async function fetchChannelPrincipals(): Promise<ChannelPrincipal[]> {
   return data.principals
 }
 
+export interface ChannelAttachment {
+  id: string
+  filename: string
+  contentType: string
+  byteSize: number
+  url: string
+}
+
+export async function uploadChannelImage(channelId: string, file: File, uploadId: string): Promise<ChannelAttachment> {
+  const response = await fetch(`${BASE}/api/channels/${encodeURIComponent(channelId)}/attachments`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': file.type,
+      'X-Filename': encodeURIComponent(file.name || 'pasted-image'),
+      'X-Upload-ID': uploadId,
+    },
+    body: file,
+  })
+  const data = await responseJson<{ attachment: ChannelAttachment }>(response)
+  return {
+    ...data.attachment,
+    url: `${BASE}/api/channels/${encodeURIComponent(channelId)}/attachments/${encodeURIComponent(data.attachment.id)}`,
+  }
+}
+
 export async function createChannel(input: { slug: string; title: string; description?: string }): Promise<ChannelInfo> {
   const data = await responseJson<{ channel: ChannelInfo }>(await fetch(`${BASE}/api/channels`, {
     method: 'POST',

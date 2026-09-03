@@ -92,6 +92,15 @@ const STAGING_DIR = path.join(STATE_PATHS.release.root, 'static-staging');
 const MAX_SSE_PER_SESSION = 10;
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+const MAX_CHANNEL_ATTACHMENT_BYTES = 15 * 1024 * 1024;
+const MAX_CHANNEL_STORAGE_BYTES = 512 * 1024 * 1024;
+const CHANNEL_IMAGE_TYPES = new Map([
+  ['image/png', '.png'],
+  ['image/jpeg', '.jpg'],
+  ['image/gif', '.gif'],
+  ['image/webp', '.webp'],
+]);
+const CHANNEL_UPLOADS_DIR = STATE_PATHS.coordination.channelUploadsDir;
 const CODEX_SESSIONS_ROOT = STATE_PATHS.harness.codexSessionsDir;
 // Codex now writes large context/permissions preambles before the first real
 // prompt. Keep enough headroom to find cwd, titles, and worker markers.
@@ -5724,6 +5733,99 @@ app.post('/api/channels/:id/messages', async (req, res) => {
     res.status(201).json({ message });
   } catch (error) {
     res.status(channelErrorStatus(error)).json({ error: error.message });
+  }
+});
+
+app.post('/api/channels/:id/attachments', async (req, res) => {
+  let createdFile = false;
+  let filePath = null;
+  try {
+    const principal = channelRequester(req);
+    channels.getChannel(req.params.id, principal.id);
+    const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
+    const extension = CHANNEL_IMAGE_TYPES.get(contentType);
+    if (!extension) throw httpError(415, 'channel attachments must be PNG, JPEG, GIF, or WebP images');
+    const attachmentId = String(req.headers['x-upload-id'] || randomUUID());
+    if (!UUID_RE.test(attachmentId)) throw httpError(400, 'attachment id must be a UUID');
+    let filename;
+    try { filename = decodeURIComponent(String(req.headers['x-filename'] || 'image')); }
+    catch { throw httpError(400, 'invalid attachment filename'); }
+    const safeFilename = filename.replace(/[^a-zA-Z0-9._\- ]/g, '').slice(0, 100) || `image${extension}`;
+    const declaredSize = Number(req.headers['content-length'] || 0);
+    if (declaredSize > MAX_CHANNEL_ATTACHMENT_BYTES) throw httpError(413, 'channel image exceeds 15 MB limit');
+    const body = await readBoundedBody(req, MAX_CHANNEL_ATTACHMENT_BYTES, 'channel image exceeds 15 MB limit');
+    if (!body.length) throw httpError(400, 'channel image is empty');
+    const contentHash = createHash('sha256').update(body).digest('hex');
+    const channelDir = path.join(CHANNEL_UPLOADS_DIR, req.params.id);
+    fs.mkdirSync(channelDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(channelDir, 0o700);
+    const storageName = `${attachmentId}${extension}`;
+    filePath = path.join(channelDir, storageName);
+    let existing = null;
+    try { existing = fs.readFileSync(filePath); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (existing && !existing.equals(body)) throw httpError(409, 'attachment id already exists with different content');
+    if (!existing && channels.attachmentUsage({ channelId: req.params.id, principalId: principal.id }) + body.length > MAX_CHANNEL_STORAGE_BYTES) {
+      throw httpError(413, 'channel image storage exceeds its 512 MB quota');
+    }
+    if (!existing) {
+      const temporary = path.join(channelDir, `.${attachmentId}-${randomUUID()}.tmp`);
+      try {
+        fs.writeFileSync(temporary, body, { flag: 'wx', mode: 0o600 });
+        fs.linkSync(temporary, filePath);
+        createdFile = true;
+      } finally {
+        try { fs.unlinkSync(temporary); } catch {}
+      }
+    }
+    const attachment = channels.registerAttachment({
+      id: attachmentId,
+      channelId: req.params.id,
+      uploaderId: principal.id,
+      filename: safeFilename,
+      contentType,
+      byteSize: body.length,
+      contentHash,
+      storageName,
+    });
+    res.status(createdFile ? 201 : 200).json({
+      attachment: {
+        id: attachment.id,
+        filename: attachment.filename,
+        contentType: attachment.contentType,
+        byteSize: attachment.byteSize,
+        url: `/api/channels/${encodeURIComponent(req.params.id)}/attachments/${encodeURIComponent(attachment.id)}`,
+      },
+    });
+  } catch (error) {
+    if (createdFile && filePath) {
+      try { fs.unlinkSync(filePath); } catch {}
+    }
+    res.status(channelErrorStatus(error)).json({ error: error.message });
+  }
+});
+
+app.get('/api/channels/:id/attachments/:attachmentId', (req, res) => {
+  try {
+    const principal = channelRequester(req);
+    const attachment = channels.getAttachment({
+      id: req.params.attachmentId,
+      channelId: req.params.id,
+      principalId: principal.id,
+    });
+    const filePath = path.join(CHANNEL_UPLOADS_DIR, attachment.channelId, attachment.storageName);
+    if (!fs.statSync(filePath).isFile()) throw httpError(404, 'attachment file is missing');
+    res.setHeader('Content-Type', attachment.contentType);
+    res.setHeader('Content-Length', String(attachment.byteSize));
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(attachment.filename)}`);
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', () => res.destroy());
+    stream.pipe(res);
+  } catch (error) {
+    const status = error.code === 'ENOENT' ? 404 : channelErrorStatus(error);
+    res.status(status).json({ error: error.message });
   }
 });
 

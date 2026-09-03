@@ -14,6 +14,7 @@ import {
   subscribeChannels,
   updateChannelAttention,
   updateChannelThread,
+  uploadChannelImage,
   type ChannelActivityItem,
   type ChannelInfo,
   type ChannelMessage,
@@ -26,6 +27,10 @@ import './channels.css'
 
 type ChannelSection = 'activity' | 'channels' | 'threads' | 'dms'
 type DialogKind = 'channel' | 'dm' | 'members' | null
+type PendingChannelImage = { id: string; file: File; previewUrl: string }
+const CHANNEL_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+const MAX_CHANNEL_IMAGE_BYTES = 15 * 1024 * 1024
+const MAX_CHANNEL_IMAGES = 6
 
 type ChannelsSnapshot = {
   channels: ChannelInfo[]
@@ -42,6 +47,11 @@ export interface ChannelsHomeProps {
 
 const emptySnapshot: ChannelsSnapshot = { channels: [], dms: [], principal: null }
 
+function channelSection(params: URLSearchParams): ChannelSection {
+  const view = params.get('view')
+  return view === 'activity' || view === 'threads' || view === 'dms' ? view : 'channels'
+}
+
 function relativeTime(iso: string) {
   const elapsed = Math.max(0, Date.now() - Date.parse(iso))
   const minutes = Math.floor(elapsed / 60_000)
@@ -51,6 +61,22 @@ function relativeTime(iso: string) {
   if (hours < 24) return `${hours}h`
   const days = Math.floor(hours / 24)
   return days < 7 ? `${days}d` : new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(new Date(iso))
+}
+
+function activeSnooze(until: string | null) {
+  return !!until && Date.parse(until) > Date.now()
+}
+
+async function boundedBrowserWait<T>(promise: Promise<T>, message: string): Promise<T> {
+  let timer: number | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => { timer = window.setTimeout(() => reject(new Error(message)), 5_000) }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 function initials(principal: Pick<ChannelPrincipal, 'displayName'>) {
@@ -96,7 +122,7 @@ function Identity(props: { person: ChannelPrincipal; compact?: boolean }) {
 
 export default function ChannelsHome(props: ChannelsHomeProps) {
   const query = new URLSearchParams(location.search)
-  const [section, setSection] = createSignal<ChannelSection>(query.get('view') === 'activity' ? 'activity' : query.get('view') === 'threads' ? 'threads' : query.get('view') === 'dms' ? 'dms' : 'channels')
+  const [section, setSection] = createSignal<ChannelSection>(channelSection(query))
   const [snapshot, setSnapshot] = createSignal<ChannelsSnapshot>(emptySnapshot)
   const [selectedChannelId, setSelectedChannelId] = createSignal(query.get('channel'))
   const [roots, setRoots] = createSignal<ChannelMessage[]>([])
@@ -108,6 +134,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [error, setError] = createSignal('')
   const [rootDraft, setRootDraft] = createSignal('')
   const [replyDraft, setReplyDraft] = createSignal('')
+  const [rootImages, setRootImages] = createSignal<PendingChannelImage[]>([])
+  const [replyImages, setReplyImages] = createSignal<PendingChannelImage[]>([])
   const [sending, setSending] = createSignal(false)
   const [dialog, setDialog] = createSignal<DialogKind>(null)
   const [dialogValue, setDialogValue] = createSignal('')
@@ -121,6 +149,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [announcement, setAnnouncement] = createSignal('')
   let refreshTimer: number | undefined
   let threadScroller: HTMLElement | undefined
+  let rootComposer: HTMLTextAreaElement | undefined
+  let replyComposer: HTMLTextAreaElement | undefined
+  let cancellingTitleEdit = false
   let loadGeneration = 0
   const readMessageByThread = new Map<string, string>()
 
@@ -131,8 +162,20 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     ? activity().items.filter(item => item.kind === 'needs_you' || item.kind === 'failure' || item.kind === 'mention')
     : activity().items)
   const currentHumanIsOwner = createMemo(() => selectedChannel()?.members.some(member => member.id === snapshot().principal?.id && member.role === 'owner'))
+  const notificationDisabled = createMemo(() => ['enabling', 'enabled', 'denied', 'unavailable'].includes(pushState()))
+  const notificationLabel = createMemo(() => {
+    if (pushState() === 'enabled') return 'Notifications on'
+    if (pushState() === 'enabling') return 'Enabling notifications…'
+    if (pushState() === 'denied') return 'Notifications blocked'
+    if (pushState() === 'unavailable') return 'Notifications unavailable'
+    if (pushState() === 'error') return 'Try notifications again'
+    return 'Turn on notifications'
+  })
+  const notificationHint = createMemo(() => pushState() === 'denied'
+    ? 'Allow notifications in browser settings'
+    : notificationLabel())
 
-  function updateLocation(nextSection = section(), channelId = selectedChannelId(), rootId = thread()?.id || null) {
+  function updateLocation(nextSection = section(), channelId = selectedChannelId(), rootId = thread()?.id || null, mode: 'replace' | 'push' = 'replace') {
     const url = new URL(location.href)
     url.searchParams.set('surface', 'channels')
     url.searchParams.set('view', nextSection)
@@ -140,7 +183,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     else url.searchParams.delete('channel')
     if (rootId) url.searchParams.set('thread', rootId)
     else url.searchParams.delete('thread')
-    history.replaceState({ channels: true }, '', `${url.pathname}${url.search}`)
+    const state = { channels: true, view: nextSection, channelId, channelThread: rootId }
+    if (mode === 'push') history.pushState(state, '', `${url.pathname}${url.search}`)
+    else history.replaceState(state, '', `${url.pathname}${url.search}`)
   }
 
   async function loadRoots(channelId: string, generation = loadGeneration) {
@@ -193,17 +238,20 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       setActivity(nextActivity)
       setPrincipals(nextPrincipals)
       const requested = selectedChannelId()
-      const fallback = nextSnapshot.channels[0]?.id || nextSnapshot.dms[0]?.id || null
+      const fallback = section() === 'dms'
+        ? nextSnapshot.dms[0]?.id || null
+        : nextSnapshot.channels[0]?.id || nextSnapshot.dms[0]?.id || null
       const channelId = [...nextSnapshot.channels, ...nextSnapshot.dms].some(item => item.id === requested) ? requested : fallback
+      const rootId = channelId ? thread()?.id || query.get('thread') : null
       setSelectedChannelId(channelId)
       if (channelId) {
         await loadRoots(channelId, generation)
-        const rootId = thread()?.id || query.get('thread')
         if (rootId) await loadThread(channelId, rootId, generation).catch(() => setThread(null))
       } else {
         setRoots([])
         setThread(null)
       }
+      if (options.initial) updateLocation(section(), channelId, rootId, 'replace')
       const badge = nextActivity.unread
       const appNavigator = navigator as Navigator & { setAppBadge?: (count?: number) => Promise<void>; clearAppBadge?: () => Promise<void> }
       if (badge > 0) appNavigator.setAppBadge?.(badge).catch(() => {})
@@ -231,7 +279,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setThread(null)
     setRoots([])
     setLoading(true)
-    updateLocation(nextSection, channel.id, null)
+    updateLocation(nextSection, channel.id, null, 'push')
     try {
       await loadRoots(channel.id)
     } catch (reason) {
@@ -246,27 +294,96 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setError('')
     try {
       await loadThread(channelId, rootId)
-      updateLocation(section(), channelId, rootId)
+      updateLocation(section(), channelId, rootId, 'push')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Thread could not be loaded')
     }
   }
 
   function closeThread() {
+    const rootId = thread()?.id
     setThread(null)
     setEditingTitle(false)
-    updateLocation(section(), selectedChannelId(), null)
+    if (rootId && history.state?.channelThread === rootId && history.length > 1) history.back()
+    else updateLocation(section(), selectedChannelId(), null, 'replace')
+  }
+  function addImages(inReply: boolean, images: File[]) {
+    const current = inReply ? replyImages() : rootImages()
+    const supported = images.filter(file => CHANNEL_IMAGE_TYPES.has(file.type) && file.size <= MAX_CHANNEL_IMAGE_BYTES)
+    if (supported.length !== images.length) {
+      setError('Attach PNG, JPEG, GIF, or WebP images up to 15 MB each.')
+    }
+    const additions = supported.slice(0, Math.max(0, MAX_CHANNEL_IMAGES - current.length))
+      .map(file => ({ id: crypto.randomUUID(), file, previewUrl: URL.createObjectURL(file) }))
+    if (!additions.length) return
+    const setter = inReply ? setReplyImages : setRootImages
+    setter(existing => [...existing, ...additions])
+    setAnnouncement(`${additions.length} image${additions.length === 1 ? '' : 's'} attached.`)
+  }
+
+  function removeImage(inReply: boolean, id: string) {
+    const images = inReply ? replyImages : rootImages
+    const setter = inReply ? setReplyImages : setRootImages
+    const removed = images().find(image => image.id === id)
+    if (removed) URL.revokeObjectURL(removed.previewUrl)
+    setter(current => current.filter(image => image.id !== id))
+  }
+
+  function clearImages(inReply: boolean) {
+    const images = inReply ? replyImages : rootImages
+    const setter = inReply ? setReplyImages : setRootImages
+    for (const image of images()) URL.revokeObjectURL(image.previewUrl)
+    setter([])
+  }
+
+  function pasteImages(event: ClipboardEvent & { currentTarget: HTMLTextAreaElement }, inReply: boolean) {
+    const clipboard = event.clipboardData
+    if (!clipboard) return
+    const itemImages = [...clipboard.items]
+      .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+      .map(item => item.getAsFile())
+      .filter((file): file is File => !!file)
+    const images = itemImages.length
+      ? itemImages
+      : [...clipboard.files].filter(file => file.type.startsWith('image/'))
+    if (!images.length) return
+
+    event.preventDefault()
+    const pastedText = clipboard.getData('text/plain')
+    if (pastedText) {
+      const value = inReply ? replyDraft() : rootDraft()
+      const setter = inReply ? setReplyDraft : setRootDraft
+      const start = event.currentTarget.selectionStart ?? value.length
+      const end = event.currentTarget.selectionEnd ?? start
+      setter(`${value.slice(0, start)}${pastedText}${value.slice(end)}`)
+      queueMicrotask(() => event.currentTarget.setSelectionRange(start + pastedText.length, start + pastedText.length))
+    }
+    addImages(inReply, images)
+  }
+
+  async function contentWithImages(channelId: string, content: string, images: PendingChannelImage[]) {
+    const parts = content ? [content] : []
+    const attachments = await Promise.all(images.map(image =>
+      uploadChannelImage(channelId, image.file, image.id)))
+    for (const attachment of attachments) {
+      const alt = (attachment.filename || 'pasted image').replace(/[[\]\\]/g, '_')
+      parts.push(`![${alt}](<${attachment.url.replace(/>/g, '%3E')}>)`)
+    }
+    return parts.join('\n\n')
   }
 
   async function sendRoot() {
     const channelId = selectedChannelId()
-    const content = rootDraft().trim()
-    if (!channelId || !content || sending()) return
+    const draft = rootDraft().trim()
+    const images = rootImages()
+    if (!channelId || (!draft && !images.length) || sending()) return
     setSending(true)
     setError('')
     try {
+      const content = await contentWithImages(channelId, draft, images)
       const message = await postChannelMessage(channelId, content)
       setRootDraft('')
+      clearImages(false)
       await loadRoots(channelId)
       await openThread(message.threadRootId, channelId)
       setAnnouncement('Message delivered. The thread is open.')
@@ -279,13 +396,16 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
   async function sendReply() {
     const current = thread()
-    const content = replyDraft().trim()
-    if (!current || !content || sending()) return
+    const draft = replyDraft().trim()
+    const images = replyImages()
+    if (!current || (!draft && !images.length) || sending()) return
     setSending(true)
     setError('')
     try {
+      const content = await contentWithImages(current.channelId, draft, images)
       await postChannelMessage(current.channelId, content, current.id, current.messages.at(-1)?.id)
       setReplyDraft('')
+      clearImages(true)
       await Promise.all([loadThread(current.channelId, current.id), loadRoots(current.channelId)])
       setAnnouncement('Reply delivered.')
     } catch (reason) {
@@ -299,9 +419,26 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const setter = inReply ? setReplyDraft : setRootDraft
     const current = inReply ? replyDraft() : rootDraft()
     setter(`${current}${current && !/\s$/.test(current) ? ' ' : ''}@${agent.username} `)
+    queueMicrotask(() => (inReply ? replyComposer : rootComposer)?.focus())
+  }
+
+  function startThreadTitleEdit() {
+    const current = thread()
+    if (!current) return
+    cancellingTitleEdit = false
+    setTitleDraft(current.title)
+    setEditingTitle(true)
+  }
+
+  function cancelThreadTitleEdit() {
+    cancellingTitleEdit = true
+    setTitleDraft(thread()?.title || '')
+    setEditingTitle(false)
+    queueMicrotask(() => { cancellingTitleEdit = false })
   }
 
   async function saveThreadTitle() {
+    if (cancellingTitleEdit) return
     const current = thread()
     const title = titleDraft().trim()
     if (!current || !title || title === current.title) {
@@ -321,7 +458,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   async function setAttention(action: 'follow' | 'done' | 'snooze', value = true) {
     const current = thread()
     if (!current) return
-    const until = action === 'snooze' ? new Date(Date.now() + 60 * 60 * 1000).toISOString() : null
+    const until = action === 'snooze' && value ? new Date(Date.now() + 60 * 60 * 1000).toISOString() : null
     try {
       setThread(await updateChannelAttention(current.channelId, current.id, action, value, until))
       queueRefresh()
@@ -355,6 +492,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
   function openDialog(kind: Exclude<DialogKind, null>) {
     setDialog(kind)
+    queueMicrotask(() => document.querySelector<HTMLElement>('.channel-dialog input, .channel-dialog button')?.focus())
     setDialogValue('')
     setDialogTitle('')
     setDialogError('')
@@ -416,26 +554,36 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   }
 
   async function enableNotifications() {
-    if (pushState() !== 'idle') return
+    if (pushState() !== 'idle' && pushState() !== 'error') return
     if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
       setPushState('unavailable')
+      setAnnouncement('This browser does not support push notifications.')
+      return
+    }
+    if (Notification.permission === 'denied') {
+      setPushState('denied')
+      setAnnouncement('Notifications are blocked. Allow them in browser settings.')
       return
     }
     setPushState('enabling')
     try {
-      const permission = await Notification.requestPermission()
+      const permission = await boundedBrowserWait(Notification.requestPermission(), 'Notification permission timed out')
       if (permission !== 'granted') {
+        setAnnouncement('Notifications are blocked. Allow them in browser settings.')
         setPushState('denied')
         return
       }
-      const registration = await navigator.serviceWorker.ready
+      const registration = await boundedBrowserWait(navigator.serviceWorker.ready, 'Notification service did not become ready')
       const response = await fetch(appUrl('/api/push/key'))
       const body = await response.json()
       if (!response.ok || typeof body.key !== 'string') throw new Error(body.error || 'Push key unavailable')
-      const subscription = await registration.pushManager.getSubscription() || await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: pushKey(body.key),
-      })
+      const subscription = await registration.pushManager.getSubscription() || await boundedBrowserWait(
+        registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: pushKey(body.key),
+        }),
+        'Notification subscription timed out',
+      )
       const saved = await fetch(appUrl('/api/push/subscribe'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -446,11 +594,54 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       setAnnouncement('Notifications are on for mentions, direct messages, failures, and agent replies you asked for.')
     } catch {
       setPushState('error')
+      setAnnouncement('Notifications could not be enabled. Try again.')
+    }
+  }
+
+  async function restoreLocation() {
+    const params = new URLSearchParams(location.search)
+    const nextSection = channelSection(params)
+    const listed = allChannels()
+    const requestedChannel = params.get('channel')
+    const fallback = nextSection === 'dms'
+      ? snapshot().dms[0]?.id || null
+      : snapshot().channels[0]?.id || snapshot().dms[0]?.id || null
+    const channelId = listed.some(channel => channel.id === requestedChannel) ? requestedChannel : fallback
+    const rootId = params.get('thread')
+    const changedChannel = channelId !== selectedChannelId()
+    const generation = ++loadGeneration
+    setSection(nextSection)
+    setSelectedChannelId(channelId)
+    setThread(null)
+    if (!channelId) {
+      setRoots([])
+      return
+    }
+    try {
+      if (changedChannel) {
+        setLoading(true)
+        setRoots([])
+        await loadRoots(channelId, generation)
+      }
+      if (rootId) await loadThread(channelId, rootId, generation)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Navigation could not be restored')
+    } finally {
+      setLoading(false)
     }
   }
 
   onMount(() => {
     void refresh({ initial: true })
+    const onPopState = () => { void restoreLocation() }
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && dialog()) {
+        event.preventDefault()
+        setDialog(null)
+      }
+    }
+    window.addEventListener('popstate', onPopState)
+    window.addEventListener('keydown', onEscape)
     const unsubscribe = subscribeChannels(queueRefresh)
     if ('Notification' in window && Notification.permission === 'granted' && 'serviceWorker' in navigator) {
       navigator.serviceWorker.ready
@@ -461,6 +652,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     onCleanup(() => {
       unsubscribe()
       clearTimeout(refreshTimer)
+      window.removeEventListener('popstate', onPopState)
+      window.removeEventListener('keydown', onEscape)
+      for (const image of [...rootImages(), ...replyImages()]) URL.revokeObjectURL(image.previewUrl)
     })
   })
 
@@ -478,12 +672,14 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     }
     setSection(next)
     setThread(null)
-    updateLocation(next, selectedChannelId(), null)
+    updateLocation(next, selectedChannelId(), null, 'push')
   }
 
   const renderComposer = (inReply = false) => {
     const value = inReply ? replyDraft : rootDraft
     const setter = inReply ? setReplyDraft : setRootDraft
+    const images = inReply ? replyImages : rootImages
+    let imageInput: HTMLInputElement | undefined
     return (
       <div class="channel-compose-wrap">
         <Show when={agents().length > 0}>
@@ -494,10 +690,36 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             )}</For>
           </div>
         </Show>
+        <Show when={images().length > 0}>
+          <div class="channel-image-previews" aria-label="Attached images">
+            <For each={images()}>{image => (
+              <div class="channel-image-preview">
+                <img src={image.previewUrl} alt={image.file.name || 'Pasted image'} />
+                <button type="button" onClick={() => removeImage(inReply, image.id)} aria-label={`Remove ${image.file.name || 'pasted image'}`}>&times;</button>
+              </div>
+            )}</For>
+          </div>
+        </Show>
         <div class="channel-composer" classList={{ 'channel-composer-thread': inReply }}>
+          <input
+            ref={imageInput}
+            type="file"
+            accept="image/png,image/jpeg,image/gif,image/webp"
+            multiple
+            hidden
+            onChange={event => {
+              if (event.currentTarget.files?.length) addImages(inReply, [...event.currentTarget.files])
+              event.currentTarget.value = ''
+            }}
+          />
+          <button type="button" class="channel-attach" onClick={() => imageInput?.click()} aria-label="Attach images">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 12.5 14 7a3 3 0 1 1 4.2 4.2l-7.1 7.1a5 5 0 0 1-7.1-7.1l7.4-7.4" /></svg>
+          </button>
           <textarea
+            ref={element => { if (inReply) replyComposer = element; else rootComposer = element }}
             value={value()}
             onInput={event => setter(event.currentTarget.value)}
+            onPaste={event => pasteImages(event, inReply)}
             onKeyDown={event => {
               if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
                 event.preventDefault()
@@ -512,7 +734,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             type="button"
             class="channel-send"
             onClick={() => void (inReply ? sendReply() : sendRoot())}
-            disabled={sending() || !value().trim()}
+            disabled={sending() || (!value().trim() && !images().length)}
             aria-label={sending() ? 'Sending' : 'Send message'}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 4 17 8-17 8 3-8-3-8Zm3 8h14" /></svg>
@@ -615,9 +837,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         </div>
 
         <div class="channels-rail-footer">
-          <button type="button" class="channels-notify" classList={{ active: pushState() === 'enabled' }} onClick={() => void enableNotifications()} disabled={pushState() === 'enabling' || pushState() === 'enabled'}>
+          <button type="button" class="channels-notify" classList={{ active: pushState() === 'enabled' }} onClick={() => void enableNotifications()} disabled={notificationDisabled()} title={notificationHint()} aria-label={notificationHint()}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 9a5 5 0 0 1 10 0c0 5 2 6 2 6H5s2-1 2-6Zm3 9h4" /></svg>
-            <span>{pushState() === 'enabled' ? 'Notifications on' : pushState() === 'enabling' ? 'Enabling…' : 'Turn on notifications'}</span>
+            <span>{notificationLabel()}</span>
           </button>
           <Show when={props.showPersonal}>
             <button type="button" onClick={props.onFeed}>
@@ -634,9 +856,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
           <header class="channel-view-header channel-activity-header">
             <div><small>Your inbox</small><h1>Activity</h1><p>Read is not done. Clear work when it no longer needs your attention.</p></div>
             <div class="channel-header-actions">
-              <button type="button" classList={{ active: activityNeedsOnly() }} onClick={() => setActivityNeedsOnly(!activityNeedsOnly())}>Needs you <b>{activity().needsYou}</b></button>
-              <button type="button" classList={{ active: pushState() === 'enabled' }} onClick={() => void enableNotifications()} disabled={pushState() === 'enabling' || pushState() === 'enabled'}>
-                {pushState() === 'enabled' ? 'Alerts on' : pushState() === 'enabling' ? 'Enabling…' : 'Alerts'}
+              <button type="button" classList={{ active: activityNeedsOnly() }} aria-pressed={activityNeedsOnly()} onClick={() => setActivityNeedsOnly(!activityNeedsOnly())}>Needs you <b>{activity().needsYou}</b></button>
+              <button type="button" classList={{ active: pushState() === 'enabled' }} onClick={() => void enableNotifications()} disabled={notificationDisabled()} title={notificationHint()}>
+                {pushState() === 'enabled' ? 'Alerts on' : pushState() === 'denied' ? 'Alerts blocked' : pushState() === 'unavailable' ? 'Alerts unavailable' : pushState() === 'error' ? 'Retry alerts' : pushState() === 'enabling' ? 'Enabling…' : 'Alerts'}
               </button>
               <button type="button" onClick={() => void refresh()} disabled={refreshing()}>{refreshing() ? 'Checking…' : 'Refresh'}</button>
             </div>
@@ -738,12 +960,18 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
               <button type="button" class="channel-thread-back" onClick={closeThread} aria-label="Close thread">←</button>
               <div>
                 <small>Thread · {current().messages.length - 1} replies</small>
-                <Show when={editingTitle()} fallback={<button type="button" class="channel-thread-title" onClick={() => setEditingTitle(true)}>{current().title}</button>}>
+                <Show when={editingTitle()} fallback={<button type="button" class="channel-thread-title" onClick={startThreadTitleEdit} title="Edit thread title">{current().title}</button>}>
                   <input
                     value={titleDraft()}
                     onInput={event => setTitleDraft(event.currentTarget.value)}
                     onBlur={() => void saveThreadTitle()}
-                    onKeyDown={event => { if (event.key === 'Enter') void saveThreadTitle(); if (event.key === 'Escape') setEditingTitle(false) }}
+                    onKeyDown={event => {
+                      if (event.key === 'Enter') void saveThreadTitle()
+                      if (event.key === 'Escape') {
+                        event.preventDefault()
+                        cancelThreadTitleEdit()
+                      }
+                    }}
                     aria-label="Thread title"
                     autofocus
                   />
@@ -753,9 +981,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             </header>
 
             <div class="channel-thread-actions">
-              <button type="button" classList={{ active: current().following }} onClick={() => void setAttention('follow', !current().following)}>{current().following ? 'Following' : 'Follow'}</button>
-              <button type="button" onClick={() => void setAttention('snooze')}>Snooze</button>
-              <button type="button" class="channel-done" classList={{ active: !!current().doneAt }} onClick={() => void setAttention('done', !current().doneAt)}>{current().doneAt ? 'Reopen' : 'Done'}</button>
+              <button type="button" classList={{ active: current().following }} aria-pressed={current().following} onClick={() => void setAttention('follow', !current().following)}>{current().following ? 'Following' : 'Follow'}</button>
+              <button type="button" classList={{ active: activeSnooze(current().snoozedUntil) }} aria-pressed={activeSnooze(current().snoozedUntil)} onClick={() => void setAttention('snooze', !activeSnooze(current().snoozedUntil))}>{activeSnooze(current().snoozedUntil) ? 'Snoozed 1h' : 'Snooze'}</button>
+              <button type="button" class="channel-done" classList={{ active: !!current().doneAt }} aria-pressed={!!current().doneAt} onClick={() => void setAttention('done', !current().doneAt)}>{current().doneAt ? 'Reopen' : 'Done'}</button>
             </div>
 
             <section class="channel-thread-messages" ref={threadScroller}>
@@ -790,7 +1018,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       </nav>
 
       <Show when={dialog()}>
-        <div class="channel-dialog-scrim" onClick={event => { if (event.target === event.currentTarget) setDialog(null) }}>
+        <div class="channel-dialog-scrim" onClick={event => { if (event.target === event.currentTarget) setDialog(null) }} onKeyDown={event => { if (event.key === 'Escape') setDialog(null) }}>
           <section class="channel-dialog" role="dialog" aria-modal="true" aria-labelledby="channel-dialog-title">
             <header><small>{dialog() === 'dm' ? 'Private line' : 'Shared studio'}</small><h2 id="channel-dialog-title">{dialog() === 'channel' ? 'Create a channel' : dialog() === 'members' ? 'Invite a human' : 'Start a direct message'}</h2><button type="button" onClick={() => setDialog(null)} aria-label="Close">×</button></header>
             <Show when={dialog() === 'dm'} fallback={

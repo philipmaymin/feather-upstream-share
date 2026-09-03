@@ -51,6 +51,7 @@ function fixtureState() {
       actor: coordinator,
     }],
     posts: [],
+    attachments: [],
   }
 }
 
@@ -62,6 +63,26 @@ async function installChannels(page, state) {
     if (pathname === '/api/me') {
       if (state.authDelay) await new Promise(resolve => setTimeout(resolve, state.authDelay))
       return route.fulfill({ json: state.user || { username: 'philip', admin: true } })
+    }
+    if (pathname === `/api/channels/${channel.id}/attachments` && request.method() === 'POST') {
+      const id = request.headers()['x-upload-id']
+      const filename = decodeURIComponent(request.headers()['x-filename'] || 'pasted-image.png')
+      const attachment = {
+        id,
+        filename,
+        contentType: request.headers()['content-type'],
+        byteSize: request.postDataBuffer()?.length || 0,
+        url: `/api/channels/${channel.id}/attachments/${id}`,
+      }
+      state.attachments.push(attachment)
+      return route.fulfill({ status: 201, json: { attachment } })
+    }
+    if (pathname.startsWith(`/api/channels/${channel.id}/attachments/`) && request.method() === 'GET') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'image/png',
+        body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZP0kAAAAASUVORK5CYII=', 'base64'),
+      })
     }
     if (pathname === '/api/channels' && request.method() === 'GET') return route.fulfill({ json: { channels: [channel], dms: [], principal: state.principal || philip } })
     if (pathname === '/api/channels/activity') return route.fulfill({ json: { items: state.activity, unread: state.activity.filter(item => !item.readAt && !item.doneAt).length, needsYou: 0 } })
@@ -86,6 +107,7 @@ async function installChannels(page, state) {
     const threadMatch = pathname.match(/^\/api\/channels\/channel-films7\/threads\/([^/]+)$/)
     if (threadMatch && request.method() === 'GET') return route.fulfill({ json: { thread: state.threads.get(threadMatch[1]) } })
     if (threadMatch && request.method() === 'PATCH') {
+      state.threadPatches = (state.threadPatches || 0) + 1
       const current = state.threads.get(threadMatch[1])
       Object.assign(current, JSON.parse(request.postData() || '{}'))
       return route.fulfill({ json: { thread: current } })
@@ -102,6 +124,14 @@ async function installChannels(page, state) {
       if (body.action === 'snooze') current.snoozedUntil = body.until
       if (body.action === 'read') state.activity = state.activity.map(item => item.thread?.id === current.id ? { ...item, readAt: NOW } : item)
       return route.fulfill({ json: { thread: current } })
+    }
+    if (pathname === '/api/channels/executions/execution-1/cancel' && request.method() === 'POST') {
+      const execution = state.threads.get('root-1').executions[0]
+      execution.state = 'killed'
+      execution.completedAt = NOW
+      execution.error = 'Stopped by a channel member'
+      state.cancelled = (state.cancelled || 0) + 1
+      return route.fulfill({ json: { ok: true, state: 'killed' } })
     }
     if (pathname === '/api/sessions' && request.method() === 'GET') return route.fulfill({ json: { sessions: [] } })
     if (pathname === '/api/agents') return route.fulfill({ json: { agents: [{ id: 'omp', label: 'oh-my-pi', available: true, default: true }] } })
@@ -136,7 +166,39 @@ test.describe('Channels PWA', () => {
     await expect(page.locator('.channel-thread-pane').getByText('Agent', { exact: true }).first()).toBeVisible()
     await expect(page.locator('.channel-thread-pane')).toContainText('Agent work · 1 turn')
     await expect(page.locator('.channel-execution')).toContainText('@coordinator')
-    await expect(page.locator('.channel-execution')).toContainText('running · depth 0')
+
+    const threadPane = page.locator('.channel-thread-pane')
+    await threadPane.getByRole('button', { name: 'Stop', exact: true }).click()
+    await expect(threadPane.locator('.channel-execution')).toContainText('killed')
+    await expect(threadPane.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0)
+    expect(state.cancelled).toBe(1)
+    await threadPane.locator('.channel-mention-row').getByRole('button', { name: '@caretaker' }).click()
+    await expect(page.getByLabel('Thread reply')).toBeFocused()
+    await expect(page.getByLabel('Thread reply')).toHaveValue('@caretaker ')
+    await page.getByLabel('Thread reply').fill('')
+
+    await threadPane.getByTitle('Edit thread title').click()
+    await page.getByLabel('Thread title').fill('This title must not persist')
+    await page.getByLabel('Thread title').press('Escape')
+    await expect(threadPane.getByTitle('Edit thread title')).toContainText('The dramatic question in the opening')
+    expect(state.threadPatches || 0).toBe(0)
+    await threadPane.getByTitle('Edit thread title').click()
+    await page.getByLabel('Thread title').fill('A sharper dramatic question')
+    await page.getByLabel('Thread title').press('Enter')
+    await expect(threadPane.getByTitle('Edit thread title')).toContainText('A sharper dramatic question')
+    expect(state.threadPatches).toBe(1)
+
+    await threadPane.getByRole('button', { name: 'Snooze', exact: true }).click()
+    await expect(threadPane.getByRole('button', { name: 'Snoozed 1h', exact: true })).toBeVisible()
+    await threadPane.getByRole('button', { name: 'Snoozed 1h', exact: true }).click()
+    await expect(threadPane.getByRole('button', { name: 'Snooze', exact: true })).toBeVisible()
+
+    await page.goBack()
+    await expect(threadPane).not.toHaveClass(/open/)
+    await expect(page).not.toHaveURL(/thread=/)
+    await page.goForward()
+    await expect(threadPane).toHaveClass(/open/)
+    await expect(page.locator('.channel-execution')).toContainText('killed · depth 0')
 
     await page.getByRole('button', { name: 'Close thread' }).click()
     const composer = page.getByLabel('New channel message')
@@ -159,6 +221,32 @@ test.describe('Channels PWA', () => {
     await expect(page.getByRole('heading', { name: 'Nothing is waiting on you' })).toBeVisible()
   })
 
+  test('dialogs, empty DMs, and Escape behavior match their labels', async ({ page }) => {
+    const state = fixtureState()
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 1180, height: 820 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    await page.getByRole('button', { name: 'Create channel', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Create a channel' })).toBeVisible()
+    await page.getByRole('textbox', { name: 'Channel name' }).press('Escape')
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+
+    await page.getByRole('button', { name: 'Invite', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Invite a human' })).toBeVisible()
+    await page.getByRole('textbox', { name: 'Username' }).press('Escape')
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+
+    await page.getByRole('button', { name: 'Start direct message', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Start a direct message' })).toBeVisible()
+    await expect(page.getByRole('button', { name: /Caretaker Agent/ })).toBeVisible()
+    await page.getByRole('button', { name: 'Close', exact: true }).click()
+
+    await page.goto(`${BASE}/?app=fledge&surface=channels&view=dms`)
+    await expect(page.getByRole('heading', { name: 'No direct messages yet' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: '#films7' })).toHaveCount(0)
+  })
+
   test('waits for shared identity before mounting role-specific navigation', async ({ page }) => {
     const state = fixtureState()
     state.authDelay = 400
@@ -172,6 +260,22 @@ test.describe('Channels PWA', () => {
     await expect(page.getByTestId('channels-home')).toBeVisible()
     await expect(page.locator('.channels-root')).not.toHaveClass(/channels-root-personal/)
     await expect(page.locator('.channels-mobile-nav').getByRole('button', { name: 'Runs' })).toHaveCount(0)
+  })
+
+  test('notification denial becomes an honest disabled state', async ({ page }) => {
+    const state = fixtureState()
+    await page.addInitScript(() => {
+      Object.defineProperty(Notification, 'permission', { configurable: true, get: () => 'denied' })
+    })
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels&view=activity`)
+
+    const alerts = page.getByRole('button', { name: 'Alerts', exact: true })
+    await alerts.click()
+    const blocked = page.getByRole('button', { name: 'Alerts blocked', exact: true })
+    await expect(blocked).toBeDisabled()
+    await expect(blocked).toHaveAttribute('title', 'Allow notifications in browser settings')
   })
 
   test('mobile thread is full-screen and preserves direct navigation', async ({ page }) => {
@@ -192,7 +296,7 @@ test.describe('Channels PWA', () => {
     await page.getByRole('button', { name: /2 replies/ }).click()
     const pane = page.locator('.channel-thread-pane')
     await expect(pane).toHaveClass(/open/)
-    await expect(pane).toHaveCSS('position', 'fixed')
+    await expect(pane).toHaveCSS('position', 'absolute')
     await expect(pane.getByText('Continuity audit begins here.', { exact: false })).toBeVisible()
     const scrollerBox = await pane.locator('.channel-thread-messages').boundingBox()
     const latestBox = await pane.locator('.channel-thread-messages .channel-message').last().boundingBox()
@@ -200,5 +304,57 @@ test.describe('Channels PWA', () => {
     expect(latestBox.y).toBeLessThan(scrollerBox.y + scrollerBox.height)
     await pane.getByRole('button', { name: 'Close thread' }).click()
     await expect(pane).not.toHaveClass(/open/)
+  })
+
+  test('mobile composer shows typed text and sends pasted images', async ({ page }) => {
+    const state = fixtureState()
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    const composer = page.getByLabel('New channel message')
+    await composer.fill('Visible on iPhone')
+    await expect(composer).toHaveValue('Visible on iPhone')
+    await expect(composer).toHaveCSS('font-size', '16px')
+    expect(await composer.evaluate(element => getComputedStyle(element).webkitTextFillColor)).toBe('rgb(24, 33, 30)')
+    await page.evaluate(() => document.documentElement.style.setProperty('--vh', '4px'))
+    const compactComposer = await page.locator('.channel-compose-wrap').first().boundingBox()
+    const compactNav = await page.locator('.channels-mobile-nav').boundingBox()
+    expect(compactComposer.y + compactComposer.height).toBeLessThanOrEqual(compactNav.y + 1)
+    await expect(composer).toBeVisible()
+    await page.evaluate(() => document.documentElement.style.setProperty('--vh', '8.44px'))
+    await expect(page.getByRole('button', { name: 'Attach images' })).toBeVisible()
+    const fileChooser = page.waitForEvent('filechooser')
+    await page.getByRole('button', { name: 'Attach images' }).click()
+    await (await fileChooser).setFiles({
+      name: 'selected.png',
+      mimeType: 'image/png',
+      buffer: Buffer.from('selected-image'),
+    })
+    await expect(page.locator('.channel-image-preview')).toHaveCount(1)
+    await page.getByRole('button', { name: 'Remove selected.png' }).click()
+    await expect(page.locator('.channel-image-preview')).toHaveCount(0)
+
+    await composer.fill('')
+    await composer.evaluate(element => {
+      const clipboard = new DataTransfer()
+      clipboard.setData('text/plain', 'See the keyboard screenshot.')
+      clipboard.items.add(new File(['image-bytes'], 'mobile-screenshot.png', { type: 'image/png' }))
+      element.dispatchEvent(new ClipboardEvent('paste', { clipboardData: clipboard, bubbles: true, cancelable: true }))
+    })
+
+    await expect(composer).toHaveValue('See the keyboard screenshot.')
+    await expect(page.locator('.channel-image-preview')).toHaveCount(1)
+    await expect(page.getByRole('button', { name: 'Send message' })).toBeEnabled()
+    await page.getByRole('button', { name: 'Send message' }).click()
+
+    await expect.poll(() => state.attachments.length).toBe(1)
+    await expect.poll(() => state.posts.length).toBe(1)
+    expect(state.attachments[0].filename).toBe('mobile-screenshot.png')
+    expect(state.attachments[0].byteSize).toBe(11)
+    expect(state.posts[0].content).toContain('See the keyboard screenshot.')
+    expect(state.posts[0].content).toContain(`/api/channels/${channel.id}/attachments/${state.attachments[0].id}`)
+    await expect(page.locator('.channel-image-preview')).toHaveCount(0)
+    await expect(page.locator('.channel-thread-pane .markdown img[alt="mobile-screenshot.png"]')).toBeVisible()
   })
 })

@@ -4,6 +4,7 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { spawn } from 'child_process'
+import { randomUUID } from 'crypto'
 
 const roots = []
 const servers = []
@@ -135,5 +136,52 @@ describe('shared channels API', () => {
       body: JSON.stringify({ principalId: 'human:not-a-member' }),
     })
     assert.equal(forbidden.status, 403)
+  })
+
+  it('stores channel images behind membership-scoped URLs', async () => {
+    const { base, stderr } = await startServer()
+    const boot = await body(await fetch(`${base}/api/channels/bootstrap-films7`, { method: 'POST', headers: headers() }))
+    const channelId = boot.channel.id
+    const attachmentId = randomUUID()
+    const bytes = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4])
+    const uploaded = await fetch(`${base}/api/channels/${channelId}/attachments`, {
+      method: 'POST',
+      headers: {
+        ...headers('maya'),
+        'Content-Type': 'image/png',
+        'X-Filename': encodeURIComponent('pasted frame.png'),
+        'X-Upload-ID': attachmentId,
+      },
+      body: bytes,
+    })
+    assert.equal(uploaded.status, 201, stderr())
+    const attachment = (await body(uploaded)).attachment
+    assert.equal(attachment.id, attachmentId)
+    assert.equal(attachment.filename, 'pasted frame.png')
+    assert.equal(attachment.byteSize, bytes.length)
+    assert.match(attachment.url, new RegExp(`/api/channels/${channelId}/attachments/${attachmentId}$`))
+
+    const fetched = await fetch(`${base}${attachment.url}`, { headers: headers('maya') })
+    assert.equal(fetched.status, 200)
+    assert.equal(fetched.headers.get('content-type'), 'image/png')
+    assert.deepEqual(Buffer.from(await fetched.arrayBuffer()), bytes)
+    assert.equal((await fetch(`${base}${attachment.url}`, { headers: headers('zoe') })).status, 403)
+
+    const conflict = await fetch(`${base}/api/channels/${channelId}/attachments`, {
+      method: 'POST',
+      headers: {
+        ...headers('maya'),
+        'Content-Type': 'image/png',
+        'X-Filename': encodeURIComponent('different.png'),
+        'X-Upload-ID': attachmentId,
+      },
+      body: Buffer.from([9, 9, 9]),
+    })
+    assert.equal(conflict.status, 409)
+    assert.equal((await fetch(`${base}/api/channels/${channelId}/attachments`, {
+      method: 'POST',
+      headers: { ...headers('maya'), 'Content-Type': 'image/svg+xml', 'X-Upload-ID': randomUUID() },
+      body: '<svg/>',
+    })).status, 415)
   })
 })
