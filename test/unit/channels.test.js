@@ -115,6 +115,22 @@ describe('channel event store', () => {
     assert.equal(dispatch.threadRootId, latest.id)
     assert.notEqual(dispatch.threadRootId, first.id)
     assert.equal(store.enqueueLatestUnansweredThread({ channelId: fresh.id, actorId: philip.id }), false)
+    assert.equal(store.executionForMember({ executionId: dispatch.executionId, principalId: philip.id }).sessionId, freshCoordinator.sessionId)
+    const outsider = store.ensureHuman({ username: 'outsider', displayName: 'Outsider' })
+    assert.throws(() => store.executionForMember({ executionId: dispatch.executionId, principalId: outsider.id }), /not an active channel member/)
+    store.completeExecution({ executionId: dispatch.executionId, content: 'Coordinator is here.' })
+    const followUp = store.postMessage({
+      channelId: fresh.id,
+      authorId: philip.id,
+      content: 'Where are we now?',
+      threadRootId: latest.id,
+      replyToId: latest.id,
+      messageType: 'human',
+      idempotencyKey: 'client:fairfield:follow-up',
+    })
+    const followUpDispatch = store.claimDispatch()
+    assert.equal(followUpDispatch.agent.id, freshCoordinator.id)
+    assert.equal(followUpDispatch.triggerMessageId, followUp.id)
   })
 
   it('models flat threads, explicit agent mentions, and bounded agent dispatch', () => {

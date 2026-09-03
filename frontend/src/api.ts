@@ -237,6 +237,13 @@ export interface ChannelExecution {
   error: string | null
 }
 
+export interface ChannelExecutionPeek {
+  execution: Pick<ChannelExecution, 'id' | 'state' | 'agent' | 'startedAt' | 'completedAt'>
+  activity: string
+  steps: Array<{ id: string; tool: string; intent: string | null; status: 'working' | 'completed' | 'failed' }>
+  updatedAt: string | null
+}
+
 export interface ChannelThread {
   id: string
   channelId: string
@@ -368,6 +375,10 @@ export async function createChannelDm(principalId: string): Promise<ChannelInfo>
     body: JSON.stringify({ principalId }),
   }))
   return data.channel
+}
+
+export async function fetchChannelExecutionPeek(executionId: string): Promise<ChannelExecutionPeek> {
+  return responseJson(await fetch(`${BASE}/api/channels/executions/${encodeURIComponent(executionId)}/peek`))
 }
 
 export async function cancelChannelExecution(executionId: string): Promise<void> {

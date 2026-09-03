@@ -551,6 +551,30 @@ test.describe('Message rendering', () => {
   })
 })
 
+test('an active release update never reloads a focused Room chat draft', async ({ page }) => {
+  await page.clock.install()
+  let releaseAdvanced = false
+  let mainNavigations = 0
+  page.on('framenavigated', frame => { if (frame === page.mainFrame()) mainNavigations++ })
+  await page.route('**/api/version', route => route.fulfill({
+    json: releaseAdvanced
+      ? { activeJs: 'index-new-release.js', stagingJs: 'index-new-release.js', changes: 'Interaction fixes' }
+      : { activeJs: null, stagingJs: null, changes: '' },
+  }))
+  await page.goto(`${BASE}/#${TEST_SESSION_ID}`)
+  await expect(page.locator('.markdown').first()).toBeVisible({ timeout: 10000 })
+  const textarea = page.locator('textarea[placeholder="Send a message..."]')
+  await textarea.fill('Keep this Room draft through the update check')
+  await textarea.focus()
+
+  releaseAdvanced = true
+  await page.clock.fastForward(30_000)
+  await expect(page.getByRole('button', { name: 'Update Available' })).toBeVisible()
+  await expect(textarea).toBeFocused()
+  await expect(textarea).toHaveValue('Keep this Room draft through the update check')
+  expect(mainNavigations).toBe(1)
+})
+
 // ── Chat input ──────────────────────────────────────────────────────────────
 
 test.describe('Chat input', () => {

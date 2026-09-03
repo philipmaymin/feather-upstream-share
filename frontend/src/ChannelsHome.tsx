@@ -6,6 +6,7 @@ import {
   createChannel,
   createChannelDm,
   fetchChannelActivity,
+  fetchChannelExecutionPeek,
   fetchChannelMessages,
   fetchChannelPrincipals,
   fetchChannelThread,
@@ -16,6 +17,8 @@ import {
   updateChannelThread,
   uploadChannelImage,
   type ChannelActivityItem,
+  type ChannelExecution,
+  type ChannelExecutionPeek,
   type ChannelInfo,
   type ChannelMessage,
   type ChannelPrincipal,
@@ -137,6 +140,15 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [rootImages, setRootImages] = createSignal<PendingChannelImage[]>([])
   const [replyImages, setReplyImages] = createSignal<PendingChannelImage[]>([])
   const [sending, setSending] = createSignal(false)
+  const [expandedThreadIds, setExpandedThreadIds] = createSignal<Set<string>>(new Set())
+  const [inlineThreads, setInlineThreads] = createSignal<Record<string, ChannelThread>>({})
+  const [inlineDrafts, setInlineDrafts] = createSignal<Record<string, string>>({})
+  const [inlineSendingRootId, setInlineSendingRootId] = createSignal<string | null>(null)
+  const [rosterOpen, setRosterOpen] = createSignal(false)
+  const [peekExecutionId, setPeekExecutionId] = createSignal<string | null>(null)
+  const [executionPeek, setExecutionPeek] = createSignal<ChannelExecutionPeek | null>(null)
+  const [peekLoading, setPeekLoading] = createSignal(false)
+  const [peekError, setPeekError] = createSignal('')
   const [attentionAction, setAttentionAction] = createSignal<'follow' | 'done' | 'snooze' | null>(null)
   const [dialog, setDialog] = createSignal<DialogKind>(null)
   const [dialogValue, setDialogValue] = createSignal('')
@@ -149,9 +161,11 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [pushState, setPushState] = createSignal<'idle' | 'enabling' | 'enabled' | 'denied' | 'error' | 'unavailable'>('idle')
   const [announcement, setAnnouncement] = createSignal('')
   let refreshTimer: number | undefined
+  let peekTimer: number | undefined
   let threadScroller: HTMLElement | undefined
   let rootComposer: HTMLTextAreaElement | undefined
   let replyComposer: HTMLTextAreaElement | undefined
+  const inlineComposers = new Map<string, HTMLTextAreaElement>()
   let cancellingTitleEdit = false
   let loadGeneration = 0
   const readMessageByThread = new Map<string, string>()
@@ -193,6 +207,16 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const messages = await fetchChannelMessages(channelId)
     if (generation !== loadGeneration || selectedChannelId() !== channelId) return
     setRoots(messages)
+  }
+
+  async function loadInlineThread(channelId: string, rootId: string, generation = loadGeneration) {
+    const next = await fetchChannelThread(channelId, rootId)
+    if (generation !== loadGeneration || selectedChannelId() !== channelId || !expandedThreadIds().has(rootId)) return
+    setInlineThreads(current => ({ ...current, [rootId]: next }))
+  }
+
+  function inlineRepliesFor(message: ChannelMessage) {
+    return inlineThreads()[message.threadRootId]?.messages.slice(1) || message.replies || []
   }
 
   async function loadThread(channelId: string, rootId: string, generation = loadGeneration) {
@@ -247,6 +271,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       setSelectedChannelId(channelId)
       if (channelId) {
         await loadRoots(channelId, generation)
+        await Promise.all([...expandedThreadIds()].map(expandedId =>
+          loadInlineThread(channelId, expandedId, generation).catch(() => {})))
         if (rootId) await loadThread(channelId, rootId, generation).catch(() => setThread(null))
       } else {
         setRoots([])
@@ -278,6 +304,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setSelectedChannelId(channel.id)
     setSection(nextSection)
     setThread(null)
+    setExpandedThreadIds(new Set())
+    setInlineThreads({})
+    setRosterOpen(false)
     setRoots([])
     setLoading(true)
     updateLocation(nextSection, channel.id, null, 'push')
@@ -386,8 +415,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       setRootDraft('')
       clearImages(false)
       await loadRoots(channelId)
-      await openThread(message.threadRootId, channelId)
-      setAnnouncement('Message delivered. The thread is open.')
+      setExpandedThreadIds(current => new Set(current).add(message.threadRootId))
+      setAnnouncement('Message delivered. Reply inline or open Focus for the full thread.')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Message was not sent. Your draft is unchanged.')
     } finally {
@@ -416,11 +445,95 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     }
   }
 
+  function toggleInlineThread(message: ChannelMessage) {
+    const opening = !expandedThreadIds().has(message.threadRootId)
+    setExpandedThreadIds(current => {
+      const next = new Set(current)
+      if (opening) next.add(message.threadRootId)
+      else next.delete(message.threadRootId)
+      return next
+    })
+    if (!opening) {
+      inlineComposers.delete(message.threadRootId)
+      return
+    }
+    void loadInlineThread(message.channelId, message.threadRootId).catch(() => {})
+    const lastMessageId = message.replies?.at(-1)?.id
+    if (lastMessageId && readMessageByThread.get(message.threadRootId) !== lastMessageId) {
+      readMessageByThread.set(message.threadRootId, lastMessageId)
+      void updateChannelAttention(message.channelId, message.threadRootId, 'read').catch(() => {
+        if (readMessageByThread.get(message.threadRootId) === lastMessageId) readMessageByThread.delete(message.threadRootId)
+      })
+    }
+  }
+
+  async function sendInlineReply(message: ChannelMessage) {
+    const rootId = message.threadRootId
+    const draft = (inlineDrafts()[rootId] || '').trim()
+    if (!draft || inlineSendingRootId()) return
+    setInlineSendingRootId(rootId)
+    setError('')
+    try {
+      await postChannelMessage(message.channelId, draft, rootId, inlineRepliesFor(message).at(-1)?.id || message.id)
+      setInlineDrafts(current => ({ ...current, [rootId]: '' }))
+      await Promise.all([loadRoots(message.channelId), loadInlineThread(message.channelId, rootId)])
+      if (thread()?.id === rootId) await loadThread(message.channelId, rootId)
+      setAnnouncement('Reply delivered.')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Reply was not sent. Your draft is unchanged.')
+    } finally {
+      setInlineSendingRootId(null)
+    }
+  }
+
+  function mentionInline(agent: ChannelPrincipal, rootId: string) {
+    const current = inlineDrafts()[rootId] || ''
+    setInlineDrafts(drafts => ({
+      ...drafts,
+      [rootId]: `${current}${current && !/\s$/.test(current) ? ' ' : ''}@${agent.username} `,
+    }))
+    queueMicrotask(() => inlineComposers.get(rootId)?.focus())
+  }
+
   function mention(agent: ChannelPrincipal, inReply: boolean) {
     const setter = inReply ? setReplyDraft : setRootDraft
     const current = inReply ? replyDraft() : rootDraft()
     setter(`${current}${current && !/\s$/.test(current) ? ' ' : ''}@${agent.username} `)
     queueMicrotask(() => (inReply ? replyComposer : rootComposer)?.focus())
+  }
+
+  async function loadExecutionPeek(executionId: string) {
+    try {
+      const next = await fetchChannelExecutionPeek(executionId)
+      if (peekExecutionId() !== executionId) return
+      setExecutionPeek(next)
+      setPeekError('')
+      if (next.execution.state !== 'running') clearInterval(peekTimer)
+    } catch (reason) {
+      if (peekExecutionId() === executionId) {
+        setPeekError(reason instanceof Error ? reason.message : 'Live agent activity is unavailable')
+      }
+    } finally {
+      if (peekExecutionId() === executionId) setPeekLoading(false)
+    }
+  }
+
+  function openExecutionPeek(execution: ChannelExecution) {
+    clearInterval(peekTimer)
+    setPeekExecutionId(execution.id)
+    setExecutionPeek(null)
+    setPeekError('')
+    setPeekLoading(true)
+    void loadExecutionPeek(execution.id)
+    peekTimer = window.setInterval(() => void loadExecutionPeek(execution.id), 1_500)
+  }
+
+  function closeExecutionPeek() {
+    clearInterval(peekTimer)
+    setPeekExecutionId(null)
+    setExecutionPeek(null)
+    setPeekError('')
+    setPeekLoading(false)
   }
 
   function startThreadTitleEdit() {
@@ -627,6 +740,11 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const generation = ++loadGeneration
     setSection(nextSection)
     setSelectedChannelId(channelId)
+    if (changedChannel) {
+      setExpandedThreadIds(new Set())
+      setInlineThreads({})
+      setRosterOpen(false)
+    }
     setThread(null)
     if (!channelId) {
       setRoots([])
@@ -650,9 +768,19 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     void refresh({ initial: true })
     const onPopState = () => { void restoreLocation() }
     const onEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && dialog()) {
+      if (event.key !== 'Escape') return
+      if (peekExecutionId()) {
+        event.preventDefault()
+        closeExecutionPeek()
+      } else if (dialog()) {
         event.preventDefault()
         setDialog(null)
+      } else if (rosterOpen()) {
+        event.preventDefault()
+        setRosterOpen(false)
+      } else if (thread()) {
+        event.preventDefault()
+        closeThread()
       }
     }
     window.addEventListener('popstate', onPopState)
@@ -667,6 +795,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     onCleanup(() => {
       unsubscribe()
       clearTimeout(refreshTimer)
+      clearInterval(peekTimer)
       window.removeEventListener('popstate', onPopState)
       window.removeEventListener('keydown', onEscape)
       for (const image of [...rootImages(), ...replyImages()]) URL.revokeObjectURL(image.previewUrl)
@@ -760,6 +889,23 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     )
   }
 
+  const renderExecution = (execution: ChannelExecution) => (
+    <div class="channel-execution">
+      <PersonMark person={{ ...execution.agent, kind: 'agent' }} small />
+      <div>
+        <b>@{execution.agent.username}</b>
+        <span>{execution.state === 'running' ? 'Working now' : execution.state === 'done' ? 'Completed' : execution.state === 'error' && execution.error === 'Server restarted during execution' ? 'Interrupted by update · retried automatically' : execution.state === 'error' ? 'Failed' : 'Stopped'}</span>
+        <Show when={execution.error && execution.error !== 'Server restarted during execution'}><p>{execution.error}</p></Show>
+      </div>
+      <Show when={execution.state === 'running'}>
+        <div class="channel-execution-actions">
+          <button type="button" class="channel-peek-action" onClick={() => openExecutionPeek(execution)}>Peek</button>
+          <button type="button" onClick={async () => { await cancelChannelExecution(execution.id); queueRefresh() }}>Stop</button>
+        </div>
+      </Show>
+    </div>
+  )
+
   const renderMessage = (message: ChannelMessage, inThread = false) => (
     <article class="channel-message" classList={{ 'channel-message-agent': message.author.kind === 'agent', 'channel-message-system': message.messageType === 'system' }}>
       <PersonMark person={message.author} />
@@ -774,20 +920,61 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             <div class="channel-participants" aria-label="Thread participants">
               <For each={[...new Map((message.replies || []).map(reply => [reply.author.id, reply.author])).values()].slice(0, 4)}>{person => <PersonMark person={person} small />}</For>
             </div>
-            <button type="button" onClick={() => void openThread(message.threadRootId)}>
-              {message.thread!.replyCount ? `${message.thread!.replyCount} ${message.thread!.replyCount === 1 ? 'reply' : 'replies'}` : 'Start thread'}
-              <span aria-hidden="true">→</span>
+            <button type="button" aria-expanded={expandedThreadIds().has(message.threadRootId)} onClick={() => toggleInlineThread(message)}>
+              {expandedThreadIds().has(message.threadRootId)
+                ? 'Hide replies'
+                : message.thread!.replyCount
+                  ? `${message.thread!.replyCount} ${message.thread!.replyCount === 1 ? 'reply' : 'replies'}`
+                  : 'Reply'}
+              <span aria-hidden="true">{expandedThreadIds().has(message.threadRootId) ? '↑' : '↓'}</span>
+            </button>
+            <button type="button" class="channel-focus-thread" onClick={() => void openThread(message.threadRootId)} aria-label={`Focus thread: ${message.thread!.title}`}>
+              Focus <span aria-hidden="true">↗</span>
             </button>
             <Show when={message.thread!.state !== 'open'}>
               <span class={`channel-state channel-state-${message.thread!.state}`}>{message.thread!.state.replace('_', ' ')}</span>
             </Show>
             <Show when={message.thread!.unread}><span class="channel-unread-dot" title="Unread replies" /></Show>
           </div>
-          <Show when={(message.replies || []).length > 0}>
-            <button class="channel-reply-preview" type="button" onClick={() => void openThread(message.threadRootId)}>
+          <Show when={!expandedThreadIds().has(message.threadRootId) && (message.replies || []).length > 0}>
+            <button class="channel-reply-preview" type="button" onClick={() => toggleInlineThread(message)}>
               <PersonMark person={message.replies!.at(-1)!.author} small />
               <span><b>{message.replies!.at(-1)!.author.displayName}</b> {message.replies!.at(-1)!.content.replace(/[#*_`]/g, '').slice(0, 150)}</span>
             </button>
+          </Show>
+          <Show when={expandedThreadIds().has(message.threadRootId)}>
+            <section class="channel-inline-thread" aria-label={`Expanded thread: ${message.thread!.title}`}>
+              <Show when={inlineRepliesFor(message).length > 0} fallback={<p class="channel-inline-empty">No replies yet. Continue the thread here.</p>}>
+                <Index each={inlineRepliesFor(message)}>{reply => renderMessage(reply(), true)}</Index>
+              </Show>
+              <Show when={agents().length > 0}>
+                <div class="channel-inline-mentions">
+                  <span>Bring in</span>
+                  <For each={agents()}>{agent => (
+                    <button type="button" onClick={() => mentionInline(agent, message.threadRootId)}>@{agent.username}</button>
+                  )}</For>
+                </div>
+              </Show>
+              <form class="channel-inline-reply" onSubmit={event => { event.preventDefault(); void sendInlineReply(message) }}>
+                <textarea
+                  ref={element => { inlineComposers.set(message.threadRootId, element) }}
+                  value={inlineDrafts()[message.threadRootId] || ''}
+                  onInput={event => setInlineDrafts(current => ({ ...current, [message.threadRootId]: event.currentTarget.value }))}
+                  onKeyDown={event => {
+                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                      event.preventDefault()
+                      void sendInlineReply(message)
+                    }
+                  }}
+                  rows={2}
+                  placeholder="Reply in this thread"
+                  aria-label={`Reply to thread: ${message.thread!.title}`}
+                />
+                <button type="submit" disabled={inlineSendingRootId() === message.threadRootId || !(inlineDrafts()[message.threadRootId] || '').trim()}>
+                  {inlineSendingRootId() === message.threadRootId ? 'Sending…' : 'Reply'}
+                </button>
+              </form>
+            </section>
           </Show>
         </Show>
       </div>
@@ -943,10 +1130,34 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                   <h1>{channel().type === 'dm' ? dmName(channel(), snapshot().principal?.id) : `#${channel().slug}`}</h1>
                   <p>{channel().description || (channel().type === 'dm' ? 'A private conversation between members.' : '')}</p>
                 </div>
-                <div class="channel-member-cluster" aria-label={`${channel().members.length} members`}>
-                  <For each={channel().members.slice(0, 5)}>{member => <PersonMark person={member} />}</For>
-                  <span>{channel().members.length}</span>
+                <div class="channel-member-cluster">
+                  <button
+                    type="button"
+                    class="channel-roster-toggle"
+                    aria-label={`${channel().members.length} members`}
+                    aria-expanded={rosterOpen()}
+                    onClick={() => setRosterOpen(!rosterOpen())}
+                  >
+                    <For each={channel().members.slice(0, 5)}>{member => <PersonMark person={member} />}</For>
+                    <span>{channel().members.length}</span>
+                  </button>
                   <Show when={currentHumanIsOwner()}><button type="button" onClick={() => openDialog('members')}>Invite</button></Show>
+                  <Show when={rosterOpen()}>
+                    <section class="channel-roster-popover" aria-label="Channel members">
+                      <header><b>Who’s here</b><span>Agents wake when messaged—no restart needed.</span></header>
+                      <For each={channel().members}>{member => (
+                        <Show when={member.kind === 'agent'} fallback={
+                          <div class="channel-roster-member"><PersonMark person={member} /><Identity person={member} compact /></div>
+                        }>
+                          <button type="button" class="channel-roster-member" onClick={() => { mention(member, false); setRosterOpen(false) }}>
+                            <PersonMark person={member} />
+                            <Identity person={member} compact />
+                            <small>{channel().defaultAgentId === member.id ? 'Answers by default' : 'Mention to involve'}</small>
+                          </button>
+                        </Show>
+                      )}</For>
+                    </section>
+                  </Show>
                 </div>
               </header>
               <section class="channel-timeline" aria-label={`${channel().title} messages`} aria-busy={loading()}>
@@ -962,19 +1173,12 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         </Show>
       </main>
 
-      <aside class="channel-thread-pane" classList={{ open: !!thread() }} aria-label="Open thread">
-        <Show when={thread()} fallback={
-          <div class="channel-thread-empty" aria-hidden="true">
-            <span class="channel-thread-empty-mark" />
-            <h2>Open a thread</h2>
-            <p>Replies, agent work, and decisions stay together here.</p>
-          </div>
-        }>{current => (
-          <>
+      <Show when={thread()}>{current => (
+        <aside class="channel-thread-pane open" aria-label="Focused thread">
             <header class="channel-thread-header">
-              <button type="button" class="channel-thread-back" onClick={closeThread} aria-label="Close thread">←</button>
+              <button type="button" class="channel-thread-back" onClick={closeThread} aria-label="Close focused thread">←</button>
               <div>
-                <small>Thread · {current().messages.length - 1} replies</small>
+                <small>Focused thread · {current().messages.length - 1} replies</small>
                 <Show when={editingTitle()} fallback={<button type="button" class="channel-thread-title" onClick={startThreadTitleEdit} title="Edit thread title">{current().title}</button>}>
                   <input
                     value={titleDraft()}
@@ -984,6 +1188,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                       if (event.key === 'Enter') void saveThreadTitle()
                       if (event.key === 'Escape') {
                         event.preventDefault()
+                        event.stopPropagation()
                         cancelThreadTitleEdit()
                       }
                     }}
@@ -1003,26 +1208,52 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
             <section class="channel-thread-messages" ref={threadScroller}>
               <Index each={current().messages}>{message => renderMessage(message(), true)}</Index>
-              <Show when={current().executions.length > 0}>
-                <details class="channel-worklog" open={current().executions.some(execution => execution.state === 'running' || execution.state === 'error')}>
-                  <summary>
-                    <span class="channel-worklog-pulse" classList={{ running: current().executions.some(execution => execution.state === 'running') }} />
-                    Agent work · {current().executions.length} {current().executions.length === 1 ? 'turn' : 'turns'}
-                  </summary>
-                  <For each={current().executions}>{execution => (
-                    <div class="channel-execution">
-                      <PersonMark person={{ ...execution.agent, kind: 'agent' }} small />
-                      <div><b>@{execution.agent.username}</b><span>{execution.state} · depth {execution.depth}</span><Show when={execution.error}><p>{execution.error}</p></Show></div>
-                      <Show when={execution.state === 'running'}><button type="button" onClick={async () => { await cancelChannelExecution(execution.id); queueRefresh() }}>Stop</button></Show>
-                    </div>
-                  )}</For>
+              <Show when={current().executions.some(execution => execution.state === 'running')}>
+                <section class="channel-active-work" aria-label="Agents working now">
+                  <header><span class="channel-worklog-pulse running" />Working now</header>
+                  <For each={current().executions.filter(execution => execution.state === 'running')}>{renderExecution}</For>
+                </section>
+              </Show>
+              <Show when={current().executions.some(execution => execution.state !== 'running')}>
+                <details class="channel-worklog">
+                  <summary>Past agent activity · {current().executions.filter(execution => execution.state !== 'running').length}</summary>
+                  <For each={current().executions.filter(execution => execution.state !== 'running')}>{renderExecution}</For>
                 </details>
               </Show>
             </section>
             {renderComposer(true)}
-          </>
-        )}</Show>
-      </aside>
+        </aside>
+      )}</Show>
+
+      <Show when={peekExecutionId()}>
+        <aside class="channel-agent-peek" aria-label="Live agent peek">
+          <header>
+            <div><small>Read-only live view</small><h2>{executionPeek()?.execution.agent.displayName || 'Agent work'}</h2></div>
+            <button type="button" onClick={closeExecutionPeek} aria-label="Close live agent peek">×</button>
+          </header>
+          <Show when={peekLoading() && !executionPeek()}><div class="channel-peek-loading">Opening live activity…</div></Show>
+          <Show when={peekError()}><div class="channel-peek-error">{peekError()}</div></Show>
+          <Show when={executionPeek()}>{peek => (
+            <div class="channel-peek-body">
+              <div class="channel-peek-current">
+                <span class="channel-worklog-pulse" classList={{ running: peek().execution.state === 'running' }} />
+                <div><small>{peek().execution.state === 'running' ? 'Working now' : 'Finished'}</small><p>{peek().activity}</p></div>
+              </div>
+              <Show when={peek().steps.length > 0} fallback={<p class="channel-peek-empty">The agent is working, but has not started a tool action yet.</p>}>
+                <ol class="channel-peek-steps">
+                  <For each={peek().steps}>{step => (
+                    <li classList={{ working: step.status === 'working', failed: step.status === 'failed' }}>
+                      <span>{step.status === 'working' ? 'Now' : step.status === 'failed' ? 'Failed' : 'Done'}</span>
+                      <div><b>{step.tool}</b><Show when={step.intent}><p>{step.intent}</p></Show></div>
+                    </li>
+                  )}</For>
+                </ol>
+              </Show>
+              <footer>{peek().updatedAt ? `Updated ${relativeTime(peek().updatedAt!)}` : 'Waiting for the next live update'}</footer>
+            </div>
+          )}</Show>
+        </aside>
+      </Show>
 
       <nav class="channels-mobile-nav" classList={{ personal: props.showPersonal }} aria-label="Channel workspace navigation">
         <button type="button" classList={{ active: section() === 'activity' }} onClick={() => navigate('activity')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5zM8 9h8M8 13h6" /></svg><span>Activity</span><Show when={activity().unread}><b>{activity().unread}</b></Show></button>

@@ -5,6 +5,7 @@ import os from 'os'
 import path from 'path'
 import { spawn } from 'child_process'
 import { randomUUID } from 'crypto'
+import { ChannelStore } from '../../lib/channels.js'
 
 const roots = []
 const servers = []
@@ -18,21 +19,26 @@ afterEach(async () => {
   while (roots.length) fs.rmSync(roots.pop(), { recursive: true, force: true })
 })
 
-async function startServer({ failTmuxSpawn = false } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feather-channels-api-'))
-  roots.push(root)
-  const home = path.join(root, 'home')
-  const state = path.join(root, 'state')
-  const bin = path.join(root, 'bin')
-  fs.mkdirSync(home)
-  fs.mkdirSync(state)
-  fs.mkdirSync(bin)
-  fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh
+async function startServer({ failTmuxSpawn = false, sharedRoot = null } = {}) {
+  const root = sharedRoot || fs.mkdtempSync(path.join(os.tmpdir(), 'feather-channels-api-'))
+  if (!sharedRoot) {
+    roots.push(root)
+    const home = path.join(root, 'home')
+    const state = path.join(root, 'state')
+    const bin = path.join(root, 'bin')
+    fs.mkdirSync(home)
+    fs.mkdirSync(state)
+    fs.mkdirSync(bin)
+    fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh
 [ "$1" = "has-session" ] && exit 1
 ${failTmuxSpawn ? '[ "$1" = "new-session" ] && exit 1' : ''}
 exit 0
 `)
-  fs.chmodSync(path.join(bin, 'tmux'), 0o755)
+    fs.chmodSync(path.join(bin, 'tmux'), 0o755)
+  }
+  const home = path.join(root, 'home')
+  const state = path.join(root, 'state')
+  const bin = path.join(root, 'bin')
   const port = 47_000 + Math.floor(Math.random() * 1_000)
   const base = `http://127.0.0.1:${port}`
   const child = spawn(process.execPath, ['server-single.js'], {
@@ -54,7 +60,7 @@ exit 0
   child.stderr.on('data', chunk => { stderr += chunk })
   for (let attempt = 0; attempt < 100; attempt++) {
     try {
-      if ((await fetch(`${base}/api/health`)).ok) return { root, home, base, stderr: () => stderr }
+      if ((await fetch(`${base}/api/health`)).ok) return { root, home, base, port, child, stderr: () => stderr }
     } catch {}
     await new Promise(resolve => setTimeout(resolve, 30))
   }
@@ -122,6 +128,82 @@ describe('shared channels API', () => {
     const replay = await body(replayResponse)
     assert.equal(replay.channel.id, first.channel.id)
     assert.deepEqual(replay.channel.members.map(member => member.id).sort(), first.channel.members.map(member => member.id).sort())
+  })
+
+  it('exposes a membership-scoped read-only peek without leaking agent session ids', async () => {
+    const { base, home } = await startServer()
+    const created = await body(await fetch(`${base}/api/channels`, {
+      method: 'POST',
+      headers: { ...headers(), 'Idempotency-Key': 'api:create:peek' },
+      body: JSON.stringify({ slug: 'peek-room', title: 'Peek Room' }),
+    }))
+    const store = new ChannelStore({ file: path.join(home, '.feather', 'channels-v1.sqlite3') })
+    try {
+      const owner = store.ensureHuman({ username: 'philip', displayName: 'Philip' })
+      store.postMessage({
+        channelId: created.channel.id,
+        authorId: owner.id,
+        content: 'Start work that I can inspect.',
+        messageType: 'human',
+        idempotencyKey: 'client:peek:start',
+      })
+      const dispatch = store.claimDispatch()
+      assert.ok(dispatch)
+
+      const response = await fetch(`${base}/api/channels/executions/${dispatch.executionId}/peek`, { headers: headers() })
+      assert.equal(response.status, 200)
+      const peek = await body(response)
+      assert.equal(peek.execution.id, dispatch.executionId)
+      assert.equal(peek.execution.state, 'running')
+      assert.match(peek.activity, /Starting/)
+      assert.equal(JSON.stringify(peek).includes(dispatch.agent.sessionId), false)
+      assert.equal((await fetch(`${base}/api/channels/executions/${dispatch.executionId}/peek`, { headers: headers('maya') })).status, 403)
+    } finally {
+      store.close()
+    }
+  })
+
+  it('notifies one server when another process changes the shared channel database', async () => {
+    const first = await startServer()
+    const second = await startServer({ sharedRoot: first.root })
+    assert.notEqual(first.port, second.port)
+    assert.equal(first.child.exitCode, null, `first server exited: ${first.stderr()}`)
+    const controller = new AbortController()
+    const stream = await fetch(`${first.base}/api/channels/stream`, { headers: headers(), signal: controller.signal })
+    assert.equal(stream.status, 200)
+    const reader = stream.body.getReader()
+    const decoder = new TextDecoder()
+    const connected = await reader.read()
+    assert.match(decoder.decode(connected.value), /event: connected/)
+
+    const created = await fetch(`${second.base}/api/channels`, {
+      method: 'POST',
+      headers: { ...headers(), 'Idempotency-Key': 'api:cross-process-channel' },
+      body: JSON.stringify({ slug: 'cross-process', title: 'Cross Process' }),
+    })
+    assert.equal(created.status, 201, second.stderr())
+
+    let events = ''
+    let timeout
+    const failed = new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error('cross-process channel change was not delivered')), 4_000)
+    })
+    try {
+      await Promise.race([
+        (async () => {
+          while (!events.includes('event: channel')) {
+            const chunk = await reader.read()
+            if (chunk.done) throw new Error('channel stream ended before durable change notification')
+            events += decoder.decode(chunk.value, { stream: true })
+          }
+        })(),
+        failed,
+      ])
+    } finally {
+      clearTimeout(timeout)
+    }
+    assert.match(events, /"channelId":null/)
+    controller.abort()
   })
 
   it('creates Rooms with an assigned OMP Leader and Caretaker', async () => {

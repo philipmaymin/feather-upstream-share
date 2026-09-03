@@ -5600,9 +5600,13 @@ function ensureChannelStaffing(channelId, actorId, { dispatchLatest = false } = 
       sessionId: randomUUID(),
       makeDefault: true,
     }).principal;
-  } else if (!channel.defaultAgentId) {
-    channels.setDefaultAgent({ channelId, actorId, agentId: coordinator.id });
   }
+  channel = channels.getChannel(channelId, actorId);
+  channels.setDefaultAgent({
+    channelId,
+    actorId,
+    agentId: channel.defaultAgentId || coordinator.id,
+  });
   channel = channels.getChannel(channelId, actorId);
   let caretaker = channel.members.find(member =>
     member.kind === 'agent' && member.displayName.toLowerCase() === 'caretaker');
@@ -5632,7 +5636,7 @@ function staffExistingPhilipChannels() {
   const owner = channels.ensureHuman({ username: 'philip', displayName: 'Philip' });
   if (!owner) return;
   for (const channel of channels.listChannels(owner.id)) {
-    if (channel.type !== 'channel' || channel.members.filter(member => member.kind === 'agent').length >= 2) continue;
+    if (channel.type !== 'channel') continue;
     try { ensureChannelStaffing(channel.id, owner.id, { dispatchLatest: true }); }
     catch (error) { console.warn(`[channels] could not staff #${channel.slug || channel.id}:`, error.message); }
   }
@@ -5686,9 +5690,19 @@ app.get('/api/channels/stream', (req, res) => {
   const clients = channelStreamClients.get(principal.id);
   clients.add(res);
   res.write('event: connected\ndata: {}\n\n');
+  let dataVersion = channels.dataVersion();
+  let ticks = 0;
   const heartbeat = setInterval(() => {
-    try { res.write('event: heartbeat\ndata: {}\n\n'); } catch {}
-  }, 15_000);
+    try {
+      const nextVersion = channels.dataVersion();
+      if (nextVersion !== dataVersion) {
+        dataVersion = nextVersion;
+        res.write(`event: channel\ndata: ${JSON.stringify({ channelId: null, at: new Date().toISOString() })}\n\n`);
+      } else if (++ticks % 15 === 0) {
+        res.write('event: heartbeat\ndata: {}\n\n');
+      }
+    } catch {}
+  }, 1_000);
   res.on('close', () => {
     clearInterval(heartbeat);
     clients.delete(res);
@@ -6031,6 +6045,61 @@ app.post('/api/channels/:id/threads/:rootId/attention', (req, res) => {
     });
     if (result.changed) emitChannelChange(req.params.id, 'attention');
     res.json({ thread: result.thread });
+  } catch (error) {
+    res.status(channelErrorStatus(error)).json({ error: error.message });
+  }
+});
+
+app.get('/api/channels/executions/:executionId/peek', (req, res) => {
+  try {
+    const principal = channelRequester(req);
+    const execution = channels.executionForMember({
+      executionId: req.params.executionId,
+      principalId: principal.id,
+    });
+    if (!execution) throw httpError(404, 'no such execution');
+    const tools = new Map();
+    const replay = ompBridgeReplay.get(execution.sessionId);
+    if (replay) {
+      const entries = [...replay.entries.values()].sort((left, right) => left.sequence - right.sequence);
+      for (const { event } of entries) {
+        if (event.type === 'work_snapshot') {
+          for (const block of event.blocks || []) {
+            if (block.type !== 'tool_use') continue;
+            tools.set(block.id, {
+              id: block.id,
+              tool: block.name,
+              intent: block.intent || null,
+              status: tools.get(block.id)?.status || 'working',
+            });
+          }
+        } else if (event.type.startsWith('tool_execution_')) {
+          tools.set(event.toolCallId, {
+            id: event.toolCallId,
+            tool: event.toolName,
+            intent: event.intent || tools.get(event.toolCallId)?.intent || null,
+            status: event.type === 'tool_execution_end' ? (event.isError ? 'failed' : 'completed') : 'working',
+          });
+        }
+      }
+    }
+    let activity = lastActivity.get(execution.sessionId) || null;
+    if (!activity && execution.state === 'running') {
+      try { activity = extractActivity(capturePaneLines(existingTmuxName(execution.sessionId)).lines); } catch {}
+    }
+    const seenAt = ompBridgeLastSeen.get(execution.sessionId)?.seenAt;
+    res.json({
+      execution: {
+        id: execution.id,
+        state: execution.state,
+        agent: execution.agent,
+        startedAt: execution.startedAt,
+        completedAt: execution.completedAt,
+      },
+      activity: activity || (execution.state === 'running' ? 'Starting the next action…' : 'No longer running'),
+      steps: [...tools.values()].slice(-8),
+      updatedAt: Number.isFinite(seenAt) ? new Date(seenAt).toISOString() : null,
+    });
   } catch (error) {
     res.status(channelErrorStatus(error)).json({ error: error.message });
   }

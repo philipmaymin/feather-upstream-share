@@ -430,6 +430,7 @@ export default function App() {
 
   const lastSeenUpdatedAt = new Map<string, string>() // session ID -> last known updatedAt
   const [updateAvailable, setUpdateAvailable] = createSignal(false)
+  const [activeReloadAvailable, setActiveReloadAvailable] = createSignal(false)
   const [updateChanges, setUpdateChanges] = createSignal('')
   const [showChangelog, setShowChangelog] = createSignal(false)
   const currentJsFile = document.querySelector<HTMLScriptElement>('script[src*="index-"]')?.src.match(/index-[^.]+\.js/)?.[0] || null
@@ -739,31 +740,13 @@ export default function App() {
         const r = await fetch(appUrl('/api/version'))
         if (!r.ok) return
         const { stagingJs, activeJs, changes } = await r.json()
-        // A resident mobile/PWA bundle can survive a deployment indefinitely.
-        // Reload once when the *active* immutable asset advances. Do not react
-        // to stagingJs here: candidates are built and tested before promotion.
-        if (activeJs && currentJsFile && activeJs !== currentJsFile) {
-          const reloadKey = `feather:asset-reload:${activeJs}`
-          try {
-            if (sessionStorage.getItem(reloadKey) !== '1') {
-              sessionStorage.setItem(reloadKey, '1')
-              location.reload()
-              return
-            }
-            console.warn(`Feather bundle ${currentJsFile} still differs from active ${activeJs}; suppressing reload loop`)
-          } catch {
-            // If storage is unavailable, preserve a usable client and leave the
-            // explicit Update Available action as the recovery path.
-          }
-        } else if (activeJs) {
-          try { sessionStorage.removeItem(`feather:asset-reload:${activeJs}`) } catch {}
-        }
-        if (stagingJs && currentJsFile && stagingJs !== currentJsFile) {
-          setUpdateAvailable(true)
-          if (changes) setUpdateChanges(changes)
-        } else {
-          setUpdateAvailable(false)
-        }
+        // Never reload an active chat automatically. Deployments can arrive
+        // while the user is typing; the explicit update action is the safe boundary.
+        const activeChanged = !!(activeJs && currentJsFile && activeJs !== currentJsFile)
+        const stagedChanged = !!(stagingJs && currentJsFile && stagingJs !== currentJsFile)
+        setActiveReloadAvailable(activeChanged)
+        setUpdateAvailable(activeChanged || stagedChanged)
+        if (changes) setUpdateChanges(changes)
       } catch {}
     }
     checkForUpdate()
@@ -2862,11 +2845,15 @@ export default function App() {
             <div style={{ display: 'flex', 'justify-content': 'space-between', 'align-items': 'center', 'margin-bottom': '6px' }}>
               <span style={{ 'font-size': '11px', 'font-weight': '600', color: '#4aba6a' }}>What's New</span>
               <button onClick={async () => {
+                if (activeReloadAvailable()) {
+                  location.reload()
+                  return
+                }
                 try {
                   const r = await fetch(appUrl('/api/update'), { method: 'POST' })
                   if (r.ok) location.reload()
                 } catch {}
-              }} style={{ background: '#4aba6a', color: '#000', border: 'none', 'border-radius': '6px', padding: '4px 12px', 'font-size': '11px', 'font-weight': '600', cursor: 'pointer' }}>Perform Update</button>
+              }} style={{ background: '#4aba6a', color: '#000', border: 'none', 'border-radius': '6px', padding: '4px 12px', 'font-size': '11px', 'font-weight': '600', cursor: 'pointer' }}>{activeReloadAvailable() ? 'Reload now' : 'Perform Update'}</button>
             </div>
             <Show when={updateChanges()}>
               <pre style={{ 'font-size': '11px', color: '#888', 'white-space': 'pre-wrap', 'word-break': 'break-word', margin: '0', 'font-family': 'inherit' }}>{updateChanges()}</pre>

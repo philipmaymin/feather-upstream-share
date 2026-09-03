@@ -50,6 +50,12 @@ function fixtureState() {
       messageId: 'reply-1', preview: root.replies[0].content,
       actor: coordinator,
     }],
+    peek: {
+      execution: { id: 'execution-1', state: 'running', agent: coordinator, startedAt: NOW, completedAt: null },
+      activity: 'Opening the Blackboard gradebook…',
+      steps: [{ id: 'tool-browser', tool: 'browser', intent: 'Open Homework 1 submissions', status: 'working' }],
+      updatedAt: NOW,
+    },
     posts: [],
     attachments: [],
   }
@@ -103,6 +109,12 @@ async function installChannels(page, state) {
       if (body.threadRootId) {
         const existing = state.threads.get(body.threadRootId)
         existing.messages.push(posted)
+        const root = state.roots.find(candidate => candidate.id === body.threadRootId)
+        if (root) {
+          root.replies.push(posted)
+          root.thread.replyCount = root.replies.length
+          root.thread.updatedAt = NOW
+        }
       } else {
         const root = { ...posted, thread: { title: body.content, state: 'working', replyCount: 0, updatedAt: NOW, unread: false, following: true, doneAt: null, snoozedUntil: null }, replies: [] }
         state.roots.push(root)
@@ -131,8 +143,11 @@ async function installChannels(page, state) {
       if (body.action === 'read') state.activity = state.activity.map(item => item.thread?.id === current.id ? { ...item, readAt: NOW } : item)
       return route.fulfill({ json: { thread: current } })
     }
+    if (pathname === '/api/channels/executions/execution-1/peek' && request.method() === 'GET') {
+      return route.fulfill({ json: state.peek })
+    }
     if (pathname === '/api/channels/executions/execution-1/cancel' && request.method() === 'POST') {
-      const execution = state.threads.get('root-1').executions[0]
+      const execution = state.threads.get('root-1').executions.find(candidate => candidate.id === 'execution-1')
       execution.state = 'killed'
       execution.completedAt = NOW
       execution.error = 'Stopped by a channel member'
@@ -151,6 +166,17 @@ async function installChannels(page, state) {
 test.describe('Channels PWA', () => {
   test('desktop keeps shared work legible from channel to execution', async ({ page }) => {
     const state = fixtureState()
+    state.threads.get('root-1').executions.unshift({
+      id: 'execution-past',
+      state: 'done',
+      agent: caretaker,
+      triggerMessageId: 'root-1',
+      finalMessageId: 'reply-2',
+      depth: 0,
+      startedAt: NOW,
+      completedAt: NOW,
+      error: null,
+    })
     await installChannels(page, state)
     await page.setViewportSize({ width: 1440, height: 900 })
     await page.goto(`${BASE}/?app=fledge&surface=channels`)
@@ -160,22 +186,48 @@ test.describe('Channels PWA', () => {
     await expect(page.getByText('What dramatic question should the opening make impossible to ignore?')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Rooms' })).toHaveCount(0)
     await expect(page.locator('.channels-root')).not.toHaveClass(/channel-thread-open/)
+    await page.getByRole('button', { name: '3 members' }).click()
+    await expect(page.getByText('Agents wake when messaged—no restart needed.')).toBeVisible()
+    await page.getByRole('button', { name: /Coordinator.*Answers by default/ }).click()
+    await expect(page.getByLabel('New channel message')).toBeFocused()
+    await expect(page.getByLabel('New channel message')).toHaveValue('@coordinator ')
+    await page.getByLabel('New channel message').fill('')
     const mainWidthBefore = await page.locator('.channels-main').evaluate(element => element.getBoundingClientRect().width)
 
     await page.getByRole('button', { name: /2 replies/ }).click()
-    await expect(page.locator('.channels-root')).toHaveClass(/channel-thread-open/)
+    const inlineThread = page.getByRole('region', { name: /Expanded thread:/ })
+    await expect(inlineThread).toBeVisible()
+    await expect(page.locator('.channels-root')).not.toHaveClass(/channel-thread-open/)
     const mainWidthAfter = await page.locator('.channels-main').evaluate(element => element.getBoundingClientRect().width)
     expect(mainWidthAfter).toBe(mainWidthBefore)
-    await expect(page.locator('.channel-thread-messages .channel-message')).toHaveCount(3)
+    await expect(inlineThread.locator('.channel-message')).toHaveCount(2)
+    const inlineReply = inlineThread.getByRole('textbox', { name: /Reply to thread:/ })
+    await inlineReply.fill('Inline reply without leaving the timeline.')
+    await inlineReply.press('Control+Enter')
+    await expect(inlineThread.locator('.channel-message')).toHaveCount(3)
+
+    await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
+    await expect(page.locator('.channels-root')).toHaveClass(/channel-thread-open/)
+    await expect(page.getByRole('complementary', { name: 'Focused thread' })).toBeVisible()
+    await expect(page.locator('.channel-thread-messages .channel-message')).toHaveCount(4)
     expect(await page.locator('.channel-thread-messages .channel-message').evaluateAll(elements =>
       elements.every(element => getComputedStyle(element).opacity === '1'))).toBe(true)
     await expect(page.locator('.channel-thread-pane').getByText('Agent', { exact: true }).first()).toBeVisible()
-    await expect(page.locator('.channel-thread-pane')).toContainText('Agent work · 1 turn')
-    await expect(page.locator('.channel-execution')).toContainText('@coordinator')
+    await expect(page.getByRole('region', { name: 'Agents working now' })).toBeVisible()
+    await expect(page.locator('.channel-active-work .channel-execution')).toContainText('@coordinator')
+    await expect(page.locator('.channel-worklog')).not.toHaveAttribute('open', '')
+    await expect(page.locator('.channel-worklog summary')).toContainText('Past agent activity · 1')
+    await page.getByRole('button', { name: 'Peek', exact: true }).click()
+    const livePeek = page.getByRole('complementary', { name: 'Live agent peek' })
+    await expect(livePeek).toContainText('Opening the Blackboard gradebook…')
+    await expect(livePeek).toContainText('Open Homework 1 submissions')
+    await livePeek.getByRole('button', { name: 'Close live agent peek' }).click()
+    await expect(livePeek).toHaveCount(0)
 
     const threadPane = page.locator('.channel-thread-pane')
     await threadPane.getByRole('button', { name: 'Stop', exact: true }).click()
-    await expect(threadPane.locator('.channel-execution')).toContainText('killed')
+    await threadPane.locator('.channel-worklog summary').click()
+    await expect(threadPane.getByText('Stopped', { exact: true })).toBeVisible()
     await expect(threadPane.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0)
     expect(state.cancelled).toBe(1)
     await threadPane.locator('.channel-mention-row').getByRole('button', { name: '@caretaker' }).click()
@@ -199,19 +251,13 @@ test.describe('Channels PWA', () => {
     await threadPane.getByRole('button', { name: 'Snoozed 1h', exact: true }).click()
     await expect(threadPane.getByRole('button', { name: 'Snooze', exact: true })).toBeVisible()
 
-    await page.goBack()
-    await expect(threadPane).not.toHaveClass(/open/)
-    await expect(page).not.toHaveURL(/thread=/)
-    await page.goForward()
-    await expect(threadPane).toHaveClass(/open/)
-    await expect(page.locator('.channel-execution')).toContainText('killed · depth 0')
 
-    await page.getByRole('button', { name: 'Close thread' }).click()
+    await page.getByRole('button', { name: 'Close focused thread' }).click()
     const composer = page.getByLabel('New channel message')
     await composer.fill('Build a silent ending that earns the final held look.')
     await composer.press('Control+Enter')
-    await expect(page.locator('.channel-thread-pane')).toContainText('Build a silent ending that earns the final held look.')
-    expect(state.posts).toHaveLength(1)
+    await expect(page.getByLabel('Reply to thread: Build a silent ending that earns the final held look.')).toBeVisible()
+    expect(state.posts).toHaveLength(2)
   })
 
   test('Activity behaves as a triage inbox rather than another feed', async ({ page }) => {
@@ -337,7 +383,7 @@ test.describe('Channels PWA', () => {
     await expect(blocked).toHaveAttribute('title', 'Allow notifications in browser settings')
   })
 
-  test('mobile thread is full-screen and preserves direct navigation', async ({ page }) => {
+  test('mobile supports inline replies and a full-screen focused thread', async ({ page }) => {
     const state = fixtureState()
     const longResult = `Continuity audit begins here. ${'A verified detail follows. '.repeat(120)}`
     state.threads.get('root-1').messages.at(-1).content = longResult
@@ -353,16 +399,18 @@ test.describe('Channels PWA', () => {
     await expect(mobileNav.getByRole('button', { name: 'DMs' })).toBeVisible()
 
     await page.getByRole('button', { name: /2 replies/ }).click()
+    await expect(page.getByRole('region', { name: /Expanded thread:/ })).toBeVisible()
+    await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
     const pane = page.locator('.channel-thread-pane')
-    await expect(pane).toHaveClass(/open/)
+    await expect(pane).toBeVisible()
     await expect(pane).toHaveCSS('position', 'absolute')
     await expect(pane.getByText('Continuity audit begins here.', { exact: false })).toBeVisible()
     const scrollerBox = await pane.locator('.channel-thread-messages').boundingBox()
     const latestBox = await pane.locator('.channel-thread-messages .channel-message').last().boundingBox()
     expect(latestBox.y).toBeGreaterThanOrEqual(scrollerBox.y - 1)
     expect(latestBox.y).toBeLessThan(scrollerBox.y + scrollerBox.height)
-    await pane.getByRole('button', { name: 'Close thread' }).click()
-    await expect(pane).not.toHaveClass(/open/)
+    await pane.getByRole('button', { name: 'Close focused thread' }).click()
+    await expect(pane).toHaveCount(0)
   })
 
   test('mobile composer shows typed text and sends pasted images', async ({ page }) => {
@@ -414,6 +462,6 @@ test.describe('Channels PWA', () => {
     expect(state.posts[0].content).toContain('See the keyboard screenshot.')
     expect(state.posts[0].content).toContain(`/api/channels/${channel.id}/attachments/${state.attachments[0].id}`)
     await expect(page.locator('.channel-image-preview')).toHaveCount(0)
-    await expect(page.locator('.channel-thread-pane .markdown img[alt="mobile-screenshot.png"]')).toBeVisible()
+    await expect(page.locator('.channel-timeline .markdown img[alt="mobile-screenshot.png"]')).toBeVisible()
   })
 })
