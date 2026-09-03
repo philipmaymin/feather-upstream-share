@@ -137,6 +137,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [rootImages, setRootImages] = createSignal<PendingChannelImage[]>([])
   const [replyImages, setReplyImages] = createSignal<PendingChannelImage[]>([])
   const [sending, setSending] = createSignal(false)
+  const [attentionAction, setAttentionAction] = createSignal<'follow' | 'done' | 'snooze' | null>(null)
   const [dialog, setDialog] = createSignal<DialogKind>(null)
   const [dialogValue, setDialogValue] = createSignal('')
   const [dialogTitle, setDialogTitle] = createSignal('')
@@ -457,13 +458,24 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
   async function setAttention(action: 'follow' | 'done' | 'snooze', value = true) {
     const current = thread()
-    if (!current) return
+    if (!current || attentionAction()) return
     const until = action === 'snooze' && value ? new Date(Date.now() + 60 * 60 * 1000).toISOString() : null
+    const optimistic = {
+      ...current,
+      ...(action === 'follow' ? { following: value } : {}),
+      ...(action === 'done' ? { doneAt: value ? new Date().toISOString() : null } : {}),
+      ...(action === 'snooze' ? { snoozedUntil: until } : {}),
+    }
+    setAttentionAction(action)
+    setThread(optimistic)
     try {
       setThread(await updateChannelAttention(current.channelId, current.id, action, value, until))
       queueRefresh()
     } catch (reason) {
+      if (thread()?.id === current.id) setThread(current)
       setError(reason instanceof Error ? reason.message : 'Thread state could not be changed')
+    } finally {
+      setAttentionAction(null)
     }
   }
 
@@ -981,9 +993,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             </header>
 
             <div class="channel-thread-actions">
-              <button type="button" classList={{ active: current().following }} aria-pressed={current().following} onClick={() => void setAttention('follow', !current().following)}>{current().following ? 'Following' : 'Follow'}</button>
-              <button type="button" classList={{ active: activeSnooze(current().snoozedUntil) }} aria-pressed={activeSnooze(current().snoozedUntil)} onClick={() => void setAttention('snooze', !activeSnooze(current().snoozedUntil))}>{activeSnooze(current().snoozedUntil) ? 'Snoozed 1h' : 'Snooze'}</button>
-              <button type="button" class="channel-done" classList={{ active: !!current().doneAt }} aria-pressed={!!current().doneAt} onClick={() => void setAttention('done', !current().doneAt)}>{current().doneAt ? 'Reopen' : 'Done'}</button>
+              <button type="button" disabled={!!attentionAction()} classList={{ active: current().following }} aria-pressed={current().following} onClick={() => void setAttention('follow', !current().following)}>{current().following ? 'Following' : 'Follow'}</button>
+              <button type="button" disabled={!!attentionAction()} classList={{ active: activeSnooze(current().snoozedUntil) }} aria-pressed={activeSnooze(current().snoozedUntil)} onClick={() => void setAttention('snooze', !activeSnooze(current().snoozedUntil))}>{activeSnooze(current().snoozedUntil) ? 'Snoozed 1h' : 'Snooze'}</button>
+              <button type="button" disabled={!!attentionAction()} class="channel-done" classList={{ active: !!current().doneAt }} aria-pressed={!!current().doneAt} onClick={() => void setAttention('done', !current().doneAt)}>{current().doneAt ? 'Reopen' : 'Done'}</button>
             </div>
 
             <section class="channel-thread-messages" ref={threadScroller}>
