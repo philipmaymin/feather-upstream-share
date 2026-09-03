@@ -59,8 +59,11 @@ async function installChannels(page, state) {
     const request = route.request()
     const url = new URL(request.url())
     const pathname = url.pathname
-    if (pathname === '/api/me') return route.fulfill({ json: { username: 'philip', admin: true } })
-    if (pathname === '/api/channels' && request.method() === 'GET') return route.fulfill({ json: { channels: [channel], dms: [], principal: philip } })
+    if (pathname === '/api/me') {
+      if (state.authDelay) await new Promise(resolve => setTimeout(resolve, state.authDelay))
+      return route.fulfill({ json: state.user || { username: 'philip', admin: true } })
+    }
+    if (pathname === '/api/channels' && request.method() === 'GET') return route.fulfill({ json: { channels: [channel], dms: [], principal: state.principal || philip } })
     if (pathname === '/api/channels/activity') return route.fulfill({ json: { items: state.activity, unread: state.activity.filter(item => !item.readAt && !item.doneAt).length, needsYou: 0 } })
     if (pathname === '/api/channels/principals') return route.fulfill({ json: { principals: [philip, coordinator, caretaker] } })
     if (pathname === '/api/channels/stream') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'event: connected\ndata: {}\n\n' })
@@ -121,9 +124,15 @@ test.describe('Channels PWA', () => {
     await expect(page.getByText('What dramatic question should the opening make impossible to ignore?')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Rooms' })).toHaveCount(0)
     await expect(page.locator('.channels-root')).not.toHaveClass(/channel-thread-open/)
+    const mainWidthBefore = await page.locator('.channels-main').evaluate(element => element.getBoundingClientRect().width)
 
     await page.getByRole('button', { name: /2 replies/ }).click()
     await expect(page.locator('.channels-root')).toHaveClass(/channel-thread-open/)
+    const mainWidthAfter = await page.locator('.channels-main').evaluate(element => element.getBoundingClientRect().width)
+    expect(mainWidthAfter).toBe(mainWidthBefore)
+    await expect(page.locator('.channel-thread-messages .channel-message')).toHaveCount(3)
+    expect(await page.locator('.channel-thread-messages .channel-message').evaluateAll(elements =>
+      elements.every(element => getComputedStyle(element).opacity === '1'))).toBe(true)
     await expect(page.locator('.channel-thread-pane').getByText('Agent', { exact: true }).first()).toBeVisible()
     await expect(page.locator('.channel-thread-pane')).toContainText('Agent work · 1 turn')
     await expect(page.locator('.channel-execution')).toContainText('@coordinator')
@@ -150,8 +159,26 @@ test.describe('Channels PWA', () => {
     await expect(page.getByRole('heading', { name: 'Nothing is waiting on you' })).toBeVisible()
   })
 
+  test('waits for shared identity before mounting role-specific navigation', async ({ page }) => {
+    const state = fixtureState()
+    state.authDelay = 400
+    state.user = { username: 'maya', admin: false }
+    state.principal = { ...philip, id: 'human:maya', username: 'maya', displayName: 'Maya', role: 'member' }
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    await expect(page.locator('.channels-boot')).toBeVisible()
+    await expect(page.getByTestId('channels-home')).toBeVisible()
+    await expect(page.locator('.channels-root')).not.toHaveClass(/channels-root-personal/)
+    await expect(page.locator('.channels-mobile-nav').getByRole('button', { name: 'Runs' })).toHaveCount(0)
+  })
+
   test('mobile thread is full-screen and preserves direct navigation', async ({ page }) => {
     const state = fixtureState()
+    const longResult = `Continuity audit begins here. ${'A verified detail follows. '.repeat(120)}`
+    state.threads.get('root-1').messages.at(-1).content = longResult
+    state.roots[1].replies.at(-1).content = longResult
     await installChannels(page, state)
     await page.setViewportSize({ width: 390, height: 844 })
     await page.goto(`${BASE}/?app=fledge&surface=channels`)
@@ -166,7 +193,11 @@ test.describe('Channels PWA', () => {
     const pane = page.locator('.channel-thread-pane')
     await expect(pane).toHaveClass(/open/)
     await expect(pane).toHaveCSS('position', 'fixed')
-    await expect(pane.getByText('Continuity holds if the unopened letter remains visible in both shots.')).toBeVisible()
+    await expect(pane.getByText('Continuity audit begins here.', { exact: false })).toBeVisible()
+    const scrollerBox = await pane.locator('.channel-thread-messages').boundingBox()
+    const latestBox = await pane.locator('.channel-thread-messages .channel-message').last().boundingBox()
+    expect(latestBox.y).toBeGreaterThanOrEqual(scrollerBox.y - 1)
+    expect(latestBox.y).toBeLessThan(scrollerBox.y + scrollerBox.height)
     await pane.getByRole('button', { name: 'Close thread' }).click()
     await expect(pane).not.toHaveClass(/open/)
   })

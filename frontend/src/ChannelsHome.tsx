@@ -1,4 +1,4 @@
-import { For, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
+import { For, Index, Show, createMemo, createSignal, onCleanup, onMount } from 'solid-js'
 import {
   addChannelMember,
   bootstrapFilms7,
@@ -120,7 +120,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [pushState, setPushState] = createSignal<'idle' | 'enabling' | 'enabled' | 'denied' | 'error' | 'unavailable'>('idle')
   const [announcement, setAnnouncement] = createSignal('')
   let refreshTimer: number | undefined
+  let threadScroller: HTMLElement | undefined
   let loadGeneration = 0
+  const readMessageByThread = new Map<string, string>()
 
   const allChannels = createMemo(() => [...snapshot().channels, ...snapshot().dms])
   const selectedChannel = createMemo(() => allChannels().find(channel => channel.id === selectedChannelId()) || null)
@@ -150,10 +152,29 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   async function loadThread(channelId: string, rootId: string, generation = loadGeneration) {
     const next = await fetchChannelThread(channelId, rootId)
     if (generation !== loadGeneration || selectedChannelId() !== channelId) return
+    const openingThread = thread()?.id !== rootId
+    const pinnedToLatest = !threadScroller
+      || threadScroller.scrollHeight - threadScroller.scrollTop - threadScroller.clientHeight < 96
     setThread(next)
     setTitleDraft(next.title)
-    if (next.messages.length) {
-      await updateChannelAttention(channelId, rootId, 'read').catch(() => null)
+    if (openingThread || pinnedToLatest) {
+      queueMicrotask(() => requestAnimationFrame(() => {
+        if (thread()?.id !== rootId || !threadScroller) return
+        const messages = threadScroller.querySelectorAll<HTMLElement>(':scope > .channel-message')
+        const latest = messages.item(messages.length - 1)
+        if (latest && latest.offsetHeight > threadScroller.clientHeight - 24) {
+          latest.scrollIntoView({ block: 'start' })
+        } else {
+          threadScroller.scrollTop = threadScroller.scrollHeight
+        }
+      }))
+    }
+    const lastMessageId = next.messages.at(-1)?.id
+    if (lastMessageId && readMessageByThread.get(rootId) !== lastMessageId) {
+      readMessageByThread.set(rootId, lastMessageId)
+      await updateChannelAttention(channelId, rootId, 'read').catch(() => {
+        if (readMessageByThread.get(rootId) === lastMessageId) readMessageByThread.delete(rootId)
+      })
     }
   }
 
@@ -303,7 +324,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const until = action === 'snooze' ? new Date(Date.now() + 60 * 60 * 1000).toISOString() : null
     try {
       setThread(await updateChannelAttention(current.channelId, current.id, action, value, until))
-      await refresh()
+      queueRefresh()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Thread state could not be changed')
     }
@@ -314,7 +335,11 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     try {
       await updateChannelAttention(item.channel.id, item.thread.id, snooze ? 'snooze' : 'done', true,
         snooze ? new Date(Date.now() + 60 * 60 * 1000).toISOString() : null)
-      await refresh()
+      setActivity(current => {
+        const items = current.items.filter(candidate => candidate.thread?.id !== item.thread?.id)
+        return { ...current, items, unread: items.filter(candidate => !candidate.readAt).length }
+      })
+      queueRefresh()
       setAnnouncement(snooze ? 'Thread snoozed for one hour.' : 'Thread marked done.')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Activity state could not be changed')
@@ -660,13 +685,19 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
         <Show when={section() === 'channels' || section() === 'dms'}>
           <Show when={selectedChannel()} fallback={
-            <div class="channel-empty channel-empty-full">
-              <span class="channel-empty-rule" /><small>Fresh workspace</small>
-              <h1>{section() === 'dms' ? 'No direct messages yet' : snapshot().principal?.username === 'philip' ? 'Open the Films 7 studio' : 'No shared channels yet'}</h1>
-              <p>{section() === 'dms' ? 'Start a private line with any human or agent who shares a channel with you.' : 'One timeline for humans and agents. Work branches into flat, readable threads.'}</p>
-              <Show when={section() === 'dms'}><button type="button" onClick={() => openDialog('dm')}>Start a direct message</button></Show>
-              <Show when={section() !== 'dms' && snapshot().principal?.username === 'philip'}><button type="button" onClick={() => void createPilot()}>Create #films7</button></Show>
-            </div>
+            <Show when={!loading()} fallback={
+              <div class="channel-initial-loading" role="status" aria-label="Opening channels">
+                <span /><span /><span />
+              </div>
+            }>
+              <div class="channel-empty channel-empty-full">
+                <span class="channel-empty-rule" /><small>Fresh workspace</small>
+                <h1>{section() === 'dms' ? 'No direct messages yet' : snapshot().principal?.username === 'philip' ? 'Open the Films 7 studio' : 'No shared channels yet'}</h1>
+                <p>{section() === 'dms' ? 'Start a private line with any human or agent who shares a channel with you.' : 'One timeline for humans and agents. Work branches into flat, readable threads.'}</p>
+                <Show when={section() === 'dms'}><button type="button" onClick={() => openDialog('dm')}>Start a direct message</button></Show>
+                <Show when={section() !== 'dms' && snapshot().principal?.username === 'philip'}><button type="button" onClick={() => void createPilot()}>Create #films7</button></Show>
+              </div>
+            </Show>
           }>{channel => (
             <>
               <header class="channel-view-header channel-conversation-header">
@@ -686,7 +717,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                 <Show when={!loading() && roots().length === 0}>
                   <div class="channel-empty"><small>The first note</small><h2>Set the work in motion</h2><p>Ask plainly. The default agent will answer in a thread; mention another agent when its perspective matters.</p></div>
                 </Show>
-                <For each={roots()}>{message => renderMessage(message)}</For>
+                <Index each={roots()}>{message => renderMessage(message())}</Index>
               </section>
               {renderComposer(false)}
             </>
@@ -695,7 +726,13 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       </main>
 
       <aside class="channel-thread-pane" classList={{ open: !!thread() }} aria-label="Open thread">
-        <Show when={thread()}>{current => (
+        <Show when={thread()} fallback={
+          <div class="channel-thread-empty" aria-hidden="true">
+            <span class="channel-thread-empty-mark" />
+            <h2>Open a thread</h2>
+            <p>Replies, agent work, and decisions stay together here.</p>
+          </div>
+        }>{current => (
           <>
             <header class="channel-thread-header">
               <button type="button" class="channel-thread-back" onClick={closeThread} aria-label="Close thread">←</button>
@@ -721,8 +758,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
               <button type="button" class="channel-done" classList={{ active: !!current().doneAt }} onClick={() => void setAttention('done', !current().doneAt)}>{current().doneAt ? 'Reopen' : 'Done'}</button>
             </div>
 
-            <section class="channel-thread-messages">
-              <For each={current().messages}>{message => renderMessage(message, true)}</For>
+            <section class="channel-thread-messages" ref={threadScroller}>
+              <Index each={current().messages}>{message => renderMessage(message(), true)}</Index>
               <Show when={current().executions.length > 0}>
                 <details class="channel-worklog" open={current().executions.some(execution => execution.state === 'running' || execution.state === 'error')}>
                   <summary>

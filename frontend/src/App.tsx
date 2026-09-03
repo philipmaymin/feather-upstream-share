@@ -169,7 +169,7 @@ const isFledgeHost = isSharedAppHost || new URLSearchParams(location.search).get
 type HomeView = 'feed' | 'channels' | 'rooms'
 
 export default function App() {
-  const [authUser, setAuthUser] = createSignal<{ username: string; admin: boolean } | null>({ username: 'philip', admin: true })
+  const [authUser, setAuthUser] = createSignal<{ username: string; admin: boolean } | null>(null)
   const [authChecked, setAuthChecked] = createSignal(true)
   const [loginError, setLoginError] = createSignal('')
   const [loginLoading, setLoginLoading] = createSignal(false)
@@ -702,16 +702,18 @@ export default function App() {
     // Legacy Rooms remain in personal Feather. The shared app mounts Channels
     // directly and must not pay for or expose the old Room directory.
     if (!isFledgeHost) fetchRooms().catch(() => {})
-    // Caddy/Authelia is the authentication boundary. Direct loopback access is
-    // intentionally the Philip instance, so informational identity lookup must
-    // never block the UI from mounting.
-    setAuthUser({ username: 'philip', admin: true })
+    // Resolve identity before mounting the shared shell. Rendering Philip-only
+    // controls optimistically made other humans watch the header and mobile
+    // navigation rearrange after every cold load.
     setAuthChecked(true)
     void checkAuth().then(user => {
-      const authenticated = user || { username: 'philip', admin: true }
+      const authenticated = user || (isFledgeHost
+        ? { username: 'unknown', admin: false }
+        : { username: 'philip', admin: true })
       setAuthUser(authenticated)
       if (!isFledgeHost || authenticated.username === 'philip') return initApp()
     }).catch(() => {
+      setAuthUser(isFledgeHost ? { username: 'unknown', admin: false } : { username: 'philip', admin: true })
       if (!isFledgeHost) void initApp()
     })
     // Check for updates every 30 seconds
@@ -2461,12 +2463,16 @@ export default function App() {
                   codexAvailable={codexAvailable()}
                 />
               }>
-                <ChannelsHome
-                  onFeed={() => openFledgeSurface('feed')}
-                  onMenu={() => setSidebar(true)}
-                  onNewChat={() => handleNew(false, 'omp')}
-                  showPersonal={authUser()?.username === 'philip'}
-                />
+                <Show when={authUser()} fallback={<div class="channels-boot" role="status" aria-label="Opening shared workspace"><span /><span /><span /></div>}>
+                  {user => (
+                    <ChannelsHome
+                      onFeed={() => openFledgeSurface('feed')}
+                      onMenu={() => setSidebar(true)}
+                      onNewChat={() => handleNew(false, 'omp')}
+                      showPersonal={user().username === 'philip'}
+                    />
+                  )}
+                </Show>
               </Show>
             }>
               <FeedHome

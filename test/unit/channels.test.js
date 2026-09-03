@@ -106,6 +106,36 @@ describe('channel event store', () => {
     assert.equal(activity[0].updates, 2)
   })
 
+  it('recognizes Markdown-styled agent requests as Needs you', () => {
+    const { store, philip, channel } = setup()
+    const maya = store.addHumanMember({
+      channelId: channel.id,
+      actorId: philip.id,
+      username: 'maya',
+      displayName: 'Maya',
+    }).principal
+    const root = store.postMessage({
+      channelId: channel.id,
+      authorId: philip.id,
+      content: 'Tell me which ending needs a decision.',
+      messageType: 'human',
+      idempotencyKey: 'client:needs-you',
+    })
+    const dispatch = store.claimDispatch()
+    store.completeExecution({
+      executionId: dispatch.executionId,
+      content: '**NEEDS YOU:** Choose whether the final look lands before or after the cut.',
+    })
+
+    assert.equal(store.getThread(root.id, philip.id).state, 'needs_you')
+    assert.equal(store.listActivity(philip.id)[0].kind, 'needs_you')
+    assert.equal(store.listActivity(maya.id).length, 0, 'Needs you targets thread participants, not every channel member')
+    store.updateThread({ rootId: root.id, actorId: philip.id, state: 'resolved' })
+    assert.equal(store.reconcileAgentAttentionSignals(), 1)
+    assert.equal(store.getThread(root.id, philip.id).state, 'needs_you')
+    assert.equal(store.reconcileAgentAttentionSignals(), 0)
+  })
+
   it('separates unread, follow, done, snooze, and notification reason', () => {
     const { store, philip, channel } = setup()
     const root = store.postMessage({
@@ -124,7 +154,8 @@ describe('channel event store', () => {
     assert.match(activity[0].reason, /as an agent/)
     assert.equal(activity[0].actor.kind, 'agent')
 
-    store.updateThreadAttention({ rootId: root.id, principalId: philip.id, action: 'read' })
+    assert.equal(store.updateThreadAttention({ rootId: root.id, principalId: philip.id, action: 'read' }).changed, true)
+    assert.equal(store.updateThreadAttention({ rootId: root.id, principalId: philip.id, action: 'read' }).changed, false, 're-reading an unchanged thread is a no-op')
     let thread = store.getThread(root.id, philip.id)
     assert.equal(thread.following, true)
 
