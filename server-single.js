@@ -5431,7 +5431,10 @@ app.get('/api/sessions', (req, res) => {
     }
     const channelWorkspaceRoot = path.resolve(STATE_PATHS.workspace.channelWorkspacesDir) + path.sep;
     const channelAgentSessionIds = channels.agentSessionIds();
+    const roomResidentSessionIds = new Set(Object.values(ROOM_RESIDENTS_STATE.read())
+      .flatMap(residents => Object.values(residents).map(resident => resident.sessionId)));
     sessions = sessions.filter(session => !channelAgentSessionIds.has(session.id)
+      && !roomResidentSessionIds.has(session.id)
       && !String(session.cwd || '').startsWith(channelWorkspaceRoot));
     res.json({ sessions });
   }
