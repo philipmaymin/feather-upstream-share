@@ -66,6 +66,10 @@ const configuredPulseMax = Number(process.env.FEATHER_ROOM_PULSE_MAX_CONCURRENT)
 const ROOM_PULSE_MAX_CONCURRENT = Math.max(1, Number.isFinite(configuredPulseMax) && configuredPulseMax > 0
   ? Math.floor(configuredPulseMax) : 3);
 const ROOM_PULSE_STARTED_AT = Date.now();
+const configuredChannelTurnLimit = Number(process.env.FEATHER_CHANNEL_TURN_LIMIT_MS);
+const CHANNEL_TURN_LIMIT_MS = Number.isFinite(configuredChannelTurnLimit) && configuredChannelTurnLimit > 0
+  ? Math.floor(configuredChannelTurnLimit)
+  : null;
 const READ_ONLY_ERROR = Object.freeze({ error: 'read-only canary', code: 'FEATHER_READ_ONLY' });
 const SESSION_READ_ROUTE = /^\/api\/sessions\/[^/]+\/(messages|stream|export|protocol-runs)$/;
 const SESSION_ROOM_ROUTE = /^\/api\/sessions\/[^/]+\/room$/;
@@ -1290,14 +1294,16 @@ async function runChannelDispatch(item) {
       spawnOrResume(item.agent.sessionId, workspace, !!getOmpSessionId(item.agent.sessionId), 'omp');
     }
     await sendInputToSessionIdempotent(item.agent.sessionId, channelAgentPrompt(item), item.executionId);
-    const timer = setTimeout(() => {
-      channelAgentTimers.delete(item.executionId);
-      channels.failExecution(item.executionId, 'Agent exceeded the 15-minute channel turn limit');
-      emitChannelChange(item.channelId, 'execution');
-      deliverChannelSignal(item.threadRootId, 'failure').catch(() => {});
-    }, 15 * 60 * 1000);
-    timer.unref();
-    channelAgentTimers.set(item.executionId, timer);
+    if (CHANNEL_TURN_LIMIT_MS) {
+      const timer = setTimeout(() => {
+        channelAgentTimers.delete(item.executionId);
+        channels.failExecution(item.executionId, 'Agent exceeded the configured channel turn limit');
+        emitChannelChange(item.channelId, 'execution');
+        deliverChannelSignal(item.threadRootId, 'failure').catch(() => {});
+      }, CHANNEL_TURN_LIMIT_MS);
+      timer.unref();
+      channelAgentTimers.set(item.executionId, timer);
+    }
     emitChannelChange(item.channelId, 'execution');
   } catch (error) {
     channels.failExecution(item.executionId, error.message);
@@ -2687,6 +2693,7 @@ app.get('/api/health', (_req, res) => res.json({
     backgroundControllers: !READ_ONLY_MODE,
     maxUploadBytes: MAX_UPLOAD_BYTES,
     maxAudioBytes: MAX_AUDIO_BYTES,
+    channelTurnLimitMs: CHANNEL_TURN_LIMIT_MS,
   },
 }));
 

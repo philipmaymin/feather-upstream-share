@@ -1,3 +1,6 @@
+## 2026-09-04 - Long-running channel work
+- **Channel agents no longer fail after an arbitrary 15-minute wall-clock deadline.** Turns run until the agent completes or a member stops them; operators can still opt into a hard deadline with `FEATHER_CHANNEL_TURN_LIMIT_MS`, and `/api/health` reports the effective value.
+
 ## 2026-09-04 - Direct-message read receipts
 - **Opening a direct message now clears its unread notification.** Fledge acknowledges every unread thread shown in the visible DM conversation, then reconciles the Activity, document-title, app, and conversation badges; background tabs and other channel views do not consume unread DMs.
 

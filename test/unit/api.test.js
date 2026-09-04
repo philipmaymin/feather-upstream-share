@@ -385,6 +385,7 @@ describe('GET /api/health', () => {
     assert.ok(body.uptime > 0)
     assert.equal(body.capabilities.maxUploadBytes, 50 * 1024 * 1024)
     assert.equal(body.capabilities.maxAudioBytes, 25 * 1024 * 1024)
+    assert.equal(body.capabilities.channelTurnLimitMs, null)
   })
 })
 describe('push subscription security', () => {
