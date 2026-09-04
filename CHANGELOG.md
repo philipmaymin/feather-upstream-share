@@ -1,3 +1,6 @@
+## 2026-09-04 - Reliable channel creation
+- **New channels no longer fall through to the “Create your first channel” screen.** Fledge now commits the server-confirmed channel to local navigation state before opening it, so overlapping live refreshes cannot invalidate both the creation refresh and the destination transition; direct-message creation uses the same race-safe handoff.
+
 ## 2026-09-04 - Long-running channel work
 - **Channel agents no longer fail after an arbitrary 15-minute wall-clock deadline.** Turns run until the agent completes or a member stops them; operators can still opt into a hard deadline with `FEATHER_CHANNEL_TURN_LIMIT_MS`, and `/api/health` reports the effective value.
 

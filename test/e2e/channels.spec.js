@@ -98,6 +98,8 @@ async function installChannels(page, state) {
     }
     if (pathname === '/api/channels' && request.method() === 'GET') {
       state.channelGets = (state.channelGets || 0) + 1
+      const gate = state.channelGetGates?.[state.channelGets]
+      if (gate) await gate
       return route.fulfill({ json: { channels: state.channels || [channel], dms: state.dms || [], principal: state.principal || philip } })
     }
     if (pathname === '/api/channels' && request.method() === 'POST' && state.createdChannel) {
@@ -499,6 +501,38 @@ test.describe('Channels PWA', () => {
     await expect(memberCluster.locator('[title="Coordinator · agent"]')).toBeVisible()
     await expect(memberCluster.locator('[title="Btw · agent"]')).toBeVisible()
     await expect(memberCluster.locator('[title="Caretaker · agent"]')).toBeVisible()
+  })
+
+  test('a created channel survives overlapping live refreshes', async ({ page }) => {
+    const state = fixtureState()
+    state.createdChannel = {
+      ...channel,
+      id: 'channel-overlap',
+      slug: 'overlap',
+      title: 'Overlap',
+      unread: 0,
+    }
+    let releaseFirstRefresh = () => {}
+    let releaseSecondRefresh = () => {}
+    state.channelGetGates = {
+      2: new Promise(resolve => { releaseFirstRefresh = resolve }),
+      3: new Promise(resolve => { releaseSecondRefresh = resolve }),
+    }
+    await installChannels(page, state)
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    await page.getByRole('button', { name: 'Create channel', exact: true }).click()
+    await page.getByRole('textbox', { name: 'Channel name' }).fill('Overlap')
+    await page.locator('.channel-dialog-submit').click()
+    await expect.poll(() => state.channelGets).toBe(2)
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+    await expect.poll(() => state.channelGets).toBe(3)
+    releaseFirstRefresh()
+    await expect.poll(() => new URL(page.url()).searchParams.get('channel')).toBe(state.createdChannel.id)
+    releaseSecondRefresh()
+
+    await expect(page.getByRole('heading', { name: '#overlap' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Create your first channel' })).toHaveCount(0)
   })
 
   test('keeps a created channel visible when agent staffing fails', async ({ page }) => {

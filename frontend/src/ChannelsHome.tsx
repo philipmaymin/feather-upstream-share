@@ -207,6 +207,14 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     ? activity().items.filter(item => item.kind === 'needs_you' || item.kind === 'failure' || item.kind === 'mention')
     : activity().items)
   const currentHumanIsOwner = createMemo(() => selectedChannel()?.members.some(member => member.id === snapshot().principal?.id && member.role === 'owner'))
+
+  function rememberChannel(channel: ChannelInfo) {
+    if (channel.type === 'dm') {
+      setSnapshot(current => ({ ...current, dms: [...current.dms.filter(item => item.id !== channel.id), channel] }))
+      return
+    }
+    setSnapshot(current => ({ ...current, channels: [...current.channels.filter(item => item.id !== channel.id), channel] }))
+  }
   const notificationDisabled = createMemo(() => ['enabling', 'enabled', 'denied', 'unavailable'].includes(pushState()))
   const notificationLabel = createMemo(() => {
     if (pushState() === 'enabled') return 'Notifications on'
@@ -735,8 +743,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       if (kind === 'channel') {
         const slug = value.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '')
         const result = await createChannel({ slug, title: dialogTitle().trim() || value })
-        await refresh()
+        rememberChannel(result.channel)
         await chooseChannel(result.channel)
+        queueRefresh()
         if (result.staffing.status === 'failed') {
           setError(`Channel created, but its agents could not start: ${result.staffing.error || 'unknown error'}`)
         }
@@ -760,9 +769,10 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setDialogError('')
     try {
       const channel = await createChannelDm(principal.id)
+      rememberChannel(channel)
       setDialog(null)
-      await refresh()
       await chooseChannel(channel, 'dms')
+      queueRefresh()
     } catch (reason) {
       setDialogError(reason instanceof Error ? reason.message : 'Direct message could not be opened')
     } finally {
