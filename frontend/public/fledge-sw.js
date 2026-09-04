@@ -49,13 +49,24 @@ self.addEventListener('fetch', event => {
 self.addEventListener('push', event => {
   let payload = {}
   try { payload = event.data?.json() || {} } catch { payload = { body: event.data?.text() || '' } }
-  event.waitUntil(self.registration.showNotification(payload.title || 'Fledge', {
+  const tasks = [self.registration.showNotification(payload.title || 'Fledge', {
     body: payload.body || 'A new dispatch is ready.',
     tag: payload.tag || 'fledge-dispatch',
     icon: '/fledge-icon-192.png',
     badge: '/fledge-icon-192.png',
     data: { url: payload.url || '/' },
-  }))
+  })]
+  const badgeCount = Number(payload.badgeCount)
+  if (Number.isSafeInteger(badgeCount) && badgeCount >= 0) {
+    if (badgeCount > 0 && 'setAppBadge' in self.navigator) {
+      tasks.push(self.navigator.setAppBadge(badgeCount))
+    } else if (badgeCount === 0 && 'clearAppBadge' in self.navigator) {
+      tasks.push(self.navigator.clearAppBadge())
+    } else if (badgeCount === 0 && 'setAppBadge' in self.navigator) {
+      tasks.push(self.navigator.setAppBadge(0))
+    }
+  }
+  event.waitUntil(Promise.all(tasks))
 })
 
 self.addEventListener('notificationclick', event => {

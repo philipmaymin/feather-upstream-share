@@ -167,7 +167,12 @@ async function installChannels(page, state) {
       }
       if (body.action === 'follow') current.following = body.value
       if (body.action === 'snooze') current.snoozedUntil = body.until
-      if (body.action === 'read') state.activity = state.activity.map(item => item.thread?.id === current.id ? { ...item, readAt: NOW } : item)
+      if (body.action === 'read') {
+        current.lastReadSeq = Math.max(0, ...current.messages.map(message => message.seq))
+        const root = state.roots.find(candidate => candidate.id === current.id)
+        if (root?.thread) root.thread.unread = false
+        state.activity = state.activity.map(item => item.thread?.id === current.id ? { ...item, readAt: NOW } : item)
+      }
       return route.fulfill({ json: { thread: current } })
     }
     if (pathname === '/api/channels/executions/execution-1/peek' && request.method() === 'GET') {
@@ -495,6 +500,30 @@ test.describe('Channels PWA', () => {
     await card.getByRole('button', { name: 'Hide replies' }).click()
     await expect(card.locator('.channel-message-body img')).toHaveCount(0)
     await expect(summary).toBeVisible()
+  })
+
+  test('keeps the foreground app icon badge synchronized with unread threads', async ({ page }) => {
+    const state = fixtureState()
+    const focused = state.threads.get('root-1')
+    focused.messages = focused.messages.map((item, index) => ({ ...item, seq: index + 1 }))
+    focused.lastReadSeq = 1
+    await page.addInitScript(() => {
+      window.__fledgeBadgeCalls = []
+      Object.defineProperty(navigator, 'setAppBadge', {
+        configurable: true,
+        value: async count => { window.__fledgeBadgeCalls.push(['set', count]) },
+      })
+      Object.defineProperty(navigator, 'clearAppBadge', {
+        configurable: true,
+        value: async () => { window.__fledgeBadgeCalls.push(['clear']) },
+      })
+    })
+    await installChannels(page, state)
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    await expect.poll(() => page.evaluate(() => window.__fledgeBadgeCalls)).toContainEqual(['set', 1])
+    await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
+    await expect.poll(() => page.evaluate(() => window.__fledgeBadgeCalls)).toContainEqual(['clear'])
   })
 
   test('desktop dims settled read threads until they are expanded', async ({ page }) => {

@@ -5767,7 +5767,7 @@ app.get('/api/channels/activity', (req, res) => {
     });
     res.json({
       items,
-      unread: items.filter(item => !item.readAt && !item.doneAt).length,
+      unread: channels.unreadActivityCount(principal.id),
       needsYou: items.filter(item => item.kind === 'needs_you' || item.kind === 'failure').length,
     });
   } catch (error) {
@@ -7110,11 +7110,18 @@ app.delete('/api/push/subscribe', (req, res) => {
   }
 });
 
+function pushPayloadForUser(username, payload) {
+  return {
+    ...payload,
+    badgeCount: channels.unreadActivityCount(`human:${username || 'philip'}`),
+  };
+}
+
 async function pushToAll(payload) {
   const subs = readUserJson('push-subscriptions.json', []);
   if (!subs.length) return { results: [], removed: 0 };
   const keys = pushKeys();
-  const results = await Promise.all(subs.map(sub => webpush.send(sub, payload, keys)));
+  const results = await Promise.all(subs.map(sub => webpush.send(sub, pushPayloadForUser(sub.username, payload), keys)));
   const gone = new Set(results.filter(result => result.gone).map(result => result.endpoint));
   if (gone.size) {
     try { writeUserJson('push-subscriptions.json', subs.filter(sub => !gone.has(sub.endpoint))); } catch {}
@@ -7127,7 +7134,8 @@ async function pushToUser(username, payload) {
   const subs = all.filter(sub => (sub.username || 'philip') === username);
   if (!subs.length) return { results: [], removed: 0 };
   const keys = pushKeys();
-  const results = await Promise.all(subs.map(sub => webpush.send(sub, payload, keys)));
+  const personalized = pushPayloadForUser(username, payload);
+  const results = await Promise.all(subs.map(sub => webpush.send(sub, personalized, keys)));
   const gone = new Set(results.filter(result => result.gone).map(result => result.endpoint));
   if (gone.size) {
     try { writeUserJson('push-subscriptions.json', all.filter(sub => !gone.has(sub.endpoint))); } catch {}

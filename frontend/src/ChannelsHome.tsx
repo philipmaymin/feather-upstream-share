@@ -102,6 +102,18 @@ async function boundedBrowserWait<T>(promise: Promise<T>, message: string): Prom
   }
 }
 
+function syncAppBadge(count: number) {
+  if (typeof navigator === 'undefined') return
+  const appNavigator = navigator as Navigator & {
+    setAppBadge?: (count?: number) => Promise<void>
+    clearAppBadge?: () => Promise<void>
+  }
+  const badgeCount = Math.max(0, Math.floor(Number(count) || 0))
+  if (badgeCount > 0) appNavigator.setAppBadge?.(badgeCount).catch(() => {})
+  else if (appNavigator.clearAppBadge) appNavigator.clearAppBadge().catch(() => {})
+  else appNavigator.setAppBadge?.(0).catch(() => {})
+}
+
 function initials(principal: Pick<ChannelPrincipal, 'displayName'>) {
   return principal.displayName.split(/\s+/).slice(0, 2).map(part => part[0] || '').join('').toUpperCase()
 }
@@ -241,6 +253,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   let loadGeneration = 0
   let threadLoadRequest = 0
   const readMessageByThread = new Map<string, string>()
+  let appBadgeUnread = 0
 
   const allChannels = createMemo(() => [...snapshot().channels, ...snapshot().dms])
   const selectedChannel = createMemo(() => allChannels().find(channel => channel.id === selectedChannelId()) || null)
@@ -417,10 +430,17 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     }
     const lastMessageId = next.messages.at(-1)?.id
     if (lastMessageId && readMessageByThread.get(rootId) !== lastMessageId) {
+      const hadUnread = next.messages.some(message => message.seq > next.lastReadSeq)
       readMessageByThread.set(rootId, lastMessageId)
-      await updateChannelAttention(channelId, rootId, 'read').catch(() => {
+      try {
+        await updateChannelAttention(channelId, rootId, 'read')
+        if (hadUnread) {
+          appBadgeUnread = Math.max(0, appBadgeUnread - 1)
+          syncAppBadge(appBadgeUnread)
+        }
+      } catch {
         if (readMessageByThread.get(rootId) === lastMessageId) readMessageByThread.delete(rootId)
-      })
+      }
     }
   }
 
@@ -438,6 +458,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       setSnapshot(nextSnapshot)
       setActivity(nextActivity)
       setPrincipals(nextPrincipals)
+      appBadgeUnread = nextActivity.unread
       const requested = selectedChannelId()
       const fallback = section() === 'dms'
         ? nextSnapshot.dms[0]?.id || null
@@ -456,10 +477,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         setThread(null)
       }
       if (options.initial) updateLocation(section(), channelId, rootId, 'replace')
-      const badge = nextActivity.unread
-      const appNavigator = navigator as Navigator & { setAppBadge?: (count?: number) => Promise<void>; clearAppBadge?: () => Promise<void> }
-      if (badge > 0) appNavigator.setAppBadge?.(badge).catch(() => {})
-      else appNavigator.clearAppBadge?.().catch(() => {})
+      const badge = appBadgeUnread
+      syncAppBadge(badge)
       document.title = badge ? `(${badge}) Fledge` : 'Fledge'
     } catch (reason) {
       if (generation === loadGeneration) setError(reason instanceof Error ? reason.message : 'Channels could not be loaded')
@@ -942,7 +961,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       })
       if (!saved.ok) throw new Error('Subscription could not be saved')
       setPushState('enabled')
-      setAnnouncement('Notifications are on for mentions, direct messages, failures, and agent replies you asked for.')
+      syncAppBadge(appBadgeUnread)
+      setAnnouncement('Notifications and the app icon unread badge are on.')
     } catch {
       setPushState('error')
       setAnnouncement('Notifications could not be enabled. Try again.')

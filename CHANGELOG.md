@@ -1,3 +1,7 @@
+## 2026-09-04 - iOS PWA unread badges
+- **The installed Fledge web app now shows its unread count on the iOS Home Screen icon.** Every push carries the recipient’s exact durable unread-thread count, and the service worker sets or clears the app badge while Fledge is closed instead of waiting for the app to reopen.
+- **Foreground and background counts now reconcile to one source of truth.** Opening or finishing unread work clears the badge promptly, refreshing restores the exact count, and granting notification permission immediately applies the current count.
+
 ## 2026-09-04 - Resume unread threads where work changed
 - **Thread triage is complete without hiding newly created work.** The default `All` view ranks mentions, unread threads, decisions, failures, and active work first; one-tap `Needs attention`, `Mentions`, `Unread`, `Done`, and `All` filters expose live counts on mobile and desktop while read threads remain visually quieter.
 - **Opening an unread thread now lands at the first unread message instead of the beginning or end.** Fledge uses each member’s durable read cursor, shows two preceding messages for context, labels the boundary with a prominent `New since your last visit` divider, and reports the unread count in the focused-thread header.
