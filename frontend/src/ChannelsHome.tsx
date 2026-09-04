@@ -31,7 +31,7 @@ import './channels.css'
 
 type ChannelSection = 'activity' | 'channels' | 'threads' | 'dms'
 type DialogKind = 'channel' | 'dm' | 'members' | null
-type ChannelThreadFilter = 'needs' | 'open' | 'all'
+type ChannelThreadFilter = 'needs' | 'mentions' | 'unread' | 'done' | 'all'
 type PendingChannelImage = { id: string; file: File; previewUrl: string }
 const CHANNEL_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
 const MAX_CHANNEL_IMAGE_BYTES = 15 * 1024 * 1024
@@ -71,7 +71,8 @@ function channelSection(params: URLSearchParams): ChannelSection {
 
 function channelThreadFilter(params: URLSearchParams): ChannelThreadFilter {
   const filter = params.get('threadFilter')
-  return filter === 'needs' || filter === 'open' ? filter : 'all'
+  if (filter === 'needs' || filter === 'mentions' || filter === 'unread' || filter === 'done') return filter
+  return 'all'
 }
 
 function relativeTime(iso: string) {
@@ -127,21 +128,19 @@ function threadNeedsAttention(message: ChannelMessage) {
     && (thread.unread || thread.state === 'needs_you' || !!thread.recovery)
 }
 
-function threadIsOpen(message: ChannelMessage) {
-  return message.messageType !== 'system' && !!message.thread
-    && !message.thread.doneAt && message.thread.state !== 'resolved'
-}
-
 function threadIsActive(message: ChannelMessage) {
   const thread = message.thread
   return !!thread && (thread.state === 'working' || thread.delivery.activeCount > 0 || thread.delivery.queuedCount > 0)
 }
 
+
 function attentionPriority(message: ChannelMessage) {
-  if (message.thread?.recovery) return 4
-  if (message.thread?.state === 'needs_you') return 3
-  if (message.thread?.unread) return 2
-  return threadIsActive(message) ? 1 : 0
+  if (message.thread?.doneAt) return -1
+  if (message.thread?.recovery) return 6
+  if (message.thread?.state === 'needs_you') return 5
+  if (message.thread?.mentioned) return 4
+  if (message.thread?.unread) return 3
+  return threadIsActive(message) ? 2 : 0
 }
 
 function pushKey(value: string): ArrayBuffer {
@@ -251,25 +250,43 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     : activity().items)
   const threadCounts = createMemo(() => {
     let needs = 0
-    let open = 0
+    let mentions = 0
+    let unread = 0
+    let done = 0
     for (const message of roots()) {
+      if (message.messageType === 'system' || !message.thread) continue
       if (threadNeedsAttention(message)) needs += 1
-      if (threadIsOpen(message)) open += 1
+      if (message.thread.mentioned) mentions += 1
+      if (message.thread.unread) unread += 1
+      if (message.thread.doneAt) done += 1
     }
-    return { needs, open, all: roots().length }
+    return { needs, mentions, unread, done, all: roots().length }
   })
   const visibleRoots = createMemo(() => {
     const filter = threadFilter()
-    if (filter === 'all') return roots()
-    const visible = roots().filter(message => filter === 'needs' ? threadNeedsAttention(message) : threadIsOpen(message))
-    if (filter === 'needs') {
-      visible.sort((left, right) => attentionPriority(right) - attentionPriority(left)
-        || Date.parse(right.thread?.updatedAt || right.createdAt) - Date.parse(left.thread?.updatedAt || left.createdAt))
-    }
-    return visible
+    const visible = roots().filter(message => {
+      if (filter === 'all') return true
+      if (filter === 'needs') return threadNeedsAttention(message)
+      if (filter === 'mentions') return message.messageType !== 'system' && !!message.thread?.mentioned
+      if (filter === 'unread') return message.messageType !== 'system' && !!message.thread?.unread
+      return message.messageType !== 'system' && !!message.thread?.doneAt
+    })
+    return visible.sort((left, right) => attentionPriority(right) - attentionPriority(left)
+      || Date.parse(right.thread?.updatedAt || right.createdAt) - Date.parse(left.thread?.updatedAt || left.createdAt))
   })
-  const nextUnreadRoot = createMemo(() => roots().find(message =>
-    message.messageType !== 'system' && message.thread?.unread && message.threadRootId !== thread()?.id) || null)
+  function unreadNeighbor(direction: -1 | 1) {
+    const messages = roots()
+    const currentIndex = messages.findIndex(message => message.threadRootId === thread()?.id)
+    if (currentIndex < 0) return null
+    for (let offset = 1; offset < messages.length; offset++) {
+      const index = (currentIndex + direction * offset + messages.length) % messages.length
+      const candidate = messages[index]
+      if (candidate.messageType !== 'system' && candidate.thread?.unread) return candidate
+    }
+    return null
+  }
+  const previousUnreadRoot = createMemo(() => unreadNeighbor(-1))
+  const nextUnreadRoot = createMemo(() => unreadNeighbor(1))
   const focusedThreadView = createMemo(() => {
     const current = thread()
     if (!current) return { messages: [] as ChannelMessage[], hiddenCount: 0, firstUnreadId: null as string | null, unreadCount: 0 }
@@ -1127,10 +1144,16 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     <div class="channel-thread-toolbar">
       <div class="channel-thread-filters" role="group" aria-label="Thread filters">
         <button type="button" classList={{ active: threadFilter() === 'needs' }} aria-pressed={threadFilter() === 'needs'} onClick={() => chooseThreadFilter('needs')}>
-          <span>Needs me</span><b>{threadCounts().needs}</b>
+          <span>Needs attention</span><b>{threadCounts().needs}</b>
         </button>
-        <button type="button" classList={{ active: threadFilter() === 'open' }} aria-pressed={threadFilter() === 'open'} onClick={() => chooseThreadFilter('open')}>
-          <span>Open</span><b>{threadCounts().open}</b>
+        <button type="button" classList={{ active: threadFilter() === 'mentions' }} aria-pressed={threadFilter() === 'mentions'} onClick={() => chooseThreadFilter('mentions')}>
+          <span>Mentions</span><b>{threadCounts().mentions}</b>
+        </button>
+        <button type="button" classList={{ active: threadFilter() === 'unread' }} aria-pressed={threadFilter() === 'unread'} onClick={() => chooseThreadFilter('unread')}>
+          <span>Unread</span><b>{threadCounts().unread}</b>
+        </button>
+        <button type="button" classList={{ active: threadFilter() === 'done' }} aria-pressed={threadFilter() === 'done'} onClick={() => chooseThreadFilter('done')}>
+          <span>Done</span><b>{threadCounts().done}</b>
         </button>
         <button type="button" classList={{ active: threadFilter() === 'all' }} aria-pressed={threadFilter() === 'all'} onClick={() => chooseThreadFilter('all')}>
           <span>All</span><b>{threadCounts().all}</b>
@@ -1140,15 +1163,24 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     </div>
   )
 
-  const renderFilteredEmpty = () => (
-    <Show when={!loading() && roots().length > 0 && visibleRoots().length === 0}>
-      <div class="channel-filter-empty" role="status">
-        <b>{threadFilter() === 'needs' ? 'Nothing needs you' : 'No open threads'}</b>
-        <span>{threadFilter() === 'needs' ? 'Unread replies, decisions, and failures will appear here.' : 'Every thread in this channel is resolved or done.'}</span>
-        <button type="button" onClick={() => chooseThreadFilter('all')}>Show all threads</button>
-      </div>
-    </Show>
-  )
+  const renderFilteredEmpty = () => {
+    const copy = () => ({
+      needs: ['Nothing needs you', 'Unread replies, decisions, and failures will appear here.'],
+      mentions: ['No new mentions', 'Unread threads that mention you will appear here.'],
+      unread: ['You’re caught up', 'Threads with new messages will appear here.'],
+      done: ['No done threads', 'Threads you mark Done will remain available here.'],
+      all: ['', ''],
+    }[threadFilter()])
+    return (
+      <Show when={!loading() && roots().length > 0 && visibleRoots().length === 0}>
+        <div class="channel-filter-empty" role="status">
+          <b>{copy()[0]}</b>
+          <span>{copy()[1]}</span>
+          <button type="button" onClick={() => chooseThreadFilter('all')}>Show all threads</button>
+        </div>
+      </Show>
+    )
+  }
 
   const renderExecution = (execution: ChannelExecution) => (
     <div class="channel-execution">
@@ -1403,11 +1435,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
           {renderThreadFilters()}
           <section class="channel-thread-index">
             {renderFilteredEmpty()}
-            <For each={[...visibleRoots()].sort((left, right) => (
-              threadFilter() === 'needs'
-                ? attentionPriority(right) - attentionPriority(left)
-                : Date.parse(right.thread?.updatedAt || right.createdAt) - Date.parse(left.thread?.updatedAt || left.createdAt)
-            ))}>{root => (
+            <For each={visibleRoots()}>{root => (
               <button type="button" class="channel-thread-index-row" classList={{
                 'needs-attention': threadNeedsAttention(root),
                 read: !root.thread?.unread,
@@ -1525,6 +1553,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             <div class="channel-thread-actions">
               <button type="button" disabled={!!attentionAction()} classList={{ active: current().following }} aria-pressed={current().following} onClick={() => void setAttention('follow', !current().following)}>{current().following ? 'Following' : 'Follow'}</button>
               <button type="button" disabled={!!attentionAction()} classList={{ active: activeSnooze(current().snoozedUntil) }} aria-pressed={activeSnooze(current().snoozedUntil)} onClick={() => void setAttention('snooze', !activeSnooze(current().snoozedUntil))}>{activeSnooze(current().snoozedUntil) ? 'Snoozed 1h' : 'Snooze'}</button>
+              <Show when={previousUnreadRoot()}>{previous => (
+                <button type="button" class="channel-previous-unread" onClick={() => void openThread(previous().threadRootId, previous().channelId)}>← Previous unread</button>
+              )}</Show>
               <Show when={nextUnreadRoot()}>{next => (
                 <button type="button" class="channel-next-unread" onClick={() => void openThread(next().threadRootId, next().channelId)}>Next unread →</button>
               )}</Show>

@@ -22,12 +22,12 @@ function message(id, author, content, rootId = id, type = author.kind === 'agent
 function fixtureState() {
   const bridge = {
     ...message('bridge', philip, 'Continuity bridge: the #films6 Wiki remains read-only historical context.', 'bridge', 'system'),
-    thread: { title: 'Continuity bridge', state: 'open', replyCount: 0, updatedAt: NOW, unread: false, following: true, doneAt: null, snoozedUntil: null, delivery: { queuedAgents: [], activeAgents: [], queuedCount: 0, activeCount: 0 }, recovery: null },
+    thread: { title: 'Continuity bridge', state: 'open', replyCount: 0, updatedAt: NOW, unread: false, mentioned: false, following: true, doneAt: null, snoozedUntil: null, delivery: { queuedAgents: [], activeAgents: [], queuedCount: 0, activeCount: 0 }, recovery: null },
     replies: [],
   }
   const root = {
     ...message('root-1', philip, 'What dramatic question should the opening make impossible to ignore?'),
-    thread: { title: 'The dramatic question in the opening', state: 'working', replyCount: 2, updatedAt: NOW, unread: true, following: true, doneAt: null, snoozedUntil: null, delivery: { queuedAgents: [btw], activeAgents: [coordinator], queuedCount: 1, activeCount: 1 }, recovery: null },
+    thread: { title: 'The dramatic question in the opening', state: 'working', replyCount: 2, updatedAt: NOW, unread: true, mentioned: false, following: true, doneAt: null, snoozedUntil: null, delivery: { queuedAgents: [btw], activeAgents: [coordinator], queuedCount: 1, activeCount: 1 }, recovery: null },
     replies: [
       message('reply-1', coordinator, 'The opening should ask whether she will trade the truth for belonging.', 'root-1'),
       message('reply-2', caretaker, 'Continuity holds if the unopened letter remains visible in both shots.', 'root-1'),
@@ -308,7 +308,7 @@ test.describe('Channels PWA', () => {
     const state = fixtureState()
     state.threadDelays = { 'root-1': 300, bridge: 10 }
     await installChannels(page, state)
-    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&threadFilter=all`)
 
     await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
     await page.getByRole('button', { name: 'Focus thread: Continuity bridge' }).click()
@@ -508,20 +508,23 @@ test.describe('Channels PWA', () => {
     const urgent = state.roots.find(candidate => candidate.id === 'root-1')
     urgent.content = 'Unread decision thread'
     urgent.thread.state = 'needs_you'
+    urgent.thread.mentioned = true
     urgent.thread.unread = true
     await installChannels(page, state)
-    await page.setViewportSize({ width: 1180, height: 820 })
-    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&threadFilter=all`)
 
     const filters = page.getByRole('group', { name: 'Thread filters' })
-    await expect(filters.getByRole('button', { name: /Needs me/ })).toContainText('1')
-    await expect(filters.getByRole('button', { name: /Open/ })).toContainText('1')
+    await expect(filters.getByRole('button', { name: /Needs attention/ })).toContainText('1')
+    await expect(filters.getByRole('button', { name: /Mentions/ })).toContainText('1')
+    await expect(filters.getByRole('button', { name: /Unread/ })).toContainText('1')
+    await expect(filters.getByRole('button', { name: /Done/ })).toContainText('1')
     await expect(filters.getByRole('button', { name: /All/ })).toContainText('2')
     const settledCard = page.locator('.channel-message').filter({ hasText: 'Settled reference thread' })
     const urgentCard = page.locator('.channel-message').filter({ hasText: 'Unread decision thread' })
     await expect(settledCard).toHaveClass(/channel-message-settled/)
     await expect(settledCard).toHaveClass(/channel-message-read/)
     await expect(urgentCard).toHaveClass(/channel-message-needs-attention/)
+    await expect(page.locator('.channel-timeline > .channel-message').first()).toContainText('Unread decision thread')
     expect(await settledCard.locator('.channel-message-content').evaluate(element => Number(getComputedStyle(element).opacity))).toBeLessThan(0.7)
     await settledCard.getByRole('button', { name: 'Reply', exact: true }).click()
     await expect(settledCard).toHaveClass(/channel-message-expanded/)
@@ -530,15 +533,20 @@ test.describe('Channels PWA', () => {
     expect(await settledCard.locator('.channel-message-content').evaluate(element => Number(getComputedStyle(element).opacity))).toBeLessThan(0.7)
 
 
-    await filters.getByRole('button', { name: /Needs me/ }).click()
-    await expect(page).toHaveURL(/threadFilter=needs/)
+    await filters.getByRole('button', { name: /Mentions/ }).click()
+    await expect(page).toHaveURL(/threadFilter=mentions/)
     await expect(urgentCard).toBeVisible()
     await expect(settledCard).toHaveCount(0)
+    await filters.getByRole('button', { name: /Done/ }).click()
+    await expect(settledCard).toBeVisible()
+    await expect(urgentCard).toHaveCount(0)
+    await filters.getByRole('button', { name: /Needs attention/ }).click()
+    await expect(page).toHaveURL(/threadFilter=needs/)
     await page.getByRole('button', { name: 'Threads', exact: true }).click()
-    await expect(page.getByRole('group', { name: 'Thread filters' }).getByRole('button', { name: /Needs me/ })).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.getByRole('group', { name: 'Thread filters' }).getByRole('button', { name: /Needs attention/ })).toHaveAttribute('aria-pressed', 'true')
     await expect(page.locator('.channel-thread-index-row')).toHaveCount(1)
     await page.reload()
-    await expect(page.getByRole('group', { name: 'Thread filters' }).getByRole('button', { name: /Needs me/ })).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.getByRole('group', { name: 'Thread filters' }).getByRole('button', { name: /Needs attention/ })).toHaveAttribute('aria-pressed', 'true')
   })
   test('focused unread threads resume at new work with bounded context', async ({ page }) => {
     const state = fixtureState()
@@ -574,8 +582,10 @@ test.describe('Channels PWA', () => {
 
     await pane.getByRole('button', { name: 'Show 6 earlier messages' }).click()
     await expect(pane.getByText('Historical reply 1', { exact: true })).toBeVisible()
-    await pane.getByRole('button', { name: 'Next unread →' }).click()
+    await pane.getByRole('button', { name: '← Previous unread' }).click()
     await expect(pane.getByTitle('Edit thread title')).toContainText('Continuity bridge')
+    await pane.getByRole('button', { name: 'Next unread →' }).click()
+    await expect(pane.getByTitle('Edit thread title')).toContainText('The dramatic question')
   })
 
   test('mobile attention filter has a useful caught-up state', async ({ page }) => {

@@ -1156,8 +1156,9 @@
   font-size: 16px;
 }
 
-.channel-thread-actions { padding: 8px 18px; display: flex; gap: 6px; border-bottom: 1px solid var(--channel-line); }
+.channel-thread-actions { padding: 8px 18px; display: flex; gap: 6px; overflow-x: auto; border-bottom: 1px solid var(--channel-line); }
 .channel-thread-actions .channel-done { margin-left: auto; }
+.channel-thread-actions button { flex: 0 0 auto; }
 .channel-thread-messages { flex: 1; padding: 3px 18px 25px; }
 .channel-thread-messages .channel-message { grid-template-columns: 31px minmax(0, 1fr); gap: 9px; padding: 16px 0; }
 .channel-thread-messages .channel-avatar { width: 28px; height: 28px; }
@@ -1189,6 +1190,7 @@
 }
 .channel-unread-divider::before,
 .channel-unread-divider::after { height: 1px; flex: 1; content: ""; background: rgba(185, 120, 52, .42); }
+.channel-previous-unread,
 .channel-next-unread { color: #81521d; border-color: rgba(185, 120, 52, .38); }
 .channel-thread-pane .channel-compose-wrap { padding-left: 16px; padding-right: 16px; background: linear-gradient(to top, var(--channel-paper-deep) 78%, rgba(233, 229, 218, 0)); }
 .channel-thread-pane .channel-compose-hint { right: 16px; }
@@ -1565,7 +1567,7 @@
   .channel-timeline { padding: 2px 15px 20px; }
   .channel-thread-toolbar { min-height: 43px; padding: 5px 12px; overflow-x: auto; }
   .channel-thread-filters { flex-shrink: 0; }
-  .channel-thread-filters button { min-height: 29px; padding: 4px 7px; }
+  .channel-thread-filters button { min-height: 29px; padding: 4px; gap: 4px; }
   .channel-thread-filter-summary { display: none; }
   .channel-message-needs-attention,
   .channel-message-active:not(.channel-message-needs-attention) { margin-left: -8px; padding-left: 7px; }

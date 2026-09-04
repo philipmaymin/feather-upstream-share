@@ -356,8 +356,29 @@ describe('channel event store', () => {
     store.updateThreadAttention({ rootId: root.id, principalId: philip.id, action: 'done', value: false })
     store.updateThreadAttention({ rootId: root.id, principalId: philip.id, action: 'snooze', until: '2999-01-01T00:00:00.000Z' })
     assert.equal(store.listActivity(philip.id).length, 0)
+
     thread = store.getThread(root.id, philip.id)
     assert.equal(thread.snoozedUntil, '2999-01-01T00:00:00.000Z')
+  })
+  it('projects unread mentions into thread triage', () => {
+    const { store, philip, channel } = setup()
+    const maya = store.addHumanMember({
+      channelId: channel.id,
+      actorId: philip.id,
+      username: 'maya',
+      displayName: 'Maya',
+    }).principal
+    const root = store.postMessage({
+      channelId: channel.id,
+      authorId: maya.id,
+      content: '@philip Please decide which version ships.',
+      messageType: 'human',
+      idempotencyKey: 'client:mention-filter',
+    })
+
+    assert.equal(store.listChannelRoots(channel.id, philip.id)[0].thread.mentioned, true)
+    store.updateThreadAttention({ rootId: root.id, principalId: philip.id, action: 'read' })
+    assert.equal(store.listChannelRoots(channel.id, philip.id)[0].thread.mentioned, false)
   })
 
   it('enforces membership, supports human invitations, and creates one DM per pair', () => {

@@ -225,6 +225,7 @@ export interface ChannelMessage {
     replyCount: number
     updatedAt: string
     unread: boolean
+    mentioned: boolean
     following: boolean
     doneAt: string | null
     snoozedUntil: string | null
