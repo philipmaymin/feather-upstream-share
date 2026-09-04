@@ -497,7 +497,7 @@ test.describe('Channels PWA', () => {
     await expect(summary).toBeVisible()
   })
 
-  test('desktop prioritizes attention and dims settled read threads', async ({ page }) => {
+  test('desktop dims settled read threads until they are expanded', async ({ page }) => {
     const state = fixtureState()
     const settled = state.roots.find(candidate => candidate.id === 'bridge')
     settled.messageType = 'human'
@@ -522,6 +522,12 @@ test.describe('Channels PWA', () => {
     await expect(settledCard).toHaveClass(/channel-message-read/)
     await expect(urgentCard).toHaveClass(/channel-message-needs-attention/)
     expect(await settledCard.locator('.channel-message-content').evaluate(element => Number(getComputedStyle(element).opacity))).toBeLessThan(0.7)
+    await settledCard.getByRole('button', { name: 'Reply', exact: true }).click()
+    await expect(settledCard).toHaveClass(/channel-message-expanded/)
+    await expect(settledCard.locator('.channel-message-content')).toHaveCSS('opacity', '1')
+    await settledCard.getByRole('button', { name: 'Hide replies', exact: true }).click()
+    expect(await settledCard.locator('.channel-message-content').evaluate(element => Number(getComputedStyle(element).opacity))).toBeLessThan(0.7)
+
 
     await filters.getByRole('button', { name: /Needs me/ }).click()
     await expect(page).toHaveURL(/threadFilter=needs/)

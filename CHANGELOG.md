@@ -1,6 +1,6 @@
 ## 2026-09-04 - Attention-first channel triage
 - **Every channel now has one-tap `Needs me`, `Open`, and `All` thread views.** Counts stay visible, the chosen view survives channel navigation and reloads through the URL, and empty filters explain what will appear there with a direct path back to all history.
-- **Visual weight now follows responsibility.** Unread replies, decisions, failures, and active agent work retain full contrast with explicit `New` labels and edge emphasis; read threads recede, resolved or done threads recede further while remaining legible and recoverable on hover or focus.
+- **Visual weight now follows responsibility without fighting active reading.** Unread replies, decisions, failures, and active agent work retain full contrast with explicit `New` labels and edge emphasis; read threads recede, resolved or done threads recede further while remaining legible, and expanding any thread immediately restores full contrast until it is collapsed again.
 - **The same triage model spans channel timelines and the Threads index.** Fledge keeps read separate from done and uses three stable views instead of copying the filter sprawl of general-purpose chat tools.
 
 ## 2026-09-04 - Compact threads and stable reply ownership

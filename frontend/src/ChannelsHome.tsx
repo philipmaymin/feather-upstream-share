@@ -1143,6 +1143,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       'channel-message-active': !inThread && threadIsActive(message),
       'channel-message-read': !inThread && message.messageType !== 'system' && !!message.thread && !message.thread.unread,
       'channel-message-settled': !inThread && !!message.thread && (!!message.thread.doneAt || message.thread.state === 'resolved'),
+      'channel-message-expanded': !inThread && expandedThreadIds().has(message.threadRootId),
     }}>
       <PersonMark person={message.author} />
       <div class="channel-message-content">
