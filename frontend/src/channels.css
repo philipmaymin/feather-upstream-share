@@ -558,6 +558,32 @@
 }
 .channel-message-expand:hover { text-decoration: underline; }
 
+.channel-attachment-summary {
+  margin-top: 7px;
+  padding: 5px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(56, 103, 86, .2);
+  border-radius: 3px;
+  color: var(--channel-sage);
+  background: rgba(56, 103, 86, .06);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 750;
+  cursor: pointer;
+}
+.channel-attachment-summary:hover { border-color: rgba(56, 103, 86, .42); background: rgba(56, 103, 86, .1); }
+.channel-attachment-summary svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .channel-message-body .markdown { color: inherit !important; font-size: inherit; line-height: inherit; }
 .channel-message-body .markdown > :first-child { margin-top: 1px; }
 .channel-message-body .markdown > :last-child { margin-bottom: 0; }

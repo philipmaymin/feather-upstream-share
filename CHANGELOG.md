@@ -1,3 +1,7 @@
+## 2026-09-04 - Compact threads and stable reply ownership
+- **Collapsed channel threads no longer render full-size screenshot previews.** Image Markdown becomes a compact paperclip-style count such as “3 images”; opening replies restores the previews, and hiding replies compacts them again.
+- **Rapid follow-ups stay with the same Coordinator.** When Coordinator is still finishing that thread’s prior turn, the next unmentioned reply queues behind it instead of switching identities to Btw; Btw remains available for separate threads while Coordinator is busy.
+
 ## 2026-09-04 - Truthful mobile notification badge
 - **The Activity count no longer appears over DMs.** The mobile badge was absolutely positioned against the entire navigation bar, so an Activity count of one landed over the DMs icon and looked like a stuck DM unread marker; each navigation button now owns its badge positioning.
 

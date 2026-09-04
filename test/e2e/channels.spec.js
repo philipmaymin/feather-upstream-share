@@ -472,6 +472,31 @@ test.describe('Channels PWA', () => {
     expect(state.roots.find(candidate => candidate.id === 'root-1').thread.delivery.queuedCount).toBe(1)
   })
 
+  test('collapsed roots replace image previews with a compact attachment summary', async ({ page }) => {
+    const state = fixtureState()
+    const root = state.roots.find(candidate => candidate.id === 'root-1')
+    root.content = `Compare these screenshots.
+
+![First screenshot](</api/channels/${channel.id}/attachments/first-shot>)
+
+![Second screenshot](</api/channels/${channel.id}/attachments/second-shot>)`
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    const card = page.locator('.channel-message').filter({ hasText: 'Compare these screenshots.' })
+    const summary = card.getByRole('button', { name: 'Show 2 images' })
+    await expect(summary).toBeVisible()
+    await expect(card.locator('.channel-message-body img')).toHaveCount(0)
+
+    await summary.click()
+    await expect(card.locator('.channel-message-body img')).toHaveCount(2)
+    await expect(card.getByRole('button', { name: 'Hide replies' })).toBeVisible()
+    await card.getByRole('button', { name: 'Hide replies' }).click()
+    await expect(card.locator('.channel-message-body img')).toHaveCount(0)
+    await expect(summary).toBeVisible()
+  })
+
   test('shows channel agent staffing while creation is pending and opens the staffed channel', async ({ page }) => {
     const state = fixtureState()
     const fairfieldCoordinator = { ...coordinator, id: 'agent:fairfield:coordinator', username: 'fairfield-coordinator' }

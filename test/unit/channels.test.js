@@ -163,7 +163,7 @@ describe('channel event store', () => {
     const followUp = store.postMessage({
       channelId: channel.id,
       authorId: philip.id,
-      content: '@coordinator Add this while you are still working.',
+      content: 'Add this while you are still working.',
       threadRootId: root.id,
       replyToId: root.id,
       messageType: 'human',

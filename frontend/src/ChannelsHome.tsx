@@ -104,6 +104,17 @@ function dmName(channel: ChannelInfo, selfId?: string | null) {
   return others.map(member => member.displayName).join(', ') || 'Direct message'
 }
 
+const CHANNEL_IMAGE_MARKDOWN = /!\[[^\]\n]*\]\(\s*(?:<[^>\n]+>|[^)\s]+)(?:\s+(?:"[^"\n]*"|'[^'\n]*'))?\s*\)/g
+
+function compactChannelImages(content: string) {
+  let count = 0
+  const text = content.replace(CHANNEL_IMAGE_MARKDOWN, () => {
+    count += 1
+    return ''
+  }).replace(/\n{3,}/g, '\n\n').trim()
+  return { text, count }
+}
+
 function pushKey(value: string): ArrayBuffer {
   const padding = '='.repeat((4 - value.length % 4) % 4)
   const binary = atob((value + padding).replace(/-/g, '+').replace(/_/g, '/'))
@@ -1036,7 +1047,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     </div>
   )
 
-  const renderMessage = (message: ChannelMessage, inThread = false) => (
+  const renderMessage = (message: ChannelMessage, inThread = false) => {
+    const attachments = compactChannelImages(message.content)
+    return (
     <article class="channel-message" classList={{ 'channel-message-agent': message.author.kind === 'agent', 'channel-message-system': message.messageType === 'system' }}>
       <PersonMark person={message.author} />
       <div class="channel-message-content">
@@ -1044,8 +1057,14 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
           <Identity person={message.author} />
           <time dateTime={message.createdAt}>{relativeTime(message.createdAt)}</time>
         </header>
-        <div class="channel-message-body" classList={{ 'channel-message-body-collapsed': !inThread && message.content.length > 520 && !expandedMessageIds().has(message.id) }}><RichMarkdown text={message.content} /></div>
-        <Show when={!inThread && message.content.length > 520}>
+        <div class="channel-message-body" classList={{ 'channel-message-body-collapsed': !inThread && !expandedThreadIds().has(message.threadRootId) && message.content.length > 520 && !expandedMessageIds().has(message.id) }}><RichMarkdown text={!inThread && !expandedThreadIds().has(message.threadRootId) ? attachments.text : message.content} /></div>
+        <Show when={!inThread && attachments.count > 0 && !expandedThreadIds().has(message.threadRootId)}>
+          <button type="button" class="channel-attachment-summary" aria-label={`Show ${attachments.count} ${attachments.count === 1 ? 'image' : 'images'}`} onClick={() => toggleInlineThread(message)}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 12.5 14 7a3 3 0 1 1 4.2 4.2l-7.1 7.1a5 5 0 0 1-7.1-7.1l7.4-7.4" /></svg>
+            <span>{attachments.count} {attachments.count === 1 ? 'image' : 'images'}</span>
+          </button>
+        </Show>
+        <Show when={!inThread && !expandedThreadIds().has(message.threadRootId) && message.content.length > 520}>
           <button type="button" class="channel-message-expand" aria-expanded={expandedMessageIds().has(message.id)} onClick={() => setExpandedMessageIds(current => {
             const next = new Set(current)
             if (next.has(message.id)) next.delete(message.id)
@@ -1126,7 +1145,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         </Show>
       </div>
     </article>
-  )
+    )
+  }
 
   return (
     <div class="channels-root" classList={{ 'channels-root-personal': props.showPersonal, 'channel-thread-open': !!thread() }} data-testid="channels-home">
