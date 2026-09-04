@@ -31,6 +31,7 @@ import './channels.css'
 
 type ChannelSection = 'activity' | 'channels' | 'threads' | 'dms'
 type DialogKind = 'channel' | 'dm' | 'members' | null
+type ChannelThreadFilter = 'needs' | 'open' | 'all'
 type PendingChannelImage = { id: string; file: File; previewUrl: string }
 const CHANNEL_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
 const MAX_CHANNEL_IMAGE_BYTES = 15 * 1024 * 1024
@@ -66,6 +67,11 @@ const emptySnapshot: ChannelsSnapshot = { channels: [], dms: [], principal: null
 function channelSection(params: URLSearchParams): ChannelSection {
   const view = params.get('view')
   return view === 'activity' || view === 'threads' || view === 'dms' ? view : 'channels'
+}
+
+function channelThreadFilter(params: URLSearchParams): ChannelThreadFilter {
+  const filter = params.get('threadFilter')
+  return filter === 'needs' || filter === 'open' ? filter : 'all'
 }
 
 function relativeTime(iso: string) {
@@ -113,6 +119,29 @@ function compactChannelImages(content: string) {
     return ''
   }).replace(/\n{3,}/g, '\n\n').trim()
   return { text, count }
+}
+
+function threadNeedsAttention(message: ChannelMessage) {
+  const thread = message.thread
+  return message.messageType !== 'system' && !!thread && !thread.doneAt
+    && (thread.unread || thread.state === 'needs_you' || !!thread.recovery)
+}
+
+function threadIsOpen(message: ChannelMessage) {
+  return message.messageType !== 'system' && !!message.thread
+    && !message.thread.doneAt && message.thread.state !== 'resolved'
+}
+
+function threadIsActive(message: ChannelMessage) {
+  const thread = message.thread
+  return !!thread && (thread.state === 'working' || thread.delivery.activeCount > 0 || thread.delivery.queuedCount > 0)
+}
+
+function attentionPriority(message: ChannelMessage) {
+  if (message.thread?.recovery) return 4
+  if (message.thread?.state === 'needs_you') return 3
+  if (message.thread?.unread) return 2
+  return threadIsActive(message) ? 1 : 0
 }
 
 function pushKey(value: string): ArrayBuffer {
@@ -186,6 +215,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [editingTitle, setEditingTitle] = createSignal(false)
   const [titleDraft, setTitleDraft] = createSignal('')
   const [activityNeedsOnly, setActivityNeedsOnly] = createSignal(false)
+  const [threadFilter, setThreadFilter] = createSignal<ChannelThreadFilter>(channelThreadFilter(query))
   const [pushState, setPushState] = createSignal<'idle' | 'enabling' | 'enabled' | 'denied' | 'error' | 'unavailable'>('idle')
   const [announcement, setAnnouncement] = createSignal('')
   const [restartNotice, setRestartNotice] = createSignal('')
@@ -217,6 +247,25 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const visibleActivity = createMemo(() => activityNeedsOnly()
     ? activity().items.filter(item => item.kind === 'needs_you' || item.kind === 'failure' || item.kind === 'mention')
     : activity().items)
+  const threadCounts = createMemo(() => {
+    let needs = 0
+    let open = 0
+    for (const message of roots()) {
+      if (threadNeedsAttention(message)) needs += 1
+      if (threadIsOpen(message)) open += 1
+    }
+    return { needs, open, all: roots().length }
+  })
+  const visibleRoots = createMemo(() => {
+    const filter = threadFilter()
+    if (filter === 'all') return roots()
+    const visible = roots().filter(message => filter === 'needs' ? threadNeedsAttention(message) : threadIsOpen(message))
+    if (filter === 'needs') {
+      visible.sort((left, right) => attentionPriority(right) - attentionPriority(left)
+        || Date.parse(right.thread?.updatedAt || right.createdAt) - Date.parse(left.thread?.updatedAt || left.createdAt))
+    }
+    return visible
+  })
   const currentHumanIsOwner = createMemo(() => selectedChannel()?.members.some(member => member.id === snapshot().principal?.id && member.role === 'owner'))
 
   function rememberChannel(channel: ChannelInfo) {
@@ -243,6 +292,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const url = new URL(location.href)
     url.searchParams.set('surface', 'channels')
     url.searchParams.set('view', nextSection)
+
     if (channelId) url.searchParams.set('channel', channelId)
     else url.searchParams.delete('channel')
     if (rootId) url.searchParams.set('thread', rootId)
@@ -250,6 +300,14 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const state = { channels: true, view: nextSection, channelId, channelThread: rootId, channelThreadPushed: mode === 'push' }
     if (mode === 'push') history.pushState(state, '', `${url.pathname}${url.search}`)
     else history.replaceState(state, '', `${url.pathname}${url.search}`)
+  }
+
+  function chooseThreadFilter(filter: ChannelThreadFilter) {
+    setThreadFilter(filter)
+    const url = new URL(location.href)
+    if (filter === 'all') url.searchParams.delete('threadFilter')
+    else url.searchParams.set('threadFilter', filter)
+    history.replaceState({ ...(history.state || {}), channelThreadFilter: filter }, '', `${url.pathname}${url.search}`)
   }
 
   async function loadRoots(channelId: string, generation = loadGeneration) {
@@ -851,6 +909,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const generation = ++loadGeneration
     const request = ++threadLoadRequest
     setSection(nextSection)
+    setThreadFilter(channelThreadFilter(params))
     setSelectedChannelId(channelId)
     if (changedChannel) {
       setExpandedThreadIds(new Set())
@@ -1025,6 +1084,33 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     )
   }
 
+  const renderThreadFilters = () => (
+    <div class="channel-thread-toolbar">
+      <div class="channel-thread-filters" role="group" aria-label="Thread filters">
+        <button type="button" classList={{ active: threadFilter() === 'needs' }} aria-pressed={threadFilter() === 'needs'} onClick={() => chooseThreadFilter('needs')}>
+          <span>Needs me</span><b>{threadCounts().needs}</b>
+        </button>
+        <button type="button" classList={{ active: threadFilter() === 'open' }} aria-pressed={threadFilter() === 'open'} onClick={() => chooseThreadFilter('open')}>
+          <span>Open</span><b>{threadCounts().open}</b>
+        </button>
+        <button type="button" classList={{ active: threadFilter() === 'all' }} aria-pressed={threadFilter() === 'all'} onClick={() => chooseThreadFilter('all')}>
+          <span>All</span><b>{threadCounts().all}</b>
+        </button>
+      </div>
+      <span class="channel-thread-filter-summary" aria-live="polite">{visibleRoots().length} of {threadCounts().all} threads</span>
+    </div>
+  )
+
+  const renderFilteredEmpty = () => (
+    <Show when={!loading() && roots().length > 0 && visibleRoots().length === 0}>
+      <div class="channel-filter-empty" role="status">
+        <b>{threadFilter() === 'needs' ? 'Nothing needs you' : 'No open threads'}</b>
+        <span>{threadFilter() === 'needs' ? 'Unread replies, decisions, and failures will appear here.' : 'Every thread in this channel is resolved or done.'}</span>
+        <button type="button" onClick={() => chooseThreadFilter('all')}>Show all threads</button>
+      </div>
+    </Show>
+  )
+
   const renderExecution = (execution: ChannelExecution) => (
     <div class="channel-execution">
       <PersonMark person={{ ...execution.agent, kind: 'agent' }} small />
@@ -1050,7 +1136,14 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const renderMessage = (message: ChannelMessage, inThread = false) => {
     const attachments = compactChannelImages(message.content)
     return (
-    <article class="channel-message" classList={{ 'channel-message-agent': message.author.kind === 'agent', 'channel-message-system': message.messageType === 'system' }}>
+    <article class="channel-message" classList={{
+      'channel-message-agent': message.author.kind === 'agent',
+      'channel-message-system': message.messageType === 'system',
+      'channel-message-needs-attention': !inThread && threadNeedsAttention(message),
+      'channel-message-active': !inThread && threadIsActive(message),
+      'channel-message-read': !inThread && message.messageType !== 'system' && !!message.thread && !message.thread.unread,
+      'channel-message-settled': !inThread && !!message.thread && (!!message.thread.doneAt || message.thread.state === 'resolved'),
+    }}>
       <PersonMark person={message.author} />
       <div class="channel-message-content">
         <header>
@@ -1091,7 +1184,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             <Show when={message.thread!.state !== 'open'}>
               <span class={`channel-state channel-state-${message.thread!.state}`}>{message.thread!.state.replace('_', ' ')}</span>
             </Show>
-            <Show when={message.thread!.unread}><span class="channel-unread-dot" title="Unread replies" /></Show>
+            <Show when={message.thread!.unread}><span class="channel-unread-badge">New</span></Show>
           </div>
           {renderDelivery(message.thread!.delivery)}
           <Show when={message.thread!.recovery}>{failed => (
@@ -1267,12 +1360,22 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
           <header class="channel-view-header">
             <div><small>{selectedChannel()?.slug ? `#${selectedChannel()!.slug}` : 'Current conversation'}</small><h1>Threads</h1><p>Every thread in this channel, ordered by its latest update.</p></div>
           </header>
+          {renderThreadFilters()}
           <section class="channel-thread-index">
-            <For each={[...roots()].sort((a, b) => Date.parse(b.thread?.updatedAt || b.createdAt) - Date.parse(a.thread?.updatedAt || a.createdAt))}>{root => (
-              <button type="button" class="channel-thread-index-row" onClick={() => void openThread(root.id)}>
+            {renderFilteredEmpty()}
+            <For each={[...visibleRoots()].sort((left, right) => (
+              threadFilter() === 'needs'
+                ? attentionPriority(right) - attentionPriority(left)
+                : Date.parse(right.thread?.updatedAt || right.createdAt) - Date.parse(left.thread?.updatedAt || left.createdAt)
+            ))}>{root => (
+              <button type="button" class="channel-thread-index-row" classList={{
+                'needs-attention': threadNeedsAttention(root),
+                read: !root.thread?.unread,
+                settled: !!root.thread?.doneAt || root.thread?.state === 'resolved',
+              }} onClick={() => void openThread(root.id)}>
                 <span class={`channel-state channel-state-${root.thread?.state || 'open'}`}>{root.thread?.state?.replace('_', ' ') || 'open'}</span>
                 <div><h2>{root.thread?.title}</h2><p>{root.content}</p></div>
-                <span>{root.thread?.replyCount || 0} replies</span>
+                <span>{root.thread?.replyCount || 0} replies<Show when={root.thread?.unread}><b class="channel-thread-index-new">New</b></Show></span>
               </button>
             )}</For>
           </section>
@@ -1337,12 +1440,14 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                   </Show>
                 </div>
               </header>
+              {renderThreadFilters()}
               <section class="channel-timeline" aria-label={`${channel().title} messages`} aria-busy={loading()}>
                 <Show when={loading()}><div class="channel-loading"><span /><span /><span /></div></Show>
                 <Show when={!loading() && roots().length === 0}>
                   <div class="channel-empty"><small>The first note</small><h2>Set the work in motion</h2><p>Coordinator answers directly when free. While Coordinator is busy, Btw handles quick questions or queues substantial work behind it.</p></div>
                 </Show>
-                <Index each={roots()}>{message => renderMessage(message())}</Index>
+                {renderFilteredEmpty()}
+                <For each={visibleRoots()}>{message => renderMessage(message)}</For>
               </section>
               {renderComposer(false)}
             </>

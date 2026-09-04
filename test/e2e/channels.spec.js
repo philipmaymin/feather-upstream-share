@@ -497,6 +497,63 @@ test.describe('Channels PWA', () => {
     await expect(summary).toBeVisible()
   })
 
+  test('desktop prioritizes attention and dims settled read threads', async ({ page }) => {
+    const state = fixtureState()
+    const settled = state.roots.find(candidate => candidate.id === 'bridge')
+    settled.messageType = 'human'
+    settled.content = 'Settled reference thread'
+    settled.thread.state = 'resolved'
+    settled.thread.doneAt = NOW
+    const urgent = state.roots.find(candidate => candidate.id === 'root-1')
+    urgent.content = 'Unread decision thread'
+    urgent.thread.state = 'needs_you'
+    urgent.thread.unread = true
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 1180, height: 820 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    const filters = page.getByRole('group', { name: 'Thread filters' })
+    await expect(filters.getByRole('button', { name: /Needs me/ })).toContainText('1')
+    await expect(filters.getByRole('button', { name: /Open/ })).toContainText('1')
+    await expect(filters.getByRole('button', { name: /All/ })).toContainText('2')
+    const settledCard = page.locator('.channel-message').filter({ hasText: 'Settled reference thread' })
+    const urgentCard = page.locator('.channel-message').filter({ hasText: 'Unread decision thread' })
+    await expect(settledCard).toHaveClass(/channel-message-settled/)
+    await expect(settledCard).toHaveClass(/channel-message-read/)
+    await expect(urgentCard).toHaveClass(/channel-message-needs-attention/)
+    expect(await settledCard.locator('.channel-message-content').evaluate(element => Number(getComputedStyle(element).opacity))).toBeLessThan(0.7)
+
+    await filters.getByRole('button', { name: /Needs me/ }).click()
+    await expect(page).toHaveURL(/threadFilter=needs/)
+    await expect(urgentCard).toBeVisible()
+    await expect(settledCard).toHaveCount(0)
+    await page.getByRole('button', { name: 'Threads', exact: true }).click()
+    await expect(page.getByRole('group', { name: 'Thread filters' }).getByRole('button', { name: /Needs me/ })).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.locator('.channel-thread-index-row')).toHaveCount(1)
+    await page.reload()
+    await expect(page.getByRole('group', { name: 'Thread filters' }).getByRole('button', { name: /Needs me/ })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('mobile attention filter has a useful caught-up state', async ({ page }) => {
+    const state = fixtureState()
+    for (const root of state.roots) {
+      root.thread.unread = false
+      root.thread.state = 'resolved'
+      root.thread.doneAt = NOW
+      root.thread.recovery = null
+      root.thread.delivery = { queuedAgents: [], activeAgents: [], queuedCount: 0, activeCount: 0 }
+    }
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels&threadFilter=needs`)
+
+    await expect(page.getByRole('status')).toContainText('Nothing needs you')
+    await expect(page.getByRole('status')).toContainText('Unread replies, decisions, and failures will appear here.')
+    await page.getByRole('button', { name: 'Show all threads' }).click()
+    await expect(page).not.toHaveURL(/threadFilter=/)
+    await expect(page.locator('.channel-message')).toHaveCount(2)
+  })
+
   test('shows channel agent staffing while creation is pending and opens the staffed channel', async ({ page }) => {
     const state = fixtureState()
     const fairfieldCoordinator = { ...coordinator, id: 'agent:fairfield:coordinator', username: 'fairfield-coordinator' }
