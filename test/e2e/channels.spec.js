@@ -98,7 +98,7 @@ async function installChannels(page, state) {
     }
     if (pathname === '/api/channels' && request.method() === 'GET') {
       state.channelGets = (state.channelGets || 0) + 1
-      return route.fulfill({ json: { channels: state.channels || [channel], dms: [], principal: state.principal || philip } })
+      return route.fulfill({ json: { channels: state.channels || [channel], dms: state.dms || [], principal: state.principal || philip } })
     }
     if (pathname === '/api/channels' && request.method() === 'POST' && state.createdChannel) {
       if (state.channelCreateGate) await state.channelCreateGate
@@ -110,6 +110,9 @@ async function installChannels(page, state) {
     if (pathname === '/api/channels/stream') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'event: connected\ndata: {}\n\n' })
     if (pathname === `/api/channels/${channel.id}/messages` && request.method() === 'GET') return route.fulfill({ json: { messages: state.roots } })
     if (state.createdChannel && pathname === `/api/channels/${state.createdChannel.id}/messages` && request.method() === 'GET') return route.fulfill({ json: { messages: [] } })
+    if (state.dm && pathname === `/api/channels/${state.dm.id}/messages` && request.method() === 'GET') {
+      return route.fulfill({ json: { messages: state.dmRoots } })
+    }
     if (pathname === `/api/channels/${channel.id}/messages` && request.method() === 'POST') {
       const body = JSON.parse(request.postData() || '{}')
       const id = `posted-${state.posts.length + 1}`
@@ -141,6 +144,16 @@ async function installChannels(page, state) {
       const current = state.threads.get(threadMatch[1])
       Object.assign(current, JSON.parse(request.postData() || '{}'))
       return route.fulfill({ json: { thread: current } })
+    }
+    if (state.dm && pathname === `/api/channels/${state.dm.id}/threads/${state.dmRoot.id}/attention`) {
+      const body = JSON.parse(request.postData() || '{}')
+      if (body.action === 'read') {
+        state.dmReadRequests = (state.dmReadRequests || 0) + 1
+        state.dm.unread = 0
+        state.dmRoot.thread.unread = false
+        state.activity = state.activity.map(item => item.thread?.id === state.dmRoot.id ? { ...item, readAt: NOW } : item)
+      }
+      return route.fulfill({ json: { thread: state.dmThread } })
     }
     const attentionMatch = pathname.match(/^\/api\/channels\/channel-films7\/threads\/([^/]+)\/attention$/)
     if (attentionMatch) {
@@ -339,6 +352,58 @@ test.describe('Channels PWA', () => {
     await expect(page.getByRole('heading', { name: 'Activity' })).toBeVisible()
     await page.getByRole('button', { name: 'Done', exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Nothing is waiting on you' })).toBeVisible()
+  })
+
+  test('opening a direct message clears its unread notification', async ({ page }) => {
+    const state = fixtureState()
+    const dm = {
+      id: 'dm-caretaker', slug: null, title: 'Philip and Caretaker', description: '',
+      type: 'dm', defaultAgentId: caretaker.id, createdAt: NOW, archivedAt: null,
+      unread: 1, members: [philip, caretaker],
+    }
+    const dmRoot = {
+      id: 'dm-root', channelId: dm.id, seq: 1, threadRootId: 'dm-root', replyToId: null,
+      messageType: 'agent', content: 'I checked the work and left you one private note.',
+      createdAt: NOW, editedAt: null, author: caretaker, metadata: {},
+      thread: {
+        title: 'Private note', state: 'open', replyCount: 0, updatedAt: NOW, unread: true,
+        following: true, doneAt: null, snoozedUntil: null,
+        delivery: { queuedAgents: [], activeAgents: [], queuedCount: 0, activeCount: 0 },
+        recovery: null,
+      },
+      replies: [],
+    }
+    state.dm = dm
+    state.dms = [dm]
+    state.dmRoot = dmRoot
+    state.dmRoots = [dmRoot]
+    state.dmThread = {
+      id: dmRoot.id, channelId: dm.id, title: dmRoot.thread.title, state: 'open',
+      following: true, doneAt: null, snoozedUntil: null, messages: [dmRoot], executions: [],
+    }
+    state.activity = [{
+      id: 'dm-notice', kind: 'direct_message', reason: 'Caretaker sent you a direct message',
+      createdAt: NOW, readAt: null, doneAt: null,
+      channel: { id: dm.id, slug: dm.slug, title: dm.title },
+      thread: { id: dmRoot.id, title: dmRoot.thread.title, state: dmRoot.thread.state },
+      messageId: dmRoot.id, preview: dmRoot.content, actor: caretaker,
+    }]
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels&view=channels`)
+
+    await expect(page).toHaveTitle('(1) Fledge')
+    await page.locator('.channels-mobile-nav').getByRole('button', { name: 'DMs' }).click()
+    let dmRow = page.getByRole('dialog', { name: 'Direct messages' }).getByRole('button', { name: /Caretaker/ })
+    await expect(dmRow.locator('strong')).toHaveText('1')
+    await dmRow.click()
+
+    await expect(page.getByRole('heading', { name: 'Caretaker' })).toBeVisible()
+    await expect.poll(() => state.dmReadRequests || 0).toBe(1)
+    await expect(page).toHaveTitle('Fledge')
+    await page.locator('.channels-mobile-nav').getByRole('button', { name: 'DMs' }).click()
+    dmRow = page.getByRole('dialog', { name: 'Direct messages' }).getByRole('button', { name: /Caretaker/ })
+    await expect(dmRow.locator('strong')).toHaveCount(0)
   })
 
   test('blank Peek identifies a stopped process and restarts the same turn', async ({ page }) => {

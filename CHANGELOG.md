@@ -1,3 +1,6 @@
+## 2026-09-04 - Direct-message read receipts
+- **Opening a direct message now clears its unread notification.** Fledge acknowledges every unread thread shown in the visible DM conversation, then reconciles the Activity, document-title, app, and conversation badges; background tabs and other channel views do not consume unread DMs.
+
 ## 2026-08-30 - Fledge agent feed PWA
 - **Fledge turns Feather into a feed-first mobile app at `app.feather.plus`.** The installable PWA opens on a live editorial stream of recent agent results, Room briefings, active work, failures, and decisions waiting on Philip; Rooms, search, chat, files, terminal, prompts, updates, approvals, and creation remain inside the same interface.
 - **For You explains its ranking and learns from use.** Waiting decisions stay first, failures and active work remain visible, completed posts paginate without gaps, and bounded Room/project affinity adapts within each priority class from opens and thumb feedback. Latest and Needs Me remain deterministic alternatives.

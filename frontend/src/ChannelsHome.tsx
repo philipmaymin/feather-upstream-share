@@ -237,6 +237,25 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const messages = await fetchChannelMessages(channelId)
     if (generation !== loadGeneration || selectedChannelId() !== channelId) return
     setRoots(messages)
+    if (section() !== 'dms' || selectedChannel()?.type !== 'dm' || document.hidden) return
+
+    const acknowledgements = messages
+      .filter(message => message.thread?.unread)
+      .map(async message => {
+        const lastMessageId = message.replies?.at(-1)?.id || message.id
+        if (readMessageByThread.get(message.threadRootId) === lastMessageId) return false
+        readMessageByThread.set(message.threadRootId, lastMessageId)
+        try {
+          await updateChannelAttention(channelId, message.threadRootId, 'read')
+          return true
+        } catch {
+          if (readMessageByThread.get(message.threadRootId) === lastMessageId) {
+            readMessageByThread.delete(message.threadRootId)
+          }
+          return false
+        }
+      })
+    if (acknowledgements.length && (await Promise.all(acknowledgements)).some(Boolean)) queueRefresh()
   }
 
   async function loadInlineThread(channelId: string, rootId: string, generation = loadGeneration) {
