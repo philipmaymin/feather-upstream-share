@@ -263,6 +263,7 @@ export interface ChannelThread {
   channelId: string
   title: string
   state: 'open' | 'working' | 'needs_you' | 'resolved'
+  lastReadSeq: number
   following: boolean
   doneAt: string | null
   snoozedUntil: string | null

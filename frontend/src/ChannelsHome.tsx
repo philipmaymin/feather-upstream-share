@@ -183,6 +183,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [selectedChannelId, setSelectedChannelId] = createSignal(query.get('channel'))
   const [roots, setRoots] = createSignal<ChannelMessage[]>([])
   const [thread, setThread] = createSignal<ChannelThread | null>(null)
+  const [threadUnreadAfterSeq, setThreadUnreadAfterSeq] = createSignal<number | null>(null)
+  const [threadHistoryExpanded, setThreadHistoryExpanded] = createSignal(false)
   const [activity, setActivity] = createSignal<{ items: ChannelActivityItem[]; unread: number; needsYou: number }>({ items: [], unread: 0, needsYou: 0 })
   const [principals, setPrincipals] = createSignal<ChannelPrincipal[]>([])
   const [loading, setLoading] = createSignal(true)
@@ -265,6 +267,25 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         || Date.parse(right.thread?.updatedAt || right.createdAt) - Date.parse(left.thread?.updatedAt || left.createdAt))
     }
     return visible
+  })
+  const nextUnreadRoot = createMemo(() => roots().find(message =>
+    message.messageType !== 'system' && message.thread?.unread && message.threadRootId !== thread()?.id) || null)
+  const focusedThreadView = createMemo(() => {
+    const current = thread()
+    if (!current) return { messages: [] as ChannelMessage[], hiddenCount: 0, firstUnreadId: null as string | null, unreadCount: 0 }
+    const unreadAfter = threadUnreadAfterSeq()
+    const firstUnreadIndex = unreadAfter === null
+      ? -1
+      : current.messages.findIndex(message => message.seq > unreadAfter)
+    const start = threadHistoryExpanded()
+      ? 0
+      : Math.max(0, firstUnreadIndex >= 0 ? firstUnreadIndex - 2 : current.messages.length - 5)
+    return {
+      messages: current.messages.slice(start),
+      hiddenCount: start,
+      firstUnreadId: firstUnreadIndex >= 0 ? current.messages[firstUnreadIndex].id : null,
+      unreadCount: firstUnreadIndex >= 0 ? current.messages.length - firstUnreadIndex : 0,
+    }
   })
   const currentHumanIsOwner = createMemo(() => selectedChannel()?.members.some(member => member.id === snapshot().principal?.id && member.role === 'owner'))
 
@@ -351,11 +372,23 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const openingThread = thread()?.id !== rootId
     const pinnedToLatest = !threadScroller
       || threadScroller.scrollHeight - threadScroller.scrollTop - threadScroller.clientHeight < 96
+    if (openingThread) {
+      setThreadUnreadAfterSeq(Number(next.lastReadSeq || 0))
+      setThreadHistoryExpanded(false)
+    }
     setThread(next)
     setTitleDraft(next.title)
     if (openingThread || pinnedToLatest) {
       queueMicrotask(() => requestAnimationFrame(() => {
         if (thread()?.id !== rootId || !threadScroller) return
+        const unreadBoundary = openingThread
+          ? threadScroller.querySelector<HTMLElement>('[data-first-unread]')
+          : null
+        if (unreadBoundary) {
+          if (threadScroller.querySelector('.channel-thread-history-toggle')) threadScroller.scrollTop = 0
+          else unreadBoundary.scrollIntoView({ block: 'center' })
+          return
+        }
         const messages = threadScroller.querySelectorAll<HTMLElement>(':scope > .channel-message')
         const latest = messages.item(messages.length - 1)
         if (latest && latest.offsetHeight > threadScroller.clientHeight - 24) {
@@ -439,6 +472,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setSelectedChannelId(channel.id)
     setSection(nextSection)
     setThread(null)
+    setThreadUnreadAfterSeq(null)
+    setThreadHistoryExpanded(false)
     setExpandedThreadIds(new Set())
     setExpandedMessageIds(new Set())
     setInlineThreads({})
@@ -474,6 +509,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     ++threadLoadRequest
     const rootId = thread()?.id
     setThread(null)
+    setThreadUnreadAfterSeq(null)
+    setThreadHistoryExpanded(false)
     setEditingTitle(false)
     if (rootId && history.state?.channelThread === rootId && history.state?.channelThreadPushed && history.length > 1) history.back()
     else updateLocation(section(), selectedChannelId(), null, 'replace')
@@ -917,6 +954,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       setInlineThreads({})
       setRosterOpen(false)
     }
+    setThreadUnreadAfterSeq(null)
+    setThreadHistoryExpanded(false)
     setThread(null)
     if (!channelId) {
       setRoots([])
@@ -1461,7 +1500,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             <header class="channel-thread-header">
               <button type="button" class="channel-thread-back" onClick={closeThread} aria-label="Close focused thread">←</button>
               <div>
-                <small>Focused thread · {current().messages.length - 1} replies</small>
+                <small>Focused thread · {current().messages.length - 1} replies<Show when={focusedThreadView().unreadCount > 0}> · {focusedThreadView().unreadCount} new</Show></small>
                 <Show when={editingTitle()} fallback={<button type="button" class="channel-thread-title" onClick={startThreadTitleEdit} title="Edit thread title">{current().title}</button>}>
                   <input
                     value={titleDraft()}
@@ -1486,12 +1525,27 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             <div class="channel-thread-actions">
               <button type="button" disabled={!!attentionAction()} classList={{ active: current().following }} aria-pressed={current().following} onClick={() => void setAttention('follow', !current().following)}>{current().following ? 'Following' : 'Follow'}</button>
               <button type="button" disabled={!!attentionAction()} classList={{ active: activeSnooze(current().snoozedUntil) }} aria-pressed={activeSnooze(current().snoozedUntil)} onClick={() => void setAttention('snooze', !activeSnooze(current().snoozedUntil))}>{activeSnooze(current().snoozedUntil) ? 'Snoozed 1h' : 'Snooze'}</button>
+              <Show when={nextUnreadRoot()}>{next => (
+                <button type="button" class="channel-next-unread" onClick={() => void openThread(next().threadRootId, next().channelId)}>Next unread →</button>
+              )}</Show>
               <button type="button" disabled={!!attentionAction()} class="channel-done" classList={{ active: !!current().doneAt }} aria-pressed={!!current().doneAt} onClick={() => void setAttention('done', !current().doneAt)}>{current().doneAt ? 'Reopen' : 'Done'}</button>
             </div>
             {renderDelivery(current().delivery)}
 
             <section class="channel-thread-messages" ref={threadScroller}>
-              <Index each={current().messages}>{message => renderMessage(message(), true)}</Index>
+              <Show when={focusedThreadView().hiddenCount > 0}>
+                <button type="button" class="channel-thread-history-toggle" onClick={() => setThreadHistoryExpanded(true)}>
+                  Show {focusedThreadView().hiddenCount} earlier {focusedThreadView().hiddenCount === 1 ? 'message' : 'messages'}
+                </button>
+              </Show>
+              <For each={focusedThreadView().messages}>{message => (
+                <>
+                  <Show when={message.id === focusedThreadView().firstUnreadId}>
+                    <div class="channel-unread-divider" data-first-unread role="separator"><span>New since your last visit</span></div>
+                  </Show>
+                  {renderMessage(message, true)}
+                </>
+              )}</For>
               <Show when={current().executions.some(execution => execution.state === 'running')}>
                 <section class="channel-active-work" aria-label="Agents working now">
                   <header><span class="channel-worklog-pulse running" />Working now</header>

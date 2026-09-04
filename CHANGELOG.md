@@ -1,3 +1,7 @@
+## 2026-09-04 - Resume unread threads where work changed
+- **Opening an unread thread now lands at the first unread message instead of the beginning or end.** Fledge uses each member’s durable read cursor, shows two preceding messages for context, labels the boundary with a prominent `New since your last visit` divider, and reports the unread count in the focused-thread header.
+- **Old history no longer blocks the current work.** Earlier read messages collapse behind a counted `Show earlier messages` control; fully read threads open on their five most recent messages, and `Next unread` moves directly to the next unread thread without returning to the channel timeline.
+
 ## 2026-09-04 - Attention-first channel triage
 - **Every channel now has one-tap `Needs me`, `Open`, and `All` thread views.** Counts stay visible, the chosen view survives channel navigation and reloads through the URL, and empty filters explain what will appear there with a direct path back to all history.
 - **Visual weight now follows responsibility without fighting active reading.** Unread replies, decisions, failures, and active agent work retain full contrast with explicit `New` labels and edge emphasis; read threads recede, resolved or done threads recede further while remaining legible, and expanding any thread immediately restores full contrast until it is collapsed again.

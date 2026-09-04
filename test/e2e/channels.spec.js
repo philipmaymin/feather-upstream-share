@@ -34,9 +34,9 @@ function fixtureState() {
     ],
   }
   const threads = new Map([
-    ['bridge', { id: 'bridge', channelId: channel.id, title: 'Continuity bridge', state: 'open', following: true, doneAt: null, snoozedUntil: null, messages: [bridge], executions: [] }],
+    ['bridge', { id: 'bridge', channelId: channel.id, title: 'Continuity bridge', state: 'open', lastReadSeq: 1, following: true, doneAt: null, snoozedUntil: null, messages: [bridge], executions: [] }],
     ['root-1', {
-      id: 'root-1', channelId: channel.id, title: 'The dramatic question in the opening', state: 'working', following: true, doneAt: null, snoozedUntil: null,
+      id: 'root-1', channelId: channel.id, title: 'The dramatic question in the opening', state: 'working', lastReadSeq: 1, following: true, doneAt: null, snoozedUntil: null,
       delivery: { queuedAgents: [btw], activeAgents: [coordinator], queuedCount: 1, activeCount: 1 },
       messages: [root, ...root.replies],
       executions: [{ id: 'execution-1', state: 'running', agent: coordinator, triggerMessageId: 'root-1', finalMessageId: null, depth: 0, startedAt: NOW, completedAt: null, error: null, canRestart: true }],
@@ -498,6 +498,7 @@ test.describe('Channels PWA', () => {
   })
 
   test('desktop dims settled read threads until they are expanded', async ({ page }) => {
+
     const state = fixtureState()
     const settled = state.roots.find(candidate => candidate.id === 'bridge')
     settled.messageType = 'human'
@@ -538,6 +539,43 @@ test.describe('Channels PWA', () => {
     await expect(page.locator('.channel-thread-index-row')).toHaveCount(1)
     await page.reload()
     await expect(page.getByRole('group', { name: 'Thread filters' }).getByRole('button', { name: /Needs me/ })).toHaveAttribute('aria-pressed', 'true')
+  })
+  test('focused unread threads resume at new work with bounded context', async ({ page }) => {
+    const state = fixtureState()
+    const root = state.roots.find(candidate => candidate.id === 'root-1')
+    root.thread.replyCount = 12
+    root.thread.unread = true
+    const replies = Array.from({ length: 12 }, (_, index) => ({
+      ...message(`history-${index + 1}`, index % 2 ? caretaker : coordinator,
+        `${index < 7 ? 'Historical' : 'Unread'} reply ${index + 1}`, root.id),
+      seq: index + 2,
+    }))
+    root.replies = replies.slice(-3)
+    const focused = state.threads.get(root.id)
+    focused.lastReadSeq = 8
+    focused.messages = [{ ...root, seq: 1 }, ...replies]
+    focused.executions = []
+    const bridge = state.roots.find(candidate => candidate.id === 'bridge')
+    bridge.messageType = 'human'
+    bridge.thread.unread = true
+    state.threads.get('bridge').lastReadSeq = 0
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 1180, height: 820 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
+    const pane = page.getByRole('complementary', { name: 'Focused thread' })
+    await expect(pane).toContainText('5 new')
+    await expect(pane.getByText('Historical reply 1', { exact: true })).toHaveCount(0)
+    await expect(pane.getByText('Historical reply 6', { exact: true })).toBeVisible()
+    await expect(pane.locator('.channel-unread-divider')).toHaveText('New since your last visit')
+    await expect(pane.locator('.channel-unread-divider + .channel-message')).toContainText('Unread reply 8')
+    await expect(pane.getByRole('button', { name: 'Show 6 earlier messages' })).toBeVisible()
+
+    await pane.getByRole('button', { name: 'Show 6 earlier messages' }).click()
+    await expect(pane.getByText('Historical reply 1', { exact: true })).toBeVisible()
+    await pane.getByRole('button', { name: 'Next unread →' }).click()
+    await expect(pane.getByTitle('Edit thread title')).toContainText('Continuity bridge')
   })
 
   test('mobile attention filter has a useful caught-up state', async ({ page }) => {

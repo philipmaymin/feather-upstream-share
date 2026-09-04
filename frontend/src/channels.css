@@ -1162,6 +1162,34 @@
 .channel-thread-messages .channel-message { grid-template-columns: 31px minmax(0, 1fr); gap: 9px; padding: 16px 0; }
 .channel-thread-messages .channel-avatar { width: 28px; height: 28px; }
 .channel-thread-messages .channel-message-body { font-size: 12.5px; }
+.channel-thread-history-toggle {
+  margin: 12px auto 2px;
+  padding: 5px 10px;
+  display: block;
+  border: 1px solid rgba(56, 103, 86, .24);
+  border-radius: 13px;
+  color: var(--channel-sage);
+  background: rgba(255, 255, 255, .45);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 750;
+  cursor: pointer;
+}
+.channel-unread-divider {
+  margin: 10px 0 2px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: #986127;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.channel-unread-divider::before,
+.channel-unread-divider::after { height: 1px; flex: 1; content: ""; background: rgba(185, 120, 52, .42); }
+.channel-next-unread { color: #81521d; border-color: rgba(185, 120, 52, .38); }
 .channel-thread-pane .channel-compose-wrap { padding-left: 16px; padding-right: 16px; background: linear-gradient(to top, var(--channel-paper-deep) 78%, rgba(233, 229, 218, 0)); }
 .channel-thread-pane .channel-compose-hint { right: 16px; }
 

@@ -341,9 +341,12 @@ describe('channel event store', () => {
     assert.match(activity[0].reason, /as an agent/)
     assert.equal(activity[0].actor.kind, 'agent')
 
+    let thread = store.getThread(root.id, philip.id)
+    assert.equal(thread.lastReadSeq, root.seq, 'the API exposes where this member last stopped reading')
     assert.equal(store.updateThreadAttention({ rootId: root.id, principalId: philip.id, action: 'read' }).changed, true)
     assert.equal(store.updateThreadAttention({ rootId: root.id, principalId: philip.id, action: 'read' }).changed, false, 're-reading an unchanged thread is a no-op')
-    let thread = store.getThread(root.id, philip.id)
+    thread = store.getThread(root.id, philip.id)
+    assert.equal(thread.lastReadSeq, thread.messages.at(-1).seq)
     assert.equal(thread.following, true)
 
     store.updateThreadAttention({ rootId: root.id, principalId: philip.id, action: 'done' })
