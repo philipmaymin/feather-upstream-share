@@ -2140,6 +2140,8 @@ function simpleHash(str) {
 // spinner animations, runtime/cost counters) so pane-stability polling can
 // actually converge. Without this, Claude's live status bar flips the hash
 // every poll and question detection never fires.
+const BRAILLE_ACTIVITY_RE = /^[\u2800-\u28ff]\s+\S/;
+
 function paneStabilityKey(raw) {
   return raw.split('\n').filter(line => {
     const t = line.trim();
@@ -2150,7 +2152,7 @@ function paneStabilityKey(raw) {
     if (/\b\d+h\s*\d+(\.\d+)?m\b/.test(t)) return false;
     if (/\b\d+(\.\d+)?s\b.*tokens?\b/i.test(t)) return false;
     if (/\(esc to interrupt\)/i.test(t)) return false;
-    if (/^[✻·●✶⧫◆▸►▹☆★✦⏳◉⊛+*]\s+\S.*(ing\.{3}|…)/.test(t)) return false;
+    if (/^[✻·●✶⧫◆▸►▹☆★✦⏳◉⊛+*]\s+\S.*(ing\.{3}|…)/.test(t) || BRAILLE_ACTIVITY_RE.test(t)) return false;
     return true;
   }).join('\n');
 }
@@ -2164,7 +2166,7 @@ function extractActivity(lines) {
         const line = lines[j].trim();
         if (!line || /^[─━═─]+$/.test(line)) continue;
         if (/^⎿/.test(line) || /^Tip:/.test(line) || /bypass permissions/.test(line)) continue;
-        if (/^[✻·*●✶⧫◆▸►▹☆★✦⏳◉⊛]/.test(line) || /\(\d+[sm]\s/.test(line)) {
+        if (/^[✻·*●✶⧫◆▸►▹☆★✦⏳◉⊛]/.test(line) || BRAILLE_ACTIVITY_RE.test(line) || /\(\d+[sm]\s/.test(line)) {
           return line;
         }
         break;
@@ -2181,7 +2183,7 @@ function extractActivity(lines) {
     if (!line) continue;
     if (/bypass permissions/.test(line) || /\bctx\s*[\[(]/.test(line)) continue;
     if (/Claude Code v\d/.test(line) || /^Tip:/.test(line)) continue;
-    if (/^[✻·*●✶⧫◆▸►▹☆★✦⏳◉⊛]\s+\S.*(ing\.{3}|…|\(\d+[sm]\s)/.test(line)) {
+    if (/^[✻·*●✶⧫◆▸►▹☆★✦⏳◉⊛]\s+\S.*(ing\.{3}|…|\(\d+[sm]\s)/.test(line) || BRAILLE_ACTIVITY_RE.test(line)) {
       return line;
     }
   }

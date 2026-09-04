@@ -22,12 +22,12 @@ function message(id, author, content, rootId = id, type = author.kind === 'agent
 function fixtureState() {
   const bridge = {
     ...message('bridge', philip, 'Continuity bridge: the #films6 Wiki remains read-only historical context.', 'bridge', 'system'),
-    thread: { title: 'Continuity bridge', state: 'open', replyCount: 0, updatedAt: NOW, unread: false, following: true, doneAt: null, snoozedUntil: null, delivery: { queuedAgents: [], activeAgents: [], queuedCount: 0, activeCount: 0 } },
+    thread: { title: 'Continuity bridge', state: 'open', replyCount: 0, updatedAt: NOW, unread: false, following: true, doneAt: null, snoozedUntil: null, delivery: { queuedAgents: [], activeAgents: [], queuedCount: 0, activeCount: 0 }, recovery: null },
     replies: [],
   }
   const root = {
     ...message('root-1', philip, 'What dramatic question should the opening make impossible to ignore?'),
-    thread: { title: 'The dramatic question in the opening', state: 'working', replyCount: 2, updatedAt: NOW, unread: true, following: true, doneAt: null, snoozedUntil: null, delivery: { queuedAgents: [btw], activeAgents: [coordinator], queuedCount: 1, activeCount: 1 } },
+    thread: { title: 'The dramatic question in the opening', state: 'working', replyCount: 2, updatedAt: NOW, unread: true, following: true, doneAt: null, snoozedUntil: null, delivery: { queuedAgents: [btw], activeAgents: [coordinator], queuedCount: 1, activeCount: 1 }, recovery: null },
     replies: [
       message('reply-1', coordinator, 'The opening should ask whether she will trade the truth for belonging.', 'root-1'),
       message('reply-2', caretaker, 'Continuity holds if the unopened letter remains visible in both shots.', 'root-1'),
@@ -163,6 +163,12 @@ async function installChannels(page, state) {
       execution.state = 'error'
       execution.completedAt = NOW
       execution.error = 'Restarted by a channel member'
+      execution.canRestart = false
+      const queued = { queuedAgents: [coordinator], activeAgents: [], queuedCount: 1, activeCount: 0 }
+      state.roots = state.roots.map(root => root.id === 'root-1'
+        ? { ...root, thread: { ...root.thread, recovery: null, delivery: queued } }
+        : root)
+      state.threads.get('root-1').delivery = queued
       state.restarted = (state.restarted || 0) + 1
       return route.fulfill({ status: 202, json: { ok: true, state: 'queued' } })
     }
@@ -360,6 +366,43 @@ test.describe('Channels PWA', () => {
     await expect.poll(() => state.restarted).toBe(1)
     await expect(livePeek).toHaveCount(0)
     await expect(page.locator('.channel-sr-only')).toContainText('Agent turn restarted')
+  })
+
+  test('mobile exposes a failed root turn and collapses long messages without hiding recovery', async ({ page }) => {
+    const state = fixtureState()
+    const root = state.roots.find(candidate => candidate.id === 'root-1')
+    root.content = `Long channel request. ${'Important context remains available. '.repeat(40)}`
+    root.thread.state = 'needs_you'
+    root.thread.delivery = { queuedAgents: [], activeAgents: [], queuedCount: 0, activeCount: 0 }
+    root.thread.recovery = {
+      id: 'execution-1',
+      state: 'error',
+      error: 'Agent exceeded the channel turn limit',
+      agent: coordinator,
+      canRestart: true,
+    }
+    const execution = state.threads.get('root-1').executions[0]
+    execution.state = 'error'
+    execution.error = root.thread.recovery.error
+    execution.canRestart = true
+    state.threads.get('root-1').delivery = root.thread.delivery
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    const messageBody = page.locator('.channel-message-body').filter({ hasText: 'Long channel request.' })
+    await expect(page.getByRole('button', { name: 'Show full message' })).toBeVisible()
+    expect(await messageBody.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true)
+    const recovery = page.locator('.channel-root-recovery')
+    await expect(recovery).toContainText('Coordinator stopped.')
+    await expect(recovery).toContainText('Agent exceeded the channel turn limit')
+
+    await page.getByRole('button', { name: 'Show full message' }).click()
+    await expect(page.getByRole('button', { name: 'Show less' })).toBeVisible()
+    await recovery.getByRole('button', { name: 'Restart turn' }).click()
+    await expect.poll(() => state.restarted).toBe(1)
+    await expect(page.getByRole('status')).toHaveText('Restart queued for Coordinator.')
+    expect(state.roots.find(candidate => candidate.id === 'root-1').thread.delivery.queuedCount).toBe(1)
   })
 
   test('shows channel agent staffing while creation is pending and opens the staffed channel', async ({ page }) => {

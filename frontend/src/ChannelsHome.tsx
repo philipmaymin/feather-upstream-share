@@ -56,6 +56,7 @@ export interface ChannelsHomeProps {
   onFeed: () => void
   onRooms: () => void
   onMenu: () => void
+  onCloseMenu: () => void
   onNewChat: () => void
   showPersonal: boolean
 }
@@ -151,6 +152,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [replyDraft, setReplyDraft] = createSignal('')
   const [rootImages, setRootImages] = createSignal<PendingChannelImage[]>([])
   const [replyImages, setReplyImages] = createSignal<PendingChannelImage[]>([])
+  const [expandedMessageIds, setExpandedMessageIds] = createSignal<Set<string>>(new Set())
   const [sending, setSending] = createSignal(false)
   const [expandedThreadIds, setExpandedThreadIds] = createSignal<Set<string>>(new Set())
   const [inlineThreads, setInlineThreads] = createSignal<Record<string, ChannelThread>>({})
@@ -173,7 +175,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [activityNeedsOnly, setActivityNeedsOnly] = createSignal(false)
   const [pushState, setPushState] = createSignal<'idle' | 'enabling' | 'enabled' | 'denied' | 'error' | 'unavailable'>('idle')
   const [announcement, setAnnouncement] = createSignal('')
+  const [restartNotice, setRestartNotice] = createSignal('')
   let refreshTimer: number | undefined
+  let restartNoticeTimer: number | undefined
   let peekTimer: number | undefined
   let threadScroller: HTMLElement | undefined
   let rootComposer: HTMLTextAreaElement | undefined
@@ -332,6 +336,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setSection(nextSection)
     setThread(null)
     setExpandedThreadIds(new Set())
+    setExpandedMessageIds(new Set())
     setInlineThreads({})
     setRosterOpen(false)
     setRoots([])
@@ -569,11 +574,32 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
   async function restartExecution(executionId: string) {
     if (restartingExecutionId()) return
+    const agent = roots().map(root => root.thread?.recovery).find(recovery => recovery?.id === executionId)?.agent
+      || thread()?.executions.find(execution => execution.id === executionId)?.agent
+    const showQueued = () => {
+      if (!agent) return
+      const queued = { queuedAgents: [agent], activeAgents: [], queuedCount: 1, activeCount: 0 }
+      setRoots(current => current.map(root => root.thread?.recovery?.id === executionId
+        ? { ...root, thread: { ...root.thread, state: 'working', recovery: null, delivery: queued } }
+        : root))
+      setThread(current => {
+        const stale = current?.executions.find(execution => execution.id === executionId && execution.canRestart)
+        return current && stale
+          ? { ...current, state: 'working', delivery: queued, executions: current.executions.map(execution => execution.id === executionId ? { ...execution, canRestart: false } : execution) }
+          : current
+      })
+    }
     setRestartingExecutionId(executionId)
     try {
       await restartChannelExecution(executionId)
       closeExecutionPeek()
-      queueRefresh()
+      showQueued()
+      await refresh()
+      showQueued()
+      props.onCloseMenu()
+      clearTimeout(restartNoticeTimer)
+      setRestartNotice(`Restart queued for ${agent?.displayName || 'agent'}.`)
+      restartNoticeTimer = window.setTimeout(() => setRestartNotice(''), 6_000)
       setAnnouncement('Agent turn restarted. A new Working now attempt will appear.')
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : 'Agent turn could not be restarted'
@@ -779,6 +805,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setSelectedChannelId(channelId)
     if (changedChannel) {
       setExpandedThreadIds(new Set())
+      setExpandedMessageIds(new Set())
       setInlineThreads({})
       setRosterOpen(false)
     }
@@ -834,6 +861,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     onCleanup(() => {
       unsubscribe()
       clearTimeout(refreshTimer)
+      clearTimeout(restartNoticeTimer)
       clearInterval(peekTimer)
       window.removeEventListener('popstate', onPopState)
       window.removeEventListener('keydown', onEscape)
@@ -975,7 +1003,15 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
           <Identity person={message.author} />
           <time dateTime={message.createdAt}>{relativeTime(message.createdAt)}</time>
         </header>
-        <div class="channel-message-body"><RichMarkdown text={message.content} /></div>
+        <div class="channel-message-body" classList={{ 'channel-message-body-collapsed': !inThread && message.content.length > 520 && !expandedMessageIds().has(message.id) }}><RichMarkdown text={message.content} /></div>
+        <Show when={!inThread && message.content.length > 520}>
+          <button type="button" class="channel-message-expand" aria-expanded={expandedMessageIds().has(message.id)} onClick={() => setExpandedMessageIds(current => {
+            const next = new Set(current)
+            if (next.has(message.id)) next.delete(message.id)
+            else next.add(message.id)
+            return next
+          })}>{expandedMessageIds().has(message.id) ? 'Show less' : 'Show full message'}</button>
+        </Show>
         <Show when={!inThread && message.thread}>
           <div class="channel-root-footer">
             <div class="channel-participants" aria-label="Thread participants">
@@ -998,6 +1034,14 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             <Show when={message.thread!.unread}><span class="channel-unread-dot" title="Unread replies" /></Show>
           </div>
           {renderDelivery(message.thread!.delivery)}
+          <Show when={message.thread!.recovery}>{failed => (
+            <section class="channel-turn-recovery channel-root-recovery" role="alert">
+              <div><b>{failed().agent.displayName} stopped.</b><span>{failed().error || 'The turn did not complete.'}</span></div>
+              <button type="button" disabled={restartingExecutionId() === failed().id} onClick={event => { event.stopPropagation(); void restartExecution(failed().id) }}>
+                {restartingExecutionId() === failed().id ? 'Restarting…' : 'Restart turn'}
+              </button>
+            </section>
+          )}</Show>
           <Show when={!expandedThreadIds().has(message.threadRootId) && (message.replies || []).length > 0}>
             <button class="channel-reply-preview" type="button" onClick={() => toggleInlineThread(message)}>
               <PersonMark person={message.replies!.at(-1)!.author} small />
@@ -1118,6 +1162,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
       <main class="channels-main">
         <Show when={error()}><div class="channel-error" role="alert"><span>{error()}</span><button type="button" onClick={() => setError('')}>Dismiss</button></div></Show>
+        <Show when={restartNotice()}><div class="channel-restart-notice" role="status">{restartNotice()}</div></Show>
 
         <Show when={section() === 'activity'}>
           <header class="channel-view-header channel-activity-header">
@@ -1289,7 +1334,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
               })()}>{failed => (
                 <section class="channel-turn-recovery" role="alert">
                   <div><b>This agent turn stopped.</b><span>{failed().error || 'It did not complete.'}</span></div>
-                  <button type="button" disabled={restartingExecutionId() === failed().id} onClick={() => void restartExecution(failed().id)}>
+                  <button type="button" disabled={restartingExecutionId() === failed().id} onClick={event => { event.stopPropagation(); void restartExecution(failed().id) }}>
                     {restartingExecutionId() === failed().id ? 'Restarting…' : 'Restart turn'}
                   </button>
                 </section>

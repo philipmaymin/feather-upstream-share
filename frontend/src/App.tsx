@@ -2480,6 +2480,7 @@ export default function App() {
                       onFeed={() => openFledgeSurface('feed')}
                       onRooms={() => navigateFledgeHome('rooms')}
                       onMenu={() => setSidebar(true)}
+                      onCloseMenu={() => setSidebar(false)}
                       onNewChat={() => handleNew(false, 'omp')}
                       showPersonal={user().username === 'philip'}
                     />

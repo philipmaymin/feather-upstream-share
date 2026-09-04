@@ -19,7 +19,7 @@ afterEach(async () => {
   while (roots.length) fs.rmSync(roots.pop(), { recursive: true, force: true })
 })
 
-async function startServer({ failTmuxSpawn = false, sharedRoot = null } = {}) {
+async function startServer({ failTmuxSpawn = false, activeTmux = false, sharedRoot = null } = {}) {
   const root = sharedRoot || fs.mkdtempSync(path.join(os.tmpdir(), 'feather-channels-api-'))
   if (!sharedRoot) {
     roots.push(root)
@@ -30,7 +30,8 @@ async function startServer({ failTmuxSpawn = false, sharedRoot = null } = {}) {
     fs.mkdirSync(state)
     fs.mkdirSync(bin)
     fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh
-[ "$1" = "has-session" ] && exit 1
+if [ "$1" = "has-session" ]; then exit ${activeTmux ? '0' : '1'}; fi
+${activeTmux ? "if [ \"$1\" = \"capture-pane\" ]; then printf '⠴ Confirming current channel work ⟦esc⟧\\n'; exit 0; fi" : '[ "$1" = "capture-pane" ] && exit 1'}
 ${failTmuxSpawn ? '[ "$1" = "new-session" ] && exit 1' : ''}
 exit 0
 `)
@@ -175,6 +176,33 @@ describe('shared channels API', () => {
       assert.ok(retry)
       assert.notEqual(retry.executionId, dispatch.executionId)
       assert.equal(retry.triggerMessageId, dispatch.triggerMessageId)
+    } finally {
+      store.close()
+    }
+  })
+
+  it('recognizes live Braille-spinner activity in Peek', async () => {
+    const { base, home } = await startServer({ activeTmux: true })
+    const created = await body(await fetch(`${base}/api/channels`, {
+      method: 'POST',
+      headers: { ...headers(), 'Idempotency-Key': 'api:create:active-peek' },
+      body: JSON.stringify({ slug: 'active-peek', title: 'Active Peek' }),
+    }))
+    const store = new ChannelStore({ file: path.join(home, '.feather', 'channels-v1.sqlite3') })
+    try {
+      const owner = store.ensureHuman({ username: 'philip', displayName: 'Philip' })
+      store.postMessage({
+        channelId: created.channel.id,
+        authorId: owner.id,
+        content: 'Show observable live work.',
+        messageType: 'human',
+        idempotencyKey: 'client:active-peek:start',
+      })
+      const dispatch = store.claimDispatch()
+      const peek = await body(await fetch(`${base}/api/channels/executions/${dispatch.executionId}/peek`, { headers: headers() }))
+      assert.equal(peek.processActive, true)
+      assert.equal(peek.stalled, false)
+      assert.match(peek.activity, /Confirming current channel work/)
     } finally {
       store.close()
     }

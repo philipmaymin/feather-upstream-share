@@ -229,6 +229,7 @@ export interface ChannelMessage {
     doneAt: string | null
     snoozedUntil: string | null
     delivery: ChannelDelivery
+    recovery: Pick<ChannelExecution, 'id' | 'state' | 'error' | 'agent' | 'canRestart'> | null
   }
   replies?: ChannelMessage[]
 }
