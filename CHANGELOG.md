@@ -1,3 +1,6 @@
+## 2026-09-04 - Truthful mobile notification badge
+- **The Activity count no longer appears over DMs.** The mobile badge was absolutely positioned against the entire navigation bar, so an Activity count of one landed over the DMs icon and looked like a stuck DM unread marker; each navigation button now owns its badge positioning.
+
 ## 2026-09-04 - Reliable channel creation
 - **New channels no longer fall through to the “Create your first channel” screen.** Fledge now commits the server-confirmed channel to local navigation state before opening it, so overlapping live refreshes cannot invalidate both the creation refresh and the destination transition; direct-message creation uses the same race-safe handoff.
 
