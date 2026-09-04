@@ -159,6 +159,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [inlineDrafts, setInlineDrafts] = createSignal<Record<string, string>>({})
   const [inlineSendingRootId, setInlineSendingRootId] = createSignal<string | null>(null)
   const [rosterOpen, setRosterOpen] = createSignal(false)
+  const [channelDirectoryOpen, setChannelDirectoryOpen] = createSignal(false)
+  const [channelDirectoryMode, setChannelDirectoryMode] = createSignal<'channels' | 'dms'>('channels')
   const [peekExecutionId, setPeekExecutionId] = createSignal<string | null>(null)
   const [executionPeek, setExecutionPeek] = createSignal<ChannelExecutionPeek | null>(null)
   const [peekLoading, setPeekLoading] = createSignal(false)
@@ -328,6 +330,12 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     refreshTimer = window.setTimeout(() => void refresh(), 140)
   }
 
+  function openChannelDirectory(mode: 'channels' | 'dms' = 'channels') {
+    setRosterOpen(false)
+    setChannelDirectoryMode(mode)
+    setChannelDirectoryOpen(true)
+  }
+
   async function chooseChannel(channel: ChannelInfo, nextSection: ChannelSection = channel.type === 'dm' ? 'dms' : 'channels') {
     setRootDraft(loadChannelDraft(channel.id))
     ++loadGeneration
@@ -339,6 +347,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setExpandedMessageIds(new Set())
     setInlineThreads({})
     setRosterOpen(false)
+    setChannelDirectoryOpen(false)
     setRoots([])
     setLoading(true)
     updateLocation(nextSection, channel.id, null, 'push')
@@ -840,6 +849,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       } else if (dialog()) {
         event.preventDefault()
         setDialog(null)
+      } else if (channelDirectoryOpen()) {
+        event.preventDefault()
+        setChannelDirectoryOpen(false)
       } else if (rosterOpen()) {
         event.preventDefault()
         setRosterOpen(false)
@@ -1239,7 +1251,10 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                   <small>{channel().type === 'dm' ? 'Direct message' : 'Channel'}</small>
                   <div class="channel-title-row">
                     <h1>{channel().type === 'dm' ? dmName(channel(), snapshot().principal?.id) : `#${channel().slug}`}</h1>
-                    <Show when={channel().type === 'channel'}><button type="button" class="channel-new-button" onClick={() => openDialog('channel')}>New channel</button></Show>
+                    <Show when={channel().type === 'channel'}>
+                      <button type="button" class="channel-directory-button" onClick={() => openChannelDirectory('channels')}>All channels</button>
+                      <button type="button" class="channel-new-button" onClick={() => openDialog('channel')}>New channel</button>
+                    </Show>
                   </div>
                   <p>{channel().description || (channel().type === 'dm' ? 'A private conversation between members.' : '')}</p>
                 </div>
@@ -1389,11 +1404,61 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         </aside>
       </Show>
 
+      <Show when={channelDirectoryOpen()}>
+        <div class="channel-directory-scrim" onClick={event => { if (event.target === event.currentTarget) setChannelDirectoryOpen(false) }}>
+          <section class="channel-directory" role="dialog" aria-modal="true" aria-labelledby="channel-directory-title">
+            <header>
+              <div><small>Fledge</small><h2 id="channel-directory-title">{channelDirectoryMode() === 'channels' ? 'All channels' : 'Direct messages'}</h2></div>
+              <button type="button" onClick={() => setChannelDirectoryOpen(false)} aria-label={`Close ${channelDirectoryMode() === 'channels' ? 'all channels' : 'direct messages'}`}>×</button>
+            </header>
+            <div class="channel-directory-list">
+              <Show when={channelDirectoryMode() === 'channels'} fallback={
+                <For each={snapshot().dms}>{channel => {
+                  const other = channel.members.find(member => member.id !== snapshot().principal?.id)
+                  return (
+                    <button
+                      type="button"
+                      classList={{ active: selectedChannelId() === channel.id && section() === 'dms' }}
+                      aria-current={selectedChannelId() === channel.id && section() === 'dms' ? 'page' : undefined}
+                      onClick={() => void chooseChannel(channel, 'dms')}
+                    >
+                      <Show when={other} fallback={<span class="channel-directory-hash">DM</span>}>{person => <PersonMark person={person()} small />}</Show>
+                      <span><b>{dmName(channel, snapshot().principal?.id)}</b><small>{channel.description || 'Private conversation'}</small></span>
+                      <Show when={channel.unread > 0}><strong>{channel.unread}</strong></Show>
+                      <span aria-hidden="true">→</span>
+                    </button>
+                  )
+                }}</For>
+              }>
+                <For each={snapshot().channels}>{channel => (
+                  <button
+                    type="button"
+                    classList={{ active: selectedChannelId() === channel.id && section() === 'channels' }}
+                    aria-current={selectedChannelId() === channel.id && section() === 'channels' ? 'page' : undefined}
+                    onClick={() => void chooseChannel(channel)}
+                  >
+                    <span class="channel-directory-hash">#</span>
+                    <span><b>{channel.slug}</b><small>{channel.description || `${channel.members.length} members`}</small></span>
+                    <Show when={channel.unread > 0}><strong>{channel.unread}</strong></Show>
+                    <span aria-hidden="true">→</span>
+                  </button>
+                )}</For>
+              </Show>
+            </div>
+            <footer>
+              <button type="button" onClick={() => { setChannelDirectoryOpen(false); openDialog(channelDirectoryMode() === 'channels' ? 'channel' : 'dm') }}>
+                {channelDirectoryMode() === 'channels' ? 'New channel' : 'New direct message'}
+              </button>
+            </footer>
+          </section>
+        </div>
+      </Show>
+
       <nav class="channels-mobile-nav" classList={{ personal: props.showPersonal }} aria-label="Channel workspace navigation">
         <button type="button" classList={{ active: section() === 'activity' }} onClick={() => navigate('activity')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5zM8 9h8M8 13h6" /></svg><span>Activity</span><Show when={activity().unread}><b>{activity().unread}</b></Show></button>
-        <button type="button" classList={{ active: section() === 'channels' }} onClick={() => navigate('channels')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 4-2 16m10-16-2 16M4 9h16M3 15h16" /></svg><span>Channels</span></button>
+        <button type="button" classList={{ active: section() === 'channels' }} onClick={() => openChannelDirectory('channels')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 4-2 16m10-16-2 16M4 9h16M3 15h16" /></svg><span>Channels</span></button>
         <button type="button" classList={{ active: section() === 'threads' }} onClick={() => navigate('threads')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4V5Z" /></svg><span>Threads</span></button>
-        <button type="button" classList={{ active: section() === 'dms' }} onClick={() => navigate('dms')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4zM7 9h10M7 13h7" /></svg><span>DMs</span></button>
+        <button type="button" classList={{ active: section() === 'dms' }} onClick={() => openChannelDirectory('dms')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4zM7 9h10M7 13h7" /></svg><span>DMs</span></button>
         <Show when={props.showPersonal}><button type="button" onClick={props.onRooms}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l2 2h8v10H4V6Z" /></svg><span>Rooms</span></button></Show>
         <Show when={props.showPersonal}><button type="button" onClick={props.onFeed}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M5 12h10M5 19h7" /></svg><span>Runs</span></button></Show>
       </nav>

@@ -381,6 +381,20 @@
   cursor: pointer;
   white-space: nowrap;
 }
+.channel-directory-button {
+  display: none;
+  padding: 5px 8px;
+  border: 1px solid var(--channel-line);
+  border-radius: 3px;
+  color: var(--channel-ink);
+  background: rgba(255, 255, 255, .55);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 750;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
 .channel-conversation-header h1 { font-size: 28px; }
 .channel-conversation-header p { margin-top: 5px; }
 
@@ -1177,6 +1191,114 @@
 
 .channels-mobile-nav { display: none; }
 
+.channel-directory-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(8, 13, 11, .68);
+  backdrop-filter: blur(7px);
+}
+
+.channel-directory {
+  width: min(480px, 100%);
+  max-height: min(680px, 86vh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--channel-ink);
+  background: var(--channel-paper);
+  box-shadow: 0 28px 90px rgba(0, 0, 0, .34);
+  animation: channel-enter 180ms ease both;
+}
+
+.channel-directory header {
+  position: relative;
+  padding: 22px 22px 15px;
+  border-bottom: 1px solid var(--channel-line);
+}
+.channel-directory header h2 {
+  margin: 4px 0 0;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 26px;
+  font-weight: 600;
+}
+.channel-directory header > button {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  color: var(--channel-muted);
+  background: transparent;
+  font-size: 24px;
+  cursor: pointer;
+}
+
+.channel-directory-list {
+  padding: 7px 13px;
+  overflow-y: auto;
+}
+.channel-directory-list > button {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 58px;
+  padding: 10px 8px;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto 18px;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  border-bottom: 1px solid var(--channel-line);
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.channel-directory-list > button.active { background: rgba(56, 103, 86, .08); }
+.channel-directory-list > button:hover { background: rgba(255, 255, 255, .52); }
+.channel-directory-list > button > span:nth-child(2) { min-width: 0; }
+.channel-directory-list b,
+.channel-directory-list small { display: block; }
+.channel-directory-list b { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.channel-directory-list small { margin-top: 3px; overflow: hidden; color: var(--channel-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.channel-directory-list strong {
+  min-width: 19px;
+  height: 19px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: white;
+  background: var(--channel-danger);
+  font-size: 9px;
+}
+.channel-directory-hash {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--channel-sage);
+  background: rgba(56, 103, 86, .12);
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 18px;
+}
+.channel-directory footer { padding: 12px 20px 18px; }
+.channel-directory footer button {
+  width: 100%;
+  padding: 11px;
+  border: 0;
+  color: white;
+  background: var(--channel-sage);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
 .channel-dialog-scrim {
   position: absolute;
   inset: 0;
@@ -1241,7 +1363,7 @@
     padding: max(14px, env(safe-area-inset-top)) 16px 12px;
     align-items: flex-end;
   }
-  .channels-root-personal .channel-view-header { padding-left: 58px; }
+  .channels-root-personal .channel-view-header { padding-left: 16px; }
   .channel-view-header h1 { font-size: 27px; }
   .channel-view-header p { display: none; }
   .channel-conversation-header {
@@ -1256,6 +1378,7 @@
   .channel-conversation-header > div:first-child { min-width: 0; }
   .channel-conversation-header .channel-member-cluster { justify-self: end; }
   .channel-conversation-header h1 { font-size: 23px; }
+  .channel-directory-button { display: inline-block; }
   .channel-member-cluster .channel-avatar:nth-of-type(n+4) { display: none; }
   .channel-member-cluster button { padding: 6px 8px; }
   .channel-header-actions button { padding: 6px 8px; }
@@ -1279,7 +1402,7 @@
   .channel-thread-index-row .channel-state { grid-column: 1 / -1; justify-self: start; }
   .channel-thread-pane { padding-bottom: env(safe-area-inset-bottom); }
   .channel-thread-header { min-height: 70px; padding: max(11px, env(safe-area-inset-top)) 12px 9px; }
-  .channels-root-personal .channel-thread-header { padding-left: 58px; }
+  .channels-root-personal .channel-thread-header { padding-left: 12px; }
   .channel-thread-messages { padding: 2px 13px 22px; }
   .channels-mobile-nav {
     position: absolute;
@@ -1314,6 +1437,13 @@
   .channels-mobile-nav button.active { color: #f1dbb8; }
   .channels-mobile-nav svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
   .channels-mobile-nav b { position: absolute; top: 1px; left: 55%; }
+  .channel-directory-scrim { align-items: end; padding: 0; }
+  .channel-directory {
+    width: 100%;
+    max-height: calc(78vh - env(safe-area-inset-bottom));
+    padding-bottom: env(safe-area-inset-bottom);
+    border-radius: 16px 16px 0 0;
+  }
   .channel-dialog-scrim { align-items: end; padding: 0; }
   .channel-dialog { width: 100%; max-height: 82vh; padding-bottom: env(safe-area-inset-bottom); }
   .channel-empty { padding-left: 15px; padding-right: 15px; }

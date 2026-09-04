@@ -500,8 +500,19 @@ test.describe('Channels PWA', () => {
     await expect(page.locator('.channels-mobile-nav').getByRole('button', { name: 'Runs' })).toHaveCount(0)
   })
 
-  test('mobile exposes channel creation and primary workspace destinations', async ({ page }) => {
+  test('mobile makes every channel directly discoverable without a global hamburger', async ({ page }) => {
     const state = fixtureState()
+    state.channels = [
+      channel,
+      {
+        ...channel,
+        id: 'channel-operations',
+        slug: 'operations',
+        title: 'Operations',
+        description: 'Shipping, incidents, and fleet work.',
+        unread: 3,
+      },
+    ]
     state.roomSnapshot = {
       rooms: [{
         name: 'navigation-room',
@@ -529,20 +540,23 @@ test.describe('Channels PWA', () => {
     await page.setViewportSize({ width: 390, height: 844 })
     await page.goto(`${BASE}/?app=fledge&surface=channels`)
 
-    await page.getByRole('button', { name: 'New channel', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Open Fledge navigation' })).toHaveCount(0)
+    await page.getByRole('button', { name: 'All channels', exact: true }).click()
+    const directory = page.getByRole('dialog', { name: 'All channels' })
+    await expect(directory).toBeVisible()
+    await expect(directory.getByText('films7', { exact: true })).toBeVisible()
+    await expect(directory.getByText('operations', { exact: true })).toBeVisible()
+    await expect(directory.getByText('3', { exact: true })).toBeVisible()
+    await directory.getByRole('button', { name: 'New channel', exact: true }).click()
     await expect(page.getByRole('heading', { name: 'Create a channel' })).toBeVisible()
     await page.getByRole('button', { name: 'Close', exact: true }).click()
     await page.getByLabel('New channel message').fill('Draft survives workspace navigation')
-    await expect(page.locator('.channels-mobile-nav').getByRole('button', { name: 'Rooms', exact: true })).toBeVisible()
-
-    await page.getByRole('button', { name: 'Open Fledge navigation' }).click()
-    const destinations = page.getByRole('navigation', { name: 'Fledge destinations' })
-    await expect(destinations.getByRole('button', { name: 'Channels', exact: true })).toHaveAttribute('aria-current', 'page')
-    await expect(page.getByText('Visible user chat', { exact: true })).toBeVisible()
-    await expect(page.getByText(/channel-turn execution/)).toHaveCount(0)
-    await expect(destinations.getByRole('button', { name: 'Rooms', exact: true })).toBeVisible()
-    await expect(destinations.getByRole('button', { name: 'Runs', exact: true })).toBeVisible()
-    await destinations.getByRole('button', { name: 'Rooms', exact: true }).click()
+    const mobileNav = page.locator('.channels-mobile-nav')
+    await mobileNav.getByRole('button', { name: 'Channels', exact: true }).click()
+    await expect(page.getByRole('dialog', { name: 'All channels' })).toBeVisible()
+    await page.getByRole('button', { name: 'Close all channels' }).click()
+    await expect(mobileNav.getByRole('button', { name: 'Rooms', exact: true })).toBeVisible()
+    await mobileNav.getByRole('button', { name: 'Rooms', exact: true }).click()
     await expect(page).toHaveURL(/surface=rooms/)
     await expect(page.getByText('#navigation-room', { exact: true })).toBeVisible()
 
