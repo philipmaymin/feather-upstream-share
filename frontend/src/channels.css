@@ -1227,10 +1227,10 @@
 }
 .channel-directory header > button {
   position: absolute;
-  top: 16px;
-  right: 16px;
-  width: 36px;
-  height: 36px;
+  top: 12px;
+  right: 12px;
+  width: 44px;
+  height: 44px;
   border: 0;
   color: var(--channel-muted);
   background: transparent;
@@ -1263,8 +1263,8 @@
 .channel-directory-list > button > span:nth-child(2) { min-width: 0; }
 .channel-directory-list b,
 .channel-directory-list small { display: block; }
-.channel-directory-list b { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
-.channel-directory-list small { margin-top: 3px; overflow: hidden; color: var(--channel-muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.channel-directory-list b { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.channel-directory-list small { margin-top: 3px; overflow: hidden; color: var(--channel-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .channel-directory-list strong {
   min-width: 19px;
   height: 19px;
@@ -1289,12 +1289,12 @@
 .channel-directory footer { padding: 12px 20px 18px; }
 .channel-directory footer button {
   width: 100%;
-  padding: 11px;
+  padding: 13px;
   border: 0;
   color: white;
   background: var(--channel-sage);
   font: inherit;
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 750;
   cursor: pointer;
 }
@@ -1379,6 +1379,8 @@
   .channel-conversation-header .channel-member-cluster { justify-self: end; }
   .channel-conversation-header h1 { font-size: 23px; }
   .channel-directory-button { display: inline-block; }
+  .channel-directory-button,
+  .channel-new-button { min-height: 36px; padding: 7px 9px; font-size: 10px; }
   .channel-member-cluster .channel-avatar:nth-of-type(n+4) { display: none; }
   .channel-member-cluster button { padding: 6px 8px; }
   .channel-header-actions button { padding: 6px 8px; }
