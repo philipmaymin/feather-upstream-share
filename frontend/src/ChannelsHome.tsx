@@ -30,12 +30,39 @@ import { appUrl } from './lib/appPath.js'
 import './channels.css'
 
 type ChannelSection = 'activity' | 'channels' | 'threads' | 'dms'
+type ProjectView = 'control' | 'timeline'
 type DialogKind = 'channel' | 'dm' | 'members' | null
 type ChannelThreadFilter = 'needs' | 'mentions' | 'unread' | 'done' | 'all'
 type PendingChannelImage = { id: string; file: File; previewUrl: string }
 const CHANNEL_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
 const MAX_CHANNEL_IMAGE_BYTES = 15 * 1024 * 1024
 const MAX_CHANNEL_IMAGES = 6
+const PROJECT_GUIDANCE_PROMPTS = [
+  {
+    id: 'status',
+    label: 'Status',
+    question: 'What is true now?',
+    prompt: 'STATUS CHECK — Give me a concise project status as of now. Separate observed facts from agent claims. Include the objective, material changes, work in progress, the next checkpoint, and confidence. Cite the source threads you relied on. If evidence is missing, say unknown.',
+  },
+  {
+    id: 'blockers',
+    label: 'Blockers',
+    question: 'What is stopping progress?',
+    prompt: 'BLOCKER CHECK — List only current blockers. For each, state the blocked work, the exact missing input or permission, what has already been tried, and the smallest action a human can take. Separate observed failures from agent claims.',
+  },
+  {
+    id: 'assumptions',
+    label: 'Assumptions',
+    question: 'What might be wrong?',
+    prompt: 'ASSUMPTION CHECK — List the major unverified assumptions currently guiding this project. For each, state the consequence if it is wrong, the available evidence, and the lowest-cost way to verify it. Do not present an inference as fact.',
+  },
+  {
+    id: 'direction',
+    label: 'Direction',
+    question: 'Where are we drifting?',
+    prompt: 'DIRECTION CHECK — Compare current work with the project objective. Identify loops, rabbit holes, or effort that no longer advances the outcome. Recommend one bounded course correction and the next evidence that would show progress.',
+  },
+] as const
 
 
 function channelDraftKey(channelId: string) {
@@ -75,6 +102,10 @@ function channelThreadFilter(params: URLSearchParams): ChannelThreadFilter {
   return 'all'
 }
 
+function projectView(params: URLSearchParams): ProjectView {
+  return params.get('projectView') === 'timeline' ? 'timeline' : 'control'
+}
+
 function relativeTime(iso: string) {
   const elapsed = Math.max(0, Date.now() - Date.parse(iso))
   const minutes = Math.floor(elapsed / 60_000)
@@ -84,6 +115,24 @@ function relativeTime(iso: string) {
   if (hours < 24) return `${hours}h`
   const days = Math.floor(hours / 24)
   return days < 7 ? `${days}d` : new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(new Date(iso))
+}
+
+function datedTime(iso: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(new Date(iso))
+}
+
+function latestRootMessage(root: ChannelMessage) {
+  return root.replies?.at(-1) || root
+}
+
+function compactProjectExcerpt(content: string, limit = 280) {
+  const plain = compactChannelImages(content).text.replace(/[#*_`>]/g, '').replace(/\s+/g, ' ').trim()
+  return plain.length > limit ? `${plain.slice(0, limit).trimEnd()}…` : plain
 }
 
 function activeSnooze(until: string | null) {
@@ -190,6 +239,7 @@ function Identity(props: { person: ChannelPrincipal; compact?: boolean }) {
 export default function ChannelsHome(props: ChannelsHomeProps) {
   const query = new URLSearchParams(location.search)
   const [section, setSection] = createSignal<ChannelSection>(channelSection(query))
+  const [projectViewMode, setProjectViewMode] = createSignal<ProjectView>(projectView(query))
   const [snapshot, setSnapshot] = createSignal<ChannelsSnapshot>(emptySnapshot)
   const [selectedChannelId, setSelectedChannelId] = createSignal(query.get('channel'))
   const [roots, setRoots] = createSignal<ChannelMessage[]>([])
@@ -227,7 +277,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [dialogBusy, setDialogBusy] = createSignal(false)
   const [editingTitle, setEditingTitle] = createSignal(false)
   const [titleDraft, setTitleDraft] = createSignal('')
-  const [activityNeedsOnly, setActivityNeedsOnly] = createSignal(false)
+  const [activityNeedsOnly, setActivityNeedsOnly] = createSignal(true)
   const [threadFilter, setThreadFilter] = createSignal<ChannelThreadFilter>(channelThreadFilter(query))
   const [pushState, setPushState] = createSignal<'idle' | 'enabling' | 'enabled' | 'denied' | 'error' | 'unavailable'>('idle')
   const [announcement, setAnnouncement] = createSignal('')
@@ -259,7 +309,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const selectedChannel = createMemo(() => allChannels().find(channel => channel.id === selectedChannelId()) || null)
   const agents = createMemo(() => selectedChannel()?.members.filter(member => member.kind === 'agent') || [])
   const visibleActivity = createMemo(() => activityNeedsOnly()
-    ? activity().items.filter(item => item.kind === 'needs_you' || item.kind === 'failure' || item.kind === 'mention')
+    ? activity().items.filter(item => item.kind === 'needs_you' || item.kind === 'failure')
     : activity().items)
   const threadCounts = createMemo(() => {
     let needs = 0
@@ -287,6 +337,28 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     return visible.sort((left, right) => attentionPriority(right) - attentionPriority(left)
       || Date.parse(right.thread?.updatedAt || right.createdAt) - Date.parse(left.thread?.updatedAt || left.createdAt))
   })
+  const projectInterventions = createMemo(() => [...roots()]
+    .filter(message => message.messageType !== 'system' && !message.thread?.doneAt
+      && (!!message.thread?.recovery || message.thread?.state === 'needs_you'))
+    .sort((left, right) => attentionPriority(right) - attentionPriority(left)
+      || Date.parse(left.thread?.updatedAt || left.createdAt) - Date.parse(right.thread?.updatedAt || right.createdAt)))
+  const projectWork = createMemo(() => [...roots()]
+    .filter(message => message.messageType !== 'system' && !message.thread?.doneAt
+      && threadIsActive(message) && !message.thread?.recovery && message.thread?.state !== 'needs_you')
+    .sort((left, right) => Date.parse(right.thread?.updatedAt || right.createdAt) - Date.parse(left.thread?.updatedAt || left.createdAt)))
+  const recentProjectRoots = createMemo(() => [...roots()]
+    .filter(message => message.messageType !== 'system')
+    .sort((left, right) => Date.parse(right.thread?.updatedAt || right.createdAt) - Date.parse(left.thread?.updatedAt || left.createdAt))
+    .slice(0, 4))
+  const latestStatusRoot = createMemo(() => [...roots()]
+    .filter(message => message.content.trimStart().startsWith('STATUS CHECK —'))
+    .sort((left, right) => Date.parse(right.thread?.updatedAt || right.createdAt) - Date.parse(left.thread?.updatedAt || left.createdAt))[0] || null)
+  const projectUpdatedAt = createMemo(() => recentProjectRoots()[0]?.thread?.updatedAt
+    || recentProjectRoots()[0]?.createdAt
+    || selectedChannel()?.createdAt
+    || new Date().toISOString())
+  const activeTurnCount = createMemo(() => projectWork().reduce((total, message) => total + (message.thread?.delivery.activeCount || 0), 0))
+  const queuedTurnCount = createMemo(() => roots().reduce((total, message) => total + (message.thread?.delivery.queuedCount || 0), 0))
   function unreadNeighbor(direction: -1 | 1) {
     const messages = roots()
     const currentIndex = messages.findIndex(message => message.threadRootId === thread()?.id)
@@ -343,12 +415,14 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const url = new URL(location.href)
     url.searchParams.set('surface', 'channels')
     url.searchParams.set('view', nextSection)
+    if (nextSection === 'channels' && projectViewMode() === 'timeline') url.searchParams.set('projectView', 'timeline')
+    else url.searchParams.delete('projectView')
 
     if (channelId) url.searchParams.set('channel', channelId)
     else url.searchParams.delete('channel')
     if (rootId) url.searchParams.set('thread', rootId)
     else url.searchParams.delete('thread')
-    const state = { channels: true, view: nextSection, channelId, channelThread: rootId, channelThreadPushed: mode === 'push' }
+    const state = { channels: true, view: nextSection, projectView: projectViewMode(), channelId, channelThread: rootId, channelThreadPushed: mode === 'push' }
     if (mode === 'push') history.pushState(state, '', `${url.pathname}${url.search}`)
     else history.replaceState(state, '', `${url.pathname}${url.search}`)
   }
@@ -359,6 +433,36 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     if (filter === 'all') url.searchParams.delete('threadFilter')
     else url.searchParams.set('threadFilter', filter)
     history.replaceState({ ...(history.state || {}), channelThreadFilter: filter }, '', `${url.pathname}${url.search}`)
+  }
+
+  function chooseProjectView(next: ProjectView) {
+    setProjectViewMode(next)
+    const url = new URL(location.href)
+    if (next === 'timeline') url.searchParams.set('projectView', 'timeline')
+    else url.searchParams.delete('projectView')
+    history.replaceState({ ...(history.state || {}), projectView: next }, '', `${url.pathname}${url.search}`)
+  }
+
+  function prepareProjectPrompt(prompt: typeof PROJECT_GUIDANCE_PROMPTS[number]) {
+    updateRootDraft(prompt.prompt)
+    queueMicrotask(() => {
+      rootComposer?.focus()
+      rootComposer?.scrollIntoView({ block: 'nearest' })
+    })
+    setAnnouncement(`${prompt.label} prompt is ready to edit and send.`)
+  }
+
+  async function prepareInterventionReply(message: ChannelMessage) {
+    const recoveryAgent = message.thread?.recovery?.agent
+    const defaultAgent = selectedChannel()?.members.find(member => member.id === selectedChannel()?.defaultAgentId)
+    const target = recoveryAgent || defaultAgent || agents()[0]
+    const prompt = message.thread?.recovery
+      ? 'Stop repeating the failed path. State the exact failure, what changed between attempts, and one falsifiable root-cause hypothesis. Run one discriminating check before trying again, then report the evidence.'
+      : 'State the exact decision or input you need from me, why it blocks the project outcome, and the smallest safe next step. Give me bounded options and do not choose on my behalf.'
+    await openThread(message.threadRootId, message.channelId)
+    setReplyDraft(`${target ? `@${target.username} ` : ''}${prompt}`)
+    queueMicrotask(() => replyComposer?.focus())
+    setAnnouncement('A steering reply is ready to edit and send.')
   }
 
   async function loadRoots(channelId: string, generation = loadGeneration) {
@@ -507,6 +611,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     ++threadLoadRequest
     setSelectedChannelId(channel.id)
     setSection(nextSection)
+    if (nextSection === 'channels') setProjectViewMode('control')
     setThread(null)
     setThreadUnreadAfterSeq(null)
     setThreadHistoryExpanded(false)
@@ -983,6 +1088,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     const generation = ++loadGeneration
     const request = ++threadLoadRequest
     setSection(nextSection)
+    setProjectViewMode(projectView(params))
     setThreadFilter(channelThreadFilter(params))
     setSelectedChannelId(channelId)
     if (changedChannel) {
@@ -1126,8 +1232,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
               }
             }}
             rows={inReply ? 2 : 3}
-            placeholder={inReply ? 'Reply in this thread' : selectedChannel()?.type === 'dm' ? `Message ${dmName(selectedChannel()!, snapshot().principal?.id)}` : `Message #${selectedChannel()?.slug || ''}`}
-            aria-label={inReply ? 'Thread reply' : 'New channel message'}
+            placeholder={inReply ? 'Reply in this thread' : selectedChannel()?.type === 'dm' ? `Message ${dmName(selectedChannel()!, snapshot().principal?.id)}` : `Shout direction into #${selectedChannel()?.slug || ''}`}
+            aria-label={inReply ? 'Thread reply' : selectedChannel()?.type === 'dm' ? 'New direct message' : 'Project shout'}
           />
           <button
             type="button"
@@ -1173,7 +1279,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
           <span>Unread</span><b>{threadCounts().unread}</b>
         </button>
         <button type="button" classList={{ active: threadFilter() === 'done' }} aria-pressed={threadFilter() === 'done'} onClick={() => chooseThreadFilter('done')}>
-          <span>Done</span><b>{threadCounts().done}</b>
+          <span>Cleared</span><b>{threadCounts().done}</b>
         </button>
         <button type="button" classList={{ active: threadFilter() === 'all' }} aria-pressed={threadFilter() === 'all'} onClick={() => chooseThreadFilter('all')}>
           <span>All</span><b>{threadCounts().all}</b>
@@ -1188,7 +1294,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       needs: ['Nothing needs you', 'Unread replies, decisions, and failures will appear here.'],
       mentions: ['No new mentions', 'Unread threads that mention you will appear here.'],
       unread: ['You’re caught up', 'Threads with new messages will appear here.'],
-      done: ['No done threads', 'Threads you mark Done will remain available here.'],
+      done: ['No cleared threads', 'Threads you clear for yourself remain available here.'],
       all: ['', ''],
     }[threadFilter()])
     return (
@@ -1333,6 +1439,129 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     )
   }
 
+  const renderProjectControl = () => (
+    <section class="channel-control-room" aria-label="Project control room">
+      <header class="channel-control-lead">
+        <div>
+          <small>Project control room</small>
+          <h2>Steer the work, not the conversation</h2>
+          <p>Only explicit requests and stopped turns enter the intervention queue. Messages remain available as source context.</p>
+        </div>
+        <time title={projectUpdatedAt()}>Source activity through {datedTime(projectUpdatedAt())}</time>
+      </header>
+
+      <div class="channel-control-metrics" aria-label="Current project signals">
+        <div><b>{projectInterventions().length}</b><span>need steering</span></div>
+        <div><b>{activeTurnCount()}</b><span>running now</span></div>
+        <div><b>{queuedTurnCount()}</b><span>queued turns</span></div>
+        <div><b>{roots().filter(message => message.messageType !== 'system').length}</b><span>source threads</span></div>
+      </div>
+
+      <div class="channel-control-grid">
+        <div class="channel-control-primary">
+          <section class="channel-control-section channel-intervention-queue" aria-labelledby="channel-intervention-title">
+            <header>
+              <div><small>Human intervention</small><h2 id="channel-intervention-title">Needs your direction</h2></div>
+              <span>{projectInterventions().length} open</span>
+            </header>
+            <Show when={projectInterventions().length > 0} fallback={
+              <div class="channel-control-empty">
+                <b>No explicit blocker is waiting</b>
+                <p>Unread messages are deliberately excluded. A stopped turn or an agent’s explicit guidance request will appear here.</p>
+              </div>
+            }>
+              <For each={projectInterventions()}>{message => {
+                const update = latestRootMessage(message)
+                const recovery = message.thread!.recovery
+                return (
+                  <article class="channel-intervention-card" classList={{ failed: !!recovery }}>
+                    <div class="channel-intervention-meta">
+                      <span>{recovery ? 'Problem' : 'Guidance request · legacy'}</span>
+                      <time title={message.thread!.updatedAt}>{relativeTime(message.thread!.updatedAt)}</time>
+                    </div>
+                    <h3>{message.thread!.title}</h3>
+                    <p class="channel-intervention-fact">{recovery ? `${recovery.agent.displayName} stopped: ${recovery.error || 'The turn did not complete.'}` : `${update.author.displayName} explicitly requested human guidance.`}</p>
+                    <Show when={compactProjectExcerpt(update.content)}>
+                      <p class="channel-intervention-claim"><b>{update.author.kind === 'agent' ? 'Agent report' : 'Source message'}</b>{compactProjectExcerpt(update.content)}</p>
+                    </Show>
+                    <div class="channel-intervention-actions">
+                      <button type="button" class="primary" onClick={() => void prepareInterventionReply(message)}>Prepare steering reply</button>
+                      <button type="button" onClick={() => void openThread(message.threadRootId, message.channelId)}>Open context</button>
+                    </div>
+                  </article>
+                )
+              }}</For>
+            </Show>
+          </section>
+
+          <section class="channel-control-section channel-work-now" aria-labelledby="channel-work-now-title">
+            <header>
+              <div><small>Observed execution state</small><h2 id="channel-work-now-title">Work now</h2></div>
+              <span>{projectWork().length} active</span>
+            </header>
+            <Show when={projectWork().length > 0} fallback={
+              <div class="channel-control-empty compact"><b>No agent turn is running</b><p>This is an observed execution state, not a project-health judgment.</p></div>
+            }>
+              <For each={projectWork()}>{message => (
+                <article class="channel-work-card">
+                  <div><span class="channel-worklog-pulse running" /><div><b>{message.thread!.title}</b><p>{message.thread!.delivery.activeCount} running · {message.thread!.delivery.queuedCount} queued</p></div></div>
+                  <button type="button" onClick={() => void openThread(message.threadRootId, message.channelId)}>Inspect</button>
+                </article>
+              )}</For>
+            </Show>
+          </section>
+        </div>
+
+        <aside class="channel-control-brief" aria-label="Dated project brief">
+          <section class="channel-status-card">
+            <div class="channel-status-heading"><small>Dated project brief</small><time>As of {datedTime(projectUpdatedAt())}</time></div>
+            <Show when={latestStatusRoot()} fallback={
+              <>
+                <h2>No status has been published</h2>
+                <p>The interface will not manufacture a summary from chat. Ask the project for a sourced status when you need one.</p>
+              </>
+            }>{statusRoot => {
+              const update = latestRootMessage(statusRoot())
+              const answered = update.id !== statusRoot().id
+              return (
+                <>
+                  <h2>{answered ? 'Latest reported status' : 'Status request sent'}</h2>
+                  <p class="channel-status-provenance">{answered ? 'Agent claim' : 'Human request'} · {update.author.displayName} · {datedTime(update.createdAt)}</p>
+                  <p>{compactProjectExcerpt(update.content, 420)}</p>
+                  <button type="button" onClick={() => void openThread(statusRoot().threadRootId, statusRoot().channelId)}>Open status context</button>
+                </>
+              )
+            }}</Show>
+            <button type="button" class="channel-status-refresh" onClick={() => prepareProjectPrompt(PROJECT_GUIDANCE_PROMPTS[0])}>{latestStatusRoot() ? 'Prepare fresh status' : 'Prepare status request'}</button>
+          </section>
+
+          <section class="channel-guidance-prompts" aria-labelledby="channel-guidance-title">
+            <header><small>Suggested prompts</small><h2 id="channel-guidance-title">Ask what changes direction</h2></header>
+            <For each={PROJECT_GUIDANCE_PROMPTS}>{prompt => (
+              <button type="button" onClick={() => prepareProjectPrompt(prompt)}>
+                <b>{prompt.label}</b><span>{prompt.question}</span><i aria-hidden="true">→</i>
+              </button>
+            )}</For>
+          </section>
+
+          <section class="channel-recent-sources" aria-labelledby="channel-recent-title">
+            <header><small>Source record</small><h2 id="channel-recent-title">Recent updates</h2></header>
+            <For each={recentProjectRoots()}>{message => {
+              const update = latestRootMessage(message)
+              return (
+                <button type="button" onClick={() => void openThread(message.threadRootId, message.channelId)}>
+                  <span>{update.author.kind === 'agent' ? 'Agent report' : 'Human direction'} · {relativeTime(update.createdAt)}</span>
+                  <b>{message.thread?.title}</b>
+                  <p>{compactProjectExcerpt(update.content, 150)}</p>
+                </button>
+              )
+            }}</For>
+          </section>
+        </aside>
+      </div>
+    </section>
+  )
+
   return (
     <div class="channels-root" classList={{ 'channels-root-personal': props.showPersonal, 'channel-thread-open': !!thread() }} data-testid="channels-home">
       <p class="channel-sr-only" aria-live="polite">{announcement()}</p>
@@ -1347,17 +1576,17 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         <nav class="channels-primary-nav">
           <button type="button" classList={{ active: section() === 'activity' }} onClick={() => navigate('activity')}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5zM8 9h8M8 13h6M8 17h4" /></svg>
-            <span>Activity</span>
+            <span>Interventions</span>
             <Show when={activity().unread > 0}><b>{activity().unread}</b></Show>
           </button>
           <button type="button" classList={{ active: section() === 'threads' }} onClick={() => navigate('threads')}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4V5Zm4 4h8M8 12h5" /></svg>
-            <span>Threads</span>
+            <span>Context</span>
           </button>
         </nav>
 
         <div class="channels-nav-group">
-          <div class="channels-nav-heading"><span>Channels</span><button type="button" onClick={() => openDialog('channel')} aria-label="Create channel">+</button></div>
+          <div class="channels-nav-heading"><span>Projects</span><button type="button" onClick={() => openDialog('channel')} aria-label="Create project">+</button></div>
           <For each={snapshot().channels}>{channel => (
             <button
               type="button"
@@ -1412,18 +1641,18 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
         <Show when={section() === 'activity'}>
           <header class="channel-view-header channel-activity-header">
-            <div><small>Your inbox</small><h1>Activity</h1><p>Read is not done. Clear work when it no longer needs your attention.</p></div>
+            <div><small>Across all projects</small><h1>Interventions</h1><p>Only explicit guidance requests and stopped work belong here. Routine updates stay out of the way.</p></div>
             <div class="channel-header-actions">
-              <button type="button" classList={{ active: activityNeedsOnly() }} aria-pressed={activityNeedsOnly()} onClick={() => setActivityNeedsOnly(!activityNeedsOnly())}>Needs you <b>{activity().needsYou}</b></button>
+              <button type="button" classList={{ active: activityNeedsOnly() }} aria-pressed={activityNeedsOnly()} onClick={() => setActivityNeedsOnly(!activityNeedsOnly())}>{activityNeedsOnly() ? 'Show all updates' : 'Only interventions'} <b>{activity().needsYou}</b></button>
               <button type="button" classList={{ active: pushState() === 'enabled' }} onClick={() => void enableNotifications()} disabled={notificationDisabled()} title={notificationHint()}>
                 {pushState() === 'enabled' ? 'Alerts on' : pushState() === 'denied' ? 'Alerts blocked' : pushState() === 'unavailable' ? 'Alerts unavailable' : pushState() === 'error' ? 'Retry alerts' : pushState() === 'enabling' ? 'Enabling…' : 'Alerts'}
               </button>
               <button type="button" onClick={() => void refresh()} disabled={refreshing()}>{refreshing() ? 'Checking…' : 'Refresh'}</button>
             </div>
           </header>
-          <section class="channel-activity-list" aria-label="Notification inbox">
+          <section class="channel-activity-list" aria-label="Intervention inbox">
             <Show when={!loading() && visibleActivity().length === 0}>
-              <div class="channel-empty"><span class="channel-empty-rule" /><small>Inbox zero</small><h2>Nothing is waiting on you</h2><p>Mentions, direct messages, agent completions, and failures arrive here with the reason they need your attention.</p></div>
+              <div class="channel-empty"><span class="channel-empty-rule" /><small>No intervention</small><h2>Nothing needs your guidance</h2><p>Agent replies, completions, and mentions remain available under all updates without filling this queue.</p></div>
             </Show>
             <For each={visibleActivity()}>{item => (
               <article class="channel-activity-item" classList={{ unread: !item.readAt, urgent: item.kind === 'needs_you' || item.kind === 'failure' }}>
@@ -1441,7 +1670,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                 </button>
                 <div class="channel-activity-actions">
                   <button type="button" onClick={() => void finishActivity(item, true)}>Snooze 1h</button>
-                  <button type="button" class="primary" onClick={() => void finishActivity(item)}>Done</button>
+                  <button type="button" class="primary" onClick={() => void finishActivity(item)}>Clear for me</button>
                 </div>
               </article>
             )}</For>
@@ -1450,7 +1679,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
 
         <Show when={section() === 'threads'}>
           <header class="channel-view-header">
-            <div><small>{selectedChannel()?.slug ? `#${selectedChannel()!.slug}` : 'Current conversation'}</small><h1>Threads</h1><p>Every thread in this channel, ordered by its latest update.</p></div>
+            <div><small>{selectedChannel()?.slug ? `#${selectedChannel()!.slug}` : 'Current project'}</small><h1>Context</h1><p>The complete source record: conversations, agent work, and execution history.</p></div>
           </header>
           {renderThreadFilters()}
           <section class="channel-thread-index">
@@ -1478,25 +1707,31 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             }>
               <div class="channel-empty channel-empty-full">
                 <span class="channel-empty-rule" /><small>Fresh workspace</small>
-                <h1>{section() === 'dms' ? 'No direct messages yet' : 'Create your first channel'}</h1>
-                <p>{section() === 'dms' ? 'Start a private line with any human or agent who shares a channel with you.' : 'Channels keep human and agent work together in one shared timeline.'}</p>
+                <h1>{section() === 'dms' ? 'No direct messages yet' : 'Create your first project'}</h1>
+                <p>{section() === 'dms' ? 'Start a private line with any human or agent who shares a project with you.' : 'Projects keep human direction, agent work, and source context together.'}</p>
                 <Show when={section() === 'dms'}><button type="button" onClick={() => openDialog('dm')}>Start a direct message</button></Show>
-                <Show when={section() !== 'dms'}><button type="button" onClick={() => openDialog('channel')}>New channel</button></Show>
+                <Show when={section() !== 'dms'}><button type="button" onClick={() => openDialog('channel')}>New project</button></Show>
               </div>
             </Show>
           }>{channel => (
             <>
               <header class="channel-view-header channel-conversation-header">
                 <div>
-                  <small>{channel().type === 'dm' ? 'Direct message' : 'Channel'}</small>
+                  <small>{channel().type === 'dm' ? 'Direct message' : 'Project'}</small>
                   <div class="channel-title-row">
                     <h1>{channel().type === 'dm' ? dmName(channel(), snapshot().principal?.id) : `#${channel().slug}`}</h1>
                     <Show when={channel().type === 'channel'}>
-                      <button type="button" class="channel-directory-button" onClick={() => openChannelDirectory('channels')}>All channels</button>
-                      <button type="button" class="channel-new-button" onClick={() => openDialog('channel')}>New channel</button>
+                      <button type="button" class="channel-directory-button" onClick={() => openChannelDirectory('channels')}>All projects</button>
+                      <button type="button" class="channel-new-button" onClick={() => openDialog('channel')}>New project</button>
                     </Show>
                   </div>
                   <p>{channel().description || (channel().type === 'dm' ? 'A private conversation between members.' : '')}</p>
+                  <Show when={channel().type === 'channel'}>
+                    <nav class="channel-project-switch" aria-label="Project view">
+                      <button type="button" classList={{ active: projectViewMode() === 'control' }} aria-pressed={projectViewMode() === 'control'} onClick={() => chooseProjectView('control')}>Control room</button>
+                      <button type="button" classList={{ active: projectViewMode() === 'timeline' }} aria-pressed={projectViewMode() === 'timeline'} onClick={() => chooseProjectView('timeline')}>Timeline</button>
+                    </nav>
+                  </Show>
                 </div>
                 <div class="channel-member-cluster">
                   <button
@@ -1528,15 +1763,21 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                   </Show>
                 </div>
               </header>
-              {renderThreadFilters()}
-              <section class="channel-timeline" aria-label={`${channel().title} messages`} aria-busy={loading()}>
-                <Show when={loading()}><div class="channel-loading"><span /><span /><span /></div></Show>
-                <Show when={!loading() && roots().length === 0}>
-                  <div class="channel-empty"><small>The first note</small><h2>Set the work in motion</h2><p>Coordinator answers directly when free. While Coordinator is busy, Btw handles quick questions or queues substantial work behind it.</p></div>
-                </Show>
-                {renderFilteredEmpty()}
-                <For each={visibleRoots()}>{message => renderMessage(message)}</For>
-              </section>
+              <Show when={channel().type === 'channel' && projectViewMode() === 'control'} fallback={
+                <>
+                  {renderThreadFilters()}
+                  <section class="channel-timeline" aria-label={`${channel().title} messages`} aria-busy={loading()}>
+                    <Show when={loading()}><div class="channel-loading"><span /><span /><span /></div></Show>
+                    <Show when={!loading() && roots().length === 0}>
+                      <div class="channel-empty"><small>The first note</small><h2>Set the work in motion</h2><p>Coordinator answers directly when free. While Coordinator is busy, Btw handles quick questions or queues substantial work behind it.</p></div>
+                    </Show>
+                    {renderFilteredEmpty()}
+                    <For each={visibleRoots()}>{message => renderMessage(message)}</For>
+                  </section>
+                </>
+              }>
+                {renderProjectControl()}
+              </Show>
               {renderComposer(false)}
             </>
           )}</Show>
@@ -1579,7 +1820,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
               <Show when={nextUnreadRoot()}>{next => (
                 <button type="button" class="channel-next-unread" onClick={() => void openThread(next().threadRootId, next().channelId)}>Next unread →</button>
               )}</Show>
-              <button type="button" disabled={!!attentionAction()} class="channel-done" classList={{ active: !!current().doneAt }} aria-pressed={!!current().doneAt} onClick={() => void setAttention('done', !current().doneAt)}>{current().doneAt ? 'Reopen' : 'Done'}</button>
+              <button type="button" disabled={!!attentionAction()} class="channel-done" classList={{ active: !!current().doneAt }} aria-pressed={!!current().doneAt} onClick={() => void setAttention('done', !current().doneAt)}>{current().doneAt ? 'Restore' : 'Clear for me'}</button>
             </div>
             {renderDelivery(current().delivery)}
 
@@ -1668,8 +1909,8 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
         <div class="channel-directory-scrim" onClick={event => { if (event.target === event.currentTarget) setChannelDirectoryOpen(false) }}>
           <section class="channel-directory" role="dialog" aria-modal="true" aria-labelledby="channel-directory-title">
             <header>
-              <div><small>Fledge</small><h2 id="channel-directory-title">{channelDirectoryMode() === 'channels' ? 'All channels' : 'Direct messages'}</h2></div>
-              <button type="button" onClick={() => setChannelDirectoryOpen(false)} aria-label={`Close ${channelDirectoryMode() === 'channels' ? 'all channels' : 'direct messages'}`}>×</button>
+              <div><small>Fledge</small><h2 id="channel-directory-title">{channelDirectoryMode() === 'channels' ? 'All projects' : 'Direct messages'}</h2></div>
+              <button type="button" onClick={() => setChannelDirectoryOpen(false)} aria-label={`Close ${channelDirectoryMode() === 'channels' ? 'all projects' : 'direct messages'}`}>×</button>
             </header>
             <div class="channel-directory-list">
               <Show when={channelDirectoryMode() === 'channels'} fallback={
@@ -1707,17 +1948,17 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             </div>
             <footer>
               <button type="button" onClick={() => { setChannelDirectoryOpen(false); openDialog(channelDirectoryMode() === 'channels' ? 'channel' : 'dm') }}>
-                {channelDirectoryMode() === 'channels' ? 'New channel' : 'New direct message'}
+                {channelDirectoryMode() === 'channels' ? 'New project' : 'New direct message'}
               </button>
             </footer>
           </section>
         </div>
       </Show>
 
-      <nav class="channels-mobile-nav" classList={{ personal: props.showPersonal }} aria-label="Channel workspace navigation">
-        <button type="button" classList={{ active: section() === 'activity' }} onClick={() => navigate('activity')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5zM8 9h8M8 13h6" /></svg><span>Activity</span><Show when={activity().unread}><b>{activity().unread}</b></Show></button>
-        <button type="button" classList={{ active: section() === 'channels' }} onClick={() => openChannelDirectory('channels')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 4-2 16m10-16-2 16M4 9h16M3 15h16" /></svg><span>Channels</span></button>
-        <button type="button" classList={{ active: section() === 'threads' }} onClick={() => navigate('threads')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4V5Z" /></svg><span>Threads</span></button>
+      <nav class="channels-mobile-nav" classList={{ personal: props.showPersonal }} aria-label="Project workspace navigation">
+        <button type="button" classList={{ active: section() === 'activity' }} onClick={() => navigate('activity')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5zM8 9h8M8 13h6" /></svg><span>Interventions</span><Show when={activity().unread}><b>{activity().unread}</b></Show></button>
+        <button type="button" classList={{ active: section() === 'channels' }} onClick={() => openChannelDirectory('channels')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 4-2 16m10-16-2 16M4 9h16M3 15h16" /></svg><span>Projects</span></button>
+        <button type="button" classList={{ active: section() === 'threads' }} onClick={() => navigate('threads')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4V5Z" /></svg><span>Context</span></button>
         <button type="button" classList={{ active: section() === 'dms' }} onClick={() => openChannelDirectory('dms')}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4zM7 9h10M7 13h7" /></svg><span>DMs</span></button>
         <Show when={props.showPersonal}><button type="button" onClick={props.onRooms}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l2 2h8v10H4V6Z" /></svg><span>Rooms</span></button></Show>
         <Show when={props.showPersonal}><button type="button" onClick={props.onFeed}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M5 12h10M5 19h7" /></svg><span>Runs</span></button></Show>
@@ -1726,13 +1967,13 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       <Show when={dialog()}>
         <div class="channel-dialog-scrim" onClick={event => { if (event.target === event.currentTarget) setDialog(null) }} onKeyDown={event => { if (event.key === 'Escape') setDialog(null) }}>
           <section class="channel-dialog" role="dialog" aria-modal="true" aria-labelledby="channel-dialog-title">
-            <header><small>{dialog() === 'dm' ? 'Private line' : 'Shared studio'}</small><h2 id="channel-dialog-title">{dialog() === 'channel' ? 'Create a channel' : dialog() === 'members' ? 'Invite a human' : 'Start a direct message'}</h2><button type="button" onClick={() => setDialog(null)} aria-label="Close">×</button></header>
+            <header><small>{dialog() === 'dm' ? 'Private line' : 'Shared studio'}</small><h2 id="channel-dialog-title">{dialog() === 'channel' ? 'Create a project' : dialog() === 'members' ? 'Invite a human' : 'Start a direct message'}</h2><button type="button" onClick={() => setDialog(null)} aria-label="Close">×</button></header>
             <Show when={dialog() === 'dm'} fallback={
               <form onSubmit={event => { event.preventDefault(); void submitDialog() }}>
-                <label>{dialog() === 'channel' ? 'Channel name' : 'Username'}<input value={dialogValue()} onInput={event => setDialogValue(event.currentTarget.value)} placeholder={dialog() === 'channel' ? 'Film launch' : 'maya'} autofocus /></label>
+                <label>{dialog() === 'channel' ? 'Project name' : 'Username'}<input value={dialogValue()} onInput={event => setDialogValue(event.currentTarget.value)} placeholder={dialog() === 'channel' ? 'Film launch' : 'maya'} autofocus /></label>
                 <Show when={dialog() === 'channel'}><label>Display title <input value={dialogTitle()} onInput={event => setDialogTitle(event.currentTarget.value)} placeholder="Film Launch" /></label></Show>
                 <Show when={dialogError()}><p class="channel-dialog-error">{dialogError()}</p></Show>
-                <button type="submit" class="channel-dialog-submit" disabled={!dialogValue().trim() || dialogBusy()}>{dialogBusy() ? dialog() === 'channel' ? 'Adding agents…' : 'Inviting…' : dialog() === 'channel' ? 'Create channel' : 'Send invite'}</button>
+                <button type="submit" class="channel-dialog-submit" disabled={!dialogValue().trim() || dialogBusy()}>{dialogBusy() ? dialog() === 'channel' ? 'Adding agents…' : 'Inviting…' : dialog() === 'channel' ? 'Create project' : 'Send invite'}</button>
               </form>
             }>
               <div class="channel-person-list">

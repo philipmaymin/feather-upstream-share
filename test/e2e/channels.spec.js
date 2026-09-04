@@ -130,9 +130,10 @@ async function installChannels(page, state) {
           root.thread.updatedAt = NOW
         }
       } else {
-        const root = { ...posted, thread: { title: body.content, state: 'working', replyCount: 0, updatedAt: NOW, unread: false, following: true, doneAt: null, snoozedUntil: null }, replies: [] }
+        const delivery = { queuedAgents: [], activeAgents: [], queuedCount: 0, activeCount: 0 }
+        const root = { ...posted, thread: { title: body.content, state: 'working', replyCount: 0, updatedAt: NOW, unread: false, mentioned: false, following: true, doneAt: null, snoozedUntil: null, delivery, recovery: null }, replies: [] }
         state.roots.push(root)
-        state.threads.set(id, { id, channelId: channel.id, title: body.content, state: 'working', following: true, doneAt: null, snoozedUntil: null, messages: [root], executions: [] })
+        state.threads.set(id, { id, channelId: channel.id, title: body.content, state: 'working', lastReadSeq: 0, following: true, doneAt: null, snoozedUntil: null, delivery, messages: [root], executions: [] })
       }
       return route.fulfill({ status: 201, json: { message: posted } })
     }
@@ -210,7 +211,36 @@ async function installChannels(page, state) {
   })
 }
 
+async function openProjectTimeline(page) {
+  await page.getByRole('button', { name: 'Timeline', exact: true }).click()
+}
+
 test.describe('Channels PWA', () => {
+  test('project control room puts human intervention ahead of conversation volume', async ({ page }) => {
+    const state = fixtureState()
+    const root = state.roots.find(candidate => candidate.id === 'root-1')
+    root.thread.state = 'needs_you'
+    state.threads.get('root-1').state = 'needs_you'
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 1180, height: 820 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    const control = page.getByRole('region', { name: 'Project control room' })
+    await expect(control.getByRole('heading', { name: 'Steer the work, not the conversation' })).toBeVisible()
+    await expect(control.getByRole('heading', { name: 'Needs your direction' })).toBeVisible()
+    await expect(control.getByText('Guidance request · legacy')).toBeVisible()
+    await expect(page.locator('.channel-timeline')).toHaveCount(0)
+    await control.getByRole('button', { name: 'Prepare steering reply' }).click()
+    await expect(page.getByLabel('Thread reply')).toBeFocused()
+    await expect(page.getByLabel('Thread reply')).toHaveValue(/@coordinator State the exact decision or input/)
+    await page.getByRole('button', { name: 'Close focused thread' }).click()
+
+    await control.locator('.channel-guidance-prompts').getByRole('button', { name: /Status/ }).click()
+    await expect(page.getByLabel('Project shout')).toBeFocused()
+    await expect(page.getByLabel('Project shout')).toHaveValue(/^STATUS CHECK —/)
+    await openProjectTimeline(page)
+    await expect(page.getByText('What dramatic question should the opening make impossible to ignore?')).toBeVisible()
+  })
   test('desktop keeps shared work legible from channel to execution', async ({ page }) => {
     const state = fixtureState()
     state.threads.get('root-1').executions.unshift({
@@ -226,7 +256,7 @@ test.describe('Channels PWA', () => {
     })
     await installChannels(page, state)
     await page.setViewportSize({ width: 1440, height: 900 })
-    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&projectView=timeline`)
 
     await expect(page.getByTestId('channels-home')).toBeVisible()
     await expect(page.getByRole('heading', { name: '#films7' })).toBeVisible()
@@ -238,9 +268,9 @@ test.describe('Channels PWA', () => {
     await expect(page.getByText('Coordinator owns substantial work. Btw answers overflow while Coordinator is busy.')).toBeVisible()
     await expect(page.getByRole('button', { name: /Btw.*Helps while Coordinator is busy/ })).toBeVisible()
     await page.getByRole('button', { name: /Coordinator.*Main agent/ }).click()
-    await expect(page.getByLabel('New channel message')).toBeFocused()
-    await expect(page.getByLabel('New channel message')).toHaveValue('@coordinator ')
-    await page.getByLabel('New channel message').fill('')
+    await expect(page.getByLabel('Project shout')).toBeFocused()
+    await expect(page.getByLabel('Project shout')).toHaveValue('@coordinator ')
+    await page.getByLabel('Project shout').fill('')
     const mainWidthBefore = await page.locator('.channels-main').evaluate(element => element.getBoundingClientRect().width)
 
     await page.getByRole('button', { name: /2 replies/ }).click()
@@ -302,7 +332,9 @@ test.describe('Channels PWA', () => {
 
 
     await page.getByRole('button', { name: 'Close focused thread' }).click()
-    const composer = page.getByLabel('New channel message')
+    await expect(page.getByRole('complementary', { name: 'Focused thread' })).toHaveCount(0)
+    await expect(page).toHaveURL(/projectView=timeline/)
+    const composer = page.getByLabel('Project shout')
     await composer.fill('Build a silent ending that earns the final held look.')
     await composer.press('Control+Enter')
     await expect(page.getByLabel('Reply to thread: Build a silent ending that earns the final held look.')).toBeVisible()
@@ -313,7 +345,7 @@ test.describe('Channels PWA', () => {
     const state = fixtureState()
     state.threadDelays = { 'root-1': 300, bridge: 10 }
     await installChannels(page, state)
-    await page.goto(`${BASE}/?app=fledge&surface=channels&threadFilter=all`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&threadFilter=all&projectView=timeline`)
 
     await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
     await page.getByRole('button', { name: 'Focus thread: Continuity bridge' }).click()
@@ -342,13 +374,15 @@ test.describe('Channels PWA', () => {
     await expect(page.getByRole('complementary', { name: 'Focused thread' })).toHaveCount(0)
   })
 
-  test('Activity behaves as a triage inbox rather than another feed', async ({ page }) => {
+  test('Interventions behaves as a triage inbox rather than another feed', async ({ page }) => {
     const state = fixtureState()
     await installChannels(page, state)
     await page.setViewportSize({ width: 1180, height: 820 })
     await page.goto(`${BASE}/?app=fledge&surface=channels&view=activity`)
 
-    await expect(page.getByRole('heading', { name: 'Activity' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Interventions' })).toBeVisible()
+    await expect(page.getByText('Coordinator replied as an agent')).toHaveCount(0)
+    await page.getByRole('button', { name: /Show all updates/ }).click()
     await expect(page.getByText('Coordinator replied as an agent')).toBeVisible()
     await expect(page.getByText('Agent · #films7')).toBeVisible()
     await page.locator('.channel-activity-open').click()
@@ -356,9 +390,9 @@ test.describe('Channels PWA', () => {
     await expect(page).toHaveURL(/channel=channel-films7.*thread=root-1/)
     await page.getByRole('button', { name: 'Close focused thread' }).click()
     await page.locator('.channels-primary-nav button').first().click()
-    await expect(page.getByRole('heading', { name: 'Activity' })).toBeVisible()
-    await page.getByRole('button', { name: 'Done', exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'Nothing is waiting on you' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Interventions' })).toBeVisible()
+    await page.getByRole('button', { name: 'Clear for me', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Nothing needs your guidance' })).toBeVisible()
   })
 
   test('opening a direct message clears its unread notification', async ({ page }) => {
@@ -426,7 +460,7 @@ test.describe('Channels PWA', () => {
       canRestart: true,
     }
     await installChannels(page, state)
-    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&projectView=timeline`)
 
     await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
     await page.getByRole('button', { name: 'Peek', exact: true }).click()
@@ -460,7 +494,7 @@ test.describe('Channels PWA', () => {
     state.threads.get('root-1').delivery = root.thread.delivery
     await installChannels(page, state)
     await page.setViewportSize({ width: 390, height: 844 })
-    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&projectView=timeline`)
 
     const messageBody = page.locator('.channel-message-body').filter({ hasText: 'Long channel request.' })
     await expect(page.getByRole('button', { name: 'Show full message' })).toBeVisible()
@@ -487,7 +521,7 @@ test.describe('Channels PWA', () => {
 ![Second screenshot](</api/channels/${channel.id}/attachments/second-shot>)`
     await installChannels(page, state)
     await page.setViewportSize({ width: 390, height: 844 })
-    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&projectView=timeline`)
 
     const card = page.locator('.channel-message').filter({ hasText: 'Compare these screenshots.' })
     const summary = card.getByRole('button', { name: 'Show 2 images' })
@@ -519,7 +553,7 @@ test.describe('Channels PWA', () => {
       })
     })
     await installChannels(page, state)
-    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&projectView=timeline`)
 
     await expect.poll(() => page.evaluate(() => window.__fledgeBadgeCalls)).toContainEqual(['set', 1])
     await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
@@ -540,13 +574,13 @@ test.describe('Channels PWA', () => {
     urgent.thread.mentioned = true
     urgent.thread.unread = true
     await installChannels(page, state)
-    await page.goto(`${BASE}/?app=fledge&surface=channels&threadFilter=all`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&threadFilter=all&projectView=timeline`)
 
     const filters = page.getByRole('group', { name: 'Thread filters' })
     await expect(filters.getByRole('button', { name: /Needs attention/ })).toContainText('1')
     await expect(filters.getByRole('button', { name: /Mentions/ })).toContainText('1')
     await expect(filters.getByRole('button', { name: /Unread/ })).toContainText('1')
-    await expect(filters.getByRole('button', { name: /Done/ })).toContainText('1')
+    await expect(filters.getByRole('button', { name: /Cleared/ })).toContainText('1')
     await expect(filters.getByRole('button', { name: /All/ })).toContainText('2')
     const settledCard = page.locator('.channel-message').filter({ hasText: 'Settled reference thread' })
     const urgentCard = page.locator('.channel-message').filter({ hasText: 'Unread decision thread' })
@@ -566,12 +600,12 @@ test.describe('Channels PWA', () => {
     await expect(page).toHaveURL(/threadFilter=mentions/)
     await expect(urgentCard).toBeVisible()
     await expect(settledCard).toHaveCount(0)
-    await filters.getByRole('button', { name: /Done/ }).click()
+    await filters.getByRole('button', { name: /Cleared/ }).click()
     await expect(settledCard).toBeVisible()
     await expect(urgentCard).toHaveCount(0)
     await filters.getByRole('button', { name: /Needs attention/ }).click()
     await expect(page).toHaveURL(/threadFilter=needs/)
-    await page.getByRole('button', { name: 'Threads', exact: true }).click()
+    await page.getByRole('button', { name: 'Context', exact: true }).click()
     await expect(page.getByRole('group', { name: 'Thread filters' }).getByRole('button', { name: /Needs attention/ })).toHaveAttribute('aria-pressed', 'true')
     await expect(page.locator('.channel-thread-index-row')).toHaveCount(1)
     await page.reload()
@@ -598,7 +632,7 @@ test.describe('Channels PWA', () => {
     state.threads.get('bridge').lastReadSeq = 0
     await installChannels(page, state)
     await page.setViewportSize({ width: 1180, height: 820 })
-    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&projectView=timeline`)
 
     await page.getByRole('button', { name: /Focus thread: The dramatic/ }).click()
     const pane = page.getByRole('complementary', { name: 'Focused thread' })
@@ -628,7 +662,7 @@ test.describe('Channels PWA', () => {
     }
     await installChannels(page, state)
     await page.setViewportSize({ width: 390, height: 844 })
-    await page.goto(`${BASE}/?app=fledge&surface=channels&threadFilter=needs`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&threadFilter=needs&projectView=timeline`)
 
     await expect(page.getByRole('status')).toContainText('Nothing needs you')
     await expect(page.getByRole('status')).toContainText('Unread replies, decisions, and failures will appear here.')
@@ -655,8 +689,8 @@ test.describe('Channels PWA', () => {
     await installChannels(page, state)
     await page.goto(`${BASE}/?app=fledge&surface=channels`)
 
-    await page.getByRole('button', { name: 'Create channel', exact: true }).click()
-    await page.getByRole('textbox', { name: 'Channel name' }).fill('Fairfield')
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    await page.getByRole('textbox', { name: 'Project name' }).fill('Fairfield')
     await page.locator('.channel-dialog-submit').click()
     await expect(page.getByRole('button', { name: 'Adding agents…' })).toBeVisible()
     releaseStaffing()
@@ -686,8 +720,8 @@ test.describe('Channels PWA', () => {
     await installChannels(page, state)
     await page.goto(`${BASE}/?app=fledge&surface=channels`)
 
-    await page.getByRole('button', { name: 'Create channel', exact: true }).click()
-    await page.getByRole('textbox', { name: 'Channel name' }).fill('Overlap')
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    await page.getByRole('textbox', { name: 'Project name' }).fill('Overlap')
     await page.locator('.channel-dialog-submit').click()
     await expect.poll(() => state.channelGets).toBe(2)
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
@@ -715,8 +749,8 @@ test.describe('Channels PWA', () => {
     await installChannels(page, state)
     await page.goto(`${BASE}/?app=fledge&surface=channels`)
 
-    await page.getByRole('button', { name: 'Create channel', exact: true }).click()
-    await page.getByRole('textbox', { name: 'Channel name' }).fill('Partial')
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    await page.getByRole('textbox', { name: 'Project name' }).fill('Partial')
     await page.locator('.channel-dialog-submit').click()
 
     await expect(page.getByRole('heading', { name: '#partial' })).toBeVisible()
@@ -729,9 +763,9 @@ test.describe('Channels PWA', () => {
     await page.setViewportSize({ width: 1180, height: 820 })
     await page.goto(`${BASE}/?app=fledge&surface=channels`)
 
-    await page.getByRole('button', { name: 'Create channel', exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'Create a channel' })).toBeVisible()
-    await page.getByRole('textbox', { name: 'Channel name' }).press('Escape')
+    await page.getByRole('button', { name: 'Create project', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Create a project' })).toBeVisible()
+    await page.getByRole('textbox', { name: 'Project name' }).press('Escape')
     await expect(page.getByRole('dialog')).toHaveCount(0)
 
     await page.getByRole('button', { name: 'Invite', exact: true }).click()
@@ -805,26 +839,26 @@ test.describe('Channels PWA', () => {
     await page.goto(`${BASE}/?app=fledge&surface=channels`)
 
     await expect(page.getByRole('button', { name: 'Open Fledge navigation' })).toHaveCount(0)
-    await page.getByRole('button', { name: 'All channels', exact: true }).click()
-    const directory = page.getByRole('dialog', { name: 'All channels' })
+    await page.getByRole('button', { name: 'All projects', exact: true }).click()
+    const directory = page.getByRole('dialog', { name: 'All projects' })
     await expect(directory).toBeVisible()
     await expect(directory.getByText('films7', { exact: true })).toBeVisible()
     await expect(directory.getByText('operations', { exact: true })).toBeVisible()
     await expect(directory.getByText('3', { exact: true })).toBeVisible()
-    await directory.getByRole('button', { name: 'New channel', exact: true }).click()
-    await expect(page.getByRole('heading', { name: 'Create a channel' })).toBeVisible()
+    await directory.getByRole('button', { name: 'New project', exact: true }).click()
+    await expect(page.getByRole('heading', { name: 'Create a project' })).toBeVisible()
     await page.getByRole('button', { name: 'Close', exact: true }).click()
-    await page.getByLabel('New channel message').fill('Draft survives workspace navigation')
+    await page.getByLabel('Project shout').fill('Draft survives workspace navigation')
     const mobileNav = page.locator('.channels-mobile-nav')
-    const activityButton = mobileNav.getByRole('button', { name: 'Activity 1', exact: true })
+    const activityButton = mobileNav.getByRole('button', { name: 'Interventions 1', exact: true })
     const [activityBox, badgeBox] = await Promise.all([activityButton.boundingBox(), activityButton.locator('b').boundingBox()])
     expect(activityBox).not.toBeNull()
     expect(badgeBox).not.toBeNull()
     expect(badgeBox.x).toBeGreaterThanOrEqual(activityBox.x)
     expect(badgeBox.x + badgeBox.width).toBeLessThanOrEqual(activityBox.x + activityBox.width)
-    await mobileNav.getByRole('button', { name: 'Channels', exact: true }).click()
-    await expect(page.getByRole('dialog', { name: 'All channels' })).toBeVisible()
-    await page.getByRole('button', { name: 'Close all channels' }).click()
+    await mobileNav.getByRole('button', { name: 'Projects', exact: true }).click()
+    await expect(page.getByRole('dialog', { name: 'All projects' })).toBeVisible()
+    await page.getByRole('button', { name: 'Close all projects' }).click()
     await expect(mobileNav.getByRole('button', { name: 'Rooms', exact: true })).toBeVisible()
     await mobileNav.getByRole('button', { name: 'Rooms', exact: true }).click()
     await expect(page).toHaveURL(/surface=rooms/)
@@ -834,7 +868,7 @@ test.describe('Channels PWA', () => {
     await page.getByRole('navigation', { name: 'Fledge destinations' }).getByRole('button', { name: 'Channels', exact: true }).click()
     await expect(page).toHaveURL(/surface=channels/)
     await expect(page.getByRole('heading', { name: '#films7' })).toBeVisible()
-    await expect(page.getByLabel('New channel message')).toHaveValue('Draft survives workspace navigation')
+    await expect(page.getByLabel('Project shout')).toHaveValue('Draft survives workspace navigation')
   })
 
   test('notification denial becomes an honest disabled state', async ({ page }) => {
@@ -860,12 +894,12 @@ test.describe('Channels PWA', () => {
     state.roots[1].replies.at(-1).content = longResult
     await installChannels(page, state)
     await page.setViewportSize({ width: 390, height: 844 })
-    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+    await page.goto(`${BASE}/?app=fledge&surface=channels&projectView=timeline`)
 
     const mobileNav = page.locator('.channels-mobile-nav')
-    await expect(mobileNav.getByRole('button', { name: 'Activity' })).toBeVisible()
-    await expect(mobileNav.getByRole('button', { name: 'Channels' })).toBeVisible()
-    await expect(mobileNav.getByRole('button', { name: 'Threads' })).toBeVisible()
+    await expect(mobileNav.getByRole('button', { name: 'Interventions' })).toBeVisible()
+    await expect(mobileNav.getByRole('button', { name: 'Projects' })).toBeVisible()
+    await expect(mobileNav.getByRole('button', { name: 'Context' })).toBeVisible()
     await expect(mobileNav.getByRole('button', { name: 'DMs' })).toBeVisible()
 
     await page.getByRole('button', { name: /2 replies/ }).click()
@@ -889,7 +923,7 @@ test.describe('Channels PWA', () => {
     await page.setViewportSize({ width: 390, height: 844 })
     await page.goto(`${BASE}/?app=fledge&surface=channels`)
 
-    const composer = page.getByLabel('New channel message')
+    const composer = page.getByLabel('Project shout')
     await composer.fill('Visible on iPhone')
     await expect(composer).toHaveValue('Visible on iPhone')
     await expect(composer).toHaveCSS('font-size', '16px')
@@ -932,6 +966,7 @@ test.describe('Channels PWA', () => {
     expect(state.posts[0].content).toContain('See the keyboard screenshot.')
     expect(state.posts[0].content).toContain(`/api/channels/${channel.id}/attachments/${state.attachments[0].id}`)
     await expect(page.locator('.channel-image-preview')).toHaveCount(0)
+    await openProjectTimeline(page)
     await expect(page.locator('.channel-timeline .markdown img[alt="mobile-screenshot.png"]')).toBeVisible()
   })
 })

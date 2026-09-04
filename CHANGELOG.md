@@ -1,3 +1,9 @@
+## 2026-09-04 - Intervention-first project control room
+- **Projects now open on a Control room instead of a message timeline.** The first screen answers what needs human direction, what agent work is running or queued, when source activity last changed, and where to inspect context; ordinary unread conversation is deliberately excluded from the intervention queue.
+- **Problems and claims no longer blur together.** Stopped turns appear as observed Problems, explicit `NEEDS YOU:` responses remain honestly labeled legacy guidance requests, agent prose is labeled as an agent report, and the interface refuses to manufacture a project status from chat.
+- **A dated project brief and four editable steering prompts make intervention immediate.** `Status`, `Blockers`, `Assumptions`, and `Direction` prompts load into the persistent project shout box; intervention cards prepare a targeted reply in the source thread; Timeline, full Context, and recent source updates remain one action away.
+- **The navigation now reflects project work rather than chat mechanics.** Channels are presented as Projects, Activity as Interventions, Threads as Context, and personal `Done` actions as the more accurate `Clear for me`.
+
 ## 2026-09-04 - iOS PWA unread badges
 - **The installed Fledge web app now shows its unread count on the iOS Home Screen icon.** Every push carries the recipient’s exact durable unread-thread count, and the service worker sets or clears the app badge while Fledge is closed instead of waiting for the app to reopen.
 - **Foreground and background counts now reconcile to one source of truth.** Opening or finishing unread work clears the badge promptly, refreshing restores the exact count, and granting notification permission immediately applies the current count.
