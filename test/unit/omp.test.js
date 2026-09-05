@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import { resolveOmpModel, resolveOmpThinking, ompLaunchCommand, ompModelFlags, ompNeedsDeviceAuth, ompTmuxArgs, sanitizeOmpModel } from '../../lib/omp.js'
 
 describe('omp launch config', () => {
-  it('defaults the model to gpt-5.6-sol and honors a valid override', () => {
-    assert.equal(resolveOmpModel({}), 'openai-codex/gpt-5.6-sol')
+  it('defaults the model to gpt-6-astra and honors a valid override', () => {
+    assert.equal(resolveOmpModel({}), 'openai-codex/gpt-6-astra')
     assert.equal(resolveOmpModel({ FEATHER_OMP_MODEL: 'anthropic/claude-opus-4-8' }), 'anthropic/claude-opus-4-8')
     assert.equal(resolveOmpModel({ FEATHER_OMP_MODEL: 'gpt-5.6-sol' }), 'gpt-5.6-sol')
   })
@@ -13,8 +13,8 @@ describe('omp launch config', () => {
     assert.equal(resolveOmpModel({ FEATHER_OMP_MODEL: '' }), '')
     assert.equal(resolveOmpModel({ FEATHER_OMP_MODEL: '   ' }), '')
     // Anything with quotes/spaces/semicolons can't be a model id → fall back.
-    assert.equal(resolveOmpModel({ FEATHER_OMP_MODEL: "sol'; rm -rf /" }), 'openai-codex/gpt-5.6-sol')
-    assert.equal(resolveOmpModel({ FEATHER_OMP_MODEL: 'has space' }), 'openai-codex/gpt-5.6-sol')
+    assert.equal(resolveOmpModel({ FEATHER_OMP_MODEL: "sol'; rm -rf /" }), 'openai-codex/gpt-6-astra')
+    assert.equal(resolveOmpModel({ FEATHER_OMP_MODEL: 'has space' }), 'openai-codex/gpt-6-astra')
   })
 
   it('defaults thinking to xhigh and accepts only known levels', () => {
