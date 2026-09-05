@@ -17,11 +17,11 @@ describe('omp launch config', () => {
     assert.equal(resolveOmpModel({ FEATHER_OMP_MODEL: 'has space' }), 'openai-codex/gpt-6-astra')
   })
 
-  it('defaults thinking to xhigh and accepts only known levels', () => {
-    assert.equal(resolveOmpThinking({}), 'xhigh')
+  it('defaults thinking to high and accepts only known levels', () => {
+    assert.equal(resolveOmpThinking({}), 'high')
     assert.equal(resolveOmpThinking({ FEATHER_OMP_THINKING: 'medium' }), 'medium')
-    assert.equal(resolveOmpThinking({ FEATHER_OMP_THINKING: 'bogus' }), 'xhigh')
-    assert.equal(resolveOmpThinking({ FEATHER_OMP_THINKING: '' }), 'xhigh')
+    assert.equal(resolveOmpThinking({ FEATHER_OMP_THINKING: 'bogus' }), 'high')
+    assert.equal(resolveOmpThinking({ FEATHER_OMP_THINKING: '' }), 'high')
   })
 
   it('sanitizes per-session model overrides: valid id or empty, never a fallback', () => {
