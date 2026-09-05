@@ -1,3 +1,8 @@
+## 2026-09-05 - Fable-adaptive project control
+- **Each active project now gets a channel-specific control view chosen by Fable.** A background presentation planner reads a compact project snapshot, chooses one of four safe emphases—intervention, delivery, review, or direction—and updates the headline, module priority, and one editable recommended prompt without ever generating executable UI.
+- **Adaptation is bounded, cached, and credential-safe.** The browser checks every three minutes, but unchanged source fingerprints reuse the existing plan; model calls run server-side with tools, permissions, and session persistence disabled, validated structured output, a per-call budget, failure backoff, and a two-call concurrency ceiling.
+- **The view learns from project outcomes without silently training on clicks.** Useful/not-useful ratings and meaningful actions such as preparing the recommended prompt or opening source context enter the durable channel event log and become weak evidence for the next source-driven plan; every factual status and source module remains visible regardless of Fable’s choice.
+
 ## 2026-09-04 - Intervention-first project control room
 - **Projects now open on a Control room instead of a message timeline.** The first screen answers what needs human direction, what agent work is running or queued, when source activity last changed, and where to inspect context; ordinary unread conversation is deliberately excluded from the intervention queue.
 - **Problems and claims no longer blur together.** Stopped turns appear as observed Problems, explicit `NEEDS YOU:` responses remain honestly labeled legacy guidance requests, agent prose is labeled as an agent report, and the interface refuses to manufacture a project status from chat.

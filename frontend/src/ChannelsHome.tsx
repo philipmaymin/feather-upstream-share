@@ -6,11 +6,13 @@ import {
   createChannelDm,
   fetchChannelActivity,
   fetchChannelExecutionPeek,
+  fetchChannelPresentation,
   fetchChannelMessages,
   fetchChannelPrincipals,
   fetchChannelThread,
   fetchChannels,
   postChannelMessage,
+  recordChannelPresentationFeedback,
   restartChannelExecution,
   subscribeChannels,
   updateChannelAttention,
@@ -22,6 +24,7 @@ import {
   type ChannelExecutionPeek,
   type ChannelInfo,
   type ChannelMessage,
+  type ChannelPresentation,
   type ChannelPrincipal,
   type ChannelThread,
 } from './api'
@@ -247,6 +250,9 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   const [threadUnreadAfterSeq, setThreadUnreadAfterSeq] = createSignal<number | null>(null)
   const [threadHistoryExpanded, setThreadHistoryExpanded] = createSignal(false)
   const [activity, setActivity] = createSignal<{ items: ChannelActivityItem[]; unread: number; needsYou: number }>({ items: [], unread: 0, needsYou: 0 })
+  const [presentation, setPresentation] = createSignal<ChannelPresentation | null>(null)
+  const [presentationRefreshing, setPresentationRefreshing] = createSignal(false)
+  const [presentationFeedback, setPresentationFeedback] = createSignal<'helpful' | 'not_helpful' | null>(null)
   const [principals, setPrincipals] = createSignal<ChannelPrincipal[]>([])
   const [loading, setLoading] = createSignal(true)
   const [refreshing, setRefreshing] = createSignal(false)
@@ -285,6 +291,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   let refreshTimer: number | undefined
   let restartNoticeTimer: number | undefined
   let peekTimer: number | undefined
+  let presentationTimer: number | undefined
   let threadScroller: HTMLElement | undefined
   let rootComposer: HTMLTextAreaElement | undefined
   let replyComposer: HTMLTextAreaElement | undefined
@@ -303,6 +310,10 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   let loadGeneration = 0
   let threadLoadRequest = 0
   const readMessageByThread = new Map<string, string>()
+  const fablePresentation = createMemo(() => {
+    const plan = presentation()
+    return plan?.source === 'fable' ? plan : null
+  })
   let appBadgeUnread = 0
 
   const allChannels = createMemo(() => [...snapshot().channels, ...snapshot().dms])
@@ -435,21 +446,41 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     history.replaceState({ ...(history.state || {}), channelThreadFilter: filter }, '', `${url.pathname}${url.search}`)
   }
 
+  function trackPresentationAction(action: 'helpful' | 'not_helpful' | 'prompt_prepared' | 'steering_prepared' | 'context_opened' | 'timeline_opened') {
+    const channelId = selectedChannelId()
+    const plan = presentation()
+    if (!channelId || plan?.source !== 'fable') return
+    void recordChannelPresentationFeedback(channelId, {
+      planId: plan.id,
+      focus: plan.focus,
+      action,
+    }).catch(() => {})
+  }
+
   function chooseProjectView(next: ProjectView) {
     setProjectViewMode(next)
     const url = new URL(location.href)
     if (next === 'timeline') url.searchParams.set('projectView', 'timeline')
     else url.searchParams.delete('projectView')
     history.replaceState({ ...(history.state || {}), projectView: next }, '', `${url.pathname}${url.search}`)
+    if (next === 'timeline') trackPresentationAction('timeline_opened')
   }
 
-  function prepareProjectPrompt(prompt: typeof PROJECT_GUIDANCE_PROMPTS[number]) {
+  function prepareProjectPrompt(prompt: { label: string; prompt: string }) {
     updateRootDraft(prompt.prompt)
     queueMicrotask(() => {
       rootComposer?.focus()
       rootComposer?.scrollIntoView({ block: 'nearest' })
     })
+    trackPresentationAction('prompt_prepared')
     setAnnouncement(`${prompt.label} prompt is ready to edit and send.`)
+  }
+
+  function submitPresentationFeedback(action: 'helpful' | 'not_helpful') {
+    if (presentationFeedback()) return
+    setPresentationFeedback(action)
+    trackPresentationAction(action)
+    setAnnouncement('Feedback saved. Fable will use it when the project view next changes.')
   }
 
   async function prepareInterventionReply(message: ChannelMessage) {
@@ -463,6 +494,21 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setReplyDraft(`${target ? `@${target.username} ` : ''}${prompt}`)
     queueMicrotask(() => replyComposer?.focus())
     setAnnouncement('A steering reply is ready to edit and send.')
+    trackPresentationAction('steering_prepared')
+  }
+
+  async function loadPresentation(channelId: string, generation = loadGeneration) {
+    try {
+      const next = await fetchChannelPresentation(channelId)
+      if (generation !== loadGeneration || selectedChannelId() !== channelId) return
+      setPresentation(current => {
+        if (current?.id !== next.presentation.id) setPresentationFeedback(null)
+        return next.presentation
+      })
+      setPresentationRefreshing(next.refreshing)
+    } catch {
+      if (generation === loadGeneration && selectedChannelId() === channelId) setPresentationRefreshing(false)
+    }
   }
 
   async function loadRoots(channelId: string, generation = loadGeneration) {
@@ -572,13 +618,20 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       setSelectedChannelId(channelId)
       if (channelId !== requested) setRootDraft(loadChannelDraft(channelId))
       if (channelId) {
-        await loadRoots(channelId, generation)
+        await Promise.all([
+          loadRoots(channelId, generation),
+          nextSnapshot.channels.some(item => item.id === channelId)
+            ? loadPresentation(channelId, generation)
+            : Promise.resolve(),
+        ])
         await Promise.all([...expandedThreadIds()].map(expandedId =>
           loadInlineThread(channelId, expandedId, generation).catch(() => {})))
         if (rootId) await loadThread(channelId, rootId, generation).catch(() => setThread(null))
       } else {
         setRoots([])
         setThread(null)
+        setPresentation(null)
+        setPresentationRefreshing(false)
       }
       if (options.initial) updateLocation(section(), channelId, rootId, 'replace')
       const badge = appBadgeUnread
@@ -621,10 +674,15 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     setRosterOpen(false)
     setChannelDirectoryOpen(false)
     setRoots([])
+    setPresentation(null)
+    setPresentationRefreshing(false)
     setLoading(true)
     updateLocation(nextSection, channel.id, null, 'push')
     try {
-      await loadRoots(channel.id)
+      await Promise.all([
+        loadRoots(channel.id),
+        channel.type === 'channel' ? loadPresentation(channel.id) : Promise.resolve(),
+      ])
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Conversation could not be loaded')
     } finally {
@@ -1083,6 +1141,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       ? snapshot().dms[0]?.id || null
       : snapshot().channels[0]?.id || snapshot().dms[0]?.id || null
     const channelId = listed.some(channel => channel.id === requestedChannel) ? requestedChannel : fallback
+    const nextChannel = listed.find(channel => channel.id === channelId) || null
     const rootId = params.get('thread')
     const changedChannel = channelId !== selectedChannelId()
     const generation = ++loadGeneration
@@ -1096,19 +1155,26 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       setExpandedMessageIds(new Set())
       setInlineThreads({})
       setRosterOpen(false)
+      setPresentation(null)
+      setPresentationRefreshing(false)
     }
     setThreadUnreadAfterSeq(null)
     setThreadHistoryExpanded(false)
     setThread(null)
     if (!channelId) {
       setRoots([])
+      setPresentation(null)
+      setPresentationRefreshing(false)
       return
     }
     try {
       if (changedChannel) {
         setLoading(true)
         setRoots([])
-        await loadRoots(channelId, generation)
+        await Promise.all([
+          loadRoots(channelId, generation),
+          nextChannel?.type === 'channel' ? loadPresentation(channelId, generation) : Promise.resolve(),
+        ])
       }
       if (rootId) await loadThread(channelId, rootId, generation, request)
     } catch (reason) {
@@ -1145,6 +1211,12 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
     window.addEventListener('keydown', onEscape)
     document.addEventListener('visibilitychange', onVisibilityChange)
     const unsubscribe = subscribeChannels(queueRefresh)
+    presentationTimer = window.setInterval(() => {
+      const channelId = selectedChannelId()
+      if (!document.hidden && section() === 'channels' && selectedChannel()?.type === 'channel' && channelId) {
+        void loadPresentation(channelId)
+      }
+    }, 3 * 60 * 1000)
     if ('Notification' in window && Notification.permission === 'granted' && 'serviceWorker' in navigator) {
       navigator.serviceWorker.ready
         .then(registration => registration.pushManager.getSubscription())
@@ -1156,6 +1228,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
       clearTimeout(refreshTimer)
       clearTimeout(restartNoticeTimer)
       clearInterval(peekTimer)
+      clearInterval(presentationTimer)
       window.removeEventListener('popstate', onPopState)
       window.removeEventListener('keydown', onEscape)
       document.removeEventListener('visibilitychange', onVisibilityChange)
@@ -1440,15 +1513,49 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
   }
 
   const renderProjectControl = () => (
-    <section class="channel-control-room" aria-label="Project control room">
+    <section
+      class="channel-control-room"
+      classList={{
+        'channel-control-focus-intervention': (presentation()?.focus || 'intervention') === 'intervention',
+        'channel-control-focus-delivery': presentation()?.focus === 'delivery',
+        'channel-control-focus-review': presentation()?.focus === 'review',
+        'channel-control-focus-direction': presentation()?.focus === 'direction',
+      }}
+      data-presentation-focus={presentation()?.focus || 'intervention'}
+      aria-label="Project control room"
+    >
       <header class="channel-control-lead">
         <div>
-          <small>Project control room</small>
-          <h2>Steer the work, not the conversation</h2>
-          <p>Only explicit requests and stopped turns enter the intervention queue. Messages remain available as source context.</p>
+          <small>{fablePresentation() ? 'Fable adaptive view' : presentationRefreshing() ? 'Fable is reviewing this project' : 'Project control room'}</small>
+          <h2>{presentation()?.headline || 'Steer the work, not the conversation'}</h2>
+          <p>{presentation()?.rationale || 'Only explicit requests and stopped turns enter the intervention queue. Messages remain available as source context.'}</p>
         </div>
-        <time title={projectUpdatedAt()}>Source activity through {datedTime(projectUpdatedAt())}</time>
+        <time title={projectUpdatedAt()}>
+          {presentationRefreshing()
+            ? 'Reviewing new source…'
+            : fablePresentation()?.generatedAt
+              ? `Adapted ${relativeTime(fablePresentation()!.generatedAt!)} · sources through ${datedTime(projectUpdatedAt())}`
+              : `Source activity through ${datedTime(projectUpdatedAt())}`}
+        </time>
       </header>
+
+      <Show when={fablePresentation()}>{plan => (
+        <section class="channel-adaptive-recommendation" data-testid="adaptive-recommendation" aria-label="Fable recommended next move">
+          <div>
+            <small>Suggested next move</small>
+            <h3>{plan().recommendedPrompt!.question}</h3>
+            <p>Fable prepared an editable prompt. Nothing is sent until you choose.</p>
+          </div>
+          <button type="button" class="channel-adaptive-use" onClick={() => prepareProjectPrompt(plan().recommendedPrompt!)}>
+            {plan().recommendedPrompt!.label}
+          </button>
+          <div class="channel-adaptive-feedback" aria-label="Rate this adaptive focus">
+            <span>Useful focus?</span>
+            <button type="button" classList={{ selected: presentationFeedback() === 'helpful' }} aria-pressed={presentationFeedback() === 'helpful'} disabled={!!presentationFeedback()} onClick={() => submitPresentationFeedback('helpful')}>Yes</button>
+            <button type="button" classList={{ selected: presentationFeedback() === 'not_helpful' }} aria-pressed={presentationFeedback() === 'not_helpful'} disabled={!!presentationFeedback()} onClick={() => submitPresentationFeedback('not_helpful')}>Not quite</button>
+          </div>
+        </section>
+      )}</Show>
 
       <div class="channel-control-metrics" aria-label="Current project signals">
         <div><b>{projectInterventions().length}</b><span>need steering</span></div>
@@ -1486,7 +1593,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                     </Show>
                     <div class="channel-intervention-actions">
                       <button type="button" class="primary" onClick={() => void prepareInterventionReply(message)}>Prepare steering reply</button>
-                      <button type="button" onClick={() => void openThread(message.threadRootId, message.channelId)}>Open context</button>
+                      <button type="button" onClick={() => { trackPresentationAction('context_opened'); void openThread(message.threadRootId, message.channelId) }}>Open context</button>
                     </div>
                   </article>
                 )
@@ -1505,7 +1612,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
               <For each={projectWork()}>{message => (
                 <article class="channel-work-card">
                   <div><span class="channel-worklog-pulse running" /><div><b>{message.thread!.title}</b><p>{message.thread!.delivery.activeCount} running · {message.thread!.delivery.queuedCount} queued</p></div></div>
-                  <button type="button" onClick={() => void openThread(message.threadRootId, message.channelId)}>Inspect</button>
+                  <button type="button" onClick={() => { trackPresentationAction('context_opened'); void openThread(message.threadRootId, message.channelId) }}>Inspect</button>
                 </article>
               )}</For>
             </Show>
@@ -1528,7 +1635,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
                   <h2>{answered ? 'Latest reported status' : 'Status request sent'}</h2>
                   <p class="channel-status-provenance">{answered ? 'Agent claim' : 'Human request'} · {update.author.displayName} · {datedTime(update.createdAt)}</p>
                   <p>{compactProjectExcerpt(update.content, 420)}</p>
-                  <button type="button" onClick={() => void openThread(statusRoot().threadRootId, statusRoot().channelId)}>Open status context</button>
+                  <button type="button" onClick={() => { trackPresentationAction('context_opened'); void openThread(statusRoot().threadRootId, statusRoot().channelId) }}>Open status context</button>
                 </>
               )
             }}</Show>
@@ -1549,7 +1656,7 @@ export default function ChannelsHome(props: ChannelsHomeProps) {
             <For each={recentProjectRoots()}>{message => {
               const update = latestRootMessage(message)
               return (
-                <button type="button" onClick={() => void openThread(message.threadRootId, message.channelId)}>
+                <button type="button" onClick={() => { trackPresentationAction('context_opened'); void openThread(message.threadRootId, message.channelId) }}>
                   <span>{update.author.kind === 'agent' ? 'Agent report' : 'Human direction'} · {relativeTime(update.createdAt)}</span>
                   <b>{message.thread?.title}</b>
                   <p>{compactProjectExcerpt(update.content, 150)}</p>

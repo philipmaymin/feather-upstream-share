@@ -288,6 +288,31 @@ export interface ChannelActivityItem {
   updates?: number
 }
 
+export type ChannelPresentationFocus = 'intervention' | 'delivery' | 'review' | 'direction'
+
+export interface ChannelPresentation {
+  id: string
+  source: 'fable' | 'fallback'
+  model: string | null
+  focus: ChannelPresentationFocus
+  headline: string
+  rationale: string
+  recommendedPrompt: {
+    label: string
+    question: string
+    prompt: string
+  } | null
+  generatedAt: string | null
+  sourceFingerprint: string
+}
+
+export interface ChannelPresentationResponse {
+  presentation: ChannelPresentation
+  refreshing: boolean
+  checkAfterMs: number
+  checkedAt: string
+}
+
 export async function fetchChannels(): Promise<{ channels: ChannelInfo[]; dms: ChannelInfo[]; principal: ChannelPrincipal }> {
   return responseJson(await fetch(`${BASE}/api/channels`))
 }
@@ -309,6 +334,25 @@ export async function fetchChannelActivity(): Promise<{ items: ChannelActivityIt
 export async function fetchChannelPrincipals(): Promise<ChannelPrincipal[]> {
   const data = await responseJson<{ principals: ChannelPrincipal[] }>(await fetch(`${BASE}/api/channels/principals`))
   return data.principals
+}
+
+export async function fetchChannelPresentation(channelId: string): Promise<ChannelPresentationResponse> {
+  return responseJson(await fetch(`${BASE}/api/channels/${encodeURIComponent(channelId)}/presentation`))
+}
+
+export async function recordChannelPresentationFeedback(
+  channelId: string,
+  input: {
+    planId: string
+    focus: ChannelPresentationFocus
+    action: 'helpful' | 'not_helpful' | 'prompt_prepared' | 'steering_prepared' | 'context_opened' | 'timeline_opened'
+  },
+): Promise<void> {
+  await responseJson(await fetch(`${BASE}/api/channels/${encodeURIComponent(channelId)}/presentation/feedback`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify(input),
+  }))
 }
 
 export interface ChannelAttachment {
@@ -408,7 +452,7 @@ export async function cancelChannelExecution(executionId: string): Promise<void>
 
 export function subscribeChannels(onChange: (event: { channelId: string | null; type: string }) => void): () => void {
   const source = new EventSource(`${BASE}/api/channels/stream`)
-  for (const type of ['message', 'thread', 'attention', 'channel', 'execution']) {
+  for (const type of ['message', 'thread', 'attention', 'channel', 'execution', 'presentation']) {
     source.addEventListener(type, event => {
       try {
         const data = JSON.parse((event as MessageEvent).data)

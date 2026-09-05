@@ -63,6 +63,7 @@ function fixtureState() {
       canRestart: true,
     },
     posts: [],
+    presentationFeedback: [],
     attachments: [],
   }
 }
@@ -110,6 +111,30 @@ async function installChannels(page, state) {
     if (pathname === '/api/channels/activity') return route.fulfill({ json: { items: state.activity, unread: state.activity.filter(item => !item.readAt && !item.doneAt).length, needsYou: 0 } })
     if (pathname === '/api/channels/principals') return route.fulfill({ json: { principals: state.createdChannel ? [...state.createdChannel.members, coordinator, caretaker, btw] : [philip, coordinator, caretaker, btw] } })
     if (pathname === '/api/channels/stream') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'event: connected\ndata: {}\n\n' })
+    if (pathname === `/api/channels/${channel.id}/presentation` && request.method() === 'GET') {
+      return route.fulfill({
+        json: {
+          presentation: state.presentation || {
+            id: 'fallback-plan',
+            source: 'fallback',
+            model: null,
+            focus: 'intervention',
+            headline: 'Steer the work, not the conversation',
+            rationale: 'Only explicit requests and stopped turns enter the intervention queue. Messages remain available as source context.',
+            recommendedPrompt: null,
+            generatedAt: null,
+            sourceFingerprint: 'fixture',
+          },
+          refreshing: false,
+          checkAfterMs: 180000,
+          checkedAt: NOW,
+        },
+      })
+    }
+    if (pathname === `/api/channels/${channel.id}/presentation/feedback` && request.method() === 'POST') {
+      state.presentationFeedback.push(JSON.parse(request.postData() || '{}'))
+      return route.fulfill({ status: 201, json: { feedback: { acceptedAt: NOW } } })
+    }
     if (pathname === `/api/channels/${channel.id}/messages` && request.method() === 'GET') return route.fulfill({ json: { messages: state.roots } })
     if (state.createdChannel && pathname === `/api/channels/${state.createdChannel.id}/messages` && request.method() === 'GET') return route.fulfill({ json: { messages: [] } })
     if (state.dm && pathname === `/api/channels/${state.dm.id}/messages` && request.method() === 'GET') {
@@ -241,6 +266,49 @@ test.describe('Channels PWA', () => {
     await openProjectTimeline(page)
     await expect(page.getByText('What dramatic question should the opening make impossible to ignore?')).toBeVisible()
   })
+  test('Fable changes project emphasis and learns from chosen actions', async ({ page }) => {
+    const state = fixtureState()
+    state.presentation = {
+      id: 'fable-direction-plan',
+      source: 'fable',
+      model: 'fable',
+      focus: 'direction',
+      headline: 'Challenge the story assumption before more execution',
+      rationale: 'The active work is moving, but the latest source leaves the core audience assumption unverified.',
+      recommendedPrompt: {
+        label: 'Challenge assumption',
+        question: 'Which audience assumption could invalidate the current opening?',
+        prompt: 'ASSUMPTION CHECK — Identify the one audience assumption most likely to invalidate the current opening. Cite the source evidence and propose one discriminating check.',
+      },
+      generatedAt: NOW,
+      sourceFingerprint: 'direction-fixture',
+    }
+    await installChannels(page, state)
+    await page.setViewportSize({ width: 1180, height: 820 })
+    await page.goto(`${BASE}/?app=fledge&surface=channels`)
+
+    const control = page.getByRole('region', { name: 'Project control room' })
+    await expect(control).toHaveAttribute('data-presentation-focus', 'direction')
+    await expect(control.getByRole('heading', { name: 'Challenge the story assumption before more execution' })).toBeVisible()
+    await expect(page.getByTestId('adaptive-recommendation')).toContainText('Which audience assumption could invalidate the current opening?')
+    const positions = await control.evaluate(element => {
+      const brief = element.querySelector('.channel-control-brief')
+      const primary = element.querySelector('.channel-control-primary')
+      if (!brief || !primary) throw new Error('adaptive control columns are missing')
+      const briefBounds = brief.getBoundingClientRect()
+      const primaryBounds = primary.getBoundingClientRect()
+      return { briefLeft: briefBounds.left, primaryLeft: primaryBounds.left }
+    })
+    expect(positions.briefLeft).toBeLessThan(positions.primaryLeft)
+
+    await page.getByRole('button', { name: 'Challenge assumption' }).click()
+    await expect(page.getByLabel('Project shout')).toHaveValue(/^ASSUMPTION CHECK — Identify the one audience assumption/)
+    await expect.poll(() => state.presentationFeedback.some(item => item.action === 'prompt_prepared')).toBe(true)
+    await page.getByRole('button', { name: 'Yes', exact: true }).click()
+    await expect(page.getByRole('button', { name: 'Yes', exact: true })).toHaveAttribute('aria-pressed', 'true')
+    await expect.poll(() => state.presentationFeedback.some(item => item.action === 'helpful')).toBe(true)
+  })
+
   test('desktop keeps shared work legible from channel to execution', async ({ page }) => {
     const state = fixtureState()
     state.threads.get('root-1').executions.unshift({

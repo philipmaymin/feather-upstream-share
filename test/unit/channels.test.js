@@ -75,6 +75,49 @@ describe('channel event store', () => {
     assert.equal(mode, 0o600)
   })
 
+  it('keeps adaptive presentation feedback durable and idempotent', () => {
+    const { store, philip, channel } = setup()
+    const first = store.recordPresentationFeedback({
+      channelId: channel.id,
+      principalId: philip.id,
+      planId: 'fable-plan-1',
+      focus: 'direction',
+      action: 'helpful',
+      idempotencyKey: 'presentation-feedback:1',
+    })
+    const replay = store.recordPresentationFeedback({
+      channelId: channel.id,
+      principalId: philip.id,
+      planId: 'fable-plan-1',
+      focus: 'direction',
+      action: 'helpful',
+      idempotencyKey: 'presentation-feedback:1',
+    })
+    store.recordPresentationFeedback({
+      channelId: channel.id,
+      principalId: philip.id,
+      planId: 'fable-plan-1',
+      focus: 'direction',
+      action: 'prompt_prepared',
+      idempotencyKey: 'presentation-feedback:2',
+    })
+
+    assert.equal(replay.eventId, first.eventId)
+    assert.equal(replay.existing, true)
+    const summary = store.presentationFeedbackSummary(channel.id, philip.id)
+    assert.equal(summary.sampleSize, 2)
+    assert.deepEqual(summary.actions, { prompt_prepared: 1, helpful: 1 })
+    assert.deepEqual(summary.focuses, { direction: 2 })
+    assert.ok(summary.latestAt)
+    assert.throws(() => store.recordPresentationFeedback({
+      channelId: channel.id,
+      principalId: philip.id,
+      planId: 'fable-plan-2',
+      focus: 'invented',
+      action: 'helpful',
+    }), /invalid presentation focus/)
+  })
+
   it('keeps agent sessions stable and dispatches only the latest unanswered thread after staffing', () => {
     const { store, philip, channel, coordinator, caretaker, btw } = setup()
     const replay = store.addAgent({
